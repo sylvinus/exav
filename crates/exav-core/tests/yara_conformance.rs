@@ -1225,7 +1225,7 @@ fn regexp_patterns_5() {
     pattern_false!(r"/abc\B/", b"abc");
     pattern_match!(r"/\Babc/", b"1abc", b"abc");
     pattern_match!(r"/abc\B/", b"abc1", b"abc");
-    // NOTE: `\<` / `\>` are omitted — the Rust regex crate treats them as
+    // NOTE: `\<` / `\>` are omitted: the Rust regex crate treats them as
     // zero-width word boundaries, whereas yara-x treats them as literals.
     pattern_match!(r"/\b{start}abc/", b"abc", b"abc");
     pattern_match!(r"/abc\b{end}/", b"abc", b"abc");
@@ -1358,8 +1358,8 @@ fn phase_b_constructs_compile() {
 //
 // Ported from yara-x's `lib/src/tests/mod.rs` (`for_in`, `with`, `for_of`,
 // `match_count`/`match_offset`/`match_length` for-of assertions). Assertions
-// gated on the `test_proto2` module in yara-x are omitted — exav does not
-// ship a test module — but every non-module `for`/`with`/`for-of` assertion is
+// gated on the `test_proto2` module in yara-x are omitted (exav does not
+// ship a test module), but every non-module `for`/`with`/`for-of` assertion is
 // reproduced here.
 // ---------------------------------------------------------------------------
 
@@ -1512,8 +1512,8 @@ fn for_of_patterns() {
     );
 }
 
-// `for any <var> in pe.sections` — a struct-typed loop variable navigated in
-// the body — plus `with` bound to `pe` sub-values.
+// `for any <var> in pe.sections`, a struct-typed loop variable navigated in
+// the body, plus `with` bound to `pe` sub-values.
 #[test]
 fn for_in_pe_sections() {
     const PE: &[u8] = include_bytes!("testdata/tiny_pe32.exe");

@@ -1,6 +1,6 @@
 //! Container-metadata signatures (`.cdb`): match a file *inside* a container
 //! (zip/7z/tar/cab/mail/...) by the container type and the member's name,
-//! sizes, encryption and position — without needing a content signature.
+//! sizes, encryption and position, without needing a content signature.
 //!
 //! Format:
 //! `VirusName:ContainerType:ContainerSize:FileNameREGEX:FileSizeInContainer:
@@ -49,7 +49,7 @@ enum CType {
     Any,
     /// A type we model.
     Is(FileType),
-    /// A specific container type we don't produce — never matches.
+    /// A specific container type we don't produce: never matches.
     Unmodeled,
 }
 
@@ -151,23 +151,28 @@ impl CdbDb {
         self.sigs.is_empty()
     }
 
-    pub fn extend_from_text(&mut self, text: &str) {
-        self.extend_from_text_prov(text, false);
+    pub fn extend_from_text(&mut self, text: &str) -> usize {
+        self.extend_from_text_prov(text, false)
     }
 
     /// As [`CdbDb::extend_from_text`], tagging each parsed signature's
-    /// `unofficial` provenance.
-    pub fn extend_from_text_prov(&mut self, text: &str, unofficial: bool) {
+    /// `unofficial` provenance. Returns how many lines did not parse.
+    pub fn extend_from_text_prov(&mut self, text: &str, unofficial: bool) -> usize {
+        let mut skipped = 0;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if let Some(mut sig) = parse_cdb(line) {
-                sig.unofficial = unofficial;
-                self.sigs.push(sig);
+            match parse_cdb(line) {
+                Some(mut sig) => {
+                    sig.unofficial = unofficial;
+                    self.sigs.push(sig);
+                }
+                None => skipped += 1,
             }
         }
+        skipped
     }
 
     /// Return the first signature that matches the given member of a container
@@ -246,7 +251,7 @@ mod tests {
     #[test]
     fn cdb_flevel_window_filters() {
         // A `.cdb` sig whose engine feature-level window (MinFL:MaxFL) excludes
-        // the running flevel must not load — the same gate the pattern engine
+        // the running flevel must not load: the same gate the pattern engine
         // applies to `.ndb`/`.ldb`. EXAV_FLEVEL is 213.
         let mut db = CdbDb::new();
         // Deprecated window (max 200 < 213): skipped at load.
@@ -295,7 +300,7 @@ mod tests {
     }
 
     /// The real daily.cvd `Archive.Filetype.DualExtJS` sig (double-extension JS in
-    /// a ZIP) must match its member. Its `FilePos` is `1` — ClamAV counts members
+    /// a ZIP) must match its member. Its `FilePos` is `1`: ClamAV counts members
     /// from 1, so the first member is position 1 (regression: exav numbered from 0
     /// and missed these).
     #[test]

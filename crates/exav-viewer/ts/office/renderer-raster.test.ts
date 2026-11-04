@@ -8,6 +8,11 @@ import type { Grid } from "./raster.js";
 
 type Options = Record<string, unknown>;
 const viewers: { engine: string; options: Options; canvas?: HTMLElement }[] = [];
+/** What the fake sheet engine was given to load. */
+const loads: { data?: ArrayBuffer; options?: unknown }[] = [];
+
+// A CSV is read by exav-render in a worker, which the tests run in this process.
+vi.mock("./table-engine.js", () => import("../test/table.js"));
 
 /** What the fake second document was asked. */
 const exported = {
@@ -82,7 +87,9 @@ vi.mock("@silurus/ooxml/xlsx", () => ({
     constructor(_canvas: HTMLElement, options: Options) {
       viewers.push({ engine: "xlsx", options });
     }
-    async load() {}
+    async load(data?: ArrayBuffer, options?: unknown) {
+      loads.push({ data, options });
+    }
     getScale() {
       return 1;
     }
@@ -110,6 +117,7 @@ afterEach(() => {
   delete (HTMLCanvasElement.prototype as { clientWidth?: number }).clientWidth;
   delete (HTMLCanvasElement.prototype as { clientHeight?: number }).clientHeight;
   viewers.length = 0;
+  loads.length = 0;
   Object.assign(exported, { rasters: [], disposed: [], measured: [], sources: [], gate: Promise.resolve() });
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -422,12 +430,16 @@ describe("a spreadsheet", () => {
 });
 
 describe("a CSV", () => {
-  it("has one sheet, drawn from its table as a workbook", async () => {
+  it("has one sheet, and the screen and the pictures open the same workbook made of its table", async () => {
     const { mounted } = await mount(csv(), new TextEncoder().encode("a;b\n1;2\n"));
     expect(mounted.controllers.pictures!.get()).toEqual({ count: 1, space: "page" });
     const workbook = new Uint8Array(await exported.sources[0]!());
     // A ZIP: the second copy is a workbook made of the table.
     expect([...workbook.slice(0, 4)]).toEqual([0x50, 0x4b, 0x03, 0x04]);
+    // The screen loads it as a workbook, with no delimiter or encoding to name.
+    expect(loads).toHaveLength(1);
+    expect(loads[0]!.options).toBeUndefined();
+    expect(new Uint8Array(loads[0]!.data!)).toEqual(workbook);
     expect(mounted.controllers.sheets).toBeUndefined();
   });
 });

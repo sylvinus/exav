@@ -91,6 +91,12 @@ behind [`@exav/viewer`](../exav-viewer) and the decoding half of
     tables and SYLK. Values, formulas as text with their cached results,
     styles and number formats, merges, conditional formats, validations,
     comments, links, pictures, shapes and charts.
+  - **CSV and TSV** (`office-csv`, `sheets::convert_csv`, to XLSX of one
+    sheet of text cells): the encoding is exav-unpack's rule for text files
+    (a UTF-16 byte-order mark, else UTF-8 when valid, else windows-1252),
+    the separator the comma, semicolon or tab that cuts the first rows into
+    the same number of fields. With that feature alone only the XLSX writer
+    is compiled, none of the workbook readers.
   - **Presentations** (`slides`, to PPTX): PowerPoint 95 and 97 to 2003
     (2 to 4 are recognised and reported as unsupported), ODP, FODP and OTP,
     and Apple Keynote in every version. Masters, placeholders, styles,

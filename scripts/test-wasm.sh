@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Run the extractor unit tests on the 32-bit wasm32-wasip1 target under wasmtime.
 #
-# WHY: `usize` is 32-bit on wasm32 (and exav ships a WASM build — the extractor
+# WHY: `usize` is 32-bit on wasm32 (and exav ships a WASM build: the extractor
 # runs sandboxed under wasmtime in production). Integer-overflow and
 # capacity-overflow bugs on parsed offsets/lengths are invisible on a 64-bit host
-# but abort the process on wasm32. This target runs the same unit tests — which
-# include the `u32::MAX`/`u64::MAX` hostile-input regressions — with a 32-bit
+# but abort the process on wasm32. This target runs the same unit tests (which
+# include the `u32::MAX`/`u64::MAX` hostile-input regressions) with a 32-bit
 # `usize`, so that class fails the build instead of the fuzzer/prod.
 #
 # USAGE:
@@ -49,7 +49,7 @@ cargo test --lib -p exav-unpack --target wasm32-wasip1 "$@"
 cargo test -p exav-unpack --test all --target wasm32-wasip1 -- extreme
 
 # 2) The scanning core, minus `yara` (yara-x pulls wasmtime/cranelift, which
-#    can't target wasm) — so the engine/pe/patterns/phishing/dlp byte-processing
+#    can't target wasm), so the engine/pe/patterns/phishing/dlp byte-processing
 #    logic is checked on a 32-bit `usize` too. Host-filesystem tests (DB/database
 #    loaders) are `#[cfg_attr(target_family = "wasm", ignore)]` and run natively.
 cargo test --lib -p exav-core \

@@ -1,5 +1,5 @@
-//! A container (ZIP here) appended to a carrier — a PE overlay / SFX stub /
-//! dropper — must be carved and scanned. The normal scan only types offset 0, so
+//! A container (ZIP here) appended to a carrier (a PE overlay / SFX stub /
+//! dropper) must be carved and scanned. The normal scan only types offset 0, so
 //! without embedded-archive carving the payload in the overlay is invisible.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze};
@@ -52,6 +52,33 @@ fn archives_past_the_carving_cap_are_not_a_clean_scan() {
         Verdict::LimitsExceeded { reason } => assert!(reason.contains("carving"), "{reason}"),
         other => panic!("33 embedded archives must not scan clean, got {other:?}"),
     }
+}
+
+/// Both caps are `Limits`: a lower one makes a smaller object not fully
+/// scanned, a higher one or `u64::MAX` (`off`) takes more.
+#[test]
+fn the_carving_caps_are_limits() {
+    let db = Scanner::builtin();
+    let scan = |data: &[u8], set: &dyn Fn(&mut ScanOptions)| {
+        let mut opts = ScanOptions::default();
+        set(&mut opts);
+        analyze(&db, data, &opts).verdict
+    };
+    let pes = carrier(tiny_pe(), 20);
+    let gz = gzip(b"nothing to see in this member");
+    let gzs = carrier(&gz, 40);
+    let limited =
+        |v: &Verdict| matches!(v, Verdict::LimitsExceeded { reason } if reason.contains("carving"));
+    let executables = |n: u64| scan(&pes, &|o| o.limits.max_carved_executables = n);
+    let archives = |n: u64| scan(&gzs, &|o| o.limits.max_carved_archives = n);
+
+    assert!(limited(&executables(2)));
+    assert_eq!(executables(20), Verdict::Clean);
+    assert_eq!(executables(u64::MAX), Verdict::Clean);
+
+    assert!(limited(&archives(2)));
+    assert_eq!(archives(40), Verdict::Clean);
+    assert_eq!(archives(u64::MAX), Verdict::Clean);
 }
 
 /// Reaching the cap in one member does not stop the walk: a detection in a
@@ -262,5 +289,68 @@ fn a_damaged_executable_in_a_carrier_does_not_hide_the_archive_with_the_payload(
         other => {
             panic!("the archive before a damaged executable must still be found, got {other:?}")
         }
+    }
+}
+
+/// A carved archive that ends in a limit is reported if nothing is found, and
+/// the archives carved after it are still opened.
+#[test]
+fn a_carved_archive_over_a_limit_does_not_hide_the_archive_after_it() {
+    let mut opts = ScanOptions::default();
+    opts.limits.max_buffer_bytes = 64 * 1024;
+    // A member over the object limit is spilled, which is where the ratio is checked.
+    opts.spill = Some(std::sync::Arc::new(
+        exav_core::unpack::spill::MemSpill::new(),
+    ));
+    opts.limits.max_compression_ratio = 100;
+    let scan = |data: &[u8]| analyze(&Scanner::builtin(), data, &opts).verdict;
+    let bomb = gzip(&vec![0u8; 1 << 20]);
+    let eicar = exav_core::unpack::eicar();
+    let payload = gzip(&[eicar, b"\n"].concat().repeat(64));
+    assert!(!payload.windows(eicar.len()).any(|w| w == eicar));
+    let text = b"a carrier with things stapled inside it\n".as_slice();
+    let filler = [b'.'; 100].as_slice();
+
+    let alone = [text, &bomb, filler].concat();
+    match scan(&alone) {
+        Verdict::LimitsExceeded { reason } => assert!(reason.contains("ratio"), "{reason}"),
+        other => panic!("the carved bomb alone is not a full scan, got {other:?}"),
+    }
+    let control = [text, &payload, filler].concat();
+    assert!(
+        matches!(scan(&control), Verdict::Infected { .. }),
+        "the premise"
+    );
+    let both = [text, &bomb, filler, &payload, filler].concat();
+    match scan(&both) {
+        Verdict::Infected { signature, .. } => {
+            assert!(
+                signature.to_ascii_uppercase().contains("EICAR"),
+                "{signature}"
+            )
+        }
+        other => panic!("the archive after the bomb must still be opened, got {other:?}"),
+    }
+}
+
+/// Of the reasons of the parts carved from an object, password protection
+/// is reported over a limit, whichever comes first, as in a container.
+#[test]
+fn a_carved_encrypted_archive_is_reported_over_a_carved_limit() {
+    let mut opts = ScanOptions::default();
+    opts.limits.max_buffer_bytes = 64 * 1024;
+    opts.limits.max_compression_ratio = 100;
+    let scan = |data: &[u8]| analyze(&Scanner::builtin(), data, &opts).verdict;
+    let bomb = gzip(&vec![0u8; 1 << 20]);
+    let locked = include_bytes!("../fixtures/aes256_hdr.7z").as_slice();
+    let text = b"a carrier with things stapled inside it\n".as_slice();
+    let filler = [b'.'; 100].as_slice();
+    for parts in [[&bomb[..], locked], [locked, &bomb[..]]] {
+        let carrier = [text, parts[0], filler, parts[1], filler].concat();
+        assert!(
+            matches!(scan(&carrier), Verdict::PasswordProtected { .. }),
+            "{:?}",
+            scan(&carrier)
+        );
     }
 }

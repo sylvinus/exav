@@ -9,11 +9,7 @@ use std::io::{Cursor, Read};
 /// copyright Mike Krüger). Methods 1-3 are LHA `-lh6-`-compatible (decoded
 /// via `delharc`), method 4 is ARJ's own "fastest" codec, method 0 is stored;
 /// members are CRC-32 verified only when checksum verification is enabled (off by default).
-pub(crate) fn extract_arj<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_arj(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     use crate::formats::arj_parse::arj_archive::ArjArchive;
     use crate::formats::arj_parse::local_file_header::{
         CompressionMethod, FileType as ArjFileType,
@@ -32,7 +28,7 @@ pub(crate) fn extract_arj<R>(
     // structure it cannot be started from. Recovering members without a main
     // header is a new capability rather than a fallback, and pretending
     // otherwise would report an archive as walked when nothing was enumerated.
-    let mut arc = ArjArchive::new(data.to_vec())
+    let mut arc = ArjArchive::new(data.to_vec(), budget.should_verify_checksums())
         .ok_or_else(|| LimitHit::corrupt("arj: invalid header or CRC".to_string()))?;
     // Candidate passwords for garbled (encrypted) members. ARJ's GOST/garble
     // decryptors are wired to the same pool as every other archive.
@@ -61,7 +57,8 @@ pub(crate) fn extract_arj<R>(
                         header.compressed_size as u64,
                         false,
                         "unsupported ARJ compression method",
-                    ),
+                    )
+                    .of_kind(crate::tree::ReasonKind::Unsupported),
                     budget,
                 )
             {
@@ -74,15 +71,14 @@ pub(crate) fn extract_arj<R>(
         }
         let cap = budget.reserve()?;
         if header.original_size as u64 > cap {
-            // Too big to decompress within budget — but its metadata is still
+            // Too big to decompress within budget, but its metadata is still
             // valid, so yield a metadata-only member rather than abandoning the
             // archive. `.cdb` name/size signatures still match, and the members
             // after this one still get scanned.
             if let Some(r) = visit(
-                Entry::unsupported(
+                Entry::over_limit(
                     header.name.clone(),
                     header.original_size as u64,
-                    false,
                     "ARJ member exceeds size budget",
                 ),
                 budget,
@@ -98,7 +94,7 @@ pub(crate) fn extract_arj<R>(
         let buf = match arc.read(&header, budget.should_verify_checksums()) {
             Some(b) => b,
             // A garbled member we couldn't decrypt (no password worked / none
-            // supplied) is surfaced as an encrypted member — never a silent skip,
+            // supplied) is surfaced as an encrypted member, never a silent skip,
             // and it must not abort the rest of the archive.
             None if header.is_garbled() => {
                 if let Some(r) = visit(
@@ -133,7 +129,6 @@ pub(crate) fn extract_arj<R>(
                 continue;
             }
         };
-        ratio_guard(header.compressed_size as u64, buf.len() as u64, budget)?;
         budget.commit(buf.len() as u64);
         if let Some(r) = visit(Entry::new(name, buf), budget) {
             return Ok(Some(r));
@@ -141,7 +136,7 @@ pub(crate) fn extract_arj<R>(
     }
     // The iterator can only say "no more entries". If it stopped on a malformed
     // header rather than the archive's end marker, everything after that point
-    // was never enumerated — say so instead of returning as though the archive
+    // was never enumerated: say so instead of returning as though the archive
     // had been walked to the end. A wrong header CRC in particular must not be
     // able to hide the rest of an archive.
     if arc.stopped_early() {
@@ -166,7 +161,7 @@ mod tests {
     use crate::{Budget, Format, Limits, extract};
 
     /// A garbled (encrypted, `arj -g`) member is decrypted with a pool password
-    /// and its plaintext recovered — identical to the unencrypted `sample.arj`.
+    /// and its plaintext recovered, identical to the unencrypted `sample.arj`.
     #[test]
     fn garbled_member_decrypts_with_pool_password() {
         let data = include_bytes!("../../tests/fixtures/sample_garbled.arj");
@@ -218,7 +213,7 @@ mod tests {
     ///
     /// The header reader walks fixed-width fields off a slice whose length the
     /// archive chose. Any declared size that runs out mid-field is ordinary
-    /// attacker input — and the CRC is over the header bytes, so an attacker
+    /// attacker input, and the CRC is over the header bytes, so an attacker
     /// computes a valid one for whatever length they like. `extract` wraps the
     /// decoder in a panic boundary, so this calls `extract_arj` directly: the
     /// decoder itself has to hold.
@@ -239,7 +234,7 @@ mod tests {
 
             let mut budget = Budget::new(Limits::default());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                super::extract_arj::<()>(&data, &mut budget, &mut |_, _| None)
+                super::extract_arj(&data, &mut budget, &mut |_, _| None)
             }));
             assert!(
                 result.is_ok(),

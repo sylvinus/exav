@@ -392,6 +392,20 @@ test.describe("a CSV", () => {
     expect(await refused(page, 2, { width: 100 })).toBe("invalid");
     await expect.poll(async () => (await viewport(page))?.page).toBe(1);
   });
+
+  test("is read into a workbook that holds its cells in their columns, the empty ones empty", async ({ page }) => {
+    await page.goto(`./?${new URLSearchParams({ lang: "en", mode: "page" })}`);
+    // Semicolons, CRLF and windows-1252 (the accent is 0xC9): the sheet engine opens the XLSX that exav-render writes of it.
+    const table = Buffer.from("ÉÉÉÉ;;MMMM\r\nMMMM;;ÉÉÉÉ\r\n", "latin1");
+    await page.getByTestId("file-input").setInputFiles({ name: "gap.csv", mimeType: "", buffer: table });
+    await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready", { timeout: 60_000 });
+    await pages(page).toBe(1);
+    await page.waitForTimeout(800);
+    const third = async (n: number) => ink(await raster(page, 1, { width: 90, region: { x: n / 3, y: 0, width: 1 / 3, height: 1 } }));
+    expect(await third(0)).toBeGreaterThan(50);
+    expect(await third(1)).toBe(0);
+    expect(await third(2)).toBeGreaterThan(50);
+  });
 });
 
 test.describe("the converted formats", () => {

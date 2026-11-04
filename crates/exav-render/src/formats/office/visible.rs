@@ -5,7 +5,7 @@
 
 use super::text::Text;
 use super::{docs, sheets, slides};
-use exav_unpack::cfb::Compound;
+use exav_unpack::cfb::Kind;
 
 /// What a file is, among what is read here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +127,19 @@ pub fn wants(name: &str, head: &[u8]) -> bool {
     text.starts_with("id;") || xml_kind(&text).is_some()
 }
 
+/// The documents of a compound file ([`exav_unpack::cfb::compound_kinds`]): a
+/// compound file may hold several, and each is read.
+fn compound_kinds(data: &[u8]) -> Vec<Doc> {
+    exav_unpack::cfb::compound_kinds(data)
+        .into_iter()
+        .map(|k| match k {
+            Kind::Word => Doc::Docs(docs::Format::Doc),
+            Kind::Workbook => Doc::Sheets(sheets::Format::Xls),
+            Kind::Presentation => Doc::Slides(slides::Format::Ppt),
+        })
+        .collect()
+}
+
 /// What kind of document `data` is, when it is one read here.
 fn kind(name: &str, data: &[u8]) -> Option<Doc> {
     let head = &data[..data.len().min(4096)];
@@ -137,17 +150,7 @@ fn kind(name: &str, data: &[u8]) -> Option<Doc> {
         if !has_extension(name, COMPOUND_EXTENSIONS) {
             return None;
         }
-        let c = Compound::open(data)?;
-        let has = |n: &str| c.names().any(|s| s.eq_ignore_ascii_case(n));
-        return if has("WordDocument") {
-            Some(Doc::Docs(docs::Format::Doc))
-        } else if has("Workbook") || has("Book") {
-            Some(Doc::Sheets(sheets::Format::Xls))
-        } else if has("PowerPoint Document") || has("PP40") {
-            Some(Doc::Slides(slides::Format::Ppt))
-        } else {
-            None
-        };
+        return compound_kinds(data).first().copied();
     }
     if head.starts_with(b"PK") {
         return iwork(name);
@@ -210,6 +213,52 @@ pub enum Read {
 /// work.
 pub fn read(name: &str, data: &[u8], cap: usize, limits: &exav_unpack::Limits) -> Option<Read> {
     let doc = kind(name, data)?;
+    if data.starts_with(&OLE2) {
+        let kinds = compound_kinds(data);
+        if kinds.len() > 1 {
+            return read_all(&kinds, data, cap, limits);
+        }
+    }
+    read_one(doc, data, cap, limits)
+}
+
+/// The text of each document of a compound file that holds several, one
+/// after the other within `cap`. One that cannot be read cuts the text; when
+/// none can, the file is unreadable.
+fn read_all(kinds: &[Doc], data: &[u8], cap: usize, limits: &exav_unpack::Limits) -> Option<Read> {
+    let mut all = Text::default();
+    let mut read = 0;
+    let mut why = None;
+    for &doc in kinds {
+        let left = cap.saturating_sub(all.text.len());
+        match read_one(doc, data, left, limits) {
+            Some(Read::Text(t)) => {
+                read += 1;
+                let at = all.text.len();
+                all.text.push_str(&t.text);
+                all.truncated |= t.truncated;
+                let room = super::text::MAX_LINKS.saturating_sub(all.links.len());
+                all.links.extend(t.links.into_iter().take(room));
+                all.sections.extend(t.sections.into_iter().map(|mut s| {
+                    s.range = s.range.start + at..s.range.end + at;
+                    s
+                }));
+            }
+            Some(Read::Unreadable(w)) => {
+                all.truncated = true;
+                why.get_or_insert(w);
+            }
+            None => {}
+        }
+    }
+    match why {
+        Some(w) if read == 0 => Some(Read::Unreadable(w)),
+        _ if read == 0 => None,
+        _ => Some(Read::Text(all)),
+    }
+}
+
+fn read_one(doc: Doc, data: &[u8], cap: usize, limits: &exav_unpack::Limits) -> Option<Read> {
     let memory = limits.max_buffer_bytes;
     let made = match doc {
         Doc::Docs(f) => docs::text(

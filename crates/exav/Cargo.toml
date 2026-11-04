@@ -75,6 +75,8 @@ image-hash = ["exav-core/image-hash"]
 visible-text = ["exav-core/visible-text"]
 visible-text-pdf = ["exav-core/visible-text-pdf"]
 visible-text-office = ["exav-core/visible-text-office"]
+# `--qr`: the QR codes in images, read by exav-qr. Not a default.
+qr = ["exav-core/qr"]
 decrypt = ["exav-core/decrypt"]
 
 # Archive/container formats, forwarded to exav-core, then exav-unpack. `all-formats`
@@ -143,6 +145,9 @@ romfs = ["exav-core/romfs"]
 erofs = ["exav-core/erofs"]
 zoo = ["exav-core/zoo"]
 ishieldz = ["exav-core/ishieldz"]
+ishieldcab = ["exav-core/ishieldcab"]
+ishieldmsi = ["exav-core/ishieldmsi"]
+applesingle = ["exav-core/applesingle"]
 pepack = ["exav-core/pepack"]
 javaclass = ["exav-core/javaclass"]
 aimodel = ["exav-core/aimodel"]
@@ -170,6 +175,8 @@ serde_json = "1"
 # a scanned byte.
 
 [dev-dependencies]
+# Draws the QR codes the `qr` tests read.
+qrcode = { version = "0.14", default-features = false }
 
 # `.deb` packaging via cargo-deb (https://github.com/kornelski/cargo-deb):
 #   cargo build --release -p exav && cargo deb -p exav --no-build

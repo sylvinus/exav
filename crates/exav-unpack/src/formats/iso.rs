@@ -8,9 +8,6 @@ use std::io::{BufReader, Cursor, Read, Seek, Write};
 
 const SECTOR: u64 = 2048;
 
-/// Directory-walk guard. Hitting it is reported, never a quiet stop.
-const MAX_DIRS: usize = 1024;
-
 /// Decode a directory-record file identifier. Joliet supplementary descriptors
 /// store names as UCS-2 (UTF-16) big-endian; the primary descriptor uses a
 /// byte string. A trailing `;1` version suffix is stripped either way.
@@ -32,8 +29,8 @@ fn decode_name(raw: &[u8], joliet: bool) -> String {
 
 /// The root directory records worth walking, as `(joliet, root_lba, root_len)`.
 ///
-/// A malicious ISO commonly lists its payload in only ONE directory tree — often
-/// the Joliet supplementary tree, leaving the primary tree empty — to hide from
+/// A malicious ISO commonly lists its payload in only ONE directory tree (often
+/// the Joliet supplementary tree, leaving the primary tree empty) to hide from
 /// readers that parse only the other. So we enumerate every volume descriptor
 /// (they run from sector 16 until a terminator, type 255) and return the root of
 /// each primary (type 1) and Joliet (type 2) tree. Joliet roots come first so
@@ -75,14 +72,14 @@ fn vd_roots(read: &mut dyn FnMut(u64, usize) -> Vec<u8>) -> Vec<(bool, u64, u64)
 /// Walk a disc image: the ISO 9660 trees, then UDF, skipping the files the
 /// first already emitted (the order `extract_iso` uses). Each file is streamed
 /// from where it lies.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let mut source = crate::source::Reader::new(src);
-    let (members, mut seen) = stream_offsets(&mut source, budget.limits().max_buffer_bytes)?;
-    if let Some(t) = crate::stream::stream_stored(&mut source, budget, visit, members)? {
+    let (members, mut seen) = stream_offsets(&mut source, budget)?;
+    if let Some(t) = crate::stream::stream_stored_ranges(src, budget, visit, members)? {
         return Ok(Some(t));
     }
     crate::formats::udf::stream_udf(&mut source, budget, visit, &mut seen)
@@ -93,14 +90,18 @@ type StreamedTree = (Vec<Region>, HashSet<(u64, u64)>);
 
 /// Walk the ISO 9660 directory tree(s) via targeted reads (directory records
 /// are small) and return each file as a region; file extents, the bulk of a
-/// disc image, are streamed by the caller. `max_buffer` bounds each directory
-/// read. Both the primary and Joliet trees are walked; a file present in both
-/// (by extent and length) is emitted once. The extents emitted come back too, for the UDF
-/// walk that follows to skip.
+/// disc image, are streamed by the caller. The buffer limit bounds each
+/// directory read. Each directory walked is a member of the budget, and its
+/// bytes are charged to the scan budget: directories may overlap on the image,
+/// so how many are read is no measure of its size. Both the primary and Joliet
+/// trees are walked; a file present in both (by extent and length) is emitted
+/// once. The extents emitted come back too, for the UDF walk that follows to
+/// skip.
 pub(crate) fn stream_offsets<R: Read + Seek>(
     source: &mut R,
-    max_buffer: u64,
+    budget: &mut Budget,
 ) -> Result<StreamedTree, LimitHit> {
+    let max_buffer = budget.limits().max_buffer_bytes;
     let total_len = source
         .seek(std::io::SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("iso: {e}")))?;
@@ -127,7 +128,6 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
     if roots.is_empty() {
         return Ok((out, seen_files));
     }
-    let mut visited = 0usize;
     // Each queued dir carries the Joliet flag of the tree it belongs to.
     // A directory is walked once per tree, however many records name it: a
     // record can point back at its own extent.
@@ -136,19 +136,13 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
     // walked first, and a file in both trees takes its long name.
     let mut dirs: Vec<(bool, u64, u64)> = roots.into_iter().rev().collect();
     while let Some((joliet, lba, len)) = dirs.pop() {
-        visited = visited.saturating_add(1);
-        if visited > MAX_DIRS {
-            // Breaking out silently would leave every remaining directory
-            // unenumerated while the image could still be reported clean.
-            out.push(Region::Unwalked(
-                format!("<iso-directories-beyond-{MAX_DIRS}>"),
-                "too many ISO directories to walk them all",
-            ));
-            break;
-        }
+        // A walk past the member limit ends here, not quietly: the remaining
+        // directories are unenumerated.
+        budget.count_entry()?;
         let start = lba.saturating_mul(SECTOR);
         let avail = total_len.saturating_sub(start);
         let read_len = len.min(avail).min(max_buffer) as usize;
+        budget.charge_scan(read_len as u64)?;
         let dir = read_at(start, read_len);
         if let Some(e) = failed.take() {
             return Err(e);

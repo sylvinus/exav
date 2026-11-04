@@ -20,13 +20,13 @@ use crate::{Budget, LimitHit};
 const HEADER: usize = 6;
 const TRAILER: usize = 20;
 
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let mut source = Reader::new(src);
-    stream_single(&mut source, budget, visit, "lzip-content", |_| {
+    stream_single(&mut source, budget, visit, "lzip-content", &mut |_| {
         Ok(Box::new(Members::new(src)) as Box<dyn Read + '_>)
     })
 }
@@ -48,7 +48,7 @@ struct Members<'a> {
     src: &'a dyn ByteSource,
     /// Where the current or next member starts.
     at: usize,
-    member: Option<SansIo<Reader<'a>, LzmaStream>>,
+    member: Option<SansIo<'a>>,
     crc: crc32fast::Hasher,
     size: u64,
     members: usize,
@@ -107,9 +107,8 @@ impl<'a> Members<'a> {
 
     /// Check the trailer of the member whose stream just ended, and move to
     /// what follows it.
-    fn finish(&mut self, member: SansIo<Reader<'a>, LzmaStream>) -> io::Result<()> {
-        let s = member.stream();
-        let used = s.total_in() - s.unused_input().len() as u64;
+    fn finish(&mut self, member: SansIo<'a>) -> io::Result<()> {
+        let used = member.stream().used_input();
         let end = usize::try_from(used)
             .ok()
             .and_then(|n| (self.at + HEADER).checked_add(n))

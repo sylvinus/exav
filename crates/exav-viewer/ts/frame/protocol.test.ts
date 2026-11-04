@@ -1,15 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { BUILTIN_ORDER } from "../core/formats.js";
+import { MAX_HIGHLIGHT_TEXT, MAX_HIGHLIGHTS } from "../core/highlights.js";
 import { MAX_PICTURE_EDGE, MAX_PICTURE_PIXELS } from "../core/pictures.js";
 import {
   checkBytes,
   checkCommand,
   checkFrameMessage,
+  checkHighlights,
   checkOpen,
   checkOptions,
   checkRaster,
   checkReplace,
+  checkSniff,
   checkThemeMessage,
   checkUnraster,
   checkWatch,
@@ -142,6 +145,51 @@ describe("links", () => {
     expect(linkTarget("HTTP://EXAMPLE.com")).toBe("http://example.com/");
     for (const u of ["javascript:alert(1)", " javascript:alert(1)", "/a", "a.html", "data:,x", "blob:https://x/1", "file:///x", "mailto:a@b.c"]) expect(linkTarget(u), u).toBeNull();
   });
+
+  it("is refused with credentials in it, as a Markdown link's is", () => {
+    for (const u of ["https://bank.example@evil.example/", "https://user:pass@example.com/", "http://:x@example.com/"]) expect(linkTarget(u), u).toBeNull();
+  });
+});
+
+describe("names from the frame", () => {
+  const hidden = ["\u{202e}", "\u{202a}", "\u{2066}", "\u{2069}", "\u{200f}", "\u{61c}", "\u{2028}", "\u{7}", "\u{85}"];
+  it("show controls and bidirectional characters as U+FFFD, wherever the host shows them", () => {
+    for (const c of hidden) {
+      const name = `invoice${c}fdp.exe`;
+      const shown = "invoice\u{fffd}fdp.exe";
+      const member = { index: 0, name, uncompressedSize: 1, encrypted: false };
+      const archive = checkFrameMessage({
+        type: "state",
+        session: 0,
+        key: "archive",
+        value: { members: [member], opening: null, opened: { member, name, format: null, session: 1 }, refused: null },
+      });
+      expect(archive?.type === "state" && archive.value, JSON.stringify(c)).toEqual({
+        members: [{ ...member, name: shown }],
+        opening: null,
+        opened: { member: { ...member, name: shown }, name: shown, format: null, session: 1 },
+        refused: null,
+      });
+      const state = (key: string, value: unknown) => {
+        const m = checkFrameMessage({ type: "state", session: 0, key, value });
+        return m?.type === "state" ? m.value : null;
+      };
+      expect(state("layers", { kind: "layers", items: [{ id: name, name, color: "#000", visible: true }] })).toEqual({ kind: "layers", items: [{ id: name, name: shown, color: "#000", visible: true }] });
+      expect(state("sheets", { items: [{ index: 0, name }], current: 0 })).toEqual({ items: [{ index: 0, name: shown }], current: 0 });
+      expect(state("storeys", { items: [{ id: "1", name, elevation: null, visible: true }] })).toEqual({ items: [{ id: "1", name: shown, elevation: null, visible: true }] });
+      expect(state("layouts", { items: [{ id: "1", name, isModel: false }], current: "1" })).toEqual({ items: [{ id: "1", name: shown, isModel: false }], current: "1" });
+      expect(state("outline", [{ title: name, page: 1, depth: 0, offset: null }])).toEqual([{ title: shown, page: 1, depth: 0, offset: null }]);
+      expect(state("selection", { name, category: name, storey: name })).toEqual({ name: shown, category: shown, storey: shown });
+      expect(state("warnings", [{ key: "fonts", count: 1, names: [name] }])).toEqual([{ key: "fonts", count: 1, names: [shown] }]);
+    }
+    // Other text, right to left included, is as it came.
+    expect(checkFrameMessage({ type: "state", session: 0, key: "sheets", value: { items: [{ index: 0, name: "ميزانية 2024 Ü" }], current: 0 } })).toEqual({
+      type: "state",
+      session: 0,
+      key: "sheets",
+      value: { items: [{ index: 0, name: "ميزانية 2024 Ü" }], current: 0 },
+    });
+  });
 });
 
 describe("reads and the policy the frame reports", () => {
@@ -207,6 +255,29 @@ describe("what the frame takes from the host", () => {
     expect(checkOpen(open({ file: { name: "a", type: "", path: "a", format: "evil" } }), BUILTIN_ORDER)).toBeNull();
   });
 
+  it("is an open with the file's highlights, each well formed, the others left out", () => {
+    const box = { x: 0.1, y: 0.2, width: 0.3, height: 0.05 };
+    const highlights = [
+      { id: "a", text: "prix", page: 2, label: "Prix", color: "rgb(255 0 0 / 0.4)" },
+      { id: "b", page: 1, rects: [box, { x: "1" }] },
+      // No id; a colour that would load a URL; a page that is none; boxes with no page; a quote past the limit.
+      { text: "x" },
+      { id: "c", text: "x", color: "url(https://x.test/leak)" },
+      { id: "d", text: "x", page: 0 },
+      { id: "e", rects: [box] },
+      { id: "f", text: "x".repeat(MAX_HIGHLIGHT_TEXT + 1) },
+      null,
+    ];
+    const checked = checkOpen(open({ highlights, focusHighlight: "b" }), BUILTIN_ORDER)!;
+    expect(checked.highlights).toEqual([
+      { id: "a", text: "prix", page: 2, label: "Prix", color: "rgb(255 0 0 / 0.4)" },
+      { id: "b", page: 1, rects: [box] },
+    ]);
+    expect(checked.focusHighlight).toBe("b");
+    expect("highlights" in checkOpen(open({ highlights: "all" }), BUILTIN_ORDER)!).toBe(false);
+    expect(checkHighlights(new Array(MAX_HIGHLIGHTS + 1).fill({ id: "a", text: "x" }))).toBeUndefined();
+  });
+
   it("is an open that lists the files around it, within the limits, or null", () => {
     const tree = { path: "a/a.dwg", paths: ["a/a.dwg", "a/b.dwg"] };
     expect(checkOpen(open({ tree: { ...tree, extra: 1 } }), BUILTIN_ORDER)?.tree).toEqual(tree);
@@ -264,6 +335,26 @@ describe("what the frame takes from the host", () => {
     for (const bad of ["javascript:alert(1)", "data:text/javascript,1", "@Acme/To PDF", "a b", "", "x".repeat(600), "/a\nb", 5, null]) {
       expect(checkOptions({ conversion: { externalConverter: bad } }), String(bad)).toEqual({ conversion: {} });
     }
+  });
+
+  it("drops the keys that reach a prototype, and functions, at every level", () => {
+    // Parsed, so that `__proto__` is a key of its own, as it is in a message.
+    const evil = JSON.parse(
+      '{"__proto__":{"polluted":1},"constructor":{"prototype":{"polluted":1}},"prototype":{"polluted":1},"sniff":{"bytes":7,"__proto__":{"polluted":1}},"pdf":{"maxZoom":4,"__proto__":{"polluted":1},"constructor":{"polluted":1},"prototype":{"polluted":1}}}',
+    );
+    const out = checkOptions(evil);
+    expect(out).toEqual({ pdf: { maxZoom: 4 }, sniff: { bytes: 7 } });
+    for (const o of [out, out.pdf!, out.sniff!]) for (const key of ["__proto__", "constructor", "prototype", "polluted"]) expect(Object.hasOwn(o, key), key).toBe(false);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    const fn = () => 1;
+    expect(checkOptions({ pdf: { maxZoom: fn }, image: { detail: fn }, cad: { colors: fn }, media: { controls: fn }, sniff: { bytes: fn }, conversion: fn })).toEqual({ pdf: {}, image: {}, cad: {}, media: {}, sniff: {} });
+  });
+
+  it("takes the detection's timeout and size, 0 included, and no other number", () => {
+    expect(checkOptions({ sniff: { timeoutMs: 0, bytes: 0 } })).toEqual({ sniff: { timeoutMs: 0, bytes: 0 } });
+    expect(checkOptions({ sniff: { timeoutMs: 1500.5, bytes: 4096 } })).toEqual({ sniff: { timeoutMs: 1500.5, bytes: 4096 } });
+    expect(checkOptions({ sniff: { timeoutMs: -1, bytes: 1.5 } })).toEqual({ sniff: {} });
+    expect(checkOptions({ sniff: { timeoutMs: Infinity, bytes: Number.NaN } })).toEqual({ sniff: {} });
   });
 
   it("is a command of a known target with few arguments", () => {
@@ -381,6 +472,22 @@ describe("what the frame takes from the host", () => {
     expect(checkFrameMessage({ type: "replaced", call: 3, ok: true })).toEqual({ type: "replaced", call: 3, ok: true });
     expect(checkFrameMessage({ type: "replaced", call: 3, ok: "yes" })).toBeNull();
     expect(checkFrameMessage({ type: "replaced", ok: true })).toBeNull();
+  });
+
+  it("is asked what a file is from its first bytes or an http(s) address, and answers a known format or none", () => {
+    const file = { name: "a.png", type: "", path: "a.png" };
+    const head = new ArrayBuffer(4);
+    const m = { type: "sniff", call: 2, formats: ["pdf", "nope"], file, source: { kind: "head", head, size: 9 }, sniff: { timeoutMs: 0, bytes: "x" } };
+    expect(checkSniff(m, BUILTIN_ORDER)).toEqual({ type: "sniff", call: 2, formats: ["pdf"], file, source: { kind: "head", head, size: 9 }, sniff: { timeoutMs: 0 } });
+    expect(checkSniff({ ...m, source: { kind: "url", url: "https://files.test/a.png" } }, BUILTIN_ORDER)?.source).toEqual({ kind: "url", url: "https://files.test/a.png" });
+    // A size short of the bytes, an address that is not http(s), a name too long.
+    expect(checkSniff({ ...m, source: { kind: "head", head, size: 3 } }, BUILTIN_ORDER)).toBeNull();
+    expect(checkSniff({ ...m, source: { kind: "url", url: "javascript:alert(1)" } }, BUILTIN_ORDER)).toBeNull();
+    expect(checkSniff({ ...m, file: { ...file, name: "x".repeat(5000) } }, BUILTIN_ORDER)).toBeNull();
+    expect(checkFrameMessage({ type: "sniffed", call: 2, format: "pdf" })).toEqual({ type: "sniffed", call: 2, format: "pdf" });
+    expect(checkFrameMessage({ type: "sniffed", call: 2, format: null })).toEqual({ type: "sniffed", call: 2, format: null });
+    expect(checkFrameMessage({ type: "sniffed", call: 2, format: "nope" })).toBeNull();
+    expect(checkFrameMessage({ type: "sniffed", format: "pdf" })).toBeNull();
   });
 });
 

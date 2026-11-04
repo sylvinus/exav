@@ -13,7 +13,7 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 /// A `.crb` block-list entry for the signer certificate flags the signed PE by
-/// name — no opt-in flag needed (it is signature-based, like a hash detection).
+/// name, no opt-in flag needed (it is signature-based, like a hash detection).
 #[test]
 fn crb_blocklist_flags_signed_pe() {
     // SHA-1 of the fixture cert's subject DN.

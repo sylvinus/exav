@@ -34,10 +34,11 @@ rewritten at the end of this step.
   may be added is [DEPENDENCIES.md](DEPENDENCIES.md).
 - npm: `npm outdated` and `npm audit` in `crates/exav-viewer`,
   `crates/exav-unpack-wasm` and `www`.
-- Audit: `cargo deny check advisories bans sources licenses` and `cargo audit`
-  for the workspace, and `cargo deny` for the viewer and the unpack-wasm
-  manifests as CI does (`.github/workflows/ci.yml`, job `audit`). An ignore in
-  `deny.toml` whose crate has a fixed release is dropped, not kept.
+- Audit: `cargo deny --all-features check advisories bans sources licenses`
+  and `cargo audit` for the workspace, and `cargo deny` for the viewer and the
+  unpack-wasm manifests as CI does (`.github/workflows/ci.yml`, job `audit`).
+  An ignore in `deny.toml` whose crate has a fixed release is dropped, not
+  kept.
 - The MSRV: `rust-version` in `Cargo.toml` is raised only for a reason, and
   `make msrv` builds with it. Check the toolchain pinned in the workflows.
 
@@ -122,9 +123,12 @@ One edit of each, all to the same number:
 - `scripts/release.sh --gate-only`, then `make publish-check` (the gate and
   `cargo publish --dry-run` of every crate), then `make publish`.
   The gate checks the tree is clean, the version is free on crates.io, fmt and
-  clippy, the tests, the MSRV, the package contents, that the published
-  tarballs build on their own, and that no EICAR literal is in a tarball or in
-  the tracked tree. It stops for a human before the first upload.
+  clippy, the tests, the MSRV, the package contents, that the manifests of the
+  packages with a binary carry the workspace's `[profile.release]` and
+  `[profile.fast-build]` (the script copies them in, as `cargo install` reads
+  only a package's own), that the published tarballs build on their own, and
+  that no EICAR literal is in a tarball or in the tracked tree. It stops for a
+  human before the first upload.
 - Tag `vX.Y.Z` and push the tag: `.github/workflows/release.yml` builds the
   binaries and the npm tarball, `docker.yml` the image. The npm packages are
   published from their crate directories, not from `pkg/`.

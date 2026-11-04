@@ -45,12 +45,16 @@ impl<'a> Zip<'a> {
 
     /// As `get`, the caller charging the bytes.
     pub fn read(&mut self, name: &str, max: u64) -> Result<Option<Vec<u8>>> {
-        let Ok(f) = self.z.by_name(name) else {
-            return Ok(None);
+        let f = match self.z.by_name(name) {
+            Ok(f) => f,
+            // The crate refuses an encrypted member before it is read.
+            Err(zip::result::ZipError::UnsupportedArchive(m))
+                if m == zip::result::ZipError::PASSWORD_REQUIRED =>
+            {
+                return Err(Error::Encrypted);
+            }
+            Err(_) => return Ok(None),
         };
-        if f.encrypted() {
-            return Err(Error::Encrypted);
-        }
         let mut v = Vec::new();
         if f.take(max + 1).read_to_end(&mut v).is_err() {
             return Ok(None);
@@ -90,7 +94,36 @@ pub fn image_ext(d: &[u8]) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::image_ext;
+    use super::{Error, Zip, image_ext};
+    use crate::formats::office::common::package::PackageWriter;
+
+    /// A member marked encrypted (bit 0 of its flags) is an encrypted
+    /// document, not a missing part.
+    #[test]
+    fn an_encrypted_member_is_said_to_be_encrypted() {
+        let mut w = PackageWriter::new(1 << 20);
+        w.put("content.xml", b"<x/>", true).unwrap();
+        let mut bytes = w.finish().unwrap();
+        assert_eq!(
+            Zip::open(&bytes)
+                .unwrap()
+                .read("content.xml", 100)
+                .unwrap()
+                .unwrap(),
+            b"<x/>"
+        );
+        for i in 0..bytes.len().saturating_sub(10) {
+            if bytes[i..].starts_with(b"PK\x03\x04") {
+                bytes[i + 6] |= 1;
+            } else if bytes[i..].starts_with(b"PK\x01\x02") {
+                bytes[i + 8] |= 1;
+            }
+        }
+        assert!(matches!(
+            Zip::open(&bytes).unwrap().read("content.xml", 100),
+            Err(Error::Encrypted)
+        ));
+    }
 
     #[test]
     fn picture_formats_by_their_bytes() {

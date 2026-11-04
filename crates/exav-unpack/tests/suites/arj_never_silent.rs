@@ -36,7 +36,7 @@ fn emitted(blob: &[u8]) -> Vec<Entry> {
     out
 }
 
-/// Offset of the second `0x60 0xEA` header marker — i.e. the first *local* file
+/// Offset of the second `0x60 0xEA` header marker, i.e. the first *local* file
 /// header, the main header being the first.
 fn first_local_header(data: &[u8]) -> usize {
     let mut seen = 0;
@@ -69,7 +69,7 @@ fn the_unmodified_sample_extracts_cleanly() {
 fn an_unsupported_compression_method_is_reported_not_stepped_over() {
     // Byte 5 of the local header body is the compression method. 8 is not one
     // of the four ARJ methods exav decodes, but the member is still there and a
-    // real extractor unpacks it — so it must surface rather than be skipped.
+    // real extractor unpacks it, so it must surface rather than be skipped.
     let mut data = sample();
     let lh = first_local_header(&data);
     let method = lh + 4 + 5; // magic(2) + size(2) + offset of method in body
@@ -83,6 +83,23 @@ fn an_unsupported_compression_method_is_reported_not_stepped_over() {
             .map(|x| (&x.name, x.unsupported))
             .collect::<Vec<_>>()
     );
+}
+
+/// The member is reported as a method not decoded, not as damage. The header
+/// CRC-32 goes stale with the changed byte, which is read through by default.
+#[test]
+fn an_unsupported_compression_method_has_the_unsupported_kind() {
+    use exav_unpack::tree::ReasonKind;
+    let mut data = sample();
+    let method = first_local_header(&data) + 4 + 5;
+    data[method] = 5;
+
+    let e = emitted(&data);
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert_eq!(e[0].name, "payload.txt");
+    assert!(e[0].data.is_empty(), "{e:?}");
+    assert_eq!(e[0].unsupported, Some("unsupported ARJ compression method"));
+    assert_eq!(e[0].reason_kind, Some(ReasonKind::Unsupported));
 }
 
 #[test]
@@ -104,4 +121,68 @@ fn a_malformed_header_does_not_silently_hide_the_rest_of_the_archive() {
             .map(|x| (&x.name, x.unsupported))
             .collect::<Vec<_>>()
     );
+}
+
+/// Where the CRC-32 of the main header and of the first file header are.
+fn header_crcs(data: &[u8]) -> [usize; 2] {
+    let size = |at: usize| usize::from(u16::from_le_bytes([data[at + 2], data[at + 3]]));
+    let lh = first_local_header(data);
+    [4 + size(0), lh + 4 + size(lh)]
+}
+
+/// What the members are, as the scanner would be handed them.
+fn members(data: &[u8]) -> Vec<(String, Vec<u8>, Option<&'static str>)> {
+    emitted(data)
+        .into_iter()
+        .map(|e| (e.name, e.data, e.unsupported))
+        .collect()
+}
+
+/// A header whose CRC-32 is stale hides nothing: ClamAV does not look at it, and
+/// flipping a byte of it must not be a way to keep an archive from being read.
+#[test]
+fn a_stale_header_crc_is_read_through() {
+    let data = sample();
+    let want = members(&data);
+    assert!(want.iter().all(|m| m.2.is_none()) && !want.is_empty());
+    for (what, at) in ["main", "file"].into_iter().zip(header_crcs(&data)) {
+        let mut stale = data.clone();
+        stale[at] ^= 0xFF;
+        assert_eq!(members(&stale), want, "{what} header");
+    }
+}
+
+/// With checksums verified, a stale header CRC-32 is damage again: the archive
+/// is not read, or not past that header, and says so.
+#[cfg(feature = "checksums")]
+#[test]
+fn a_stale_header_crc_is_damage_when_checksums_are_verified() {
+    let data = sample();
+    let [main, file] = header_crcs(&data);
+    let verified = |blob: &[u8]| {
+        let mut out = Vec::new();
+        let mut b = Budget::new(Limits::default());
+        b.set_verify_checksums(true);
+        let r = extract_each(
+            Format::Arj,
+            blob,
+            &mut b,
+            &mut |e: Entry, _: &mut Budget| {
+                out.push(e);
+                None::<()>
+            },
+        );
+        (r.is_ok(), out)
+    };
+    let mut stale = data.clone();
+    stale[main] ^= 0xFF;
+    assert!(!verified(&stale).0, "a stale main header CRC");
+    let mut stale = data.clone();
+    stale[file] ^= 0xFF;
+    let (_, out) = verified(&stale);
+    assert!(
+        out.iter().any(|e| e.unsupported.is_some()),
+        "a stale file header CRC"
+    );
+    assert!(out.iter().all(|e| e.data.is_empty()), "{out:?}");
 }

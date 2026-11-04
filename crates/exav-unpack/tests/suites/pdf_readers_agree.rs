@@ -197,29 +197,24 @@ fn a_comment_mark_before_an_object_on_the_same_line_does_not_hide_it() {
 
 /// Reading on after an object that does not end costs the bytes read twice. A
 /// file of thousands of objects that each leave a string open would cost the
-/// square of its size, so the re-reading is bounded, and the file says so when
-/// the bound is reached.
+/// square of its size, so the bytes read again are charged to the extraction
+/// budget, and the limit is reported when it is reached.
 #[test]
-fn many_objects_that_do_not_end_are_bounded_and_reported() {
+fn many_objects_that_do_not_end_are_charged_to_the_budget() {
     let mut p = b"%PDF-1.5\n".to_vec();
     for i in 0..6000 {
         p.extend_from_slice(
             format!("{} 0 obj\n<< /A (never closed >>\nendobj\n", i + 1).as_bytes(),
         );
     }
+    let mut limits = Limits::default();
+    limits.max_extracted_bytes = 4 << 20;
     let started = std::time::Instant::now();
-    let es = entries(&p);
+    let hit = extract(Format::Pdf, &p, &mut Budget::new(limits)).unwrap_err();
     assert!(
         started.elapsed() < std::time::Duration::from_secs(20),
         "took {:?}",
         started.elapsed()
     );
-    assert!(
-        es.iter()
-            .any(|e| e.name == "pdf-overlapping-objects" && e.unsupported.is_some()),
-        "{:?}",
-        es.iter()
-            .map(|e| (&e.name, e.unsupported))
-            .collect::<Vec<_>>()
-    );
+    assert!(hit.reason.contains("extracted bytes"), "{hit}");
 }

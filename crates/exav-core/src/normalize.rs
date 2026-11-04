@@ -7,10 +7,10 @@
 //! comment insertion or whitespace padding used to evade it. This module is a
 //! clean-room implementation driven by that interoperability requirement:
 //!
-//! * [`is_textual`] — cheap gate: is a buffer worth normalising at all?
-//! * [`html`]       — decode HTML entities, lowercase, collapse whitespace.
-//! * [`text`]       — lowercase, drop control bytes, collapse whitespace.
-//! * [`javascript`] — strip comments (quote-aware), lowercase, collapse whitespace.
+//! * [`is_textual`]: a cheap gate, whether a buffer is worth normalising at all.
+//! * [`html`]: decode HTML entities, lowercase, collapse whitespace.
+//! * [`text`]: lowercase, drop control bytes, collapse whitespace.
+//! * [`javascript`]: strip comments (quote-aware), lowercase, collapse whitespace.
 //!
 //! None of these interpret attacker-controlled sizes; they walk the input once
 //! and can't panic on any byte sequence.
@@ -72,6 +72,125 @@ impl Out for Vec<u8> {
     }
 }
 
+/// The contents of the `<script>` elements of the HTML view written into it,
+/// whatever their language, each to its `</script>` or to the end, one after
+/// the other with a newline between them: what clamscan 1.4.3 normalises as a
+/// page's script. Not event handlers, nor a script's `src`.
+pub(crate) struct Scripts<O> {
+    inner: O,
+    /// The last byte of the view, for the normaliser writing it.
+    last: Option<u8>,
+    state: ScriptState,
+    /// How much of `<script` or `</script` the bytes just read are.
+    matched: usize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ScriptState {
+    /// Outside a script element.
+    Out,
+    /// `<script` read: its name ends here, or it is another tag.
+    Name,
+    /// Inside the start tag, to its `>`.
+    Tag,
+    /// Inside the script.
+    In,
+    /// Inside the end tag, to its `>`.
+    End,
+}
+
+const OPEN: &[u8] = b"<script";
+const CLOSE: &[u8] = b"</script";
+
+impl<O: Out> Scripts<O> {
+    pub(crate) fn new(inner: O) -> Self {
+        Scripts {
+            inner,
+            last: None,
+            state: ScriptState::Out,
+            matched: 0,
+        }
+    }
+
+    /// What was written, with the start of an end tag that the view ended in
+    /// given back to the script it is part of.
+    pub(crate) fn into_inner(mut self) -> O {
+        if self.state == ScriptState::In {
+            for &held in &CLOSE[..self.matched] {
+                self.inner.push(held);
+            }
+        }
+        self.inner
+    }
+}
+
+impl<O: Out> Out for Scripts<O> {
+    fn push(&mut self, b: u8) {
+        self.last = Some(b);
+        match self.state {
+            ScriptState::Out => {
+                self.matched = match b {
+                    _ if b == OPEN[self.matched] => self.matched + 1,
+                    b'<' => 1,
+                    _ => 0,
+                };
+                if self.matched == OPEN.len() {
+                    self.matched = 0;
+                    self.state = ScriptState::Name;
+                }
+            }
+            ScriptState::Name => {
+                self.state = match b {
+                    b'>' => ScriptState::In,
+                    b'/' => ScriptState::Tag,
+                    _ if b.is_ascii_whitespace() => ScriptState::Tag,
+                    b'<' => {
+                        self.matched = 1;
+                        ScriptState::Out
+                    }
+                    _ => ScriptState::Out,
+                };
+                if self.state == ScriptState::In && self.inner.last().is_some() {
+                    self.inner.push(b'\n');
+                }
+            }
+            ScriptState::Tag if b == b'>' => {
+                self.state = ScriptState::In;
+                if self.inner.last().is_some() {
+                    self.inner.push(b'\n');
+                }
+            }
+            ScriptState::Tag => {}
+            ScriptState::In => {
+                if b == CLOSE[self.matched] {
+                    self.matched += 1;
+                    if self.matched == CLOSE.len() {
+                        self.matched = 0;
+                        self.state = ScriptState::End;
+                    }
+                    return;
+                }
+                // What looked like the end tag is the script's.
+                for &held in &CLOSE[..self.matched] {
+                    self.inner.push(held);
+                }
+                self.matched = 0;
+                if b == b'<' {
+                    self.matched = 1;
+                } else {
+                    self.inner.push(b);
+                }
+            }
+            ScriptState::End if b == b'>' => self.state = ScriptState::Out,
+            ScriptState::End => {}
+        }
+    }
+
+    fn last(&self) -> Option<u8> {
+        self.last
+    }
+}
+
 /// Append `b`, collapsing any run of ASCII whitespace to a single space.
 #[inline]
 fn push_collapsed<O: Out>(out: &mut O, b: u8, prev_ws: &mut bool) {
@@ -84,6 +203,13 @@ fn push_collapsed<O: Out>(out: &mut O, b: u8, prev_ws: &mut bool) {
         out.push(b);
         *prev_ws = false;
     }
+}
+
+/// The [`Scripts`] of the [`html`] view of `data`.
+pub(crate) fn scripts(data: &[u8]) -> Vec<u8> {
+    let mut s = Scripts::new(Vec::new());
+    html_into(&mut Indexed(data), &mut s);
+    s.into_inner()
 }
 
 /// Normalise HTML: decode entities, lowercase, collapse whitespace. Tags are
@@ -134,7 +260,7 @@ fn is_word(b: u8) -> bool {
 }
 
 /// Normalise script/JavaScript: strip comments (respecting string literals),
-/// lowercase, and remove whitespace between tokens — keeping a single space only
+/// lowercase, and remove whitespace between tokens, keeping a single space only
 /// between two identifier characters so tokens don't merge. Defeats the classic
 /// comment-and-case obfuscation of `eval(unescape(...))`-style loaders (a comment
 /// between `eval(` and `unescape(` must not leave a separating space).
@@ -475,6 +601,26 @@ mod tests {
             assert_eq!(html(s), before::html(s), "{:?}", String::from_utf8_lossy(s));
         }
         assert_eq!(html(b"a&#000000065;b"), b"aab");
+    }
+
+    /// The scripts of a page are the contents of its `<script>` elements, as
+    /// clamscan 1.4.3 normalises them: each to its end tag or to the end of
+    /// the file, whatever its language, lowercased, and nothing else of it.
+    #[test]
+    fn the_scripts_of_a_page_are_its_script_elements() {
+        let s = |page: &str| String::from_utf8(scripts(page.as_bytes())).unwrap();
+        assert_eq!(s("<p>x</p><SCRIPT>var A=1;</SCRIPT><p>y</p>"), "var a=1;");
+        assert_eq!(
+            s("<script>a()</script><p>mid</p><script type=\"text/template\">b</script>"),
+            "a()\nb"
+        );
+        assert_eq!(s("<script language=vbscript>x = \"Z\"</script>"), "x = \"z\"");
+        assert_eq!(s("<body><script>var x=1;</scr ipt> and on"), "var x=1;</scr ipt> and on");
+        assert_eq!(s("<script>if (a<b) c()</script>"), "if (a<b) c()");
+        assert_eq!(s("<script>ends at the end </scri"), "ends at the end </scri");
+        assert_eq!(s("<script src=\"http://x/a.js\"></script>"), "");
+        assert_eq!(s("<a onclick=\"evil()\">x</a><scripts>no</scripts>"), "");
+        assert_eq!(s("<<script>a</script>"), "a");
     }
 
     #[test]

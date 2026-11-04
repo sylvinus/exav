@@ -12,8 +12,8 @@ categories = ["emulators", "parser-implementations"]
 readme = "README.md"
 
 # `cargo install exav-pe-emu` gives the command-line unpacker. The binary needs
-# nothing the library does not already have — no argument-parsing crate, no
-# error-handling crate — so shipping it here costs a library consumer nothing:
+# nothing the library does not already have (no argument-parsing crate, no
+# error-handling crate), so shipping it here costs a library consumer nothing:
 # Cargo builds only the lib target for a dependency.
 [[bin]]
 name = "exav-pe-emu"

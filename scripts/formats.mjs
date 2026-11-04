@@ -2,7 +2,7 @@
 // The format registry (formats/registry.json) against the code and the docs.
 //
 //     node scripts/formats.mjs check      # the registry matches the code, the docs are up to date
-//     node scripts/formats.mjs generate   # writes the generated parts of the docs
+//     node scripts/formats.mjs generate   # writes the generated parts of the docs and of the viewer
 //
 // What `check` compares, and with what:
 //   - the extractor's `Format` enum (crates/exav-unpack/src/lib.rs): every
@@ -11,9 +11,11 @@
 //     a format is "stream" in the registry exactly when it has one;
 //   - the Cargo features of exav-unpack;
 //   - the scanner's `FileType::as_str` (crates/exav-core/src/filetype.rs);
-//   - the viewer's `BUILTIN_ORDER` (the matchers themselves are compared by the
-//     viewer's own test, ts/core/registry.test.ts) ;
-//   - the generated docs: the matrix page and the summary sentences.
+//   - the viewer's `BUILTIN_ORDER` (the extensions and types of its matchers
+//     are generated from the registry, below);
+//   - the generated files: the summary sentences in the docs, and the viewer's
+//     ts/core/formats.generated.ts. The site's formats page reads the registry
+//     when the site is built.
 // The detection of the scanner is compared by a Rust test
 // (crates/exav-core/tests/suites/format_registry.rs). No dependencies.
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -28,7 +30,7 @@ const KINDS = Object.keys(registry.kinds);
 const SCAN_MODES = Object.keys(registry.scanModes);
 const READS = ["stream", "members", "whole", "reported"];
 /** FileType values that type no file on their own. */
-const INTERNAL_TYPES = ["graphics", "data", "normalised HTML", "normalised text"];
+const INTERNAL_TYPES = ["graphics", "data", "normalised HTML", "normalised text", "normalised script"];
 
 // ── Checks ───────────────────────────────────────────────────────────────────
 
@@ -51,7 +53,7 @@ export function rustFormats() {
 
 export function streamingFormats() {
   const text = read("crates/exav-unpack/src/stream.rs");
-  const body = block(text, text.indexOf("let walk: WalkFn<T> = match fmt"));
+  const body = block(text, text.indexOf("let walk: WalkFn = match fmt"));
   return [...body.matchAll(/Format::([A-Za-z0-9]+)\s*=>\s*f::/g)].map((m) => m[1]);
 }
 
@@ -143,7 +145,7 @@ export function problems() {
   }
   for (const p of plugins) if (!claimed.has(p)) add(`the viewer's plugin ${p} is in no registry entry`);
 
-  // The docs.
+  // The generated files.
   for (const [file, want] of Object.entries(generated())) {
     if (!existsSync(join(repo, file)) || read(file) !== want) out.push(`${file} is out of date: run node scripts/formats.mjs generate`);
   }
@@ -154,51 +156,58 @@ export function problems() {
   return out;
 }
 
-// ── Generated docs ───────────────────────────────────────────────────────────
+// ── Generated files ──────────────────────────────────────────────────────────
+// The site's formats page reads the registry itself when it is built
+// (www/src/components/FormatTable.astro).
 
-const scanText = (f) => ({ container: "Opened, members scanned", reported: "Reported, not opened", view: "Scanned with its text", type: "Typed, signatures applied", none: "Bytes only" })[f.scan.mode];
+const VIEWER_MODULE = "crates/exav-viewer/ts/core/formats.generated.ts";
+const WIDTH = 120;
 
-const unpackText = (f) => {
-  if (!f.unpack) return "No";
-  return { stream: "Streamed", members: "Read whole, members streamed", whole: "Read whole", reported: "Recognised, reported" }[f.unpack.read];
-};
-
-const viewerText = (f) => (f.viewer ? `\`${f.viewer}\`` : "No");
-
-const escapeCell = (s) => s.replaceAll("|", "\\|");
-
-function matrix() {
-  const lines = [
-    "---",
-    "title: Format matrix",
-    "description: Which of exav's tools reads each file format, the scanner, the extractor or the viewer, and whether the extractor streams it or reads it whole.",
-    "---",
-    "",
-    "<!-- Generated from formats/registry.json by scripts/formats.mjs: edit the registry. -->",
-    "",
-    "One table for \"can exav handle my file\": for each format, what the",
-    "[scanner](/scanner/reference/formats/) does with it, whether the",
-    "[extractor](/unpack/formats/) streams it or reads it whole (a format read",
-    "whole is held in memory up to the buffer limit), and which plugin of the",
-    "[viewer](/viewer/) opens it. The pages of each tool have the detail:",
-    "codecs, encryption, limits.",
-    "",
-    "- **Scanner.** " + Object.entries(registry.scanModes).map(([, d]) => d).join("; ") + ".",
-    "- **Extractor.** *Streamed*: the members are decoded as they are read, at any size. *Read whole*: the container is read into memory first; *members streamed* says the members then come out one at a time. *Recognised, reported*: the format is told apart and the file is reported as not examined, never clean.",
-    "- **Viewer.** The plugin, as `@exav/viewer` names it. *No*: the viewer does not open it.",
-    "",
-  ];
-  for (const [kind, title] of Object.entries(registry.kinds)) {
-    const rows = registry.formats.filter((f) => f.kind === kind);
-    if (!rows.length) continue;
-    lines.push(`## ${title}`, "", "| Format | Extensions | Scanner | Extractor | Viewer |", "|---|---|---|---|---|");
-    for (const f of rows) {
-      const ext = f.ext.length ? f.ext.map((e) => `\`${e}\``).join(" ") : "";
-      lines.push(`| ${escapeCell(f.name)} | ${ext} | ${scanText(f)} | ${unpackText(f)} | ${viewerText(f)} |`);
-    }
-    lines.push("");
+/** `items` as a TypeScript array of strings, wrapped at WIDTH columns when `indent` and the line would pass it. */
+function stringList(items, indent) {
+  if (!items.length) return "[]";
+  const quoted = items.map((s) => JSON.stringify(s));
+  const inline = `[${quoted.join(", ")}]`;
+  if (indent.length + "extensions: ".length + inline.length + 1 <= WIDTH) return inline;
+  const rows = [];
+  let row = "";
+  for (const s of quoted) {
+    if (row && indent.length + 2 + row.length + 2 + s.length + 1 > WIDTH) {
+      rows.push(row);
+      row = s;
+    } else row = row ? `${row}, ${s}` : s;
   }
-  return lines.join("\n");
+  rows.push(row);
+  return `[\n${rows.map((r) => `${indent}  ${r},`).join("\n")}\n${indent}]`;
+}
+
+/** The viewer's module of names and types: one record per registry entry that has a viewer plugin. */
+function viewerModule() {
+  const out = [
+    "// Generated by scripts/formats.mjs from formats/registry.json. Do not edit:",
+    "// change the registry and run `node scripts/formats.mjs generate`.",
+    'import type { BuiltinFormat } from "./types.js";',
+    "",
+    "/** The extensions and types of a registry entry, and the plugin that opens it. */",
+    "export interface Registered {",
+    "  readonly plugin: BuiltinFormat;",
+    "  readonly extensions: readonly string[];",
+    "  readonly types: readonly string[];",
+    "}",
+    "",
+    "/** The registry entries the viewer opens, by id. */",
+    "export const REGISTERED: Readonly<Record<string, Registered>> = {",
+  ];
+  for (const f of registry.formats) {
+    if (!f.viewer) continue;
+    out.push(`  ${JSON.stringify(f.id)}: {`);
+    out.push(`    plugin: ${JSON.stringify(f.viewer)},`);
+    out.push(`    extensions: ${stringList(f.ext, "    ")},`);
+    out.push(`    types: ${stringList(f.mime, "    ")},`);
+    out.push("  },");
+  }
+  out.push("};", "");
+  return out.join("\n");
 }
 
 /** `text` with what lies between the markers of `name` replaced. */
@@ -213,10 +222,11 @@ export function withBlock(text, name, body) {
 
 /** The files this script writes, and what they hold. */
 export function generated() {
-  const out = { "www/src/content/docs/project/formats.md": matrix() };
+  const out = {};
   for (const file of registry.summaries.files ?? []) {
     out[file] = withBlock(read(file), "viewer-summary", registry.summaries.viewer);
   }
+  out[VIEWER_MODULE] = viewerModule();
   return out;
 }
 

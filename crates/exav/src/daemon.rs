@@ -78,16 +78,18 @@
 //! A limit that prevents a full scan is reported as `ERROR` carrying
 //! `LIMITS-EXCEEDED`, never a silent `OK` (exav's core invariant).
 
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use exav_core::{
-    AllMatchOutcome, ScanOptions, ScanReport, Scanner, Verdict, VerdictCategory,
-    analyze_all_seekable, scan_path, scan_seekable_located,
+    AllMatchOutcome, ScanOptions, ScanReport, Scanner, Verdict, VerdictCategory, analyze_all_path,
+    scan_path, scan_seekable_located,
 };
 use walkdir::WalkDir;
 
@@ -243,6 +245,8 @@ impl Write for &TcpListenerStream {
 #[cfg(unix)]
 struct AncillaryReader<'a> {
     stream: &'a std::os::unix::net::UnixStream,
+    // Safety invariant: each is an open descriptor this reader alone owns,
+    // listed once.
     fds: Vec<std::os::fd::RawFd>,
 }
 
@@ -265,8 +269,21 @@ impl<'a> AncillaryReader<'a> {
             iov_base: buf.as_mut_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
         };
-        // SAFETY: msghdr is zeroed then populated with valid pointers/lengths
-        // into `iov`/`cmsg`, which outlive the call.
+        // SAFETY:
+        // - `mem::zeroed::<msghdr>`: its fields are integers and raw pointers,
+        //   for which all-zero bytes are valid values.
+        // - `recvmsg` (POSIX): `msg_iov` is one `iovec` naming `buf`, writable
+        //   for `buf.len()` bytes; `msg_control` is `cmsg`, writable for
+        //   `msg_controllen` bytes and aligned for `cmsghdr` (`u64`). Both
+        //   outlive the call, which sets `msg_controllen` to what it wrote.
+        // - `CMSG_FIRSTHDR` and `CMSG_NXTHDR` give null or a header within
+        //   those bytes, so `*c` reads a `cmsghdr` the kernel wrote.
+        // - For `SCM_RIGHTS` the kernel sets `cmsg_len` to `CMSG_LEN` of the
+        //   descriptors it installed, within the buffer: `data.add(i * 4)` for
+        //   `i < count` stays in it, and `copy_nonoverlapping` copies 4 bytes
+        //   into the local `fd`, with no alignment needed.
+        // - The descriptors are new to this process and owned by nothing
+        //   else: pushed once each, they keep the invariant of `fds`.
         let n = unsafe {
             let mut msg: libc::msghdr = std::mem::zeroed();
             msg.msg_iov = &mut iov;
@@ -320,9 +337,17 @@ impl FdSource for AncillaryReader<'_> {
             let mut scratch = [0u8; 64];
             let _ = self.recv(&mut scratch);
         }
-        // SAFETY: the fd was just received over the socket; we take ownership
-        // so the returned File closes it on drop.
+        // SAFETY: `File::from_raw_fd` needs an open descriptor the caller owns.
+        // By the invariant of `fds`, `fd` is one this reader alone owns, and
+        // `pop` removes it, so the `File` is its only owner.
         self.fds.pop().map(|fd| unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+impl SetReadTimeout for AncillaryReader<'_> {
+    fn set_read_timeout(&self, wait: Duration) -> io::Result<()> {
+        self.stream.set_read_timeout(Some(wait))
     }
 }
 
@@ -336,10 +361,11 @@ impl FdSource for AncillaryReader<'_> {
 pub(crate) fn send_fd_command(
     stream: &std::os::unix::net::UnixStream,
     cmd: &[u8],
-    fd: std::os::fd::RawFd,
+    fd: std::os::fd::BorrowedFd<'_>,
 ) -> io::Result<()> {
     use std::os::fd::{AsRawFd, RawFd};
     const FD_SIZE: usize = std::mem::size_of::<RawFd>();
+    let fd = fd.as_raw_fd();
     let mut iov = libc::iovec {
         iov_base: cmd.as_ptr() as *mut libc::c_void,
         iov_len: cmd.len(),
@@ -347,11 +373,18 @@ pub(crate) fn send_fd_command(
     // `usize` rather than `u8`: a control buffer has to be aligned for
     // `cmsghdr`, and a byte array carries no such guarantee.
     let mut control = [0usize; 8];
-    // SAFETY: msghdr is zeroed and then populated with pointers into `iov` and
-    // `control`, both of which outlive the call. The control buffer is large
-    // enough for one `SCM_RIGHTS` header plus one descriptor, and `msg_controllen`
-    // says so; `fd` stays open for the whole call, since the caller holds the
-    // `File` it came from.
+    // SAFETY:
+    // - `mem::zeroed::<msghdr>`: its fields are integers and raw pointers,
+    //   for which all-zero bytes are valid values.
+    // - `CMSG_FIRSTHDR` returns `control`'s start, non-null since
+    //   `msg_controllen` (`CMSG_SPACE` of one descriptor, 24 bytes at most)
+    //   holds a `cmsghdr`; `control` is 64 bytes, aligned for `cmsghdr`
+    //   (`usize`), so the three field writes through `c` are in bounds and
+    //   aligned, and `CMSG_DATA(c)` has room for `FD_SIZE` bytes after them.
+    // - `copy_nonoverlapping` copies `FD_SIZE` bytes from the local `fd`.
+    // - `sendmsg` (POSIX) only reads: `iov` names `cmd`, readable for
+    //   `cmd.len()` bytes, and `msg_control` the header just written; all
+    //   outlive the call. `fd` is open for it: it comes from a `BorrowedFd`.
     let sent = unsafe {
         let mut msg: libc::msghdr = std::mem::zeroed();
         msg.msg_iov = &mut iov;
@@ -388,8 +421,9 @@ impl Drop for AncillaryReader<'_> {
         // `SCM_RIGHTS` fds cannot leak them across connections and exhaust
         // `RLIMIT_NOFILE`.
         for fd in self.fds.drain(..) {
-            // SAFETY: each fd was received on this socket and is owned by us;
-            // nothing else holds it.
+            // SAFETY: `close` ends a descriptor this process owns. By the
+            // invariant of `fds`, this reader alone owns `fd`, and `drain`
+            // takes each out once.
             unsafe {
                 libc::close(fd);
             }
@@ -424,24 +458,560 @@ const MAX_COMMAND: usize = 64 * 1024;
 /// without a flag that would have to name a protocol to apply to.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
 
-/// Per-read socket timeout. Bounds how long a connection may block the daemon
-/// waiting for the client to send data (a command, or the next INSTREAM chunk),
-/// so a slow/idle client (the classic slow-loris) can't pin a connection slot
-/// (or, in the thread model where there is no per-job kill, a worker) forever.
-/// Applied to every accepted stream; a stall past this closes the connection.
-const SOCKET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Default of `?idle-secs=` on a clamd address, the most one read from a
+/// client waits (for a command, the next INSTREAM chunk, or the next command
+/// of an `IDSESSION`) and the most one write of a reply waits for a client
+/// that is not reading it. clamd's `ReadTimeout` default. It is what keeps a
+/// client that sends or takes nothing from holding a connection slot, or a
+/// pool worker; a stall past it closes the connection. It bounds each read and
+/// write, not a whole command: that is [`DEFAULT_COMMAND_READ`]'s job.
+pub(crate) const DEFAULT_IDLE: Duration = Duration::from_secs(120);
 
-/// True for I/O errors that are a normal client disconnect (or the read-timeout
-/// above), which should close the connection quietly rather than log as an error.
-fn is_benign_disconnect(e: &io::Error) -> bool {
-    matches!(
+/// The time a clamd client has, from its address: to send, to stay
+/// connected, and to take the replies.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Reads {
+    /// The most one read or one write waits (`?idle-secs=`).
+    pub idle: Duration,
+    /// The most one command takes in full (`?request-secs=`, `None` for no
+    /// limit).
+    pub command: Option<Duration>,
+    /// How long a connection stays open, from accept (`?session-secs=`, `None`
+    /// for no limit): after it no new command is read.
+    pub session: Option<Duration>,
+    /// The most the writes of one reply wait for the client, in all
+    /// (`?reply-secs=`, `None` for no limit).
+    pub reply: Option<Duration>,
+}
+
+impl Reads {
+    /// Each read bounded by [`DEFAULT_IDLE`], a command by `command`, and
+    /// nothing else.
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub(crate) fn with_command(command: Option<Duration>) -> Self {
+        Reads {
+            idle: DEFAULT_IDLE,
+            command,
+            session: None,
+            reply: None,
+        }
+    }
+}
+
+/// Default of `?request-secs=`, the most time one clamd command or ICAP
+/// request may take to arrive in full.
+pub(crate) const DEFAULT_COMMAND_READ: Duration = Duration::from_secs(600);
+
+/// `?request-secs=` as a limit: unset is the default, `0` (which `off` parses
+/// to) is no limit.
+pub(crate) fn command_read_limit(secs: Option<u64>) -> Option<Duration> {
+    match secs {
+        None => Some(DEFAULT_COMMAND_READ),
+        Some(0) => None,
+        Some(s) => Some(Duration::from_secs(s)),
+    }
+}
+
+/// An accept error that leaves the listener usable: the connection it was for
+/// is gone, or the process is short of a resource that closing connections give
+/// back. Anything else (a closed or invalid listener) is not mended by waiting.
+fn transient_accept_error(e: &io::Error) -> bool {
+    if matches!(
         e.kind(),
-        io::ErrorKind::UnexpectedEof
-            | io::ErrorKind::BrokenPipe
+        io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::TimedOut
-            | io::ErrorKind::WouldBlock
-    )
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(code) = e.raw_os_error() {
+        // Out of descriptors or memory, which closing connections give back,
+        // and the errors accept(2) says a caller is to treat like EAGAIN,
+        // which belong to the new connection and not to the listener.
+        #[cfg(target_os = "linux")]
+        if code == libc::ENONET {
+            return true;
+        }
+        return matches!(
+            code,
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::EPERM
+                | libc::EPROTO
+                | libc::ENETDOWN
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENETUNREACH
+        );
+    }
+    false
+}
+
+/// The pauses between accepts that keep failing: 5 ms, doubling to 1 s, and
+/// starting over once an accept works. Without a pause an accept that fails for
+/// want of a descriptor fails again at once, because the connection it was
+/// for stays queued, and the listener spins and floods the log.
+#[derive(Default)]
+pub(crate) struct AcceptBackoff(Option<Duration>);
+
+impl AcceptBackoff {
+    const FIRST: Duration = Duration::from_millis(5);
+    const LAST: Duration = Duration::from_secs(1);
+
+    /// How long to wait before the next accept, after one that failed.
+    pub(crate) fn pause(&mut self) -> Duration {
+        let now = self.0.unwrap_or(Self::FIRST);
+        self.0 = Some((now * 2).min(Self::LAST));
+        now
+    }
+
+    /// An accept worked.
+    pub(crate) fn reset(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// Hands each connection `accept` returns to `serve`, until an accept fails in a
+/// way waiting does not mend, which is returned. A transient failure is logged
+/// and retried after a pause ([`AcceptBackoff`]).
+fn accept_loop<S>(
+    mut accept: impl FnMut() -> io::Result<S>,
+    mut serve: impl FnMut(S),
+) -> io::Result<()> {
+    let mut backoff = AcceptBackoff::default();
+    loop {
+        match accept() {
+            Ok(conn) => {
+                backoff.reset();
+                serve(conn);
+            }
+            Err(e) if transient_accept_error(&e) => {
+                let pause = backoff.pause();
+                eprintln!(
+                    "exav: accept failed, trying again in {} ms: {e}",
+                    pause.as_millis()
+                );
+                std::thread::sleep(pause);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Runs `job`, which owns one accepted connection and was counted in `conns`,
+/// on a thread of its own. When no thread can be had the connection is dropped,
+/// as at capacity, and its count given back: `std::thread::spawn` would panic
+/// the listener's thread instead.
+fn spawn_conn(conns: &Arc<std::sync::atomic::AtomicUsize>, job: impl FnOnce() + Send + 'static) {
+    if let Err(e) = std::thread::Builder::new().spawn(job) {
+        conns.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("exav: no thread for a new connection, dropping it: {e}");
+    }
+}
+
+/// What a read fails with once its command has run out of time.
+#[derive(Debug)]
+pub(crate) struct CommandTooSlow;
+
+impl std::fmt::Display for CommandTooSlow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the client took longer than ?request-secs= to send its command")
+    }
+}
+
+impl std::error::Error for CommandTooSlow {}
+
+/// Whether `e` is [`CommandTooSlow`].
+pub(crate) fn is_too_slow(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<CommandTooSlow>())
+}
+
+/// What a write fails with once the client has not read for the whole of the
+/// socket's write timeout (`?idle-secs=`), or for the whole of the reply's
+/// time (`?reply-secs=`).
+#[derive(Debug)]
+pub(crate) struct ClientNotReading;
+
+impl std::fmt::Display for ClientNotReading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the client did not read its reply within ?idle-secs= or ?reply-secs=")
+    }
+}
+
+impl std::error::Error for ClientNotReading {}
+
+/// Whether `e` is [`ClientNotReading`].
+pub(crate) fn is_not_reading(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<ClientNotReading>())
+}
+
+/// What a read fails with when the connection reached its lifetime
+/// (`?session-secs=`) while waiting for the first byte of a command or request.
+/// An ordinary end of connection: not logged.
+#[derive(Debug)]
+pub(crate) struct SessionOver;
+
+impl std::fmt::Display for SessionOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the connection reached its ?session-secs= lifetime")
+    }
+}
+
+impl std::error::Error for SessionOver {}
+
+/// Whether `e` is [`SessionOver`].
+pub(crate) fn is_session_over(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<SessionOver>())
+}
+
+/// A transport whose wait for a write can be read and changed between writes.
+pub(crate) trait SetWriteTimeout {
+    /// The wait of one write now, `None` for none.
+    fn write_wait(&self) -> io::Result<Option<Duration>>;
+    fn set_write_wait(&self, wait: Option<Duration>) -> io::Result<()>;
+}
+
+impl SetWriteTimeout for &std::net::TcpStream {
+    fn write_wait(&self) -> io::Result<Option<Duration>> {
+        std::net::TcpStream::write_timeout(self)
+    }
+    fn set_write_wait(&self, wait: Option<Duration>) -> io::Result<()> {
+        std::net::TcpStream::set_write_timeout(self, wait)
+    }
+}
+
+impl SetWriteTimeout for &TcpListenerStream {
+    fn write_wait(&self) -> io::Result<Option<Duration>> {
+        self.0.write_timeout()
+    }
+    fn set_write_wait(&self, wait: Option<Duration>) -> io::Result<()> {
+        self.0.set_write_timeout(wait)
+    }
+}
+
+#[cfg(unix)]
+impl SetWriteTimeout for &std::os::unix::net::UnixStream {
+    fn write_wait(&self) -> io::Result<Option<Duration>> {
+        std::os::unix::net::UnixStream::write_timeout(self)
+    }
+    fn set_write_wait(&self, wait: Option<Duration>) -> io::Result<()> {
+        std::os::unix::net::UnixStream::set_write_timeout(self, wait)
+    }
+}
+
+/// Memory has no socket to wait on.
+#[cfg(any(test, feature = "fuzzing"))]
+impl SetWriteTimeout for &mut Vec<u8> {
+    fn write_wait(&self) -> io::Result<Option<Duration>> {
+        Ok(None)
+    }
+    fn set_write_wait(&self, _wait: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A reply writer that tells a write timeout from the other failures. The
+/// socket reports it as `WouldBlock`, which on the read side is the quiet end
+/// of an idle client.
+///
+/// With a `budget` (`?reply-secs=`) it also bounds the time the writes of one
+/// reply spend waiting for the client: each write is given the smaller of the
+/// socket's own write timeout and what is left of the budget, and the time it
+/// blocked is charged to it. The server's time between two writes is not.
+pub(crate) struct Replies<W> {
+    inner: W,
+    /// The most the writes of one reply may wait, in all. `None`: the socket's
+    /// own timeout alone, which this leaves untouched.
+    budget: Option<Duration>,
+    /// The socket's write timeout when this was made, with a `budget` only.
+    per_write: Option<Duration>,
+    /// What the writes of the running reply have waited so far.
+    spent: Duration,
+}
+
+impl<W: SetWriteTimeout> Replies<W> {
+    pub(crate) fn new(inner: W, budget: Option<Duration>) -> io::Result<Self> {
+        let per_write = match budget {
+            Some(_) => inner.write_wait()?,
+            None => None,
+        };
+        Ok(Self {
+            inner,
+            budget,
+            per_write,
+            spent: Duration::ZERO,
+        })
+    }
+}
+
+impl<W> Replies<W> {
+    /// A reply begins: its writes have the whole budget.
+    pub(crate) fn start_reply(&mut self) {
+        self.spent = Duration::ZERO;
+    }
+
+    fn not_reading() -> io::Error {
+        io::Error::new(io::ErrorKind::TimedOut, ClientNotReading)
+    }
+
+    fn named(e: io::Error) -> io::Error {
+        if matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ) {
+            Self::not_reading()
+        } else {
+            e
+        }
+    }
+}
+
+impl<W: Write + SetWriteTimeout> Write for Replies<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let Some(budget) = self.budget else {
+            return self.inner.write(buf).map_err(Self::named);
+        };
+        let left = budget.saturating_sub(self.spent);
+        if left.is_zero() {
+            return Err(Self::not_reading());
+        }
+        let wait = self.per_write.map_or(left, |each| each.min(left));
+        self.inner.set_write_wait(Some(wait))?;
+        let from = Instant::now();
+        let written = self.inner.write(buf);
+        self.spent = self.spent.saturating_add(from.elapsed());
+        written.map_err(Self::named)
+    }
+
+    /// Not charged to the budget: the writers here are sockets, which hold
+    /// nothing back for a flush to send.
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush().map_err(Self::named)
+    }
+}
+
+/// A transport whose wait for the next bytes can be changed between reads.
+pub(crate) trait SetReadTimeout {
+    fn set_read_timeout(&self, wait: Duration) -> io::Result<()>;
+}
+
+impl SetReadTimeout for std::net::TcpStream {
+    fn set_read_timeout(&self, wait: Duration) -> io::Result<()> {
+        std::net::TcpStream::set_read_timeout(self, Some(wait))
+    }
+}
+
+impl SetReadTimeout for &TcpListenerStream {
+    fn set_read_timeout(&self, wait: Duration) -> io::Result<()> {
+        self.0.set_read_timeout(Some(wait))
+    }
+}
+
+/// The time one command may take to arrive, from its first byte to the end of
+/// its data (`?request-secs=`). The socket's own timeout bounds each
+/// read; this bounds all of them, so a client that sends a byte inside every
+/// timeout cannot hold its connection.
+///
+/// One per connection, shared by the reads ([`Clocked`]) and whoever starts
+/// each command. The idle wait for a command's first byte is not part of it.
+///
+/// It also holds the connection's lifetime (`?session-secs=`), which cuts only
+/// the wait for a command's first byte: a command that has begun is read to its
+/// end.
+pub(crate) struct ReadClock {
+    /// `None`: no limit.
+    limit: Option<Duration>,
+    /// The wait of one read when the command has time to spare.
+    per_read: Duration,
+    /// When the connection's lifetime is up. `None`: no lifetime.
+    session_end: Option<Instant>,
+    /// The running command's first byte has arrived.
+    begun: Cell<bool>,
+    /// When the running command's time is up. `None` before its first byte, or
+    /// with no limit.
+    end: Cell<Option<Instant>>,
+    /// A read failed for want of time since the last [`restart`](Self::restart).
+    fired: Cell<bool>,
+}
+
+impl ReadClock {
+    pub(crate) fn new(limit: Option<Duration>, per_read: Duration) -> Self {
+        Self {
+            limit,
+            per_read,
+            session_end: None,
+            begun: Cell::new(false),
+            end: Cell::new(None),
+            fired: Cell::new(false),
+        }
+    }
+
+    /// The connection ends `session` from now. A lifetime past the range of a
+    /// clock is no lifetime.
+    pub(crate) fn lasting(mut self, session: Option<Duration>) -> Self {
+        self.session_end = session.and_then(|s| Instant::now().checked_add(s));
+        self
+    }
+
+    /// A new command begins. `started` says its first bytes are already in
+    /// hand (buffered ahead of the last command), so its time runs from now;
+    /// otherwise it runs from the first byte that arrives.
+    pub(crate) fn restart(&self, started: bool) {
+        self.begun.set(started);
+        self.end.set(if started { self.deadline() } else { None });
+        self.fired.set(false);
+    }
+
+    /// The end of a command that starts now. `None` past the range of a clock,
+    /// which is a limit no command reaches.
+    fn deadline(&self) -> Option<Instant> {
+        Instant::now().checked_add(self.limit?)
+    }
+
+    /// Whether a read failed for want of time during this command.
+    pub(crate) fn fired(&self) -> bool {
+        self.fired.get()
+    }
+
+    /// Runs `work`, the server's own time between two reads of one command,
+    /// without charging it to the client.
+    #[cfg(any(test, feature = "icap"))]
+    pub(crate) fn excluding<T>(&self, work: impl FnOnce() -> T) -> T {
+        let from = Instant::now();
+        let out = work();
+        if let Some(end) = self.end.get() {
+            self.end
+                .set(Some(end.checked_add(from.elapsed()).unwrap_or(end)));
+        }
+        out
+    }
+
+    fn expired(&self) -> io::Error {
+        self.fired.set(true);
+        io::Error::new(io::ErrorKind::TimedOut, CommandTooSlow)
+    }
+
+    /// Whether the connection has reached its lifetime. Asked between
+    /// commands, before reading another, whatever is already buffered.
+    pub(crate) fn lifetime_over(&self) -> bool {
+        self.session_end.is_some_and(|end| Instant::now() >= end)
+    }
+
+    fn lifetime_error() -> io::Error {
+        io::Error::new(io::ErrorKind::TimedOut, SessionOver)
+    }
+}
+
+/// A transport read under a [`ReadClock`].
+pub(crate) struct Clocked<'a, R> {
+    inner: R,
+    clock: &'a ReadClock,
+}
+
+impl<'a, R> Clocked<'a, R> {
+    pub(crate) fn new(inner: R, clock: &'a ReadClock) -> Self {
+        Self { inner, clock }
+    }
+
+    #[cfg(any(test, feature = "icap"))]
+    pub(crate) fn get_ref(&self) -> &R {
+        &self.inner
+    }
+}
+
+impl<R: Read + SetReadTimeout> Read for Clocked<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let clock = self.clock;
+        if clock.limit.is_none() && clock.session_end.is_none() {
+            return self.inner.read(buf);
+        }
+        // The wait of this read: what is left of the command's time, or before
+        // its first byte what is left of the connection's lifetime, when that
+        // is less than the socket's own. A timeout on the shorter wait is the
+        // command's or the lifetime's, not the socket's.
+        let mut wait = clock.per_read;
+        let mut cut_by_clock = false;
+        let mut cut_by_session = false;
+        if let Some(end) = clock.end.get() {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(clock.expired());
+            }
+            if left <= wait {
+                wait = left;
+                cut_by_clock = true;
+            }
+        } else if !clock.begun.get()
+            && let Some(end) = clock.session_end
+        {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(ReadClock::lifetime_error());
+            }
+            if left <= wait {
+                wait = left;
+                cut_by_session = true;
+            }
+        }
+        self.inner.set_read_timeout(wait)?;
+        match self.inner.read(buf) {
+            Ok(n) => {
+                if n > 0 && !clock.begun.get() {
+                    clock.begun.set(true);
+                    if clock.end.get().is_none() {
+                        clock.end.set(clock.deadline());
+                    }
+                }
+                Ok(n)
+            }
+            Err(e)
+                if (cut_by_clock || cut_by_session)
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+            {
+                Err(if cut_by_clock {
+                    clock.expired()
+                } else {
+                    ReadClock::lifetime_error()
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl<R: FdSource> FdSource for Clocked<'_, R> {
+    fn take_fd(&mut self) -> Option<File> {
+        self.inner.take_fd()
+    }
+}
+
+/// True for I/O errors that are a normal client disconnect (or the read-timeout
+/// above), which should close the connection quietly rather than log as an
+/// error. A command that ran out of time, or a client that stopped reading its
+/// replies, is not one: it is a limit, and the operator should see it.
+fn is_benign_disconnect(e: &io::Error) -> bool {
+    !is_too_slow(e)
+        && !is_not_reading(e)
+        && matches!(
+            e.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::WouldBlock
+        )
 }
 
 /// RAII counter: decrements the live-connection count when the handler thread
@@ -493,8 +1063,11 @@ pub fn supervise(
         }
         // Restarting: the listeners' threads must not see their reads and
         // accepts interrupted by a signal meant for this one.
-        install_restarting_handler(libc::SIGHUP, on_sighup);
-        install_restarting_handler(libc::SIGUSR2, on_sigusr2);
+        // SAFETY: both handlers are async-signal-safe, as their docs say.
+        unsafe {
+            install_restarting_handler(libc::SIGHUP, on_sighup);
+            install_restarting_handler(libc::SIGUSR2, on_sigusr2);
+        }
     }
     loop {
         #[cfg(unix)]
@@ -523,10 +1096,15 @@ pub fn supervise(
 /// (here it exits the process; the thread model has no supervisor to unwind).
 /// `allow_http_scan` controls whether the exav-only `SCANURL` command fetches,
 /// off by default, since it lets any client that can reach the socket make the
-/// daemon fetch a URL.
+/// daemon fetch a URL. `reads` bound how long a client takes to send and to
+/// take its replies ([`Reads`]).
 ///
 /// Each connection is served with the database current when it opened; a
-/// reload ([`supervise`]) swaps it for the connections after.
+/// reload ([`supervise`]) swaps it for the connections after. An accept that
+/// fails for a transient reason (out of descriptors, a connection lost before
+/// it was accepted) is logged and retried after a pause; any other accept error
+/// ends the listener and is returned.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     db: Arc<SharedDb>,
     addr: ListenAddr,
@@ -534,6 +1112,7 @@ pub fn run(
     allow_shutdown: bool,
     allow_http_scan: bool,
     max_connections: usize,
+    reads: Reads,
 ) -> io::Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     SHUTDOWN_ALLOWED.store(allow_shutdown, Ordering::Relaxed);
@@ -555,84 +1134,90 @@ pub fn run(
         ListenAddr::Unix { path, mode } => {
             let listener = bind_unix_socket(&path, mode)?;
             eprintln!("exav: daemon listening on unix:{}", path.display());
-            for stream in listener.incoming() {
-                let stream = stream?;
-                let _ = stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT));
-                if conns.fetch_add(1, Ordering::Relaxed) >= max_connections {
-                    conns.fetch_sub(1, Ordering::Relaxed);
-                    continue; // at capacity: drop the connection
-                }
-                let (db, opts, c) = (db.current(), Arc::clone(&opts), Arc::clone(&conns));
-                std::thread::spawn(move || {
-                    let _guard = ConnGuard(c);
-                    // The fd-capturing reader handles FILDES; the writer is a
-                    // second borrow of the same stream (full-duplex socket).
-                    let reader = AncillaryReader::new(&stream);
-                    // Thread model: no per-job kill, so the per-command timer is a
-                    // no-op; the read timeout above is what bounds a stalled client.
-                    let shutdown = || {
-                        if allow_shutdown {
-                            std::process::exit(0)
-                        } else {
-                            false
-                        }
-                    };
-                    if let Err(e) = handle_conn(
-                        reader,
-                        &stream,
-                        &db,
-                        &opts,
-                        &|| {},
-                        &|| {},
-                        &request_reload,
-                        &shutdown,
-                        allow_http_scan,
-                    ) && !is_benign_disconnect(&e)
-                    {
-                        eprintln!("exav: connection error: {e}");
+            accept_loop(
+                || listener.accept().map(|(stream, _)| stream),
+                |stream| {
+                    let _ = stream.set_read_timeout(Some(reads.idle));
+                    let _ = stream.set_write_timeout(Some(reads.idle));
+                    if conns.fetch_add(1, Ordering::Relaxed) >= max_connections {
+                        conns.fetch_sub(1, Ordering::Relaxed);
+                        return; // at capacity: drop the connection
                     }
-                });
-            }
-            Ok(())
+                    let (db, opts, c) = (db.current(), Arc::clone(&opts), Arc::clone(&conns));
+                    spawn_conn(&conns, move || {
+                        let _guard = ConnGuard(c);
+                        // The fd-capturing reader handles FILDES; the writer is a
+                        // second borrow of the same stream (full-duplex socket).
+                        let reader = AncillaryReader::new(&stream);
+                        // Thread model: no per-job kill, so the per-command timer is a
+                        // no-op; `reads` is what bounds a stalled client.
+                        let shutdown = || {
+                            if allow_shutdown {
+                                std::process::exit(0)
+                            } else {
+                                false
+                            }
+                        };
+                        if let Err(e) = handle_conn(
+                            reader,
+                            &stream,
+                            &db,
+                            &opts,
+                            &|| {},
+                            &|| {},
+                            &request_reload,
+                            &shutdown,
+                            allow_http_scan,
+                            reads,
+                        ) && !is_benign_disconnect(&e)
+                        {
+                            eprintln!("exav: connection error: {e}");
+                        }
+                    });
+                },
+            )
         }
         ListenAddr::Tcp(addr) => {
             let listener = TcpListener::bind(&addr)?;
             eprintln!("exav: daemon listening on tcp:{addr}");
-            for stream in listener.incoming() {
-                let tcp = stream?;
-                let _ = tcp.set_read_timeout(Some(SOCKET_READ_TIMEOUT));
-                let stream = TcpListenerStream(tcp);
-                if conns.fetch_add(1, Ordering::Relaxed) >= max_connections {
-                    conns.fetch_sub(1, Ordering::Relaxed);
-                    continue; // at capacity: drop the connection
-                }
-                let (db, opts, c) = (db.current(), Arc::clone(&opts), Arc::clone(&conns));
-                std::thread::spawn(move || {
-                    let _guard = ConnGuard(c);
-                    let shutdown = || {
-                        if allow_shutdown {
-                            std::process::exit(0)
-                        } else {
-                            false
-                        }
-                    };
-                    if let Err(e) = handle_conn(
-                        &stream,
-                        &stream,
-                        &db,
-                        &opts,
-                        &|| {},
-                        &|| {},
-                        &request_reload,
-                        &shutdown,
-                        allow_http_scan,
-                    ) && !is_benign_disconnect(&e)
-                    {
-                        eprintln!("exav: connection error: {e}");
+            accept_loop(
+                || listener.accept().map(|(tcp, _)| tcp),
+                |tcp| {
+                    let _ = tcp.set_read_timeout(Some(reads.idle));
+                    let _ = tcp.set_write_timeout(Some(reads.idle));
+                    let stream = TcpListenerStream(tcp);
+                    if conns.fetch_add(1, Ordering::Relaxed) >= max_connections {
+                        conns.fetch_sub(1, Ordering::Relaxed);
+                        return; // at capacity: drop the connection
                     }
-                });
-            }
-            Ok(())
+                    let (db, opts, c) = (db.current(), Arc::clone(&opts), Arc::clone(&conns));
+                    spawn_conn(&conns, move || {
+                        let _guard = ConnGuard(c);
+                        let shutdown = || {
+                            if allow_shutdown {
+                                std::process::exit(0)
+                            } else {
+                                false
+                            }
+                        };
+                        if let Err(e) = handle_conn(
+                            &stream,
+                            &stream,
+                            &db,
+                            &opts,
+                            &|| {},
+                            &|| {},
+                            &request_reload,
+                            &shutdown,
+                            allow_http_scan,
+                            reads,
+                        ) && !is_benign_disconnect(&e)
+                        {
+                            eprintln!("exav: connection error: {e}");
+                        }
+                    });
+                },
+            )
         }
     }
 }
@@ -690,6 +1275,11 @@ pub struct PoolConfig {
     /// the same reason: it lets any client that can reach the socket make the
     /// daemon fetch a URL.
     pub allow_http_scan: bool,
+    /// How long a client may take to send and to take its replies ([`Reads`]).
+    /// The job's own timer starts after the command line has been read, so
+    /// these also cover the line; it also covers the writes, unless
+    /// `max_scan_time` is off.
+    pub reads: Reads,
 }
 
 /// A bound listening socket the workers share across `fork()`.
@@ -727,34 +1317,36 @@ fn bind_listener(addr: &ListenAddr) -> io::Result<BoundListener> {
 
 /// Bind the daemon's Unix socket at `path` with permission bits `mode`.
 ///
-/// `bind` takes the socket's mode from the process umask, so the socket is
-/// listening before any `chmod` runs and, under a permissive umask, listening
-/// at 0777 while it does. Binding under a umask of 0777 instead creates it with
-/// no permissions at all: the only mode a client can ever find on the path is
-/// the one asked for. A failed `chmod` is fatal for the same reason: the
-/// socket would otherwise stay at mode 000 and refuse everyone silently.
+/// `bind` takes the socket's mode from the process umask, so a socket bound at
+/// `path` would be listening before its `chmod` runs. It is bound instead in a
+/// new directory beside `path` that only this user can enter, given its mode
+/// there, and renamed to `path`: the only mode a client can ever find on the
+/// path is the one asked for, and the umask, which every thread of the process
+/// shares, is left alone. The rename replaces a stale socket from a previous
+/// run.
 ///
-/// The path itself is still a name another process can replace between the two
-/// calls if it can write the directory, so a socket belongs somewhere only its
-/// owner can write (`$XDG_RUNTIME_DIR` or `/var/run`), not world-writable
-/// `/tmp`, where another local user can pre-create the path.
+/// The path itself is still a name another process can replace if it can write
+/// the directory, so a socket belongs somewhere only its owner can write
+/// (`$XDG_RUNTIME_DIR` or `/var/run`), not world-writable `/tmp`, where another
+/// local user can pre-create the path.
 #[cfg(unix)]
 pub(crate) fn bind_unix_socket(
     path: &std::path::Path,
     mode: u32,
 ) -> io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt;
-    // Remove a stale socket from a previous run before binding.
-    let _ = std::fs::remove_file(path);
-    // SAFETY: `umask` reads and writes only the calling process's own mask.
-    // The daemon binds before it forks its workers or spawns any thread, so no
-    // other file is being created while the mask is restrictive.
-    let saved = unsafe { libc::umask(0o777) };
-    let listener = std::os::unix::net::UnixListener::bind(path);
-    // SAFETY: as above; restores the mask the process was started with.
-    unsafe { libc::umask(saved) };
-    let listener = listener?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    let private = private_dir_beside(path)?;
+    // `.N/s`: no longer than a name of four bytes or more, so a path within
+    // the length limit of a socket's is within it here too.
+    let staged = private.join("s");
+    let bound = std::os::unix::net::UnixListener::bind(&staged).and_then(|listener| {
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&staged, path)?;
+        Ok(listener)
+    });
+    let _ = std::fs::remove_file(&staged);
+    let _ = std::fs::remove_dir(&private);
+    let listener = bound?;
     if mode & 0o007 != 0 {
         eprintln!(
             "exav: socket {} is mode {mode:03o}: any local user can submit scans \
@@ -763,6 +1355,44 @@ pub(crate) fn bind_unix_socket(
         );
     }
     Ok(listener)
+}
+
+/// A new directory in the directory of `path`, mode 0700: `mkdir` fails on a
+/// name that exists, so one made here is this process's own.
+#[cfg(unix)]
+fn private_dir_beside(path: &std::path::Path) -> io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let mut builder = std::fs::DirBuilder::new();
+    // The umask can only take bits away from it; the `chmod` gives back the
+    // owner's, which a umask such as 0177 takes.
+    builder.mode(0o700);
+    for n in 0..64 {
+        let dir = parent.join(format!(".{n}"));
+        match builder.create(&dir) {
+            Ok(()) => {
+                if let Err(e) =
+                    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                {
+                    let _ = std::fs::remove_dir(&dir);
+                    return Err(e);
+                }
+                return Ok(dir);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "no free name for a private directory in {}",
+            parent.display()
+        ),
+    ))
 }
 
 /// Set to true by the parent's SIGTERM/SIGINT handler so the supervisor loop
@@ -780,20 +1410,22 @@ static RELOAD_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 #[cfg(unix)]
 static HUP_RECEIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// SIGTERM and SIGINT in the supervisor: stop. Async-signal-safe: an atomic
+/// and [`wake`].
 #[cfg(unix)]
 extern "C" fn on_shutdown(_sig: libc::c_int) {
     SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
     wake();
 }
 
-/// SIGUSR2: reload the signatures.
+/// SIGUSR2: reload the signatures. Async-signal-safe: an atomic and [`wake`].
 #[cfg(unix)]
 extern "C" fn on_sigusr2(_sig: libc::c_int) {
     RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
     wake();
 }
 
-/// SIGHUP: reopen the `--log` file.
+/// SIGHUP: reopen the `--log` file. Async-signal-safe: atomics and [`wake`].
 #[cfg(unix)]
 extern "C" fn on_sighup(_sig: libc::c_int) {
     crate::LOG_REOPEN.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -802,6 +1434,7 @@ extern "C" fn on_sighup(_sig: libc::c_int) {
 }
 
 /// SIGHUP in a worker or the side listener's child: reopen its own handle.
+/// Async-signal-safe: an atomic.
 #[cfg(unix)]
 extern "C" fn on_sighup_child(_sig: libc::c_int) {
     crate::LOG_REOPEN.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -820,10 +1453,12 @@ fn child_signals() {
         libc::signal(libc::SIGCHLD, libc::SIG_DFL);
         libc::signal(libc::SIGUSR2, libc::SIG_IGN);
     }
-    install_restarting_handler(libc::SIGHUP, on_sighup_child);
+    // SAFETY: `on_sighup_child` is async-signal-safe, as its doc says.
+    unsafe { install_restarting_handler(libc::SIGHUP, on_sighup_child) };
 }
 
-/// Wakes the supervisor so a worker exit is reaped at once.
+/// Wakes the supervisor so a worker exit is reaped at once. Async-signal-safe:
+/// [`wake`].
 #[cfg(unix)]
 extern "C" fn on_sigchld(_sig: libc::c_int) {
     wake();
@@ -832,6 +1467,8 @@ extern "C" fn on_sigchld(_sig: libc::c_int) {
 /// The supervisor's self-pipe: the signal handlers write to it and [`nap`]
 /// polls it. Interrupting a sleep is not enough, because a signal that lands
 /// while the supervisor is awake would then wait out the next full nap.
+// Safety invariant (both): -1, or an end of the self-pipe, open and
+// non-blocking for the rest of the process's life.
 #[cfg(unix)]
 static WAKE_READ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 #[cfg(unix)]
@@ -1018,8 +1655,9 @@ fn nap(d: std::time::Duration) {
         return;
     }
     let mut buf = [0u8; 16];
-    // SAFETY: reads into a local buffer from a nonblocking descriptor this
-    // process owns; stops at EAGAIN.
+    // SAFETY: `read` writes at most `buf.len()` bytes into the local `buf`.
+    // The descriptor is `WAKE_READ`'s, open and non-blocking by its
+    // invariant, so the loop ends at EAGAIN.
     while unsafe { libc::read(fds[0].fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) } > 0 {}
     // Cleared after draining: a signal before this point is handled by the
     // loop the caller is about to run, one after it writes a fresh byte.
@@ -1032,11 +1670,14 @@ fn nap(d: std::time::Duration) {
 /// unwind in-process, so we `_exit` (async-signal-safe) and let the supervisor
 /// respawn a replacement. The client gets a verdict first, as in
 /// [`on_sigabrt`]: a connection closed with no reply reads as clean to some
-/// clients.
+/// clients. Async-signal-safe: an atomic, `write` and `_exit`.
 #[cfg(unix)]
 extern "C" fn on_sigalrm(_sig: libc::c_int) {
     let fd = CURRENT_CONN_FD.load(std::sync::atomic::Ordering::Relaxed);
     if fd >= 0 {
+        // SAFETY: `write` (async-signal-safe) reads `TIMEOUT_REPLY.len()`
+        // bytes of a static. By the invariant of `CURRENT_CONN_FD`, `fd` is
+        // the open connection.
         unsafe {
             libc::write(
                 fd,
@@ -1045,15 +1686,19 @@ extern "C" fn on_sigalrm(_sig: libc::c_int) {
             );
         }
     }
+    // SAFETY: `_exit` (async-signal-safe) has no memory precondition; it ends
+    // the process without running destructors, which a handler may not run.
     unsafe { libc::_exit(EXIT_TIMEOUT) }
 }
 
 /// The job used its CPU budget (see [`arm_cpu_limit`]): answered as
 /// [`on_sigalrm`] answers, since the budget is `--max-scan-secs` too.
+/// Async-signal-safe: an atomic, `write` and `_exit`.
 #[cfg(unix)]
 extern "C" fn on_sigxcpu(_sig: libc::c_int) {
     let fd = CURRENT_CONN_FD.load(std::sync::atomic::Ordering::Relaxed);
     if fd >= 0 {
+        // SAFETY: as in `on_sigalrm`.
         unsafe {
             libc::write(
                 fd,
@@ -1062,6 +1707,7 @@ extern "C" fn on_sigxcpu(_sig: libc::c_int) {
             );
         }
     }
+    // SAFETY: as in `on_sigalrm`.
     unsafe { libc::_exit(EXIT_CPU) }
 }
 
@@ -1076,6 +1722,8 @@ const TIMEOUT_REPLY: &[u8] = b": scan exceeded --max-scan-secs LIMITS-EXCEEDED E
 /// The fd of the connection this worker is currently serving, for the abort
 /// handler below. `-1` when idle. A raw atomic because a signal handler may read
 /// nothing that could lock.
+// Safety invariant: -1, or the descriptor of the connection being served,
+// which stays open until this is set back to -1.
 #[cfg(unix)]
 static CURRENT_CONN_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
@@ -1103,6 +1751,7 @@ const ABORT_REPLY: &[u8] = b": scan aborted (out of memory) ERROR\n\0";
 extern "C" fn on_sigabrt(_sig: libc::c_int) {
     let fd = CURRENT_CONN_FD.load(std::sync::atomic::Ordering::Relaxed);
     if fd >= 0 {
+        // SAFETY: as in `on_sigalrm`, for `ABORT_REPLY`.
         unsafe {
             libc::write(
                 fd,
@@ -1111,6 +1760,7 @@ extern "C" fn on_sigabrt(_sig: libc::c_int) {
             );
         }
     }
+    // SAFETY: as in `on_sigalrm`.
     unsafe { libc::_exit(EXIT_ABORTED) }
 }
 
@@ -1125,11 +1775,13 @@ const STOPPED_REPLY: &[u8] = b": scan stopped before it finished ERROR\n\0";
 /// A worker told to stop (a shutdown, its supervisor gone, or a retired
 /// generation past its grace) answers the job it is in, as [`on_sigalrm`]
 /// does. Between jobs it just exits: a line written then would be read as the
-/// answer to the client's next command.
+/// answer to the client's next command. Async-signal-safe: atomics, `write`
+/// and `_exit`.
 #[cfg(unix)]
 extern "C" fn on_sigterm(_sig: libc::c_int) {
     let fd = CURRENT_CONN_FD.load(std::sync::atomic::Ordering::Relaxed);
     if fd >= 0 && IN_JOB.load(std::sync::atomic::Ordering::Relaxed) {
+        // SAFETY: as in `on_sigalrm`, for `STOPPED_REPLY`.
         unsafe {
             libc::write(
                 fd,
@@ -1138,6 +1790,7 @@ extern "C" fn on_sigterm(_sig: libc::c_int) {
             );
         }
     }
+    // SAFETY: as in `on_sigalrm`.
     unsafe { libc::_exit(EXIT_STOPPED) }
 }
 
@@ -1149,8 +1802,23 @@ const EXIT_STOPPED: libc::c_int = 92;
 #[cfg(unix)]
 const EXIT_ABORTED: libc::c_int = 91;
 
+/// Install `handler` for `sig`.
+///
+/// # Safety
+///
+/// The caller must ensure that `handler`, which may run on any thread and at
+/// any point of it, makes only async-signal-safe calls (POSIX) and touches no
+/// state but lock-free atomics.
 #[cfg(unix)]
-fn install_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
+unsafe fn install_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
+    // SAFETY:
+    // - `mem::zeroed::<sigaction>`: integers, the handler's address as an
+    //   integer and a `sigset_t`, for which all-zero bytes are valid values.
+    // - `sigemptyset` writes the `sigset_t` of this local.
+    // - `sigaction` reads the local and takes a null old action (POSIX).
+    //   Without `SA_SIGINFO` the kernel calls the handler with one `c_int`,
+    //   as its type says; what it may do then is this function's
+    //   precondition.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = handler as usize;
@@ -1164,8 +1832,12 @@ fn install_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
 
 /// [`install_handler`] with `SA_RESTART`, for a signal that only sets a flag in
 /// a process whose blocking calls (a client read, `accept`) must carry on.
+///
+/// # Safety
+///
+/// The caller must ensure what [`install_handler`] requires of `handler`.
 #[cfg(unix)]
-fn install_restarting_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
+unsafe fn install_restarting_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
     // SAFETY: as in `install_handler`.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -1185,6 +1857,7 @@ fn set_rlimit(resource: libc::c_int, limit: u64) {
         rlim_cur: limit as _,
         rlim_max: limit as _,
     };
+    // SAFETY: `setrlimit` reads the local `rl`; a bad resource fails.
     unsafe {
         libc::setrlimit(resource as _, &rl);
     }
@@ -1200,6 +1873,10 @@ fn arm_cpu_limit(secs: u64) {
     if secs == 0 {
         return;
     }
+    // SAFETY: `mem::zeroed` of `rusage` and `rlimit`, whose fields are
+    // integers and `timeval`s of integers, for which all-zero bytes are
+    // valid; `getrusage` and `getrlimit` write those locals, `setrlimit`
+    // reads one.
     unsafe {
         let mut ru: libc::rusage = std::mem::zeroed();
         let mut rl: libc::rlimit = std::mem::zeroed();
@@ -1226,6 +1903,7 @@ fn arm_cpu_limit(secs: u64) {
 fn current_address_space() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages: u64 = statm.split_whitespace().next()?.parse().ok()?;
+    // SAFETY: `sysconf` has no memory precondition.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     (page > 0).then(|| pages.saturating_mul(page as u64))
 }
@@ -1263,13 +1941,12 @@ pub(crate) fn fit_limits_to_job_memory(opts: &mut ScanOptions, job_memory: u64) 
         *v = (*v).min(max);
     };
     cap(&mut opts.limits.max_buffer_bytes, job_memory / 4);
-    cap(&mut opts.deep_analysis_max, job_memory / 4);
     cap(&mut opts.limits.max_bytecode_memory_bytes, job_memory / 4);
     // The cache of an object read in place, and one HTTP request held while it
     // is read, each an eighth of the job's memory at most.
     cap(&mut opts.object_cache_bytes, job_memory / 8);
     cap(&mut opts.http_request_bytes, job_memory / 8);
-    let object = opts.limits.max_buffer_bytes.max(opts.deep_analysis_max);
+    let object = opts.limits.max_buffer_bytes;
     cap(
         &mut opts.limits.max_extracted_bytes,
         job_memory.saturating_sub(2 * object + exav_core::LOWERCASE_COPY_MAX + job_memory / 10),
@@ -1455,11 +2132,15 @@ fn oneshot_exit_code() -> i32 {
 /// Separate from [`on_sigalrm`], which serves a pool worker that a parent will
 /// reap and report on. Here nobody is watching, so the handler has to say what
 /// happened itself, through `write(2)`, the only output an async-signal-safe
-/// handler may use.
+/// handler may use. Async-signal-safe: atomics, `write` and `_exit`.
 #[cfg(unix)]
 extern "C" fn on_oneshot_alarm(_sig: libc::c_int) {
     const MSG: &[u8] =
         b"exav: scan exceeded --max-scan-secs; the files after it were not scanned\n";
+    // SAFETY: `write` (async-signal-safe) reads `MSG.len()` bytes of a static
+    // into descriptor 2, which needs no precondition: a closed one fails.
+    // `_exit` (async-signal-safe) ends the process without running
+    // destructors; `oneshot_exit_code` reads atomics.
     unsafe {
         libc::write(2, MSG.as_ptr().cast(), MSG.len());
         // The code the run would have had: a detection already reported stays
@@ -1496,7 +2177,8 @@ pub(crate) fn apply_oneshot_limits(max_scan_time: Option<u64>, max_scan_memory: 
             PartialStatus::Error => 2,
         };
         ONESHOT_TIMEOUT_EXIT.store(code, std::sync::atomic::Ordering::Relaxed);
-        install_handler(libc::SIGALRM, on_oneshot_alarm);
+        // SAFETY: `on_oneshot_alarm` is async-signal-safe, as its doc says.
+        unsafe { install_handler(libc::SIGALRM, on_oneshot_alarm) };
         set_timer(std::time::Duration::from_secs(secs));
     }
 }
@@ -1524,6 +2206,8 @@ fn set_timer(d: std::time::Duration) {
             tv_usec: d.subsec_micros() as _,
         },
     };
+    // SAFETY: `setitimer` reads the local `it` and takes a null old value
+    // (POSIX).
     let armed = unsafe { libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut()) };
     if armed != 0 {
         eprintln!(
@@ -1561,7 +2245,8 @@ pub struct SideListener {
 #[cfg(unix)]
 struct Generation {
     retire: std::os::fd::OwnedFd,
-    notice: std::os::fd::OwnedFd,
+    /// The write end; none in a child once it has entered the generation.
+    notice: std::cell::RefCell<Option<std::os::fd::OwnedFd>>,
 }
 
 #[cfg(unix)]
@@ -1586,18 +2271,17 @@ impl Generation {
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
         }
-        Ok(Self { retire, notice })
+        Ok(Self {
+            retire,
+            notice: std::cell::RefCell::new(Some(notice)),
+        })
     }
 
-    /// In a child just forked: drop its copy of the write end, so only the
+    /// In a child just forked: close its copy of the write end, so only the
     /// supervisor's keeps the generation alive. Returns the end to wait on.
     fn enter(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
-        // SAFETY: closes this process's inherited copy. The `OwnedFd` is the
-        // parent's value and is never dropped here: a child does not return.
-        unsafe {
-            libc::close(self.notice.as_raw_fd());
-        }
+        drop(self.notice.borrow_mut().take());
         self.retire.as_raw_fd()
     }
 }
@@ -1654,7 +2338,8 @@ pub(crate) fn await_connection(listener: std::os::fd::RawFd, retire: std::os::fd
 /// warms the result, and re-forks the pool with the new DB. A failed reload is
 /// logged and the running DB is kept. Each of `side` is an additional listener
 /// served by a child of its own, forked, reaped and reloaded exactly as the
-/// workers are.
+/// workers are. `updater`, the `--auto-update` child, is reaped and forked
+/// again when it dies, and kept through the reloads.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 pub fn run_prefork(
@@ -1665,9 +2350,12 @@ pub fn run_prefork(
     mut datadir: Option<Watch>,
     reload_db: &dyn Fn() -> Result<Scanner, String>,
     side: &[SideListener],
+    mut updater: Option<Updater>,
 ) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     // Same SIGPIPE rationale as `run`.
+    // SAFETY: `signal` with `SIG_IGN` installs no handler and has no memory
+    // precondition.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
@@ -1739,11 +2427,14 @@ pub fn run_prefork(
     DAEMON_MAX_WORKERS.store(cfg.workers.max(1), Ordering::Relaxed);
 
     arm_wakeup()?;
-    install_handler(libc::SIGTERM, on_shutdown);
-    install_handler(libc::SIGINT, on_shutdown);
-    install_handler(libc::SIGHUP, on_sighup);
-    install_handler(libc::SIGUSR2, on_sigusr2);
-    install_handler(libc::SIGCHLD, on_sigchld);
+    // SAFETY: these handlers are async-signal-safe, as their docs say.
+    unsafe {
+        install_handler(libc::SIGTERM, on_shutdown);
+        install_handler(libc::SIGINT, on_shutdown);
+        install_handler(libc::SIGHUP, on_sighup);
+        install_handler(libc::SIGUSR2, on_sigusr2);
+        install_handler(libc::SIGCHLD, on_sigchld);
+    }
 
     // Before the first fork, so every child counts into the same block and a
     // `STATS` answered by any of them is the pool's. Without it each process
@@ -1777,9 +2468,14 @@ pub fn run_prefork(
         // reloads and the data-dir poll in this loop.
         loop {
             let mut status: libc::c_int = 0;
+            // SAFETY: `waitpid` writes the local `status`.
             let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
             if pid <= 0 {
                 break; // 0 = none exited yet; <0 = no children / error
+            }
+            if updater.as_mut().is_some_and(|u| u.reaped(pid)) {
+                log_child_exit(pid, status, "signature updater", false);
+                continue;
             }
             // A child that died mid-scan (its time ran out) takes its scans in
             // flight with it.
@@ -1871,6 +2567,9 @@ pub fn run_prefork(
         // the old signatures it serves, alive indefinitely.
         let now = std::time::Instant::now();
         let mut tick = SUPERVISOR_TICK;
+        if let Some(wait) = updater.as_mut().and_then(|u| u.due(&r#gen)) {
+            tick = tick.min(wait);
+        }
         for (&pid, r) in retiring.iter_mut().filter(|(_, r)| !r.stopped) {
             // A grace too long to add to the clock is one that never ends.
             let Some(due) = r.since.checked_add(grace) else {
@@ -1901,14 +2600,19 @@ pub fn run_prefork(
         .copied()
         .chain(side_pids.iter().flatten().copied())
         .chain(retiring.keys().copied())
+        .chain(updater.as_mut().and_then(Updater::take))
         .collect();
     for &pid in &all {
+        // SAFETY: `kill` has no memory precondition. `pid` is a child of this
+        // process that has not been reaped, so the number cannot have been
+        // reused.
         unsafe {
             libc::kill(pid, libc::SIGTERM);
         }
     }
     for &pid in &all {
         let mut status: libc::c_int = 0;
+        // SAFETY: `waitpid` writes the local `status`.
         unsafe {
             libc::waitpid(pid, &mut status, 0);
         }
@@ -1941,8 +2645,8 @@ pub fn run_prefork(
 fn die_with_parent(supervisor: libc::pid_t) {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: sets this process's own parent-death signal and reads its own
-        // parent id. Neither touches another process.
+        // SAFETY: `prctl(PR_SET_PDEATHSIG)` takes a signal number, no pointer,
+        // and sets this process's own parent-death signal.
         unsafe {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
         }
@@ -1952,7 +2656,9 @@ fn die_with_parent(supervisor: libc::pid_t) {
         // against the pid the supervisor recorded of itself is what makes that
         // check sound: a parent that is no longer *that* process is gone,
         // whatever pid took its place.
-        if unsafe { libc::getppid() } != supervisor {
+        if std::os::unix::process::parent_id() as libc::pid_t != supervisor {
+            // SAFETY: `_exit` has no memory precondition; it ends this child
+            // without running the destructors of the frames it inherited.
             unsafe { libc::_exit(0) }
         }
     }
@@ -1974,7 +2680,8 @@ fn spawn_side(
     let _ = io::stderr().flush();
     // Read before forking: afterwards the child can only ask who its parent is,
     // which does not say whether that is still the process that forked it.
-    let supervisor = unsafe { libc::getpid() };
+    let supervisor = std::process::id() as libc::pid_t;
+    // SAFETY: as in `spawn_worker`.
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(io::Error::last_os_error()),
@@ -1988,9 +2695,141 @@ fn spawn_side(
             (side.serve)(Arc::clone(db), Arc::clone(opts), retire);
             // The listener was the child's whole job, so there is nothing left
             // for it to do but let the supervisor respawn it.
+            // SAFETY: `_exit` has no memory precondition; it ends this child
+            // without running the destructors of the frames it inherited.
             unsafe { libc::_exit(2) }
         }
         n => Ok(n),
+    }
+}
+
+/// The `--auto-update` re-check of a pool, in a child of the supervisor.
+///
+/// On a thread of the supervisor it would be running whenever a worker is
+/// forked, and a child of a process with several threads can find a lock held
+/// by a thread it does not have. Forked before the database is loaded, the
+/// child holds none of it, and it stays through the reloads with the
+/// validators it has learned. It asks the supervisor for a reload with
+/// `SIGUSR2`, and one that dies is forked again. Dropping this stops it.
+#[cfg(unix)]
+pub struct Updater {
+    check: crate::signatures::AutoUpdate,
+    pid: Option<libc::pid_t>,
+    /// When the child was last forked.
+    since: Instant,
+}
+
+/// Off Unix there is no pool, and no updater child.
+#[cfg(not(unix))]
+pub enum Updater {}
+
+/// The least time between two forks of the updater's child, so that one that
+/// dies at once is not forked in a loop.
+#[cfg(unix)]
+const UPDATER_REFORK: Duration = Duration::from_secs(60);
+
+#[cfg(unix)]
+impl Updater {
+    /// Fork the child that runs `check`'s poll. Called while this process has
+    /// one thread, before the database is loaded.
+    pub fn start(check: crate::signatures::AutoUpdate) -> io::Result<Self> {
+        // The child's first request can come before the pool installs its
+        // handlers, and the default action of SIGUSR2 ends this process.
+        // SAFETY: `on_sigusr2` is async-signal-safe, as its doc says.
+        unsafe { install_handler(libc::SIGUSR2, on_sigusr2) };
+        let mut updater = Updater {
+            check,
+            pid: None,
+            since: Instant::now(),
+        };
+        updater.fork(None)?;
+        Ok(updater)
+    }
+
+    /// Fork the child. `r#gen`: the pool's current generation, whose write
+    /// end the child is not to hold.
+    fn fork(&mut self, r#gen: Option<&Generation>) -> io::Result<()> {
+        use std::io::Write as _;
+        let _ = io::stderr().flush();
+        // Read before forking; see `die_with_parent`.
+        let supervisor = std::process::id() as libc::pid_t;
+        // A fork that fails is tried again no sooner than one that dies.
+        self.since = Instant::now();
+        // SAFETY: as in `spawn_worker`.
+        let pid = unsafe { libc::fork() };
+        match pid {
+            -1 => Err(io::Error::last_os_error()),
+            0 => {
+                if let Some(g) = r#gen {
+                    g.enter();
+                }
+                child_signals();
+                die_with_parent(supervisor);
+                self.check.clone().poll(&|| {
+                    // SAFETY: `kill` has no memory precondition.
+                    unsafe { libc::kill(supervisor, libc::SIGUSR2) };
+                });
+                // SAFETY: `_exit` has no memory precondition; it ends this
+                // child without running the destructors of the frames it
+                // inherited.
+                unsafe { libc::_exit(0) }
+            }
+            n => {
+                self.pid = Some(n);
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether `pid` is the child; it is then reaped, and forked again by
+    /// [`Updater::due`].
+    fn reaped(&mut self, pid: libc::pid_t) -> bool {
+        let ours = self.pid == Some(pid);
+        if ours {
+            self.pid = None;
+        }
+        ours
+    }
+
+    /// Fork the child again if it is gone and it was last forked long enough
+    /// ago; how long until it may be otherwise. A fork that fails is logged
+    /// and tried again then: the pool serves on without it.
+    fn due(&mut self, r#gen: &Generation) -> Option<Duration> {
+        if self.pid.is_some() {
+            return None;
+        }
+        let wait = UPDATER_REFORK.saturating_sub(self.since.elapsed());
+        if !wait.is_zero() {
+            return Some(wait);
+        }
+        match self.fork(Some(r#gen)) {
+            Ok(()) => None,
+            Err(e) => {
+                eprintln!("exav: the signature updater could not be forked again: {e}");
+                Some(UPDATER_REFORK)
+            }
+        }
+    }
+
+    /// The child, for the supervisor's teardown, which reaps it.
+    fn take(&mut self) -> Option<libc::pid_t> {
+        self.pid.take()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Updater {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            let mut status: libc::c_int = 0;
+            // SAFETY: signals and reaps a child of this process that has not
+            // been reaped, so the pid cannot have been reused; `waitpid` writes
+            // the local `status`.
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
     }
 }
 
@@ -2006,7 +2845,12 @@ fn spawn_worker(
     use std::io::Write as _;
     let _ = io::stderr().flush();
     // Read before forking; see `die_with_parent`.
-    let supervisor = unsafe { libc::getpid() };
+    let supervisor = std::process::id() as libc::pid_t;
+    // SAFETY: `fork` has no memory precondition. Its child runs this
+    // program's code, which allocates and takes locks: POSIX allows that only
+    // in the child of a process that has one thread. The supervisor starts
+    // none: `--auto-update`'s periodic check is a child of its own
+    // ([`Updater`]).
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(io::Error::last_os_error()),
@@ -2047,14 +2891,18 @@ fn worker_main(
             cfg.max_memory_bytes.saturating_add(already),
         );
     }
-    install_handler(libc::SIGALRM, on_sigalrm);
-    install_handler(libc::SIGXCPU, on_sigxcpu);
-    // Report an allocation failure to the client instead of dying silently.
-    install_handler(libc::SIGABRT, on_sigabrt);
+    // SAFETY: these handlers are async-signal-safe, as their docs say.
+    unsafe {
+        install_handler(libc::SIGALRM, on_sigalrm);
+        install_handler(libc::SIGXCPU, on_sigxcpu);
+        // Report an allocation failure to the client instead of dying silently.
+        install_handler(libc::SIGABRT, on_sigabrt);
+    }
     // Replace the handlers inherited from the supervisor, so its flag-setting
     // handlers don't fire here.
     child_signals();
-    install_handler(libc::SIGTERM, on_sigterm);
+    // SAFETY: `on_sigterm` is async-signal-safe, as its doc says.
+    unsafe { install_handler(libc::SIGTERM, on_sigterm) };
     // Only now, with SIGTERM handled here: arranged before, parent death would
     // run the handler this worker inherited from the supervisor, which only
     // sets a flag, and the worker would go on to block in `accept()` exactly
@@ -2071,19 +2919,22 @@ fn worker_main(
     };
     // A `RELOAD` command reaches a worker, not the supervisor; forward it by
     // signalling the parent, which owns the pool and does the re-fork.
-    let reload = || unsafe {
-        libc::kill(libc::getppid(), libc::SIGUSR2);
+    let reload = || {
+        let parent = std::os::unix::process::parent_id() as libc::pid_t;
+        // SAFETY: `kill` has no memory precondition.
+        unsafe { libc::kill(parent, libc::SIGUSR2) };
     };
     // `SHUTDOWN` likewise forwards to the supervisor (SIGTERM → graceful
     // teardown of the whole pool). Disabled → report it wasn't honoured.
     let allow_shutdown = cfg.allow_shutdown;
     SHUTDOWN_ALLOWED.store(allow_shutdown, Ordering::Relaxed);
     let allow_http_scan = cfg.allow_http_scan;
+    let reads = cfg.reads;
     let shutdown = move || -> bool {
         if allow_shutdown {
-            unsafe {
-                libc::kill(libc::getppid(), libc::SIGTERM);
-            }
+            let parent = std::os::unix::process::parent_id() as libc::pid_t;
+            // SAFETY: `kill` has no memory precondition.
+            unsafe { libc::kill(parent, libc::SIGTERM) };
             true
         } else {
             false
@@ -2093,6 +2944,8 @@ fn worker_main(
     let mut jobs = 0u64;
     loop {
         if !await_connection(listener.as_raw_fd(), retire) {
+            // SAFETY: `_exit` has no memory precondition; it ends this child
+            // without running the destructors of the frames it inherited.
             unsafe { libc::_exit(0) }
         }
         // The listener is non-blocking, and on some systems an accepted socket
@@ -2101,7 +2954,8 @@ fn worker_main(
             BoundListener::Unix(l) => match l.accept() {
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(false);
-                    let _ = stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT));
+                    let _ = stream.set_read_timeout(Some(reads.idle));
+                    let _ = stream.set_write_timeout(Some(reads.idle));
                     // Record the fd so `on_sigabrt` can answer on this connection
                     // if the scan aborts, instead of closing without a word.
                     CURRENT_CONN_FD.store(
@@ -2119,6 +2973,7 @@ fn worker_main(
                         &reload,
                         &shutdown,
                         allow_http_scan,
+                        reads,
                     );
                     CURRENT_CONN_FD.store(-1, std::sync::atomic::Ordering::Relaxed);
                     disarm(); // ensure the timer is off between connections
@@ -2126,15 +2981,17 @@ fn worker_main(
                 }
                 // Another worker took the connection this one woke for.
                 Err(e) if lost_accept_race(&e) => continue,
-                Err(e) => unsafe {
+                Err(e) => {
                     eprintln!("exav: worker accept error: {e}");
-                    libc::_exit(1);
-                },
+                    // SAFETY: as at the top of the loop.
+                    unsafe { libc::_exit(1) }
+                }
             },
             BoundListener::Tcp(l) => match l.accept() {
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(false);
-                    let _ = stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT));
+                    let _ = stream.set_read_timeout(Some(reads.idle));
+                    let _ = stream.set_write_timeout(Some(reads.idle));
                     // As on the Unix path: without the fd, `on_sigabrt` has
                     // nowhere to send its last word and an aborted scan closes
                     // the connection in silence. TCP is the transport a
@@ -2155,16 +3012,18 @@ fn worker_main(
                         &reload,
                         &shutdown,
                         allow_http_scan,
+                        reads,
                     );
                     CURRENT_CONN_FD.store(-1, std::sync::atomic::Ordering::Relaxed);
                     disarm();
                     r
                 }
                 Err(e) if lost_accept_race(&e) => continue,
-                Err(e) => unsafe {
+                Err(e) => {
                     eprintln!("exav: worker accept error: {e}");
-                    libc::_exit(1);
-                },
+                    // SAFETY: as at the top of the loop.
+                    unsafe { libc::_exit(1) }
+                }
             },
         };
         if let Err(e) = outcome
@@ -2174,7 +3033,9 @@ fn worker_main(
         }
         jobs += 1;
         if cfg.max_jobs != 0 && jobs >= cfg.max_jobs {
-            unsafe { libc::_exit(0) } // recycle: supervisor respawns from clean parent
+            // Recycle: the supervisor respawns from a clean parent.
+            // SAFETY: as at the top of the loop.
+            unsafe { libc::_exit(0) }
         }
     }
 }
@@ -2311,10 +3172,73 @@ fn read_until<R: Read>(r: &mut BufReader<R>, delim: u8, buf: &mut Vec<u8>) -> io
 /// timer is re-armed *per command* rather than once per connection, so a long
 /// `IDSESSION` batch of quick scans isn't killed by a single budget spanning the
 /// whole session, and idle time between commands isn't charged to a scan.
+///
+/// `reads` bound each read and each command, from its first byte to the end of
+/// its data ([`Reads`]). A client past the second is told so and disconnected.
+///
+/// A reply write that fails with the socket's write timeout (set by the
+/// caller, `?idle-secs=`), or that finds the reply's time
+/// (`reads.reply`) spent, ends the connection with a [`ClientNotReading`] error,
+/// which the caller logs.
+///
+/// A connection past `reads.session` reads no new command and ends with `Ok`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_conn<R, W>(
     rd: R,
-    mut writer: W,
+    writer: W,
+    db: &Scanner,
+    opts: &ScanOptions,
+    arm: &dyn Fn(),
+    disarm: &dyn Fn(),
+    reload: &dyn Fn(),
+    shutdown: &dyn Fn() -> bool,
+    allow_http_scan: bool,
+    reads: Reads,
+) -> io::Result<()>
+where
+    R: Read + FdSource + SetReadTimeout,
+    W: Write + SetWriteTimeout,
+{
+    // The wait of a read with no command limit to cut it.
+    rd.set_read_timeout(reads.idle)?;
+    let clock = ReadClock::new(reads.command, reads.idle).lasting(reads.session);
+    let mut reader = BufReader::new(Clocked::new(rd, &clock));
+    let mut writer = Replies::new(writer, reads.reply)?;
+    let r = converse(
+        &mut reader,
+        &clock,
+        &mut writer,
+        db,
+        opts,
+        arm,
+        disarm,
+        reload,
+        shutdown,
+        allow_http_scan,
+    );
+    if let Err(e) = &r
+        && is_too_slow(e)
+    {
+        // clamd's words and framing for the same event, so a client that reads
+        // its replies reads this one the same way.
+        writer.start_reply();
+        let _ = writer.write_all(b"COMMAND READ TIMED OUT\n");
+        let _ = writer.flush();
+    }
+    match r {
+        // The lifetime ended the wait for a command: a connection that ends as
+        // any other does.
+        Err(e) if is_session_over(&e) => Ok(()),
+        r => r,
+    }
+}
+
+/// The commands of one connection, under `clock`.
+#[allow(clippy::too_many_arguments)]
+fn converse<R, W>(
+    reader: &mut BufReader<Clocked<'_, R>>,
+    clock: &ReadClock,
+    writer: &mut Replies<W>,
     db: &Scanner,
     opts: &ScanOptions,
     arm: &dyn Fn(),
@@ -2324,12 +3248,10 @@ pub(crate) fn handle_conn<R, W>(
     allow_http_scan: bool,
 ) -> io::Result<()>
 where
-    R: Read + FdSource,
-    W: Write,
+    R: Read + FdSource + SetReadTimeout,
+    W: Write + SetWriteTimeout,
 {
-    let mut reader = BufReader::new(rd);
-
-    let (cmd, delim) = match read_command(&mut reader)? {
+    let (cmd, delim) = match read_command(reader)? {
         Some(c) => c,
         None => return Ok(()),
     };
@@ -2345,7 +3267,15 @@ where
     if idsession || word.eq_ignore_ascii_case("SESSION") {
         let mut id = 0u64;
         loop {
-            let (cmd, delim) = match read_command(&mut reader)? {
+            // Past the connection's lifetime no command is read, buffered or not.
+            if clock.lifetime_over() {
+                return Ok(());
+            }
+            // Each command of a session has its own time, which runs from its
+            // first byte: the wait for that byte is the socket's timeout, or
+            // what is left of the connection's lifetime.
+            clock.restart(!reader.buffer().is_empty());
+            let (cmd, delim) = match read_command(reader)? {
                 Some(c) => c,
                 None => return Ok(()),
             };
@@ -2358,12 +3288,13 @@ where
                 continue;
             }
             id += 1;
+            writer.start_reply();
             arm();
             let r = run_command(
                 cmd,
                 word,
-                &mut reader,
-                &mut writer,
+                reader,
+                writer,
                 delim,
                 idsession.then_some(id),
                 db,
@@ -2373,19 +3304,24 @@ where
                 allow_http_scan,
             );
             disarm();
-            r?;
+            // A stream that ran out of time, or was left unread, was answered,
+            // and what is left of it on the wire is not a command.
+            if r? == Rest::Unread || clock.fired() {
+                return Ok(());
+            }
         }
     }
 
     if cmd.is_empty() || word.eq_ignore_ascii_case("END") {
         return Ok(());
     }
+    writer.start_reply();
     arm();
     let r = run_command(
         &cmd,
         &word,
-        &mut reader,
-        &mut writer,
+        reader,
+        writer,
         delim,
         None,
         db,
@@ -2395,11 +3331,12 @@ where
         allow_http_scan,
     );
     disarm();
-    r
+    r.map(|_| ())
 }
 
-/// Execute one command and write its reply line(s). FILDES is handled here
-/// (it needs the fd-capturing reader); everything else goes to `dispatch`.
+/// Execute one command and write its reply line(s), and say what it left of
+/// its request. FILDES is handled here (it needs the fd-capturing reader);
+/// everything else goes to `dispatch`.
 #[allow(clippy::too_many_arguments)]
 fn run_command<R, W>(
     cmd: &str,
@@ -2413,19 +3350,19 @@ fn run_command<R, W>(
     reload: &dyn Fn(),
     shutdown: &dyn Fn() -> bool,
     allow_http_scan: bool,
-) -> io::Result<()>
+) -> io::Result<Rest>
 where
     R: Read + FdSource,
     W: Write,
 {
-    let replies = if word.eq_ignore_ascii_case("FILDES") {
-        vec![fildes(reader, db, opts)]
+    let (replies, rest) = if word.eq_ignore_ascii_case("FILDES") {
+        (vec![fildes(reader, db, opts)], Rest::Read)
     } else if word.eq_ignore_ascii_case("RELOAD") {
         // Ask the supervisor to re-read the data dir and re-fork the pool. The
         // reply is clamd's `RELOADING` either way; the reload happens out of band
         // (a no-op in the thread model, which has no supervisor to re-fork).
         reload();
-        vec!["RELOADING".to_string()]
+        (vec!["RELOADING".to_string()], Rest::Read)
     } else if word.eq_ignore_ascii_case("SHUTDOWN") || word.eq_ignore_ascii_case("QUIT") {
         // clamd accepts QUIT as an alias for SHUTDOWN. Answering
         // `UNKNOWN COMMAND` leaves a client that speaks clamd unable to stop a
@@ -2434,11 +3371,12 @@ where
         // teardown and returns true; if the command is disabled it returns false
         // and we surface an error instead of a silent no-op. clamd sends no reply
         // on success, so neither do we (the process tears down).
-        if shutdown() {
+        let replies = if shutdown() {
             Vec::new()
         } else {
             vec!["SHUTDOWN: command disabled ERROR".to_string()]
-        }
+        };
+        (replies, Rest::Read)
     } else {
         dispatch(cmd, word, reader, delim, db, opts, allow_http_scan)?
     };
@@ -2454,7 +3392,7 @@ where
     for reply in replies {
         write_reply(writer, id, &reply, delim)?;
     }
-    Ok(())
+    Ok(rest)
 }
 
 /// Whether a command's replies are scan results, and so belong in `--log`.
@@ -2499,8 +3437,8 @@ fn fildes<R: Read + FdSource>(
     }
 }
 
-/// Run a single command, returning the reply line(s). For INSTREAM the chunk
-/// stream is consumed from `reader`.
+/// Run a single command, returning the reply line(s) and what it left of its
+/// request. For INSTREAM the chunk stream is consumed from `reader`.
 fn dispatch<R: Read>(
     cmd: &str,
     word: &str,
@@ -2509,7 +3447,7 @@ fn dispatch<R: Read>(
     db: &Scanner,
     opts: &ScanOptions,
     allow_http_scan: bool,
-) -> io::Result<Vec<String>> {
+) -> io::Result<(Vec<String>, Rest)> {
     let arg = cmd[word.len()..].trim();
     // The fuzz target feeds this arbitrary bytes, and a path in them would be
     // opened on the machine fuzzing.
@@ -2518,10 +3456,12 @@ fn dispatch<R: Read>(
         word.to_ascii_uppercase().as_str(),
         "SCAN" | "CONTSCAN" | "MULTISCAN" | "ALLMATCHSCAN"
     ) {
-        return Ok(vec![format!(
-            "{word}: paths are not read when fuzzing ERROR"
-        )]);
+        return Ok((
+            vec![format!("{word}: paths are not read when fuzzing ERROR")],
+            Rest::Read,
+        ));
     }
+    let streamed = |(reply, rest)| Ok((vec![reply], rest));
     let reply = match word.to_ascii_uppercase().as_str() {
         "PING" => vec!["PONG".to_string()],
         // clamd-compatible `ClamAV <release>/<db-version>/<db-time>` so version-
@@ -2567,7 +3507,7 @@ fn dispatch<R: Read>(
         // All-match: report every matching signature per file (not just the
         // first), one reply line each: clamd's ALLMATCHSCAN semantics.
         "ALLMATCHSCAN" => scan_tree_allmatch(db, opts, arg),
-        "INSTREAM" => vec![instream(db, opts, reader)?],
+        "INSTREAM" => return streamed(instream(db, opts, reader)?),
         // Extended INSTREAM: same chunk framing, structured JSON reply with the
         // nested match location. Older/newer clients that don't know it fall to
         // the `UNKNOWN COMMAND` arm below and degrade cleanly.
@@ -2575,9 +3515,9 @@ fn dispatch<R: Read>(
         // multi-volume archive split across them can be rejoined; bare
         // `EXINSTREAM` is the single-file form and is unchanged.
         "EXINSTREAM" if arg.eq_ignore_ascii_case("MULTI") => {
-            vec![exinstream_multi(db, opts, reader)?]
+            return streamed(exinstream_multi(db, opts, reader)?);
         }
-        "EXINSTREAM" => vec![exinstream(db, opts, reader)?],
+        "EXINSTREAM" => return streamed(exinstream(db, opts, reader)?),
         #[cfg(feature = "http-scan")]
         "SCANURL" => {
             vec![if allow_http_scan {
@@ -2594,7 +3534,7 @@ fn dispatch<R: Read>(
         )],
         _ => vec![format!("UNKNOWN COMMAND {word} ERROR")],
     };
-    Ok(reply)
+    Ok((reply, Rest::Read))
 }
 
 pub(crate) fn write_reply<W: Write>(
@@ -2769,26 +3709,22 @@ fn volume_set_lines(
         // directory of large ordinary files is not read here at all.
         let mut verdicts = exav_core::analyze_volume_sets(db, &names, opts, |name| {
             let mut data = Vec::new();
-            File::open(dir.join(name))?
-                .take(opts.deep_analysis_max.saturating_add(1))
-                .read_to_end(&mut data)?;
+            exav_core::unpack::source::read_capped(
+                &mut File::open(dir.join(name))?,
+                &mut data,
+                opts.limits.max_buffer_bytes.saturating_add(1),
+            )?;
             Ok(data)
         });
-        // The sets whose volumes carry their own headers (RAR, ZIP, CAB). A
-        // `.cab` is read by its head to see whether it names a neighbour, and
-        // no name is turned into a path: only names in this directory's list.
-        verdicts.extend(exav_core::analyze_split_sets(
+        // The sets whose volumes carry their own headers (RAR, ZIP, CAB), read
+        // where they lie. A `.cab` is read by its head to see whether it names
+        // a neighbour, and no name is turned into a path: only names in this
+        // directory's list.
+        verdicts.extend(exav_core::analyze_split_sets_seekable(
             db,
             &names,
             opts,
-            |name, head| {
-                let limit = head.map_or(opts.deep_analysis_max.saturating_add(1), |n| n as u64);
-                let mut data = Vec::new();
-                File::open(dir.join(name))?
-                    .take(limit)
-                    .read_to_end(&mut data)?;
-                Ok(data)
-            },
+            |name| File::open(dir.join(name)),
         ));
         for v in verdicts {
             // Named for the archive, not the fragment: `big.7z FOUND …` tells an
@@ -2849,14 +3785,9 @@ fn scan_one_allmatch(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String
     if path.is_empty() {
         return vec!["ALLMATCHSCAN: missing path ERROR".to_string()];
     }
-    let opened = File::open(Path::new(path)).and_then(|f| f.metadata().map(|m| (f, m.len())));
-    let (file, size) = match opened {
-        Ok(o) => o,
-        Err(e) => return vec![format!("{path}: {e} ERROR")],
-    };
     // Isolate a panic on a crafted file into an ERROR for this target.
     let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        analyze_all_seekable(db, file, size, opts)
+        analyze_all_path(db, Path::new(path), opts)
     }));
     let found = match found {
         Ok(Ok(found)) => Ok(found),
@@ -2891,15 +3822,10 @@ fn scan_url(db: &Scanner, opts: &ScanOptions, url: &str) -> String {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return format!("{url}: SCANURL requires an http(s) URL ERROR");
     }
-    let reader = match exav_core::source::HttpRangeReader::open_with(
-        url,
-        opts.object_cache_block_bytes,
-        opts.http_request_bytes,
-    ) {
+    let (reader, size) = match exav_core::source::open_http(url, opts) {
         Ok(r) => r,
         Err(e) => return format!("{url}: {e} ERROR"),
     };
-    let size = reader.len();
     let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         exav_core::scan_seekable(db, reader, size, opts)
     }));
@@ -2919,6 +3845,16 @@ fn scan_url(db: &Scanner, opts: &ScanOptions, url: &str) -> String {
 /// busy indefinitely, since every individual read arrives inside the socket
 /// timeout and so never trips it.
 pub(crate) const MAX_DRAIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What a command leaves of its request on the connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rest {
+    /// Nothing: the next byte is the next command's.
+    Read,
+    /// Bytes that were not read and are not a command: the connection is
+    /// closed after the reply.
+    Unread,
+}
 
 /// A stream payload materialized into a **seekable** source: in RAM when small,
 /// else spilled to an auto-deleting temp file. A seekable view is what lets a
@@ -2992,7 +3928,7 @@ pub(crate) fn buffer_to_seekable<R: Read>(reader: &mut R) -> io::Result<Held> {
     use crate::spill::SpillError;
     let threshold = crate::spill::config().threshold;
     let mut buf = Vec::new();
-    reader.by_ref().take(threshold).read_to_end(&mut buf)?;
+    exav_core::unpack::source::read_capped(&mut *reader, &mut buf, threshold)?;
     let mut block = vec![0u8; 64 * 1024];
     let got = match (buf.len() as u64) < threshold {
         true => 0,
@@ -3130,20 +4066,19 @@ fn instream<R: Read>(
     db: &Scanner,
     opts: &ScanOptions,
     reader: &mut BufReader<R>,
-) -> io::Result<String> {
+) -> io::Result<(String, Rest)> {
     let mut stream = Instream::new(reader, opts.max_scan_size);
     let held = buffer_to_seekable(&mut stream)?;
-    // Counts what was not held, so the size is the stream's. A drain that
-    // stops at its cap only means the connection will not be reusable.
-    let _reached_terminator = stream.drain()?;
+    // Counts what was not held, so the size is the stream's.
+    let rest = stream.drain()?;
     // Answering a prefix would answer a question the client never finished
     // asking, and `OK` on the benign head of a file is a bypass anyone can drive.
     // Not a partial either: `--partial-as ok` would turn it back into that `OK`.
     if stream.truncated() {
-        return Ok(format!("stream: {STREAM_CUT} ERROR"));
+        return Ok((format!("stream: {STREAM_CUT} ERROR"), rest));
     }
     let (report, _loc) = scan_payload_timed(db, opts, &held, stream.total(), "stream")?;
-    Ok(verdict_line("stream", &report))
+    Ok((verdict_line("stream", &report), rest))
 }
 
 /// `EXINSTREAM`: scan a file sent over the exact INSTREAM chunk framing and reply
@@ -3156,7 +4091,7 @@ fn exinstream<R: Read>(
     db: &Scanner,
     opts: &ScanOptions,
     reader: &mut BufReader<R>,
-) -> io::Result<String> {
+) -> io::Result<(String, Rest)> {
     // Materialize to a seekable source (RAM small / temp file large), the same
     // path as INSTREAM, bounded by `--max-input-bytes` (disk is the ceiling). That is
     // the flag this cap actually reads: `opts.max_scan_size` is exav-core's
@@ -3166,20 +4101,21 @@ fn exinstream<R: Read>(
     let held = match buffer_to_seekable(&mut stream) {
         Ok(h) => h,
         Err(e) => {
-            let _ = stream.drain();
-            return Ok(json_error(&format!("stream read error: {e}")));
+            let rest = stream.drain().unwrap_or(Rest::Unread);
+            return Ok((json_error(&format!("stream read error: {e}")), rest));
         }
     };
     // As in INSTREAM: counts what was not held.
-    let _reached_terminator = stream.drain()?;
+    let rest = stream.drain()?;
     // As in INSTREAM: a prefix is not the file, so it gets no verdict.
     if stream.truncated() {
-        return Ok(json_error(STREAM_CUT));
+        return Ok((json_error(STREAM_CUT), rest));
     }
-    match scan_payload_timed(db, opts, &held, stream.total(), "stream") {
-        Ok((report, loc)) => Ok(verdict_json(&report, loc)),
-        Err(e) => Ok(json_error(&format!("scan error: {e}"))),
-    }
+    let reply = match scan_payload_timed(db, opts, &held, stream.total(), "stream") {
+        Ok((report, loc)) => verdict_json(&report, loc),
+        Err(e) => json_error(&format!("scan error: {e}")),
+    };
+    Ok((reply, rest))
 }
 
 /// Longest filename accepted in an `EXINSTREAM MULTI` request.
@@ -3235,8 +4171,10 @@ fn exinstream_multi<R: Read>(
     db: &Scanner,
     opts: &ScanOptions,
     reader: &mut BufReader<R>,
-) -> io::Result<String> {
+) -> io::Result<(String, Rest)> {
     use serde_json::json;
+    // An answer before the request's end leaves the rest of it unread.
+    let refused = |reason: &str| Ok((json_error(reason), Rest::Unread));
     let mut names: Vec<String> = Vec::new();
     // `None` for a file the daemon could not hold.
     let mut payloads: Vec<Option<StreamPayload>> = Vec::new();
@@ -3262,10 +4200,10 @@ fn exinstream_multi<R: Read>(
             break;
         }
         if n > MAX_STREAM_NAME {
-            return Ok(json_error("filename too long"));
+            return refused("filename too long");
         }
         if names.len() >= MAX_STREAM_FILES {
-            return Ok(json_error("too many files in one request"));
+            return refused("too many files in one request");
         }
         let mut raw = vec![0u8; n as usize];
         if read_full(reader, &mut raw)? < raw.len() {
@@ -3277,14 +4215,11 @@ fn exinstream_multi<R: Read>(
         let mut stream = Instream::new(reader, opts.max_scan_size);
         let held = match buffer_to_seekable(&mut stream) {
             Ok(h) => h,
-            Err(e) => {
-                let _ = stream.drain();
-                return Ok(json_error(&format!("stream read error: {e}")));
-            }
+            Err(e) => return refused(&format!("stream read error: {e}")),
         };
         // Past a drain that stopped at its cap, or at end of input, the next
         // file's framing is not where the loop would look for it.
-        let cut = !stream.drain()? || stream.truncated();
+        let cut = stream.drain()? == Rest::Unread || stream.truncated();
         let fields = if stream.truncated() {
             json!({"status": "ERROR", "reason": STREAM_CUT})
         } else {
@@ -3311,10 +4246,10 @@ fn exinstream_multi<R: Read>(
         // reply describes a request the daemon actually held rather than one it
         // died part-way through.
         if held_ram > MAX_STREAM_REQUEST_RAM || held_spill > MAX_STREAM_REQUEST_SPILL {
-            return Ok(json_error(
+            return refused(
                 "request too large: the files sent together exceed what one \
                  request may hold",
-            ));
+            );
         }
     }
 
@@ -3331,7 +4266,7 @@ fn exinstream_multi<R: Read>(
         payloads[i]
             .as_ref()
             .ok_or_else(|| io::Error::other("stream was not held"))?
-            .bytes_capped(opts.deep_analysis_max)?
+            .bytes_capped(opts.limits.max_buffer_bytes)?
             .ok_or_else(|| io::Error::other("stream too large to rejoin"))
     };
     let mut verdicts = exav_core::analyze_volume_sets(db, &names, opts, held_bytes);
@@ -3373,7 +4308,12 @@ fn exinstream_multi<R: Read>(
         // clean" would be wrong about a batch it never fully sent.
         out["truncated"] = json!(true);
     }
-    Ok(out.to_string())
+    let rest = if request_truncated {
+        Rest::Unread
+    } else {
+        Rest::Read
+    };
+    Ok((out.to_string(), rest))
 }
 
 /// One `files[]` entry: `"name"` first, then the verdict fields, then `"set"`
@@ -3524,23 +4464,19 @@ impl<'a, R: Read> Instream<'a, R> {
     /// Draining is a courtesy (it lets the connection carry another command
     /// instead of being reset), and a courtesy with no bound is a way to hold a
     /// worker. Every read completes inside the socket timeout, so the timeout
-    /// never fires while a client keeps sending; without a cap one connection
-    /// can occupy a slot for as long as it likes, and in the thread model there
-    /// is no per-command timer behind it.
+    /// never fires while a client keeps sending. The command's read time
+    /// (`?request-secs=`) bounds it unless that is off; without either,
+    /// one connection can occupy a slot for as long as it likes.
     ///
-    /// Past the cap the reply still goes out and the rest of the client's bytes
-    /// are left in the socket. The session is then desynchronised (the leftover
-    /// payload parses as garbage commands), which is the client's own doing and
-    /// costs it a byte for every byte the daemon reads. What it no longer buys
-    /// is a worker held for free.
-    ///
-    /// Returns whether the terminator was reached.
-    fn drain(&mut self) -> io::Result<bool> {
+    /// Past the cap the reply still goes out, and the rest of the client's
+    /// bytes are left unread: [`Rest::Unread`], after which the connection is
+    /// closed.
+    fn drain(&mut self) -> io::Result<Rest> {
         let mut sink = [0u8; 8192];
         let mut drained = 0u64;
         while !self.done {
             if drained >= MAX_DRAIN_BYTES {
-                return Ok(false);
+                return Ok(Rest::Unread);
             }
             if self.remaining == 0 {
                 self.next_chunk()?;
@@ -3557,7 +4493,7 @@ impl<'a, R: Read> Instream<'a, R> {
             drained += n as u64;
             self.total += n as u64;
         }
-        Ok(true)
+        Ok(Rest::Read)
     }
 
     /// The stream's size: every byte received, including those past the
@@ -3620,7 +4556,10 @@ mod tests {
     fn a_scan_time_limit_past_time_t_still_arms_the_timer() {
         let armed = |it: &libc::itimerval| it.it_value.tv_sec > 0;
         let read = || {
+            // SAFETY: `itimerval` is two `timeval`s of integers, for which
+            // all-zero bytes are valid.
             let mut it: libc::itimerval = unsafe { std::mem::zeroed() };
+            // SAFETY: `getitimer` writes the local `it`.
             unsafe { libc::getitimer(libc::ITIMER_REAL, &mut it) };
             it
         };
@@ -3673,25 +4612,23 @@ mod tests {
     }
 
     /// Every cap on what a scan holds fits the grant, not only the total: the
-    /// engine reads an object whole up to `deep_analysis_max`, and a total
+    /// engine reads an object whole up to `max_buffer_bytes`, and a total
     /// already under the grant says nothing about one object's cap.
     #[test]
     fn every_holding_cap_fits_the_grant() {
         let mut opts = ScanOptions::default();
         opts.limits.max_extracted_bytes = 1024 << 20;
-        opts.deep_analysis_max = 256 << 20;
+        opts.limits.max_buffer_bytes = 256 << 20;
         fit_limits_to_job_memory(&mut opts, 300 << 20);
-        assert_eq!(opts.deep_analysis_max, 75 << 20);
+        assert_eq!(opts.limits.max_buffer_bytes, 75 << 20);
         assert_eq!(opts.limits.max_extracted_bytes, 104 << 20);
 
         let mut opts = ScanOptions::default();
         opts.limits.max_extracted_bytes = 100 << 20;
         opts.limits.max_buffer_bytes = u64::MAX;
-        opts.deep_analysis_max = u64::MAX;
         fit_limits_to_job_memory(&mut opts, 1000 << 20);
         assert_eq!(opts.limits.max_extracted_bytes, 100 << 20);
         assert_eq!(opts.limits.max_buffer_bytes, 250 << 20);
-        assert_eq!(opts.deep_analysis_max, 250 << 20);
     }
 
     /// The cache of an object read in place and an HTTP request are held
@@ -3706,7 +4643,7 @@ mod tests {
         assert_eq!(opts.http_request_bytes, 50 << 20);
         let mut opts = ScanOptions::default();
         fit_limits_to_job_memory(&mut opts, 818 << 20);
-        assert_eq!(opts.object_cache_bytes, 8 << 20);
+        assert_eq!(opts.object_cache_bytes, 32 << 20);
     }
 
     /// From live archives scanned with objects allowed up to 2000M in 2 GiB
@@ -3720,9 +4657,8 @@ mod tests {
         let mut opts = ScanOptions::default();
         opts.limits.max_extracted_bytes = 2000 << 20;
         opts.limits.max_buffer_bytes = 2000 << 20;
-        opts.deep_analysis_max = 2000 << 20;
         fit_limits_to_job_memory(&mut opts, job);
-        let object = opts.deep_analysis_max.max(opts.limits.max_buffer_bytes);
+        let object = opts.limits.max_buffer_bytes;
         assert!(opts.limits.max_extracted_bytes + 2 * object + exav_core::LOWERCASE_COPY_MAX < job);
     }
 
@@ -3738,8 +4674,44 @@ mod tests {
                 opts.limits.max_extracted_bytes
             );
             assert_eq!(fitted.limits.max_buffer_bytes, opts.limits.max_buffer_bytes);
-            assert_eq!(fitted.deep_analysis_max, opts.deep_analysis_max);
         }
+    }
+
+    /// A child that entered its generation and then drops it, as a panic
+    /// unwinding out of a worker does, closes the write end once: a descriptor
+    /// that took its number meanwhile stays open.
+    #[test]
+    fn a_generation_entered_then_dropped_closes_its_write_end_once() {
+        use std::os::fd::AsRawFd;
+        let g = Generation::new().unwrap();
+        let n = g.notice.borrow().as_ref().unwrap().as_raw_fd();
+        // SAFETY: `fork` has no memory precondition. The child is alone in its
+        // process, so no other thread takes `n` once it is closed, and it makes
+        // only async-signal-safe calls (`close`, `open`, `dup2`, `fcntl`,
+        // `_exit`), as POSIX requires of the child of a threaded process.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            g.enter();
+            // SAFETY: `open` takes a NUL-terminated path; `dup2` and `fcntl`
+            // take descriptor numbers and fail on a bad one; `_exit` ends the
+            // child without running the parent's destructors again.
+            unsafe {
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+                libc::dup2(null, n);
+                drop(g);
+                libc::_exit(i32::from(libc::fcntl(n, libc::F_GETFD) == -1));
+            }
+        }
+        assert!(pid > 0, "fork: {}", io::Error::last_os_error());
+        drop(g);
+        let mut status = 0;
+        // SAFETY: waits for the child forked above, into a local.
+        let reaped = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(reaped, pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "dropping the generation closed descriptor {n} a second time"
+        );
     }
 
     /// A signal that lands while the supervisor is awake (reaping, reloading)
@@ -3749,7 +4721,8 @@ mod tests {
     #[test]
     fn a_signal_before_the_nap_ends_it() {
         arm_wakeup().unwrap();
-        install_handler(libc::SIGUSR2, on_sigchld);
+        // SAFETY: `on_sigchld` is async-signal-safe, as its doc says.
+        unsafe { install_handler(libc::SIGUSR2, on_sigchld) };
         // SAFETY: raises a signal on this thread; its handler only wakes.
         unsafe {
             libc::raise(libc::SIGUSR2);
@@ -3886,6 +4859,7 @@ mod tests {
                 &|| {},
                 &|| false,
                 allow_http_scan,
+                Reads::with_command(None),
             );
         });
         client
@@ -3952,6 +4926,7 @@ mod tests {
                 &|| {},
                 &|| false,
                 false,
+                Reads::with_command(None),
             );
         });
         let mut r = BufReader::new(client.try_clone().unwrap());
@@ -3981,6 +4956,7 @@ mod tests {
                 &|| {},
                 &|| false,
                 false,
+                Reads::with_command(None),
             );
         });
         let mut r = BufReader::new(client.try_clone().unwrap());
@@ -4448,6 +5424,30 @@ mod tests {
         );
     }
 
+    /// The socket is bound out of reach and moved to its path with its mode: it
+    /// answers there with the mode asked for, in place of a stale one, and
+    /// nothing is left beside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_socket_is_bound_beside_its_path_and_moved_there() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let path = dir.path().join("exav.sock");
+        // The socket of an earlier run, which nothing listens on any more.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let listener = bind_unix_socket(&path, 0o640).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(meta.file_type().is_socket());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o640);
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        listener.accept().unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["exav.sock"]);
+    }
+
     #[test]
     fn scan_path_eicar_and_clean() {
         let dir = crate::tmpfile::TempDir::new().unwrap();
@@ -4690,32 +5690,13 @@ mod tests {
     }
 
     /// Send `data` plus one file descriptor as SCM_RIGHTS over the socket.
-    fn send_with_fd(stream: &UnixStream, data: &[u8], fd: std::os::fd::RawFd) {
-        use std::os::fd::AsRawFd;
-        let fdsz = std::mem::size_of::<std::os::fd::RawFd>();
-        unsafe {
-            let mut iov = libc::iovec {
-                iov_base: data.as_ptr() as *mut libc::c_void,
-                iov_len: data.len(),
-            };
-            let mut cmsg = [0u8; 64];
-            let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = cmsg.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = libc::CMSG_SPACE(fdsz as u32) as _;
-            let c = libc::CMSG_FIRSTHDR(&msg);
-            (*c).cmsg_level = libc::SOL_SOCKET;
-            (*c).cmsg_type = libc::SCM_RIGHTS;
-            (*c).cmsg_len = libc::CMSG_LEN(fdsz as u32) as _;
-            std::ptr::copy_nonoverlapping(&fd as *const _ as *const u8, libc::CMSG_DATA(c), fdsz);
-            assert!(libc::sendmsg(stream.as_raw_fd(), &msg, 0) >= 0);
-        }
+    fn send_with_fd(stream: &UnixStream, data: &[u8], fd: std::os::fd::BorrowedFd<'_>) {
+        super::send_fd_command(stream, data, fd).unwrap();
     }
 
     #[test]
     fn fildes_scans_passed_descriptor() {
-        use std::os::fd::AsRawFd;
+        use std::os::fd::AsFd;
         let dir = crate::tmpfile::TempDir::new().unwrap();
         let bad = dir.path().join("bad");
         std::fs::write(&bad, eicar()).unwrap();
@@ -4723,7 +5704,7 @@ mod tests {
 
         let mut w = serve();
         let mut r = BufReader::new(w.try_clone().unwrap());
-        send_with_fd(&w, b"zFILDES\0", f.as_raw_fd());
+        send_with_fd(&w, b"zFILDES\0", f.as_fd());
         let mut buf = Vec::new();
         r.read_until(0, &mut buf).unwrap();
         let reply = String::from_utf8_lossy(&buf);
@@ -4860,6 +5841,7 @@ mod tests {
                 &|| {},
                 &|| false,
                 false,
+                Reads::with_command(None),
             );
         });
         client.write_all(b"zSHUTDOWN\0").unwrap();
@@ -4899,6 +5881,7 @@ mod tests {
                 &|| {},
                 &shutdown,
                 false,
+                Reads::with_command(None),
             );
         });
         client.write_all(b"zSHUTDOWN\0").unwrap();
@@ -4936,6 +5919,7 @@ mod tests {
                 &reload,
                 &|| false,
                 false,
+                Reads::with_command(None),
             );
         });
         client.write_all(b"zRELOAD\0").unwrap();
@@ -4951,5 +5935,898 @@ mod tests {
             "reload hook must fire once"
         );
         let _ = client.write(b"");
+    }
+
+    /// [`serve`], with `command_read` as the most time one command may take.
+    fn serve_within(command_read: Option<Duration>) -> UnixStream {
+        let (client, server) = UnixStream::pair().unwrap();
+        let db = Scanner::builtin();
+        let opts = ScanOptions::default();
+        std::thread::spawn(move || {
+            let reader = AncillaryReader::new(&server);
+            let _ = handle_conn(
+                reader,
+                &server,
+                &db,
+                &opts,
+                &|| {},
+                &|| {},
+                &|| {},
+                &|| false,
+                false,
+                Reads::with_command(command_read),
+            );
+        });
+        client
+    }
+
+    /// A client that sends nothing is let go once one read has waited the
+    /// address's `idle-secs`.
+    #[test]
+    fn a_client_that_sends_nothing_is_let_go_after_the_idle_wait() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (db, opts) = (Scanner::builtin(), ScanOptions::default());
+        let reads = Reads {
+            idle: Duration::from_millis(300),
+            ..Reads::with_command(None)
+        };
+        let start = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let reader = AncillaryReader::new(&server);
+            let _ = handle_conn(
+                reader,
+                &server,
+                &db,
+                &opts,
+                &|| {},
+                &|| {},
+                &|| {},
+                &|| false,
+                false,
+                reads,
+            );
+        });
+        assert_eq!(read_to_close(&mut client), "");
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(250) && waited < Duration::from_secs(10),
+            "{waited:?}"
+        );
+    }
+
+    /// What the daemon sends until it closes the connection or resets it. A
+    /// daemon that never does leaves the test with what it got in 20 seconds,
+    /// not hanging.
+    fn read_to_close(client: &mut UnixStream) -> String {
+        client
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        while let Ok(n) = client.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Sends `bytes` one at a time, `gap` apart, from a thread of its own so
+    /// that the caller can read the reply meanwhile. The thread ends when the
+    /// daemon closes the connection.
+    fn drip(client: &UnixStream, bytes: Vec<u8>, gap: Duration) -> std::thread::JoinHandle<()> {
+        let mut w = client.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for b in bytes {
+                if w.write_all(&[b]).is_err() {
+                    return;
+                }
+                std::thread::sleep(gap);
+            }
+        })
+    }
+
+    /// The chunk header of an `INSTREAM` that promises 1000 bytes.
+    fn chunk_header() -> Vec<u8> {
+        1000u32.to_be_bytes().to_vec()
+    }
+
+    const TIMED_OUT: &str = "COMMAND READ TIMED OUT\n";
+
+    #[test]
+    fn a_command_line_sent_a_byte_at_a_time_is_cut_off() {
+        let mut client = serve_within(Some(Duration::from_millis(300)));
+        let sender = drip(&client, b"zINSTREAM\0".to_vec(), Duration::from_millis(50));
+        assert_eq!(read_to_close(&mut client), TIMED_OUT);
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn a_stream_sent_a_byte_at_a_time_is_cut_off() {
+        let mut client = serve_within(Some(Duration::from_millis(300)));
+        client.write_all(b"zINSTREAM\0").unwrap();
+        let mut data = chunk_header();
+        data.extend_from_slice(&[b'a'; 100]);
+        let sender = drip(&client, data, Duration::from_millis(50));
+        assert_eq!(read_to_close(&mut client), TIMED_OUT);
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn an_exinstream_sent_a_byte_at_a_time_is_answered_with_an_error() {
+        let mut client = serve_within(Some(Duration::from_millis(300)));
+        client.write_all(b"zEXINSTREAM\0").unwrap();
+        let mut data = chunk_header();
+        data.extend_from_slice(&[b'a'; 100]);
+        let sender = drip(&client, data, Duration::from_millis(50));
+        let reply = read_to_close(&mut client);
+        assert!(
+            reply.contains("\"status\":\"ERROR\"") && reply.contains("took longer"),
+            "{reply}"
+        );
+        sender.join().unwrap();
+    }
+
+    /// The same slow client, with no limit and with a long one, is served: the
+    /// cut-off above is the limit's doing, not the transport's.
+    #[test]
+    fn the_same_slow_stream_is_scanned_without_a_limit_or_within_one() {
+        for limit in [None, Some(Duration::from_secs(60))] {
+            let mut client = serve_within(limit);
+            client.write_all(b"zINSTREAM\0").unwrap();
+            let mut data = 10u32.to_be_bytes().to_vec();
+            data.extend_from_slice(&[b'a'; 10]);
+            data.extend_from_slice(&0u32.to_be_bytes());
+            let sender = drip(&client, data, Duration::from_millis(20));
+            assert_eq!(read_to_close(&mut client), "stream: OK\0", "{limit:?}");
+            sender.join().unwrap();
+        }
+    }
+
+    /// A session's commands each have their own time, from their first byte:
+    /// the wait between them is the socket's timeout, not the command's.
+    #[test]
+    fn each_command_of_a_session_has_its_own_time() {
+        let mut client = serve_within(Some(Duration::from_millis(300)));
+        client
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut r = BufReader::new(client.try_clone().unwrap());
+        let mut reply = || {
+            let mut buf = Vec::new();
+            r.read_until(0, &mut buf).unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        // The first command is in hand with the one that opens the session.
+        client.write_all(b"zIDSESSION\0zPING\0").unwrap();
+        assert_eq!(reply(), "1: PONG\0");
+        std::thread::sleep(Duration::from_millis(600));
+        client.write_all(b"zPING\0").unwrap();
+        assert_eq!(reply(), "2: PONG\0");
+        client.write_all(b"zEND\0").unwrap();
+    }
+
+    #[test]
+    fn the_wait_for_a_commands_first_byte_is_not_charged_to_it() {
+        let mut client = serve_within(Some(Duration::from_millis(300)));
+        std::thread::sleep(Duration::from_millis(600));
+        // In two pieces, so that a second read is made after the wait.
+        client.write_all(b"z").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        client.write_all(b"PING\0").unwrap();
+        assert_eq!(read_to_close(&mut client), "PONG\0");
+    }
+
+    /// A transport that gives its script's reads in turn and records the wait
+    /// it was set to before each.
+    struct Scripted {
+        reads: std::collections::VecDeque<io::Result<Vec<u8>>>,
+        waits: std::cell::RefCell<Vec<Duration>>,
+    }
+
+    impl Scripted {
+        fn new(reads: Vec<io::Result<Vec<u8>>>) -> Self {
+            Self {
+                reads: reads.into(),
+                waits: Default::default(),
+            }
+        }
+    }
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.reads.pop_front() {
+                Some(Ok(v)) => {
+                    buf[..v.len()].copy_from_slice(&v);
+                    Ok(v.len())
+                }
+                Some(Err(e)) => Err(e),
+                None => Ok(0),
+            }
+        }
+    }
+
+    impl SetReadTimeout for Scripted {
+        fn set_read_timeout(&self, wait: Duration) -> io::Result<()> {
+            self.waits.borrow_mut().push(wait);
+            Ok(())
+        }
+    }
+
+    impl FdSource for Scripted {
+        fn take_fd(&mut self) -> Option<std::fs::File> {
+            None
+        }
+    }
+
+    /// A client's bytes, made as they are read, and how many were read.
+    struct Sent<R> {
+        inner: R,
+        read: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+
+    impl<R: Read> Read for Sent<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    impl<R> SetReadTimeout for Sent<R> {
+        fn set_read_timeout(&self, _wait: Duration) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<R> FdSource for Sent<R> {
+        fn take_fd(&mut self) -> Option<std::fs::File> {
+            None
+        }
+    }
+
+    /// A stream longer than the drain reads past the limit, or a request
+    /// answered before its end, is answered, and the session ends there: the
+    /// rest of it is not read as commands.
+    #[test]
+    fn a_session_ends_after_a_stream_left_unread() {
+        let hold = 1024u64;
+        let mut opts = ScanOptions::default();
+        opts.max_scan_size = Some(hold);
+        let stream = hold + MAX_DRAIN_BYTES;
+        let name = u64::from(MAX_STREAM_NAME) + 1;
+        for (verb, before, len, first) in [
+            (&b"INSTREAM"[..], &b""[..], stream, "1: stream: "),
+            (b"EXINSTREAM", b"", stream, "1: {"),
+            // A name too long, or a file's stream.
+            (b"EXINSTREAM MULTI", b"", name, "1: {"),
+            (b"EXINSTREAM MULTI", b"\0\0\0\x01a", stream, "1: {"),
+        ] {
+            let len = len + 1024 * 1024;
+            let mut head = [b"zIDSESSION\0z", verb, b"\0", before].concat();
+            head.extend_from_slice(&u32::try_from(len).unwrap().to_be_bytes());
+            let all = head.len() as u64 + len + 4;
+            let read = std::rc::Rc::new(std::cell::Cell::new(0));
+            let sent = Sent {
+                inner: io::Cursor::new(head)
+                    .chain(io::repeat(0).take(len))
+                    .chain(io::Cursor::new(vec![0; 4])),
+                read: read.clone(),
+            };
+            let mut out = Vec::new();
+            let r = handle_conn(
+                sent,
+                &mut out,
+                &Scanner::builtin(),
+                &opts,
+                &|| {},
+                &|| {},
+                &|| {},
+                &|| false,
+                false,
+                Reads::with_command(None),
+            );
+            let out = String::from_utf8_lossy(&out);
+            let shown: String = out.chars().take(200).collect();
+            let verb = String::from_utf8_lossy(verb);
+            assert!(r.is_ok(), "{verb}: {r:?}: {shown:?}");
+            assert!(
+                out.starts_with(first) && out.matches('\0').count() == 1,
+                "{verb}: {shown:?}"
+            );
+            assert!(read.get() < all, "{verb}: the request was read to its end");
+        }
+    }
+
+    const SOCKET_WAIT: Duration = Duration::from_secs(60);
+
+    fn would_block() -> io::Error {
+        io::ErrorKind::WouldBlock.into()
+    }
+
+    /// Once a command has begun, a read waits no longer than what is left of
+    /// its time: a read already blocked is what would overshoot it.
+    #[test]
+    fn a_read_waits_no_longer_than_the_command_has_left() {
+        let clock = ReadClock::new(Some(Duration::from_secs(10)), SOCKET_WAIT);
+        let mut r = Clocked::new(
+            Scripted::new(vec![Ok(b"x".to_vec()), Ok(b"y".to_vec())]),
+            &clock,
+        );
+        let mut b = [0u8; 8];
+        assert_eq!(r.read(&mut b).unwrap(), 1);
+        assert_eq!(r.read(&mut b).unwrap(), 1);
+        let waits = r.get_ref().waits.borrow().clone();
+        assert_eq!(waits[0], SOCKET_WAIT, "before the first byte: the socket's");
+        assert!(waits[1] <= Duration::from_secs(10), "{waits:?}");
+    }
+
+    /// A timeout on the shortened wait is the command's; one on the socket's
+    /// own is not, and keeps its kind.
+    #[test]
+    fn only_a_timeout_on_the_commands_wait_is_the_commands() {
+        let mut b = [0u8; 8];
+        let clock = ReadClock::new(Some(Duration::from_secs(10)), SOCKET_WAIT);
+        let mut r = Clocked::new(
+            Scripted::new(vec![Ok(b"x".to_vec()), Err(would_block())]),
+            &clock,
+        );
+        assert_eq!(r.read(&mut b).unwrap(), 1);
+        let e = r.read(&mut b).unwrap_err();
+        assert!(is_too_slow(&e) && clock.fired(), "{e}");
+
+        let clock = ReadClock::new(Some(Duration::from_secs(1000)), SOCKET_WAIT);
+        let mut r = Clocked::new(
+            Scripted::new(vec![Ok(b"x".to_vec()), Err(would_block())]),
+            &clock,
+        );
+        assert_eq!(r.read(&mut b).unwrap(), 1);
+        let e = r.read(&mut b).unwrap_err();
+        assert!(!is_too_slow(&e) && !clock.fired(), "{e}");
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn a_read_past_the_commands_time_does_not_reach_the_transport() {
+        let clock = ReadClock::new(Some(Duration::from_millis(1)), SOCKET_WAIT);
+        clock.restart(true);
+        std::thread::sleep(Duration::from_millis(5));
+        let mut r = Clocked::new(Scripted::new(vec![Ok(b"x".to_vec())]), &clock);
+        let e = r.read(&mut [0u8; 8]).unwrap_err();
+        assert!(is_too_slow(&e) && clock.fired(), "{e}");
+        assert_eq!(r.get_ref().reads.len(), 1, "the transport was read");
+        // The next command starts afresh.
+        clock.restart(false);
+        assert_eq!(r.read(&mut [0u8; 8]).unwrap(), 1);
+    }
+
+    #[test]
+    fn without_a_limit_the_sockets_timeout_is_left_alone() {
+        let clock = ReadClock::new(None, SOCKET_WAIT);
+        let mut r = Clocked::new(Scripted::new(vec![Ok(b"x".to_vec())]), &clock);
+        assert_eq!(r.read(&mut [0u8; 8]).unwrap(), 1);
+        assert!(r.get_ref().waits.borrow().is_empty());
+    }
+
+    /// A limit no clock can add to an instant is no limit, not a panic.
+    #[test]
+    fn a_limit_past_the_range_of_a_clock_is_no_limit() {
+        let clock = ReadClock::new(Some(Duration::MAX), SOCKET_WAIT);
+        clock.restart(true);
+        let mut r = Clocked::new(
+            Scripted::new(vec![Ok(b"x".to_vec()), Ok(b"y".to_vec())]),
+            &clock,
+        );
+        assert_eq!(r.read(&mut [0u8; 8]).unwrap(), 1);
+        assert_eq!(r.read(&mut [0u8; 8]).unwrap(), 1);
+        assert!(!clock.fired());
+    }
+
+    /// The server's own time inside a command, a preview scan say, is not the
+    /// client's: the command's end moves by as much as the work took.
+    #[test]
+    fn work_the_server_does_inside_a_command_is_not_charged_to_it() {
+        let clock = ReadClock::new(Some(Duration::from_secs(10)), SOCKET_WAIT);
+        clock.restart(true);
+        let before = clock.end.get().unwrap();
+        clock.excluding(|| std::thread::sleep(Duration::from_millis(50)));
+        let after = clock.end.get().unwrap();
+        assert!(after - before >= Duration::from_millis(50));
+    }
+
+    /// A command that ran out of time is a limit the operator should see in
+    /// the log; the socket's own timeout is an idle client going away.
+    #[test]
+    fn a_command_out_of_time_is_not_a_quiet_disconnect() {
+        let slow = io::Error::new(io::ErrorKind::TimedOut, CommandTooSlow);
+        assert!(!is_benign_disconnect(&slow));
+        assert!(is_benign_disconnect(&io::ErrorKind::TimedOut.into()));
+    }
+
+    #[test]
+    fn the_limit_is_the_default_unless_given_and_off_is_none() {
+        assert_eq!(command_read_limit(None), Some(DEFAULT_COMMAND_READ));
+        assert_eq!(command_read_limit(Some(0)), None);
+        assert_eq!(command_read_limit(Some(7)), Some(Duration::from_secs(7)));
+    }
+
+    /// The error a socket gives a write that waited out its timeout is the one
+    /// an idle client's read gives. Only the writer knows which it is.
+    #[test]
+    fn a_write_that_times_out_names_the_client_that_is_not_reading() {
+        struct Fails(io::ErrorKind);
+        impl Write for Fails {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(self.0.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(self.0.into())
+            }
+        }
+        impl SetWriteTimeout for Fails {
+            fn write_wait(&self) -> io::Result<Option<Duration>> {
+                Ok(None)
+            }
+            fn set_write_wait(&self, _: Option<Duration>) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut] {
+            let mut w = Replies::new(Fails(kind), None).unwrap();
+            let e = w.write_all(b"PONG").unwrap_err();
+            assert!(is_not_reading(&e), "{kind:?}: {e}");
+            let e = w.flush().unwrap_err();
+            assert!(is_not_reading(&e), "flush, {kind:?}: {e}");
+            assert!(!is_benign_disconnect(&e), "it is logged");
+        }
+        // A client that went away is the quiet case it always was.
+        let e = Replies::new(Fails(io::ErrorKind::BrokenPipe), None)
+            .unwrap()
+            .write_all(b"PONG")
+            .unwrap_err();
+        assert!(!is_not_reading(&e) && is_benign_disconnect(&e), "{e}");
+    }
+
+    /// A client that sends commands and never reads the replies fills the
+    /// socket, and the connection is ended by the write timeout instead of
+    /// holding its thread for as long as the client keeps the socket open.
+    #[test]
+    fn a_client_that_never_reads_is_cut_by_the_write_timeout() {
+        let (client, server) = UnixStream::pair().unwrap();
+        server
+            .set_write_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let db = Scanner::builtin();
+            let opts = ScanOptions::default();
+            let r = handle_conn(
+                AncillaryReader::new(&server),
+                &server,
+                &db,
+                &opts,
+                &|| {},
+                &|| {},
+                &|| {},
+                &|| false,
+                false,
+                Reads::with_command(None),
+            );
+            let _ = done.send(r);
+        });
+        let mut w = client.try_clone().unwrap();
+        let sender = std::thread::spawn(move || {
+            if w.write_all(b"zIDSESSION\0").is_err() {
+                return;
+            }
+            // Far more replies than a socket holds, none of them read.
+            let burst = b"zVERSIONCOMMANDS\0".repeat(1000);
+            for _ in 0..200 {
+                if w.write_all(&burst).is_err() {
+                    return;
+                }
+            }
+        });
+        let r = result
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the connection was never ended");
+        let e = r.expect_err("a client that does not read is an error");
+        assert!(is_not_reading(&e) && !is_benign_disconnect(&e), "{e}");
+        drop(client);
+        sender.join().unwrap();
+    }
+
+    /// [`serve`], under `reads`.
+    fn serve_with(reads: Reads) -> UnixStream {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (db, opts) = (Scanner::builtin(), ScanOptions::default());
+        std::thread::spawn(move || {
+            let _ = handle_conn(
+                AncillaryReader::new(&server),
+                &server,
+                &db,
+                &opts,
+                &|| {},
+                &|| {},
+                &|| {},
+                &|| false,
+                false,
+                reads,
+            );
+        });
+        client
+    }
+
+    fn lasting(session: Duration) -> Reads {
+        Reads {
+            session: Some(session),
+            ..Reads::with_command(None)
+        }
+    }
+
+    /// A client that talks all the time is answered while the connection has
+    /// lifetime left, and not after: the wait for its next command is what the
+    /// lifetime cuts.
+    #[test]
+    fn a_session_client_is_answered_until_the_connection_reaches_its_lifetime() {
+        let mut client = serve_with(lasting(Duration::from_secs(1)));
+        client
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let start = Instant::now();
+        client.write_all(b"zIDSESSION\0").unwrap();
+        let mut replies = BufReader::new(client.try_clone().unwrap());
+        let mut answered = 0;
+        let ended = loop {
+            if start.elapsed() > Duration::from_secs(8) {
+                break false;
+            }
+            if client.write_all(b"zPING\0").is_err() {
+                break true;
+            }
+            let mut reply = Vec::new();
+            match replies.read_until(0, &mut reply) {
+                Ok(n) if n > 0 => {
+                    assert!(reply.ends_with(b": PONG\0"), "{reply:?}");
+                    answered += 1;
+                }
+                _ => break true,
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        };
+        let lived = start.elapsed();
+        assert!(ended, "still answering after {lived:?}");
+        assert!(answered >= 1, "never answered");
+        assert!(lived >= Duration::from_millis(900), "{lived:?}");
+        assert!(lived < Duration::from_secs(6), "{lived:?}");
+    }
+
+    /// A client that sends nothing is let go at the lifetime, not at the idle
+    /// wait.
+    #[test]
+    fn a_silent_client_is_let_go_at_the_lifetime() {
+        let mut client = serve_with(lasting(Duration::from_secs(1)));
+        let start = Instant::now();
+        assert_eq!(read_to_close(&mut client), "");
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(900) && waited < Duration::from_secs(10),
+            "{waited:?}"
+        );
+    }
+
+    /// A command whose first byte arrived before the lifetime ended is read
+    /// to its end, however long that takes, and answered; the next one is not
+    /// read.
+    #[test]
+    fn a_command_begun_before_the_lifetime_ended_is_answered() {
+        let mut client = serve_with(lasting(Duration::from_secs(1)));
+        let start = Instant::now();
+        client.write_all(b"zIDSESSION\0").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        client.write_all(b"z").unwrap();
+        std::thread::sleep(Duration::from_millis(1200));
+        client.write_all(b"PING\0zPING\0").unwrap();
+        assert_eq!(read_to_close(&mut client), "1: PONG\0");
+        assert!(start.elapsed() < Duration::from_secs(10), "never closed");
+    }
+
+    /// A reply is bounded in all, not per write: a client that does not read a
+    /// large reply is cut by `reply`, though the socket has no write timeout.
+    #[test]
+    fn a_reply_the_client_does_not_read_is_cut_by_the_reply_budget() {
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        for i in 0..8000 {
+            let name = format!("{i:04}-{}", "x".repeat(120));
+            std::fs::write(dir.path().join(name), b"clean").unwrap();
+        }
+        let (client, server) = UnixStream::pair().unwrap();
+        let reads = Reads {
+            reply: Some(Duration::from_millis(500)),
+            ..Reads::with_command(None)
+        };
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (db, opts) = (Scanner::builtin(), ScanOptions::default());
+            let r = handle_conn(
+                AncillaryReader::new(&server),
+                &server,
+                &db,
+                &opts,
+                &|| {},
+                &|| {},
+                &|| {},
+                &|| false,
+                false,
+                reads,
+            );
+            let _ = done.send(r);
+        });
+        let mut w = client.try_clone().unwrap();
+        w.write_all(format!("zCONTSCAN {}\0", dir.path().display()).as_bytes())
+            .unwrap();
+        let r = result
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the connection was never ended");
+        let e = r.expect_err("a client that does not read is an error");
+        assert!(is_not_reading(&e) && !is_benign_disconnect(&e), "{e}");
+        drop(client);
+    }
+
+    /// A writer whose writes block for scripted times. A write whose time
+    /// reaches the timeout in force waits that long and fails the way a socket
+    /// does.
+    struct Blocking {
+        /// How long each write blocks, in order; none left means no time.
+        blocks: std::cell::RefCell<std::collections::VecDeque<Duration>>,
+        /// The write timeout in force.
+        wait: Cell<Option<Duration>>,
+        /// The write timeout in force at each write.
+        given: std::cell::RefCell<Vec<Option<Duration>>>,
+        /// Times the timeout was changed.
+        sets: Cell<usize>,
+    }
+
+    impl Blocking {
+        fn new(wait: Option<Duration>, blocks: &[u64]) -> Self {
+            Self {
+                blocks: std::cell::RefCell::new(
+                    blocks.iter().map(|ms| Duration::from_millis(*ms)).collect(),
+                ),
+                wait: Cell::new(wait),
+                given: Default::default(),
+                sets: Cell::new(0),
+            }
+        }
+    }
+
+    impl Write for &Blocking {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.given.borrow_mut().push(self.wait.get());
+            let block = self.blocks.borrow_mut().pop_front().unwrap_or_default();
+            match self.wait.get() {
+                Some(wait) if block >= wait => {
+                    std::thread::sleep(wait);
+                    Err(io::ErrorKind::WouldBlock.into())
+                }
+                _ => {
+                    std::thread::sleep(block);
+                    Ok(buf.len())
+                }
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SetWriteTimeout for &Blocking {
+        fn write_wait(&self) -> io::Result<Option<Duration>> {
+            Ok(self.wait.get())
+        }
+        fn set_write_wait(&self, wait: Option<Duration>) -> io::Result<()> {
+            self.sets.set(self.sets.get() + 1);
+            self.wait.set(wait);
+            Ok(())
+        }
+    }
+
+    /// Each write is given what is left of the budget, or the socket's own
+    /// timeout when that is shorter, so the waits of one reply add up to at
+    /// most the budget.
+    #[test]
+    fn each_write_of_a_reply_gets_what_is_left_of_its_budget() {
+        let budget = Duration::from_millis(600);
+        let sock = Blocking::new(Some(Duration::from_secs(5)), &[150, 150, 150]);
+        let mut w = Replies::new(&sock, Some(budget)).unwrap();
+        for _ in 0..3 {
+            w.write_all(b"x").unwrap();
+        }
+        let given = sock.given.borrow().clone();
+        assert_eq!(given[0], Some(budget), "the whole budget at first");
+        // Each earlier write blocked for at least its 150 ms.
+        assert!(
+            given[1] <= Some(budget - Duration::from_millis(150)),
+            "{given:?}"
+        );
+        assert!(
+            given[2] <= Some(budget - Duration::from_millis(300)),
+            "{given:?}"
+        );
+
+        // The socket's own timeout, when it is the shorter.
+        let sock = Blocking::new(Some(Duration::from_millis(200)), &[]);
+        let mut w = Replies::new(&sock, Some(Duration::from_secs(10))).unwrap();
+        w.write_all(b"x").unwrap();
+        assert_eq!(sock.given.borrow()[0], Some(Duration::from_millis(200)));
+
+        // And with none, the budget alone.
+        let sock = Blocking::new(None, &[]);
+        let mut w = Replies::new(&sock, Some(budget)).unwrap();
+        w.write_all(b"x").unwrap();
+        assert_eq!(sock.given.borrow()[0], Some(budget));
+    }
+
+    /// Past the budget a write fails as a client that is not reading, whether
+    /// it ran out of time inside the write or finds none left, and the
+    /// transport is not written to again.
+    #[test]
+    fn a_write_past_the_reply_budget_fails_as_a_client_not_reading() {
+        let sock = Blocking::new(Some(Duration::from_secs(5)), &[200, 200]);
+        let mut w = Replies::new(&sock, Some(Duration::from_millis(300))).unwrap();
+        w.write_all(b"x").unwrap();
+        // 100 ms are left and the write would block for 200.
+        let e = w.write_all(b"x").unwrap_err();
+        assert!(is_not_reading(&e) && !is_benign_disconnect(&e), "{e}");
+        let e = w.write_all(b"x").unwrap_err();
+        assert!(is_not_reading(&e), "{e}");
+        assert_eq!(sock.given.borrow().len(), 2, "written to with no time left");
+    }
+
+    /// Only the time a write is blocked counts: the server's time between two
+    /// writes does not, and the next reply has the whole budget again.
+    #[test]
+    fn only_time_blocked_in_a_write_is_charged_to_the_reply() {
+        let budget = Duration::from_secs(1);
+        let sock = Blocking::new(Some(Duration::from_secs(5)), &[20, 20, 20, 20]);
+        let mut w = Replies::new(&sock, Some(budget)).unwrap();
+        for _ in 0..4 {
+            w.write_all(b"x").unwrap();
+            // Four times what the reply may wait, in all.
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        let given = sock.given.borrow().clone();
+        assert!(given[3] > Some(Duration::from_millis(500)), "{given:?}");
+
+        let sock = Blocking::new(Some(Duration::from_secs(5)), &[400, 400]);
+        let mut w = Replies::new(&sock, Some(Duration::from_millis(600))).unwrap();
+        w.write_all(b"x").unwrap();
+        w.start_reply();
+        w.write_all(b"x").unwrap();
+        assert_eq!(sock.given.borrow()[1], Some(Duration::from_millis(600)));
+    }
+
+    /// Each command of a session has its reply's whole budget: two replies
+    /// whose writes each wait about two thirds of it are both written.
+    #[test]
+    fn each_command_of_a_session_starts_a_reply() {
+        let reader = Scripted::new(vec![Ok(b"zIDSESSION\0zPING\0zPING\0".to_vec())]);
+        // `1: PONG\0` goes out in a few writes, of 100 ms each.
+        let sock = Blocking::new(Some(Duration::from_secs(5)), &[100; 16]);
+        let reads = Reads {
+            reply: Some(Duration::from_millis(600)),
+            ..Reads::with_command(None)
+        };
+        let (db, opts) = (Scanner::builtin(), ScanOptions::default());
+        let r = handle_conn(
+            reader,
+            &sock,
+            &db,
+            &opts,
+            &|| {},
+            &|| {},
+            &|| {},
+            &|| false,
+            false,
+            reads,
+        );
+        let writes = sock.given.borrow().len();
+        assert!(r.is_ok(), "after {writes} writes: {r:?}");
+        // Two replies, more than the budget's worth of writes in all.
+        assert!(writes >= 7, "{writes} writes");
+    }
+
+    /// Without a budget the socket's write timeout is not touched.
+    #[test]
+    fn without_a_reply_budget_the_sockets_write_timeout_is_left_alone() {
+        let wait = Some(Duration::from_secs(5));
+        let sock = Blocking::new(wait, &[10, 10]);
+        let mut w = Replies::new(&sock, None).unwrap();
+        w.write_all(b"x").unwrap();
+        w.start_reply();
+        w.write_all(b"x").unwrap();
+        assert_eq!(sock.sets.get(), 0);
+        assert_eq!(sock.wait.get(), wait);
+    }
+
+    fn timed_out() -> io::Error {
+        io::ErrorKind::TimedOut.into()
+    }
+
+    #[test]
+    fn an_accept_error_is_transient_unless_the_listener_is_broken() {
+        for transient in [
+            io::Error::from_raw_os_error(libc::EMFILE),
+            io::Error::from_raw_os_error(libc::ENFILE),
+            io::Error::from_raw_os_error(libc::ENOBUFS),
+            io::Error::from_raw_os_error(libc::ENOMEM),
+            io::Error::from_raw_os_error(libc::ECONNABORTED),
+            io::Error::from_raw_os_error(libc::EINTR),
+            io::Error::from_raw_os_error(libc::EPROTO),
+            io::Error::from_raw_os_error(libc::EPERM),
+            io::Error::from_raw_os_error(libc::ENETDOWN),
+            io::Error::from_raw_os_error(libc::EHOSTUNREACH),
+            io::Error::from_raw_os_error(libc::EAGAIN),
+            timed_out(),
+        ] {
+            assert!(transient_accept_error(&transient), "{transient}");
+        }
+        for broken in [
+            io::Error::from_raw_os_error(libc::EBADF),
+            io::Error::from_raw_os_error(libc::EINVAL),
+            io::Error::from_raw_os_error(libc::ENOTSOCK),
+            io::Error::from_raw_os_error(libc::EFAULT),
+            io::Error::other("anything else"),
+        ] {
+            assert!(!transient_accept_error(&broken), "{broken}");
+        }
+    }
+
+    #[test]
+    fn a_failing_accept_waits_longer_each_time_and_starts_over_after_one_that_works() {
+        let mut b = AcceptBackoff::default();
+        let ms: Vec<u128> = (0..12).map(|_| b.pause().as_millis()).collect();
+        assert_eq!(
+            ms,
+            [5, 10, 20, 40, 80, 160, 320, 640, 1000, 1000, 1000, 1000]
+        );
+        b.reset();
+        assert_eq!(b.pause(), Duration::from_millis(5));
+    }
+
+    /// Transient failures are retried, connections after them are served, and
+    /// the first error that waiting does not mend ends the loop and is returned.
+    #[test]
+    fn the_accept_loop_retries_what_is_transient_and_ends_on_the_rest() {
+        let mut script: Vec<io::Result<u32>> = (0..6)
+            .map(|_| Err(io::Error::from_raw_os_error(libc::EMFILE)))
+            .collect();
+        script.extend([
+            Ok(1),
+            Err(io::Error::from_raw_os_error(libc::ECONNABORTED)),
+            Ok(2),
+            Err(io::Error::from_raw_os_error(libc::EBADF)),
+            Ok(3),
+        ]);
+        let mut script = script.into_iter();
+        // When each accept was called.
+        let mut calls = Vec::new();
+        let mut served = Vec::new();
+        let end = accept_loop(
+            || {
+                calls.push(Instant::now());
+                script.next().unwrap()
+            },
+            |n| served.push(n),
+        );
+        assert_eq!(served, [1, 2], "the connection after the broken listener");
+        assert_eq!(end.unwrap_err().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(script.len(), 1, "nothing is accepted after the end");
+        let gap = |from: usize| calls[from + 1] - calls[from];
+        // The sixth failure in a row waited 160 ms, so the pauses grew.
+        assert!(gap(5) >= Duration::from_millis(150), "{:?}", gap(5));
+        // The failure after a good accept waited 5 ms, not the 320 ms next in line.
+        assert!(gap(7) < Duration::from_millis(200), "{:?}", gap(7));
     }
 }

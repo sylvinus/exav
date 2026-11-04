@@ -44,6 +44,9 @@ vi.mock("@silurus/ooxml/docx", () => ({
   },
 }));
 
+// The ZIP reader in this process: the page has it in a worker.
+vi.mock("./zip-engine.js", () => import("../test/sniff.js"));
+
 beforeEach(() => {
   vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
   vi.spyOn(console, "warn").mockImplementation(() => {});

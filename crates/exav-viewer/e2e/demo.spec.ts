@@ -611,6 +611,14 @@ for (const mode of ["sandbox", "page"] as const) {
         await expect(engine(page).locator("[data-ooxml-selection-run]", { hasText: /^Roof inspected\.$/ })).toHaveCount(1);
       });
 
+      test("a Word document with bytes after its end record still opens, its seven paragraphs drawn", async ({ page }) => {
+        await page.goto(`./?lang=en${query}`);
+        await page.getByTestId("file-input").setInputFiles({ name: "tail.docx", mimeType: "", buffer: Buffer.concat([sample("notes.docx"), Buffer.from("\n\0")]) });
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+        const p = await settled(page.locator(".demo-frame .exav-viewer-surface"));
+        expect(bands(p, ink, 3).length).toBe(7);
+      });
+
       test("a slide is shown whole, at its own proportions, centred on the surface, and fitted again when the view changes size", async ({ page }) => {
         await open(page, "visit.pptx");
         const slide = engine(page).locator("canvas.exav-viewer-office-canvas");
@@ -864,6 +872,82 @@ for (const mode of ["sandbox", "page"] as const) {
         await frame.getByRole("button", { name: /plan\.dxf/ }).click();
         await expect(frame.locator(".exav-viewer-layer")).toHaveCount(6);
       });
+
+      test("a member is shown as what its bytes are, whatever its name says", async ({ page }) => {
+        await page.goto(`./?lang=en${query}`);
+        const zip = storedZip([
+          ["scan.png", sample("report.pdf")],
+          ["notes.txt", sample("landscape.png")],
+          ["plan.pdf", sample("plan.dxf")],
+        ]);
+        await page.getByTestId("file-input").setInputFiles({ name: "mislabelled.zip", mimeType: "application/zip", buffer: zip });
+        const frame = page.locator(".demo-frame");
+        await frame.getByRole("button", { name: /scan\.png/ }).click();
+        await expect(frame.locator(".exav-viewer-outline-entry")).toHaveText(["Scope", "Findings", "Actions"]);
+        await frame.getByRole("button", { name: "Back to the archive" }).click();
+        await frame.getByRole("button", { name: /notes\.txt/ }).click();
+        await expect(engine(page).locator(".exav-viewer-image-picture")).toHaveCount(1);
+        await frame.getByRole("button", { name: "Back to the archive" }).click();
+        await frame.getByRole("button", { name: /plan\.pdf/ }).click();
+        await expect(frame.locator(".exav-viewer-layer")).toHaveCount(6);
+      });
+    });
+
+    test.describe("what a file says it is", () => {
+      test("a PDF named .png is shown as a PDF, in the page and in the sandboxed frame", async ({ page }) => {
+        await page.goto(`./?lang=en${query}`);
+        await page.getByTestId("file-input").setInputFiles({ name: "report.png", mimeType: "image/png", buffer: sample("report.pdf") });
+        const frame = page.locator(".demo-frame");
+        await expect(frame.locator(".exav-viewer-outline-entry")).toHaveText(["Scope", "Findings", "Actions"]);
+        await expect(frame.locator(".exav-viewer-status-error")).toHaveCount(0);
+      });
+
+      test("a picture named .pdf is shown as a picture, in the page and in the sandboxed frame", async ({ page }) => {
+        await page.goto(`./?lang=en${query}`);
+        await page.getByTestId("file-input").setInputFiles({ name: "landscape.pdf", mimeType: "application/pdf", buffer: sample("landscape.png") });
+        await expect(engine(page).locator(".exav-viewer-image-picture")).toHaveCount(1);
+        await expect(page.locator(".demo-frame .exav-viewer-status-error")).toHaveCount(0);
+      });
+
+      // The server answers the range request for the first bytes, or ignores it and sends the whole file.
+      for (const ranged of [true, false]) {
+        test(`a PDF named .png given by its address is shown as a PDF, from a server that ${ranged ? "answers" : "ignores"} range requests`, async ({ page }) => {
+          const pdf = sample("report.pdf");
+          const asked: (string | undefined)[] = [];
+          await page.route((url) => url.pathname === "/e2e/mislabelled.png", (route) => {
+            asked.push(route.request().headers().range);
+            const m = /^bytes=(\d+)-(\d+)$/.exec(route.request().headers().range ?? "");
+            if (!ranged || !m) return route.fulfill({ body: pdf, contentType: "image/png" });
+            const [from, to] = [Number(m[1]), Math.min(Number(m[2]), pdf.length - 1)];
+            return route.fulfill({ status: 206, body: pdf.subarray(from, to + 1), contentType: "image/png", headers: { "content-range": `bytes ${from}-${to}/${pdf.length}` } });
+          });
+          await page.goto(`./?lang=en&url=/e2e/mislabelled.png${query}`);
+          await expect(page.locator(".demo-frame .exav-viewer-outline-entry")).toHaveText(["Scope", "Findings", "Actions"]);
+          await expect(page.locator(".demo-frame .exav-viewer-status-error")).toHaveCount(0);
+          // The first request is for the first 64 KiB, in both cases.
+          expect(asked[0]).toBe("bytes=0-65535");
+        });
+      }
+
+      test("a package without its main part is reported as damaged, and text named .docx as the wrong type", async ({ page }) => {
+        await page.goto(`./?lang=en${query}`);
+        const broken = storedZip([["[Content_Types].xml", Buffer.from("<Types/>")], ["word/styles.xml", Buffer.from("<styles/>")]]);
+        await page.getByTestId("file-input").setInputFiles({ name: "broken.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", buffer: broken });
+        await expect(page.locator(".demo-frame .exav-viewer-status-error")).toHaveText("This file is damaged and cannot be shown.");
+        await page.getByTestId("file-input").setInputFiles({ name: "notes.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", buffer: Buffer.from("just some text, no package\n") });
+        await expect(page.locator(".demo-frame .exav-viewer-status-error")).toHaveText("This file is not of the type its name says, so it cannot be shown.");
+      });
+    });
+
+    test("sniffBytes 0 tells the files inside an archive by their names, in the frame", async ({ page }) => {
+      test.skip(mode === "page", "the demo sets the option on the sandboxed viewer only");
+      await page.goto(`./?lang=en&sniffBytes=0${query}`);
+      const zip = storedZip([["scan.png", sample("report.pdf")]]);
+      await page.getByTestId("file-input").setInputFiles({ name: "mislabelled.zip", mimeType: "application/zip", buffer: zip });
+      const frame = page.locator(".demo-frame");
+      await frame.getByRole("button", { name: /scan\.png/ }).click();
+      await expect(frame.locator(".exav-viewer-status-error")).toHaveCount(1);
+      await expect(frame.locator(".exav-viewer-outline-entry")).toHaveCount(0);
     });
 
     test.describe("text", () => {
@@ -908,14 +992,31 @@ for (const mode of ["sandbox", "page"] as const) {
         await expect(text(page).locator("a")).toHaveCount(0);
       });
 
-      test("Markdown is read by its own wasm module, fetched only when one is opened", async ({ page }) => {
+      test("a text file is decoded by the text wasm module in a worker, fetched only when one is opened", async ({ page }) => {
+        // Every document (the page, the frame) counts the modules it instantiates itself: a worker's are its own.
+        await page.addInitScript(() => {
+          const w = window as unknown as { wasmOnThread: number };
+          w.wasmOnThread = 0;
+          for (const name of ["instantiate", "instantiateStreaming"] as const) {
+            const real = WebAssembly[name] as (...a: unknown[]) => Promise<unknown>;
+            (WebAssembly as unknown as Record<string, unknown>)[name] = (...a: unknown[]) => (w.wasmOnThread++, real.apply(WebAssembly, a));
+          }
+        });
+        const workers: string[] = [];
+        page.on("worker", (worker) => workers.push(worker.url()));
         const requests = recordRequests(page);
+        const textModule = () => requests.filter((u) => u.includes("exav_viewer_text_bg") && u.includes(".wasm")).length;
+        expect(textModule()).toBe(0);
         await open(page, "notes.txt");
         await expect(text(page)).toContainText("Site visit");
-        expect(requests.filter((u) => u.includes("exav_viewer_text"))).toEqual([]);
+        expect(textModule()).toBeGreaterThan(0);
+        // The frame starts its workers from a blob; the page names them.
+        if (mode === "page") expect(workers.filter((u) => u.includes("text.worker"))).not.toHaveLength(0);
+        else expect(workers).not.toHaveLength(0);
+        const onThread = await Promise.all(page.frames().map((f) => f.evaluate(() => (window as unknown as { wasmOnThread?: number }).wasmOnThread ?? 0).catch(() => 0)));
+        expect(onThread.reduce((a, b) => a + b, 0)).toBe(0);
         await open(page, "survey.md");
         await expect(text(page).locator("h1")).toHaveText("Site survey");
-        expect(requests.filter((u) => u.includes("exav_viewer_text_bg") && u.includes(".wasm")).length).toBeGreaterThan(0);
         expect(outside(page, requests)).toEqual([]);
       });
 
@@ -974,7 +1075,10 @@ for (const mode of ["sandbox", "page"] as const) {
       });
 
       test("a file that is not text is refused as such", async ({ page }) => {
-        await openSample(page, "photo.txt", { lang: "en", ...(mode === "page" && { mode }) });
+        // Bytes no detection names; a picture named .txt is a picture, whatever its name says.
+        await page.goto(`./?lang=en${query}`);
+        const binary = Buffer.from(Array.from({ length: 600 }, (_, i) => (i % 2 === 0 ? 1 + (i % 50) : 0)));
+        await page.getByTestId("file-input").setInputFiles({ name: "data.txt", mimeType: "text/plain", buffer: binary });
         await expect(page.locator(".demo-frame .exav-viewer-status-error")).toHaveText("This file is not text, so it cannot be shown here.");
         await expect(text(page)).toHaveCount(0);
       });
@@ -1059,12 +1163,23 @@ for (const mode of ["sandbox", "page"] as const) {
         const requests = recordRequests(page);
         await open(page, "report.pdf");
         for (const marker of ["exav-viewer-cad-canvas", "exav-viewer-model-canvas", "exav-viewer-archive-member", "exav-viewer-office exav-viewer-office-"]) expect(await loaded(marker), marker).toBe(false);
-        expect(requests.filter((u) => /\.wasm$/.test(u) && !u.includes("/pdfjs/"))).toEqual([]);
+        // Every file's first bytes go through the detection, whatever its format.
+        expect(requests.filter((u) => /\.wasm$/.test(u) && !u.includes("/pdfjs/") && !u.includes("exav_viewer_sniff"))).toEqual([]);
         await pick(page, "plan.dwg");
         await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
         expect(await loaded("exav-viewer-cad-canvas")).toBe(true);
         expect(requests.some((u) => /exav_viewer_dwg_bg.*\.wasm/.test(u))).toBe(true);
         for (const marker of ["exav-viewer-model-canvas", "exav-viewer-archive-member", "exav-viewer-office exav-viewer-office-"]) expect(await loaded(marker), marker).toBe(false);
+      });
+
+      test("the CSV converter's module is fetched for a CSV, not for a PDF", async ({ page }) => {
+        const requests = recordRequests(page);
+        const table = () => requests.filter((u) => u.includes("exav_viewer_table_bg") && u.includes(".wasm")).length;
+        await open(page, "report.pdf");
+        expect(table()).toBe(0);
+        await pick(page, "quote.csv");
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+        await expect.poll(table).toBeGreaterThan(0);
       });
 
       test("the French locale translates the viewer's own strings", async ({ page }) => {

@@ -266,10 +266,11 @@ pub(crate) fn le64(src: &dyn ByteSource, off: u64) -> Option<u64> {
     ]))
 }
 
-/// A virtual disk, as a `Read + Seek`.
-pub(crate) struct VDisk<'a, L: Layout> {
+/// A virtual disk, as a `Read + Seek`. The layout is a trait object so the
+/// disk, and everything that reads it, is compiled once for all the formats.
+pub(crate) struct VDisk<'a> {
     src: &'a dyn ByteSource,
-    layout: L,
+    layout: Box<dyn Layout + 'a>,
     pos: u64,
     health: Rc<Health>,
     cache: Cache,
@@ -278,9 +279,13 @@ pub(crate) struct VDisk<'a, L: Layout> {
     last: Option<(u64, Map)>,
 }
 
-impl<'a, L: Layout> VDisk<'a, L> {
+impl<'a> VDisk<'a> {
     /// A disk that may decode `allowance` bytes in all.
-    pub(crate) fn new(src: &'a dyn ByteSource, layout: L, allowance: u64) -> Self {
+    pub(crate) fn new(
+        src: &'a dyn ByteSource,
+        layout: Box<dyn Layout + 'a>,
+        allowance: u64,
+    ) -> Self {
         VDisk {
             src,
             layout,
@@ -335,7 +340,7 @@ impl<'a, L: Layout> VDisk<'a, L> {
     }
 }
 
-impl<L: Layout> Read for VDisk<'_, L> {
+impl Read for VDisk<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let size = self.layout.size();
         if buf.is_empty() || self.pos >= size {
@@ -379,7 +384,7 @@ impl<L: Layout> Read for VDisk<'_, L> {
     }
 }
 
-impl<L: Layout> Seek for VDisk<'_, L> {
+impl Seek for VDisk<'_> {
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         let pos = match to {
             SeekFrom::Start(p) => Some(p),
@@ -401,11 +406,11 @@ fn over_allowance(name: &str) -> LimitHit {
 }
 
 /// Hand `disk` to the visitor. See the module note for the two ways.
-pub(crate) fn walk<L: Layout, T>(
-    mut disk: VDisk<'_, L>,
+pub(crate) fn walk(
+    mut disk: VDisk<'_>,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     budget.count_entry()?;
     let cap = budget.reserve()?;
     let size = disk.size();
@@ -414,7 +419,7 @@ pub(crate) fn walk<L: Layout, T>(
     match usize::try_from(size) {
         Ok(n) if size <= cap => {
             let mut data = Vec::with_capacity(crate::cap_prealloc(n));
-            if let Err(e) = (&mut disk).take(size).read_to_end(&mut data) {
+            if let Err(e) = crate::source::read_capped(&mut disk, &mut data, size) {
                 if health.over_allowance() {
                     return Err(over_allowance(name));
                 }
@@ -501,7 +506,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn read_all<L: Layout>(d: &mut VDisk<'_, L>) -> Vec<u8> {
+    fn read_all(d: &mut VDisk<'_>) -> Vec<u8> {
         let mut out = Vec::new();
         d.seek(SeekFrom::Start(0)).unwrap();
         d.read_to_end(&mut out).unwrap();
@@ -509,8 +514,8 @@ pub(crate) mod tests {
     }
 
     /// Four units of 8 bytes: stored, absent, compressed, stored past the end.
-    fn disk_of<'a>(file: &'a [u8], decodes: &Rc<Cell<u64>>) -> Table<'a> {
-        Table {
+    fn disk_of<'a>(file: &'a [u8], decodes: &Rc<Cell<u64>>) -> Box<dyn Layout + 'a> {
+        Box::new(Table {
             src: file,
             unit: 8,
             size: 30,
@@ -525,7 +530,7 @@ pub(crate) mod tests {
                 Map::Plain(8),
             ],
             decodes: decodes.clone(),
-        }
+        })
     }
 
     #[test]
@@ -619,8 +624,8 @@ pub(crate) mod tests {
             maps,
             decodes: decodes.clone(),
         };
-        let mut d = VDisk::new(&file, layout, u64::MAX);
-        let read = |d: &mut VDisk<'_, Table<'_>>, at: u64| {
+        let mut d = VDisk::new(&file, Box::new(layout), u64::MAX);
+        let read = |d: &mut VDisk<'_>, at: u64| {
             d.seek(SeekFrom::Start(at)).unwrap();
             let mut b = vec![0u8; 8192];
             d.read_exact(&mut b).unwrap();
@@ -660,7 +665,7 @@ pub(crate) mod tests {
             maps: vec![Map::Plain(0)],
             decodes: Rc::new(Cell::new(0)),
         };
-        let mut d = VDisk::new(&file, layout, u64::MAX);
+        let mut d = VDisk::new(&file, Box::new(layout), u64::MAX);
         let e = d.read_exact(&mut [0u8; 8]).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
     }

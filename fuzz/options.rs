@@ -3,7 +3,7 @@
 //! Every check that a switch turns on is a code path the default options never
 //! reach: the `alert_*` heuristics, the structured-data and phishing checks,
 //! the Authenticode parser, the block-cache read of an object over
-//! `deep_analysis_max`. The input selects them (its last two bytes for
+//! `limits.max_buffer_bytes`. The input selects them (its last two bytes for
 //! `analyze`, the header for `full_pipeline`), so a seed that opens one
 //! parser reaches it under each combination.
 //!
@@ -51,12 +51,12 @@ pub fn scan_options(bits: u16) -> ScanOptions {
         // `fuzzy_img#` decode gets: a 486-byte JPEG 2000 stream declaring
         // 2,097,181 by 17 pixels is 1.5 s in a release build and over 14 s
         // under the sanitizer, within the default's 256 MiB.
-        o.deep_analysis_max = 8 << 20;
+        o.limits.max_buffer_bytes = 8 << 20;
     }
     // An object over this is read through the block cache, which is another
     // way in than a buffer.
     if bit(13) {
-        o.deep_analysis_max = 4096;
+        o.limits.max_buffer_bytes = 4096;
     }
     if bit(14) {
         o.max_scan_size = Some(8192);

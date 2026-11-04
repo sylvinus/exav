@@ -720,7 +720,9 @@ pub(crate) fn read_sheet(
                     let flags = c.u16();
                     let id = c.u16();
                     let author = g.book.string(&mut c, 2);
-                    notes.push((row, col, Some(id), author, flags & 2 != 0));
+                    if notes.len() < 1 << 16 {
+                        notes.push((row, col, Some(id), author, flags & 2 != 0));
+                    }
                 } else {
                     let n = c.u16() as usize;
                     let text = crate::formats::office::common::codepage::decode(
@@ -759,13 +761,18 @@ pub(crate) fn read_sheet(
         }
     }
     sheet.cond_formats = cf::finish(cfs);
+    // The first object of each id.
+    let mut by_id: HashMap<u16, &Obj> = HashMap::new();
+    for o in &objs {
+        by_id.entry(o.id).or_insert(o);
+    }
     for (row, col, id, text_or_author, visible) in notes {
         let (author, text) = match id {
             None => (String::new(), text_or_author),
             Some(id) => (
                 text_or_author,
-                objs.iter()
-                    .find(|o| o.id == id)
+                by_id
+                    .get(&id)
                     .and_then(|o| o.text.clone())
                     .unwrap_or_default(),
             ),

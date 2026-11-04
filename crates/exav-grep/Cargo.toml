@@ -15,6 +15,14 @@ description = "grep for the inside of archives: search text across zip/rar/7z/ta
 name = "exav-grep"
 path = "src/main.rs"
 
+# The QR codes of images and of what holds them, over the same walk. In this
+# package, not in exav-qr (the decoder, which exav-render depends on), so that
+# it needs no second copy of the walk or of the flags.
+[[bin]]
+name = "exav-qr"
+path = "src/exav_qr.rs"
+required-features = ["qr"]
+
 [dependencies]
 exav-unpack = { path = "../exav-unpack", version = "0.0.3", default-features = false, features = ["all-formats"] }
 memchr = "2"
@@ -37,9 +45,21 @@ text-pdf = ["text", "exav-render/text-pdf"]
 # 2003 XML, SpreadsheetML 2003, SYLK, flat OpenDocument, Numbers, Pages and
 # Keynote, by sheet, slide and part. The largest readers: not a default.
 text-office = ["text", "exav-render/text-office"]
+# `--qr`: search the payloads of the QR codes in images, read by exav-qr from
+# what exav-render's image decoders give. Not a default.
+qr = [
+    "dep:exav-render", "exav-render/qr", "exav-render/image", "exav-render/webp",
+    "exav-render/ico", "exav-render/pnm", "exav-render/qoi", "exav-render/dds",
+    "exav-render/ff", "exav-render/hdr", "exav-render/jp2", "exav-render/jbig2",
+    "exav-render/raw",
+]
 # Decrypt encrypted members (ZIP/7z/DMG/Office) so their contents are searchable
 # rather than reported as unreadable.
 decrypt = ["exav-unpack/decrypt"]
+
+[dev-dependencies]
+# Draws the QR codes the `qr` tests read.
+qrcode = { version = "0.14", default-features = false }
 
 # docs.rs builds with every feature on, so the parts gated behind a feature
 # appear on the rendered page

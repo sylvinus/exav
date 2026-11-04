@@ -7,7 +7,7 @@
 //
 // The host's side of the port is recorded from the page: every message it
 // sends and every message it gets.
-import { expect, test, type Frame, type Page } from "@playwright/test";
+import { expect, test, type Frame, type Page, type Worker } from "@playwright/test";
 
 import { failOnViolations } from "./csp.js";
 import { openSample } from "./samples.js";
@@ -105,15 +105,21 @@ for (const name of FILES) {
 }
 
 test("a spreadsheet opens no second copy of the workbook until its viewport is wanted", async ({ page }) => {
-  const workers: string[] = [];
-  page.on("worker", (w) => workers.push(w.url()));
+  // The workers alive: the detection of the first bytes (host page) and the
+  // reading of the ZIP directory (frame) each copy part of the file into a
+  // worker of their own, which ends as soon as it has answered.
+  const alive = new Set<Worker>();
+  page.on("worker", (w) => {
+    alive.add(w);
+    w.on("close", () => alive.delete(w));
+  });
   await open(page, "quote.xlsx");
   await page.waitForTimeout(1500);
   await zoom(page, 1.5);
   await page.waitForTimeout(500);
-  expect(workers).toHaveLength(1);
+  expect(alive.size).toBe(1);
   await follow(page);
-  await expect.poll(() => workers.length).toBe(2);
+  await expect.poll(() => alive.size).toBe(2);
 });
 
 test("a Word document measures no page until its viewport is wanted", async ({ page }) => {

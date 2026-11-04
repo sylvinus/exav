@@ -1,3 +1,4 @@
+import { bodyChunks, createFetcher, declaredLength, joinChunks, requestRange, type Address, type Fetcher, type Resolve } from "./http.js";
 import { writable } from "./store.js";
 import type { ByteRanges, FileSource, SourceReader } from "./types.js";
 
@@ -35,7 +36,47 @@ export function sameSource(a: FileSource | null, b: FileSource | null): boolean 
   return false;
 }
 
+/** The size of a file read from an address whose server did not say it: past any size a file has. */
+export const UNKNOWN_SIZE = Number.MAX_SAFE_INTEGER;
+
+/** Some of a file's bytes, and its whole size. */
+export interface FilePart {
+  bytes: Uint8Array;
+  size: number;
+}
+
+/** The first `length` bytes of a file and its size. Throws on an answer that is not usable. */
+async function headOfUrl(http: Fetcher, length: number, signal: AbortSignal): Promise<FilePart> {
+  const a = await requestRange(http, { from: 0, to: length - 1 }, signal);
+  if (a.kind === "empty") return { bytes: new Uint8Array(), size: 0 };
+  if (a.kind === "refused") throw new Error(a.why);
+  const total = a.kind === "part" ? a.total : null;
+  return { bytes: a.bytes, size: total ?? (a.bytes.length < length ? a.bytes.length : UNKNOWN_SIZE) };
+}
+
+/** The last `length` bytes of a file and its size; null unless the server gave them as a range. */
+async function tailOfUrl(http: Fetcher, length: number, signal: AbortSignal): Promise<FilePart | null> {
+  const a = await requestRange(http, { suffix: length }, signal);
+  if (a.kind === "empty") return { bytes: new Uint8Array(), size: 0 };
+  return a.kind === "part" && a.total !== null ? { bytes: a.bytes, size: a.total } : null;
+}
+
 export interface OwnedSourceReader extends SourceReader {
+  /**
+   * The first `length` bytes of the file and its whole size (`UNKNOWN_SIZE`
+   * when a server did not say it), or null when they cannot be had. For bytes,
+   * a blob and ranges they cost no request; for an address, a range request
+   * of its own. A server that ignores ranges is not downloaded from past
+   * `length`; one that fails, or a network that does, gives null with a
+   * warning, and the file is read when a plugin asks for it.
+   */
+  head(length: number): Promise<FilePart | null>;
+  /**
+   * The last `length` bytes of the file and its whole size, by the same
+   * means as `head`; null for an address whose server answers no suffix range
+   * request (nothing is downloaded to find out).
+   */
+  tail(length: number): Promise<FilePart | null>;
   /** Revokes the object URLs it made. The session calls it when it ends. */
   dispose(): void;
 }
@@ -62,35 +103,17 @@ export function createSourceReader(source: FileSource, signal: AbortSignal): Own
     return resolved;
   };
 
-  const download = (url: string, init?: RequestInit): Promise<Uint8Array> => {
+  let fetcher: Fetcher | null = null;
+  const resign: Resolve | null = "resolve" in source ? (s) => source.resolve(s) : null;
+  const http = (address: Address): Fetcher => (fetcher ??= createFetcher(address, resign, signal));
+
+  const download = (address: Address): Promise<Uint8Array> => {
     downloaded ??= (async () => {
-      const response = await fetch(url, { ...init, signal });
+      const response = await http(address).get(null, signal);
       if (!response.ok) throw new Error(`HTTP ${response.status} for the file`);
-      const length = Number(response.headers.get("content-length"));
-      const total = Number.isFinite(length) && length > 0 ? length : null;
-      if (!response.body) {
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        progress.set({ loaded: bytes.length, total });
-        return bytes;
-      }
-      const reader = response.body.getReader();
-      const chunks: Uint8Array[] = [];
-      let loaded = 0;
-      progress.set({ loaded, total });
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        loaded += value.length;
-        progress.set({ loaded, total });
-      }
-      const out = new Uint8Array(loaded);
-      let at = 0;
-      for (const c of chunks) {
-        out.set(c, at);
-        at += c.length;
-      }
-      return out;
+      const total = declaredLength(response);
+      progress.set({ loaded: 0, total });
+      return joinChunks(await bodyChunks(response, undefined, (loaded) => progress.set({ loaded, total })));
     })();
     return downloaded;
   };
@@ -113,7 +136,7 @@ export function createSourceReader(source: FileSource, signal: AbortSignal): Own
     progress,
     async url() {
       const r = await resolve();
-      if ("url" in r) return r.url;
+      if ("url" in r) return (await http(r).address()).url;
       if ("ranges" in r) return own(new Blob([(await whole(r.ranges)) as BlobPart]));
       return own("blob" in r ? r.blob : new Blob([r.bytes as BlobPart]));
     },
@@ -122,14 +145,45 @@ export function createSourceReader(source: FileSource, signal: AbortSignal): Own
       if ("blob" in r) return r.blob;
       if ("bytes" in r) return new Blob([r.bytes as BlobPart]);
       if ("ranges" in r) return new Blob([(await whole(r.ranges)) as BlobPart]);
-      return new Blob([(await download(r.url, r.init)) as BlobPart]);
+      return new Blob([(await download(r)) as BlobPart]);
     },
     async bytes() {
       const r = await resolve();
       if ("bytes" in r) return r.bytes;
       if ("blob" in r) return new Uint8Array(await r.blob.arrayBuffer());
       if ("ranges" in r) return whole(r.ranges);
-      return download(r.url, r.init);
+      return download(r);
+    },
+    async head(length) {
+      const r = await resolve();
+      if ("bytes" in r) return { bytes: r.bytes.subarray(0, length), size: r.bytes.length };
+      if ("blob" in r) return { bytes: new Uint8Array(await r.blob.slice(0, length).arrayBuffer()), size: r.blob.size };
+      if ("ranges" in r) {
+        const n = Math.min(length, r.ranges.size);
+        return { bytes: n > 0 ? await r.ranges.read(0, n, signal) : new Uint8Array(), size: r.ranges.size };
+      }
+      try {
+        return await headOfUrl(http(r), length, signal);
+      } catch (error) {
+        if (signal.aborted) throw error;
+        console.warn("exav viewer: the first bytes of the file could not be read, its name and type decide", error);
+        return null;
+      }
+    },
+    async tail(length) {
+      const r = await resolve();
+      if ("bytes" in r) return { bytes: r.bytes.subarray(Math.max(0, r.bytes.length - length)), size: r.bytes.length };
+      if ("blob" in r) return { bytes: new Uint8Array(await r.blob.slice(Math.max(0, r.blob.size - length)).arrayBuffer()), size: r.blob.size };
+      if ("ranges" in r) {
+        const n = Math.min(length, r.ranges.size);
+        return { bytes: n > 0 ? await r.ranges.read(r.ranges.size - n, n, signal) : new Uint8Array(), size: r.ranges.size };
+      }
+      try {
+        return await tailOfUrl(http(r), length, signal);
+      } catch (error) {
+        if (signal.aborted) throw error;
+        return null;
+      }
     },
     dispose() {
       for (const url of urls.splice(0)) URL.revokeObjectURL(url);

@@ -21,8 +21,8 @@
 //! `0xCAFEBABE` is ALSO the Java `.class` magic, so detection is deliberately
 //! strict: we only claim a fat binary when `nfat_arch` is small (`1..=64`), the
 //! whole arch table is present, and every slice `[offset, offset+size)` lies
-//! within the file. A `.class` file — whose bytes 4..8 are minor/major version
-//! numbers and whose would-be "arch records" are constant-pool bytes — almost
+//! within the file. A `.class` file (whose bytes 4..8 are minor/major version
+//! numbers and whose would-be "arch records" are constant-pool bytes) almost
 //! never satisfies all three, so it is left to normal classification.
 //!
 //! Every field read is `get()`-guarded and every offset/size is validated
@@ -118,14 +118,14 @@ pub(crate) fn looks_like_machofat(p: &crate::Probe) -> bool {
 }
 
 /// Walk a universal binary, each arch image streamed from where it lies.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let mut source = crate::source::Reader::new(src);
     let members = stream_offsets(&mut source)?;
-    crate::stream::stream_stored(&mut source, budget, visit, members)
+    crate::stream::stream_stored_ranges(src, budget, visit, crate::stream::Region::list(members))
 }
 
 /// Parse arch slice offsets from a seekable source. The arch table is a bounded
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn java_class_is_not_misdetected() {
         // `.class`: CAFEBABE, then minor=0 / major=52 (Java 8) → nfat_arch reads
-        // as 52, which is inside 1..=64 — the count check alone would pass. The
+        // as 52, which is inside 1..=64: the count check alone would pass. The
         // arch-table / offset-within-file checks must still reject it.
         let mut blob = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34];
         blob.extend_from_slice(&[0xABu8; 200]); // constant pool: not valid arch records

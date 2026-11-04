@@ -12,7 +12,8 @@ yara-x, BSD-3-Clause (source derivative)
 
 Parts of the YARA engine are derived from yara-x's source:
 src/yara/base64.rs, src/yara/matcher.rs (base64 verification) and
-src/yara/modules/ (mod, pe, elf, dotnet, math, hash, string, time). The tests
+src/yara/modules/ (mod, pe, elf, dotnet, math, hash, string, time) and
+src/pe/ordinals.rs (the ordinal tables). The tests
 tests/yara_conformance.rs, tests/yara_difftest.rs and
 tests/yara_coverage_difftest.rs adapt yara-x's own. Each of these files carries
 an attribution header. The license is also in LICENSE-YARA-X.

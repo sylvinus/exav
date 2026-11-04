@@ -397,6 +397,334 @@ fn differential_pe() {
     agree("pe", PE_RULES, &pe_inputs());
 }
 
+/// What a thunk of [`pe_importing`] holds.
+enum Thunk<'a> {
+    /// A hint/name entry with this name.
+    Name(&'a [u8]),
+    Ordinal(u16),
+}
+use Thunk::{Name, Ordinal};
+
+/// A PE32 that imports `ExitProcess` by name from `KERNEL32.DLL`, and by
+/// ordinal from `WS2_32.dll` (115 and 2), `OLEAUT32.dll` (2) and `USER32.dll`
+/// (100): descriptors, names, thunk tables and hint/name entries in one
+/// section.
+fn pe_with_ordinal_imports() -> Vec<u8> {
+    pe_importing(&[
+        (b"KERNEL32.DLL", &[Name(b"ExitProcess")]),
+        (b"WS2_32.dll", &[Ordinal(115), Ordinal(2)]),
+        (b"OLEAUT32.dll", &[Ordinal(2)]),
+        (b"USER32.dll", &[Ordinal(100)]),
+    ])
+}
+
+/// A PE32 whose one section holds the import table of `libs`: the descriptors
+/// and the null one at file offset 0x200, then the names of the libraries, a
+/// thunk table each (the lookup table is the address table) and the hint/name
+/// entries.
+fn pe_importing(libs: &[(&[u8], &[Thunk])]) -> Vec<u8> {
+    let rva = |at: usize| (0x1000 + at) as u32;
+    let mut body = vec![0u8; 20 * (libs.len() + 1)];
+    let mut names = Vec::new();
+    for (name, _) in libs {
+        names.push(body.len());
+        body.extend_from_slice(name);
+        body.push(0);
+    }
+    body.resize(body.len().next_multiple_of(4), 0);
+    let mut tables = Vec::new();
+    for (_, entries) in libs {
+        tables.push(body.len());
+        body.resize(body.len() + 4 * (entries.len() + 1), 0);
+    }
+    for (i, (_, entries)) in libs.iter().enumerate() {
+        for (j, entry) in entries.iter().enumerate() {
+            let thunk = match entry {
+                Name(name) => {
+                    body.resize(body.len().next_multiple_of(2), 0);
+                    let at = body.len();
+                    body.extend_from_slice(&[0, 0]);
+                    body.extend_from_slice(name);
+                    body.push(0);
+                    rva(at)
+                }
+                Ordinal(ordinal) => 0x8000_0000 | u32::from(*ordinal),
+            };
+            let at = tables[i] + 4 * j;
+            body[at..at + 4].copy_from_slice(&thunk.to_le_bytes());
+        }
+        for (field, value) in [
+            (0, rva(tables[i])),
+            (12, rva(names[i])),
+            (16, rva(tables[i])),
+        ] {
+            body[20 * i + field..20 * i + field + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    let raw = body.len().next_multiple_of(0x200);
+    let mut f = vec![0u8; 0x200 + raw];
+    let mut put = |at: usize, bytes: &[u8]| f[at..at + bytes.len()].copy_from_slice(bytes);
+    put(0, b"MZ");
+    put(0x3c, &0x40u32.to_le_bytes());
+    put(0x40, b"PE\0\0");
+    put(0x44, &0x14cu16.to_le_bytes());
+    put(0x46, &1u16.to_le_bytes()); // sections
+    put(0x54, &0xe0u16.to_le_bytes()); // size of the optional header
+    put(0x56, &0x0102u16.to_le_bytes());
+    let opt = 0x58;
+    put(opt, &0x10bu16.to_le_bytes());
+    put(opt + 16, &0x1000u32.to_le_bytes()); // entry point
+    put(opt + 28, &0x40_0000u32.to_le_bytes()); // image base
+    put(opt + 32, &0x1000u32.to_le_bytes()); // section alignment
+    put(opt + 36, &0x200u32.to_le_bytes()); // file alignment
+    put(opt + 56, &(0x1000 + raw as u32).to_le_bytes()); // size of image
+    put(opt + 60, &0x200u32.to_le_bytes()); // size of headers
+    put(opt + 68, &3u16.to_le_bytes()); // subsystem
+    put(opt + 92, &16u32.to_le_bytes()); // data directories
+    put(opt + 96 + 8, &rva(0).to_le_bytes()); // the import table
+    put(opt + 96 + 12, &(20 * (libs.len() as u32 + 1)).to_le_bytes());
+    let section = opt + 0xe0;
+    put(section, b".idata");
+    put(section + 8, &(raw as u32).to_le_bytes()); // virtual size
+    put(section + 12, &0x1000u32.to_le_bytes());
+    put(section + 16, &(raw as u32).to_le_bytes()); // raw size
+    put(section + 20, &0x200u32.to_le_bytes());
+    put(section + 36, &0xc000_0040u32.to_le_bytes());
+    f[0x200..0x200 + body.len()].copy_from_slice(&body);
+    f
+}
+
+/// Imports by ordinal, which libyara and yara-x name from the same tables:
+/// both list `WSAStartup` for ordinal 115 of `ws2_32` and `ord100` for ordinal
+/// 100 of `user32`, and `imports(dll, ordinal)` holds only for an import by
+/// ordinal.
+const PE_ORDINAL_RULES: &str = r#"
+import "pe"
+rule ws2_name { condition: pe.imports("ws2_32.dll", "WSAStartup") }
+rule ws2_bind { condition: pe.imports("ws2_32.dll", "bind") }
+rule ws2_ord { condition: pe.imports("ws2_32.dll", 115) }
+rule ws2_numbered { condition: pe.imports("ws2_32.dll", "ord115") }
+rule ole { condition: pe.imports("oleaut32.dll", "SysAllocString") }
+rule user_name { condition: pe.imports("user32.dll", "ord100") }
+rule user_ord { condition: pe.imports("user32.dll", 100) }
+rule user_other_ord { condition: pe.imports("user32.dll", 101) }
+rule named_has_no_ordinal { condition: pe.imports("kernel32.dll", 1) }
+rule counts {
+    condition: pe.number_of_imports == 4 and pe.number_of_imported_functions == 5
+}
+rule imphash {
+    condition: pe.imphash() == "fc0dc1e0f56f5ff581a24a0da3ef55ff"
+}
+"#;
+
+#[test]
+fn differential_pe_imports_by_ordinal() {
+    let pe = pe_with_ordinal_imports();
+    let want: BTreeSet<String> = [
+        "ws2_name",
+        "ws2_bind",
+        "ws2_ord",
+        "ole",
+        "user_name",
+        "user_ord",
+        "counts",
+        "imphash",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    // What libyara 4.5.2 and yara-x 1.22.1 give for the same imports.
+    let exav = exav_core::yara::compile(PE_ORDINAL_RULES).expect("exav compile failed");
+    assert_eq!(exav_matches(&exav, &pe), want);
+    agree("pe-ordinals", PE_ORDINAL_RULES, &[&pe]);
+}
+
+/// The md5 of `s`, in hex.
+fn md5_hex(s: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    Md5::digest(s).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `pe` with its section's data at `at` in the file, its header's pointer at
+/// `pointer`, and these alignments.
+fn placed(
+    pe: &[u8],
+    file_alignment: u32,
+    section_alignment: u32,
+    pointer: u32,
+    at: usize,
+) -> Vec<u8> {
+    let mut f = pe[..0x200].to_vec();
+    f.resize(at, 0);
+    f.extend_from_slice(&pe[0x200..]);
+    let mut put = |off: usize, v: u32| f[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    put(0x58 + 32, section_alignment);
+    put(0x58 + 36, file_alignment);
+    put(0x58 + 0xe0 + 20, pointer);
+    f
+}
+
+/// Imports on which yara-x 1.21.0 and libyara 4.5.2 give different answers,
+/// and the module follows yara-x: the extension of a library is cut only if
+/// it ends the name; an ordinal is named for the whole name of its library; a
+/// function name is any printable ASCII but the space, up to 1024 bytes; a
+/// library may be empty, long or UTF-8, and not have a space; a descriptor
+/// with no table ends the table; a table is cut at 16384 functions; a section
+/// is placed at its pointer rounded to the file alignment. Not in the fixtures
+/// of the other tests, which is why they stayed green when the module followed
+/// libyara.
+#[test]
+fn differential_pe_imports_where_yarax_and_libyara_differ() {
+    let long_name = vec![b'a'; 600];
+    let long_lib = [vec![b'd'; 252], b".dll".to_vec()].concat();
+    let many = |n: usize| -> Vec<Thunk> { (0..n).map(|_| Name(b"f")).collect() };
+    let (ten_a, ten_b) = (many(10_000), many(10_000));
+    let tableless = {
+        let mut pe = pe_importing(&[
+            (b"K.DLL", &[Name(b"a")]),
+            (b"U.DLL", &[Name(b"b")]),
+            (b"G.DLL", &[Name(b"c")]),
+        ]);
+        // The second descriptor: no lookup table, no address table.
+        pe[0x200 + 20..0x200 + 24].fill(0);
+        pe[0x200 + 20 + 16..0x200 + 20 + 20].fill(0);
+        pe
+    };
+    let standard = pe_importing(&[(b"K.DLL", &[Name(b"a"), Name(b"b")])]);
+    // (a name for the rules, the PE, the string yara-x hashes for pe.imphash())
+    let cases: Vec<(&str, Vec<u8>, String)> = vec![
+        (
+            "suffix",
+            pe_importing(&[(b"x.dllx", &[Name(b"f")])]),
+            "x.dllx.f".into(),
+        ),
+        (
+            "ordinal_suffix",
+            pe_importing(&[
+                (b"ws2_32.dllx", &[Ordinal(115)]),
+                (b"ws2_32.dll.mui", &[Ordinal(2)]),
+            ]),
+            "ws2_32.dllx.ord115,ws2_32.dll.mui.ord2".into(),
+        ),
+        (
+            "dash",
+            pe_importing(&[(
+                b"K.DLL",
+                &[Name(b"a"), Name(b"a-b"), Name(b"~"), Name(b"b")],
+            )]),
+            "k.a,k.a-b,k.~,k.b".into(),
+        ),
+        (
+            "long_function",
+            pe_importing(&[(b"K.DLL", &[Name(&long_name)])]),
+            format!("k.{}", "a".repeat(600)),
+        ),
+        (
+            "empty_library",
+            pe_importing(&[(b"", &[Name(b"f")])]),
+            ".f".into(),
+        ),
+        (
+            "long_library",
+            pe_importing(&[(&long_lib, &[Name(b"f")])]),
+            format!("{}.f", "d".repeat(252)),
+        ),
+        (
+            "space_in_library",
+            pe_importing(&[(b"my lib.dll", &[Name(b"f")])]),
+            String::new(),
+        ),
+        (
+            "utf8_library",
+            pe_importing(&[("k\u{e9}rnel.dll".as_bytes(), &[Name(b"f")])]),
+            "k\u{e9}rnel.f".into(),
+        ),
+        ("no_table_ends_the_list", tableless, "k.a".into()),
+        (
+            "capped",
+            pe_importing(&[(b"K.DLL", &many(16_385))]),
+            format!("k.f{}", ",k.f".repeat(16_383)),
+        ),
+        (
+            "two_libraries_over_the_cap",
+            pe_importing(&[(b"K.DLL", &ten_a), (b"U.DLL", &ten_b)]),
+            format!("k.f{},u.f{}", ",k.f".repeat(9_999), ",u.f".repeat(9_999)),
+        ),
+        // The data of the section is where yara-x rounds its pointer to (a
+        // file alignment of 0x100), or where a section alignment of 0x1000
+        // rounds it further (0x200).
+        (
+            "rounded_to_alignment",
+            placed(&standard, 0x100, 0x200, 0x7f0, 0x700),
+            "k.a,k.b".into(),
+        ),
+        (
+            "rounded_further",
+            placed(&standard, 0x100, 0x1000, 0x7f0, 0x600),
+            "k.a,k.b".into(),
+        ),
+        (
+            "not_rounded_far_enough",
+            placed(&standard, 0x100, 0x1000, 0x7f0, 0x700),
+            String::new(),
+        ),
+    ];
+    let mut rules = String::from("import \"pe\"\n");
+    for n in [0, 1, 2, 3] {
+        rules += &format!("rule imports_{n} {{ condition: pe.number_of_imports == {n} }}\n");
+    }
+    for n in [0, 1, 2, 3, 4, 16_384, 20_000] {
+        rules += &format!(
+            "rule functions_{n} {{ condition: pe.number_of_imported_functions == {n} }}\n"
+        );
+    }
+    rules += "rule dash { condition: pe.imports(\"k.dll\", \"a-b\") and pe.imports(\"k.dll\", \"~\") }\n";
+    rules += &format!(
+        "rule long_function {{ condition: pe.imports(\"k.dll\", \"{}\") }}\n",
+        "a".repeat(600)
+    );
+    rules += "rule ws2_numbered { condition: pe.imports(\"ws2_32.dllx\", \"ord115\") }\n";
+    rules += "rule ws2_named { condition: pe.imports(\"ws2_32.dllx\", \"WSAStartup\") }\n";
+    rules += "rule ordinal_115 { condition: pe.imports(\"ws2_32.dllx\", 115) }\n";
+    rules += "rule empty_library { condition: pe.imports(\"\", \"f\") }\n";
+    for (name, _, hashed) in &cases {
+        let hash = md5_hex(hashed.as_bytes());
+        rules += &format!("rule hash_{name} {{ condition: pe.imphash() == \"{hash}\" }}\n");
+    }
+    let inputs: Vec<&[u8]> = cases.iter().map(|(_, pe, _)| pe.as_slice()).collect();
+    // What yara-x says of each: the rules that hold, besides the hashes.
+    let exav = exav_core::yara::compile(&rules).expect("exav compile failed");
+    for (name, pe, hashed) in &cases {
+        let want: &[&str] = match *name {
+            "suffix" => &["imports_1", "functions_1"],
+            "ordinal_suffix" => &["imports_2", "functions_2", "ws2_numbered", "ordinal_115"],
+            "dash" => &["imports_1", "functions_4", "dash"],
+            "long_function" => &["imports_1", "functions_1", "long_function"],
+            "empty_library" => &["imports_1", "functions_1", "empty_library"],
+            "long_library" => &["imports_1", "functions_1"],
+            "space_in_library" | "not_rounded_far_enough" => &["imports_0", "functions_0"],
+            "utf8_library" => &["imports_1", "functions_1"],
+            "no_table_ends_the_list" => &["imports_1", "functions_1"],
+            "capped" => &["imports_1", "functions_16384"],
+            "two_libraries_over_the_cap" => &["imports_2", "functions_20000"],
+            _ => &["imports_1", "functions_2"],
+        };
+        let mut want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+        // The hash rules that hold are those of the cases hashing the same
+        // string, which for a PE with no imports is the empty one.
+        want.extend(
+            cases
+                .iter()
+                .filter(|(_, _, h)| h == hashed)
+                .map(|(n, _, _)| format!("hash_{n}")),
+        );
+        want.sort();
+        let held: Vec<String> = exav_matches(&exav, pe).into_iter().collect();
+        assert_eq!(held, want, "{name}");
+    }
+    agree("pe-imports-yarax", &rules, &inputs);
+}
+
 // --- for … in / for … of / with (Phase C) ----------------------------------
 
 const FOR_RULES: &str = r#"

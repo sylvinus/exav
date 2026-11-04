@@ -12,7 +12,7 @@ use std::time::Duration;
 /// every row line up. Must match the names passed to `profile::timed` in the
 /// scan path. Appended, never reordered: the `verdict` column's position is
 /// covered by test. `unpack` is inclusive wall time inside container-extraction
-/// dispatch (nested member scans included — see the call site); `emu` splits
+/// dispatch (nested member scans included; see the call site); `emu` splits
 /// the packer emulator's share of it back out.
 const MATCHERS: &[&str] = &[
     "engine",
@@ -78,7 +78,7 @@ pub fn row(
 ///
 /// The two text columns are the only ones exav does not produce itself. The
 /// path came off the filesystem being scanned and the signature name out of a
-/// database, so both can be chosen by whoever chose what exav scanned — and
+/// database, so both can be chosen by whoever chose what exav scanned, and
 /// this file exists to be opened in a spreadsheet, where a cell starting `=`,
 /// `+`, `-` or `@` is a formula rather than a string. Excel and Sheets both
 /// treat a leading apostrophe as "this is text", so one in front costs a

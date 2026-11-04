@@ -1,11 +1,11 @@
 //! A bounded x86-32 interpreter: the execution half of the unpacking emulator.
 //!
 //! Decoding is done by [`exav_x86`] (dependency-free, `#![forbid(unsafe_code)]`,
-//! decode-only — the same decoder the bytecode `disasm_x86` API uses), so this
+//! decode-only, the same decoder the bytecode `disasm_x86` API uses), so this
 //! module only has to supply *semantics*: what each instruction does to the
 //! eight general registers, the flags and memory. That split is deliberate. A
-//! decoder is where an emulator quietly goes wrong — one mis-sized ModRM and
-//! execution continues on garbage — so it is kept in a crate whose whole job is
+//! decoder is where an emulator quietly goes wrong (one mis-sized ModRM and
+//! execution continues on garbage), so it is kept in a crate whose whole job is
 //! to be checked, instruction by instruction, against an independent decoder.
 //!
 //! The interpreter is written for *packer stubs*, not for general Windows code:
@@ -38,7 +38,7 @@ use crate::mem::{Fault, Mem};
 /// tables exist to show: which instructions this interpreter implements, at a
 /// glance. So they are re-bound here, once.
 ///
-/// Only mnemonics with a constant in `exav-x86` can appear here — that list is
+/// Only mnemonics with a constant in `exav-x86` can appear here: that list is
 /// the vocabulary a caller may pattern-match, and adding to it is deliberate.
 #[allow(non_upper_case_globals)]
 mod m {
@@ -254,7 +254,7 @@ mod m {
 }
 
 /// Why the interpreter stopped. Carried as data (not a panic, not a bool) so
-/// the unpacker can report *why* a stub did not run to completion — the
+/// the unpacker can report *why* a stub did not run to completion: the
 /// difference between "hit an instruction we don't implement" and "jumped into
 /// unmapped memory" is the difference between a bug to fix and a stub that
 /// defended itself.
@@ -269,8 +269,8 @@ pub enum Stop {
     Unsupported(u32, Mn),
     /// `int n`, `int3` or `into`.
     Interrupt(u8),
-    /// An instruction ring-3 code may not execute — `in`, `out`, `cli` with
-    /// IOPL below 3. Reported as its own stop because on Windows it is an
+    /// An instruction ring-3 code may not execute (`in`, `out`, `cli` with
+    /// IOPL below 3). Reported as its own stop because on Windows it is an
     /// exception the program can catch, and stubs use exactly that to probe for
     /// a hypervisor: `in eax, dx` on the VMware port either returns data (inside
     /// a VM) or faults (outside one), and the handler decides what the stub
@@ -309,7 +309,7 @@ pub struct Cpu {
     pub df: bool,
     /// Trap flag. Set by a stub through `popfd` to make the processor raise a
     /// single-step exception after the *next* instruction, which its own
-    /// handler catches — a standard anti-debug construction, and one that spins
+    /// handler catches: a standard anti-debug construction, and one that spins
     /// forever on an emulator that ignores the flag.
     pub tf: bool,
     /// Linear base the `fs:` override resolves to (the synthetic TEB).
@@ -325,7 +325,7 @@ pub struct Cpu {
     fpu: [f64; 8],
     fpu_top: usize,
     fpu_cw: u16,
-    /// Address of the last non-control x87 instruction — what `fnstenv` stores
+    /// Address of the last non-control x87 instruction: what `fnstenv` stores
     /// and what "GetPC" stubs read back to learn where they are executing.
     fpu_last_ip: u32,
     /// Set when an x87 computation was approximated rather than emulated. The
@@ -337,8 +337,8 @@ pub struct Cpu {
     /// Decompression stubs are tight loops, so the same few dozen instructions
     /// are decoded millions of times and caching them removes the decode from
     /// the inner loop. Each entry carries the [`Mem::code_generation`] it was
-    /// decoded under, so a write to a page that has executed — self-modifying
-    /// code — invalidates every entry at once, without touching any of them.
+    /// decoded under, so a write to a page that has executed (self-modifying
+    /// code) invalidates every entry at once, without touching any of them.
     cache: Vec<Option<(u64, u32, Insn)>>,
     /// SSE and MMX register files. Present because packers use vector moves as
     /// a wide `memcpy`, not because they compute with them.
@@ -467,7 +467,7 @@ impl Cpu {
     ///
     /// The byte registers are the encoding's own numbering: `0`–`3` are the low
     /// bytes of the first four registers, `4`–`7` the *high* bytes of those same
-    /// four. Getting that wrong is silent — `ah` and `esp` share a number.
+    /// four. Getting that wrong is silent: `ah` and `esp` share a number.
     fn reg_read(&self, num: u8, size: Size) -> u32 {
         let n = num as usize & 7;
         match size {
@@ -533,8 +533,8 @@ impl Cpu {
     ///
     /// Unlike [`Cpu::op_size`] this does not clamp to four: the callers here
     /// are the ones that move more than a register's worth at a time. An x87
-    /// escape and its `/digit` choose the width together — `fld m32fp`,
-    /// `fld m64fp` and `fld m80fp` are one mnemonic over three widths — and a
+    /// escape and its `/digit` choose the width together (`fld m32fp`,
+    /// `fld m64fp` and `fld m80fp` are one mnemonic over three widths), and a
     /// vector move takes eight or sixteen. The decoder carries it on the
     /// operand rather than leaving it to be guessed from the mnemonic.
     fn mem_width(insn: &Insn) -> u32 {
@@ -548,7 +548,7 @@ impl Cpu {
             .unwrap_or(4)
     }
 
-    /// The x87 stack slot operand `i` names, or `1` — `fxch` with no operand
+    /// The x87 stack slot operand `i` names, or `1`: `fxch` with no operand
     /// means `fxch st(1)`, and the register forms encode the slot directly.
     fn st_index(insn: &Insn, i: usize) -> usize {
         match insn.ops.get(i) {
@@ -576,7 +576,7 @@ impl Cpu {
         }
     }
 
-    /// Effective address of a memory operand — the same computation the
+    /// Effective address of a memory operand: the same computation the
     /// interpreter uses, exposed so a trace line can show where an access went.
     pub fn effective_address(&self, insn: &Insn) -> u32 {
         self.ea(insn)
@@ -754,7 +754,7 @@ impl Cpu {
     // ---- the step loop -------------------------------------------------
 
     /// Fetch, decode and execute one instruction. Returns the number of
-    /// "ticks" it cost — 1 for ordinary instructions, the iteration count for a
+    /// "ticks" it cost: 1 for ordinary instructions, the iteration count for a
     /// `rep`-prefixed string operation, so that a single `rep movsd` moving a
     /// megabyte is charged what it actually costs.
     ///
@@ -763,8 +763,8 @@ impl Cpu {
     pub fn step(&mut self, mem: &mut Mem) -> Result<u64, Stop> {
         self.partial_ticks = 0;
         // Invalidation is a *tag* comparison, not a sweep. Self-modifying code
-        // is normal here — a packer that decompresses into the pages it is
-        // executing from bumps the generation on nearly every write — and
+        // is normal here (a packer that decompresses into the pages it is
+        // executing from bumps the generation on nearly every write), and
         // clearing every slot each time costs more than the decoding it was
         // meant to save. A self-modifying stub turns the cache into pure
         // overhead, by orders of magnitude, unless invalidation is this cheap.
@@ -1763,7 +1763,7 @@ impl Cpu {
                 // is replaced and the rest of the destination is left alone.
                 // Only the load-from-memory form zero-extends. `write_simd`
                 // always zeroes first, which is right for every other mnemonic
-                // here and wrong for this one pair — a stub using the merge form
+                // here and wrong for this one pair: a stub using the merge form
                 // to assemble a value lane by lane would have each earlier lane
                 // wiped by the next write.
                 let merges = matches!(m, Movss | Movsd)
@@ -2316,7 +2316,7 @@ fn is_x87(m: Mn) -> bool {
 mod tests {
     use super::*;
 
-    /// Assemble nothing — the tests carry hand-written machine code, because
+    /// Assemble nothing: the tests carry hand-written machine code, because
     /// the point is to pin the *semantics* of specific encodings.
     fn run(code: &[u8], setup: impl FnOnce(&mut Cpu)) -> (Cpu, Mem) {
         let mut mem = Mem::new(64);
@@ -2514,7 +2514,7 @@ mod tests {
     fn an_unimplemented_instruction_names_itself() {
         let mut mem = Mem::new(16);
         mem.map(0x1000, 0x1000).unwrap();
-        // 0f 51 c0 = sqrtps xmm0, xmm0 — decodes cleanly, and floating-point
+        // 0f 51 c0 = sqrtps xmm0, xmm0: decodes cleanly, and floating-point
         // SIMD arithmetic is outside the subset the interpreter implements.
         mem.write_bytes(0x1000, &[0x0f, 0x51, 0xc0]).unwrap();
         let mut cpu = Cpu::new();

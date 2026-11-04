@@ -558,6 +558,26 @@ fn pages_text_with_its_styles_and_page() {
     );
 }
 
+/// Archives with no document object are a damaged document; a password is
+/// told by its verifier.
+#[test]
+fn pages_without_a_document_is_damaged_and_with_a_verifier_encrypted() {
+    let objects = [(2, 2001, W::default().bytes(3, b"text"))];
+    let kind = |extra: Option<&str>| {
+        let mut z = PackageWriter::new(1 << 20);
+        z.put("Index/Document.iwa", &iwa(&objects), true).unwrap();
+        if let Some(name) = extra {
+            z.put(name, b"x", true).unwrap();
+        }
+        convert(&z.finish().unwrap(), Format::Pages, &Limits::default())
+            .unwrap_err()
+            .kind()
+    };
+    assert_eq!(kind(None), "malformed");
+    assert_eq!(kind(Some(".iwpv2")), "encrypted");
+    assert_eq!(kind(Some("Doc.pages/.iwph")), "encrypted");
+}
+
 /// The memory bound counts what the model takes, which is a few kilobytes
 /// for a table cell and for a paragraph: 20,000 cells, or 100,000 paragraphs,
 /// hold some 100 and 270 MB.

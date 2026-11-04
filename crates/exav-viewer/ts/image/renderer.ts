@@ -1,7 +1,8 @@
+import { mismatchOf } from "../core/mismatch.js";
 import { planRect, type RectPlan } from "../core/pictures.js";
 import { bitmapOf, createCanvas, createPictures, release } from "../core/raster.js";
 import { derived } from "../core/store.js";
-import type { DetailSource, RasterRect, Renderer, SourceReader, Viewport, ViewportController, ViewerFile } from "../core/types.js";
+import type { DetailSource, Detector, RasterRect, Renderer, SourceReader, Viewport, ViewportController, ViewerFile } from "../core/types.js";
 import { decodeInWorker, toCanvas } from "./decode.js";
 import type { ImageOptions } from "./index.js";
 import { createSurface, SURFACE_DEFAULTS, type SurfaceOptions } from "./surface.js";
@@ -90,6 +91,7 @@ async function pictureOf(
   source: SourceReader,
   signal: AbortSignal,
   o: ImageOptions<unknown>,
+  detector?: Detector,
 ): Promise<Picture> {
   let picture: HTMLImageElement | HTMLCanvasElement;
   let natural: { width: number; height: number };
@@ -120,7 +122,13 @@ async function pictureOf(
     // What the browser does not draw, exav-render does. A copy is
     // transferred, so the source's own bytes stay usable.
     const bytes = (await source.bytes()).slice();
-    const decoded = await decodeInWorker(bytes.buffer as ArrayBuffer, o.maxDecodeBytes ?? DEFAULT_MAX_DECODE, signal);
+    let decoded: Awaited<ReturnType<typeof decodeInWorker>>;
+    try {
+      decoded = await decodeInWorker(bytes.buffer as ArrayBuffer, o.maxDecodeBytes ?? DEFAULT_MAX_DECODE, signal);
+    } catch (refused) {
+      // Bytes that neither the browser nor the decoders read may be another format.
+      throw (detector && !signal.aborted && (await mismatchOf(detector, file, await source.bytes(), "image", signal))) || refused;
+    }
     if (signal.aborted) throw new DOMException("aborted", "AbortError");
     picture = toCanvas(decoded);
     vector = false;
@@ -138,7 +146,7 @@ export const renderer: Renderer<ImageOptions<unknown>> = {
 
     let first: Picture;
     try {
-      first = await pictureOf(file, ctx.source, ctx.signal, o);
+      first = await pictureOf(file, ctx.source, ctx.signal, o, ctx.detector);
     } catch (error) {
       // A camera RAW file that embeds no preview is said so, not as an image
       // that would not decode.

@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode, type Ref } from "react";
 
 import { canOpenInTab } from "../core/source.js";
 import type { ViewerFile } from "../core/types.js";
 import { useViewerContext } from "./context.js";
 import { ChevronLeft, ChevronRight, Close, Download, External, Spinner } from "./icons.js";
 import { Piece } from "./parts.js";
-import { ViewerBody } from "./ViewerBody.js";
+import { ViewerBody, type ViewerBodyHandle } from "./ViewerBody.js";
 
 export interface ViewerDialogItem<Meta = unknown> extends ViewerFile<Meta> {
   /** The heading. */
@@ -32,6 +32,8 @@ export interface ViewerDialogProps<Meta = unknown> {
   onDownloadError?: (error: unknown, item: ViewerDialogItem<Meta>) => void;
   /** Extra footer actions, before "open in a new tab" and "download". */
   actions?: (item: ViewerDialogItem<Meta>) => ReactNode;
+  /** The body's handle (`ViewerBodyHandle`): to a page or a highlight of the file shown. */
+  ref?: Ref<ViewerBodyHandle>;
 }
 
 /** The URL a source has, when it is a plain one. */
@@ -58,7 +60,7 @@ async function download(resolve: () => Promise<string>, fileName?: string) {
  * "open in a new tab" for a URL that outlives the page, download, Escape to
  * close. Every control is at least 44px.
  */
-export function ViewerDialog<Meta = unknown>({ items, index, onIndexChange, width = "full", notice, onDownloadError, actions }: ViewerDialogProps<Meta>) {
+export function ViewerDialog<Meta = unknown>({ items, index, onIndexChange, width = "full", notice, onDownloadError, actions, ref }: ViewerDialogProps<Meta>) {
   const { t } = useViewerContext();
   const open = index !== null;
   const item = index === null ? null : (items[index] ?? null);
@@ -122,7 +124,7 @@ export function ViewerDialog<Meta = unknown>({ items, index, onIndexChange, widt
             </header>
             {notice}
             <div className="exav-viewer-frame">
-              <ViewerBody key={item.id} file={item} onPages={onPages} />
+              <ViewerBody key={item.id} file={item} onPages={onPages} ref={ref} />
             </div>
             <footer className="exav-viewer-dialog-foot">
               <div className="exav-viewer-foot-left">

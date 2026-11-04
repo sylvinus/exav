@@ -6,15 +6,15 @@
 export function safeFileName(name: string, fallback = "file"): string {
   const base = name.split(/[/\\]/).pop() ?? "";
   const cleaned = base
-    // Control characters and what Windows refuses in a name.
-    .replace(/[\u0000-\u001f\u007f<>:"|?*]/g, "_")
+    // C0 and C1 controls, the line and paragraph separators, the
+    // bidirectional marks, embeddings, overrides and isolates (a name that
+    // would show in another order than it is stored), and what Windows
+    // refuses in a name.
+    .replace(/[\u{0}-\u{1f}\u{7f}-\u{9f}\u{61c}\u{200e}\u{200f}\u{2028}\u{2029}\u{202a}-\u{202e}\u{2066}-\u{2069}<>:"|?*]/gu, "_")
     .replace(/^[.\s]+|[.\s]+$/g, "")
     .slice(0, 200);
   return cleaned || fallback;
 }
-
-/** The name @exav/unpack-wasm gives the one member of a compressed stream: "gzip-content". */
-export const STREAM_MEMBER = /^(gzip|bzip2|xz|zstd|lzip|lzma|lz4|lzw)-content$/;
 
 /** A compressed file's name, and what it is called once decompressed. */
 const SUFFIXES: [RegExp, string][] = [

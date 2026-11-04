@@ -1,4 +1,4 @@
-//! Minimal, allocation-free DER (ASN.1) reader — **vendored** to keep the tree
+//! Minimal, allocation-free DER (ASN.1) reader, **vendored** to keep the tree
 //! `unsafe`-free and dependency-light (no `der`/`rsa`/`nom`/`x509` crates). Only
 //! the definite-length subset needed for Authenticode / X.509 is implemented;
 //! every operation is bounds-checked and panic-free (no indexing, no slicing
@@ -21,7 +21,7 @@ pub(crate) struct Tlv<'a> {
     pub tag: u8,
     /// The value bytes (content), excluding tag and length.
     pub content: &'a [u8],
-    /// The full encoding (tag + length + content) — used to SHA-1 a certificate's
+    /// The full encoding (tag + length + content), used to SHA-1 a certificate's
     /// exact DER for its thumbprint.
     pub full: &'a [u8],
 }

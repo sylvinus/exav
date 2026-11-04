@@ -141,7 +141,7 @@ pub fn read(bytes: &[u8], max_triangles: usize) -> Result<Scene, Error> {
 
 /// The JSON of a document and the binary chunk of a GLB file.
 fn document(bytes: &[u8]) -> Result<(Value, Option<&[u8]>), Error> {
-    let (json_bytes, bin) = if bytes.starts_with(b"glTF") {
+    let (json_bytes, bin) = if bytes.starts_with(GLB_MAGIC) {
         container(bytes)?
     } else {
         (bytes, None)
@@ -219,13 +219,27 @@ pub fn read_with(
     Ok(scene)
 }
 
+/// The magic of a GLB file.
+const GLB_MAGIC: &[u8] = b"glTF";
+/// The only GLB version this reader reads.
+const GLB_VERSION: u32 = 2;
+
+/// The little-endian word at `at`, if the bytes reach it.
+fn word(bytes: &[u8], at: usize) -> Option<u32> {
+    let b = bytes.get(at..at.checked_add(4)?)?;
+    Some(u32::from_le_bytes(b.try_into().ok()?))
+}
+
+/// Whether `head`, the start of a file, is the header of a GLB file of the
+/// version this reader reads. Cheap: the chunks are not looked at.
+pub fn is_glb(head: &[u8]) -> bool {
+    head.starts_with(GLB_MAGIC) && word(head, 4) == Some(GLB_VERSION)
+}
+
 /// The JSON and the first binary chunk of a GLB file.
 fn container(bytes: &[u8]) -> Result<(&[u8], Option<&[u8]>), Error> {
-    let word = |at: usize| -> Option<u32> {
-        let b = bytes.get(at..at.checked_add(4)?)?;
-        Some(u32::from_le_bytes(b.try_into().ok()?))
-    };
-    if word(4) != Some(2) {
+    let word = |at: usize| word(bytes, at);
+    if word(4) != Some(GLB_VERSION) {
         return Err(Error::Unsupported("GLB version"));
     }
     let length = word(8).ok_or(Error::Invalid("GLB header"))? as usize;

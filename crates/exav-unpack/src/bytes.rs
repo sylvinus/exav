@@ -2,7 +2,7 @@
 //!
 //! `data.get(off..off + len)` panics (checks on) or wraps (WebAssembly) when a
 //! header field puts `off` near the top of `usize`, and a wrapped range can pass
-//! the bounds check it was written for. [`at`] answers `None` instead.
+//! the bounds check it was written for. `at` answers `None` instead.
 
 /// `data[off..off + len]`, or `None` if it ends past the data or the sum overflows.
 #[allow(dead_code)]

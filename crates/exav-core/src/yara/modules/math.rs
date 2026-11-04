@@ -28,7 +28,8 @@ pub(crate) fn call(func: FuncId, data: &dyn ByteSource, args: &[Value]) -> Optio
     match func {
         MathMin => Some(Value::Int(i64::min(args[0].to_i64()?, args[1].to_i64()?))),
         MathMax => Some(Value::Int(i64::max(args[0].to_i64()?, args[1].to_i64()?))),
-        MathAbs => Some(Value::Int(args[0].to_i64()?.wrapping_abs())),
+        // The smallest integer has no absolute value: undefined, as in yara-x.
+        MathAbs => Some(Value::Int(args[0].to_i64()?.checked_abs()?)),
         MathToNumber => Some(Value::Int(if truthy(&args[0]) { 1 } else { 0 })),
         MathInRange => {
             let x = args[0].to_f64()?;
@@ -403,6 +404,14 @@ mod tests {
         ));
         assert!(t(
             r#"import "math" rule r { condition: math.abs(1) == 1 }"#,
+            &[]
+        ));
+        assert!(t(
+            r#"import "math" rule r { condition: math.abs(-9223372036854775807) == 9223372036854775807 }"#,
+            &[]
+        ));
+        assert!(t(
+            r#"import "math" rule r { condition: not defined math.abs(-9223372036854775807 - 1) }"#,
             &[]
         ));
     }

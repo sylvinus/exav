@@ -26,10 +26,10 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use std::collections::HashSet;
-use std::io::{Read, Seek};
+use std::io::Read;
 
 use super::vol::{Attrs, Emit, Fill, Got, Step, Vol, be32, give, le32, read_file};
-use crate::source::{ByteSource, Reader};
+use crate::source::ByteSource;
 use crate::stream::Visit;
 use crate::{Budget, LimitHit};
 
@@ -160,6 +160,13 @@ impl Cram {
     }
 }
 
+const DIRECT: &str =
+    "cramfs file with a block stored at a direct pointer, which exav does not read";
+const BACKWARDS: &str = "cramfs file whose block pointers go backwards";
+const TOO_LONG: &str = "cramfs file with a block longer than a page can be";
+const CUT: &str = "cramfs file with a block that is not all in the volume";
+const NOT_INFLATED: &str = "cramfs file with a block that did not inflate";
+
 /// The blocks of a file, read and inflated as they are wanted.
 struct Blocks {
     /// Where each block ends.
@@ -190,8 +197,11 @@ impl Fill for Blocks {
         );
         let end = u64::from(if self.ext { raw & 0x3FFF_FFFF } else { raw });
         let want = BLOCK.min(self.size.saturating_sub(self.i.saturating_mul(BLOCK)));
-        if direct || end < self.prev {
-            return Step::Broken;
+        if direct {
+            return Step::Broken(DIRECT);
+        }
+        if end < self.prev {
+            return Step::Broken(BACKWARDS);
         }
         if end == self.prev {
             // A hole.
@@ -203,10 +213,10 @@ impl Fill for Blocks {
         // A block is a page, stored or deflated, and deflate adds a few bytes
         // to a page it cannot shrink.
         if len > BLOCK.saturating_mul(2) {
-            return Step::Broken;
+            return Step::Broken(TOO_LONG);
         }
         let Some(raw_block) = v.at(self.prev, len) else {
-            return Step::Broken;
+            return Step::Broken(CUT);
         };
         self.prev = end;
         let mut block = if stored {
@@ -214,7 +224,7 @@ impl Fill for Blocks {
         } else {
             match unzlib(&raw_block) {
                 Some(b) => b,
-                None => return Step::Broken,
+                None => return Step::Broken(NOT_INFLATED),
             }
         };
         block.resize(want, 0);
@@ -266,30 +276,24 @@ fn open(v: &mut Vol) -> Option<Cram> {
 }
 
 /// Walk a cramfs image given whole as a source.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
-    super::volumes::entries(budget, visit, "", |budget, sink| {
-        walk_volume(Reader::new(src), src.len() as u64, budget, sink)
-    })
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    super::volumes::walk_source(src, budget, visit, walk_volume)
 }
 
 /// Walk the cramfs image `disk`, which is `len` bytes long, handing each file
 /// to `visit`.
-pub(crate) fn walk_volume<D: Read + Seek, R>(
-    mut disk: D,
+pub(crate) fn walk_volume(
+    disk: &mut dyn super::vol::Disk,
     len: u64,
     budget: &mut Budget,
-    visit: Emit<R>,
-) -> Result<Option<R>, LimitHit> {
+    visit: Emit,
+) -> crate::Extracted {
     let max = crate::bytes::to_usize(budget.limits().max_buffer_bytes);
-    let mut v = Vol {
-        disk: &mut disk,
-        len,
-        max,
-    };
+    let mut v = Vol { disk, len, max };
     let head = v
         .at(0, crate::bytes::to_usize(len.min(544)))
         .unwrap_or_default();

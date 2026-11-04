@@ -248,11 +248,7 @@ pub(crate) fn looks_like_screnc(p: &crate::Probe) -> bool {
 
 /// Find every `#@~^ … ^#~@` blob, decode each, and emit the recovered plaintext
 /// as a `screnc-decoded` member. Emits nothing if no blob decodes.
-pub(crate) fn extract_screnc<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_screnc(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     let mut search_from = 0usize;
     while let Some(rel) = memchr::memmem::find(&data[search_from..], MARKER) {
         let marker_pos = search_from + rel;

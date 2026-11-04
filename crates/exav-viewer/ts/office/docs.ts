@@ -5,6 +5,7 @@
  * shrinks.
  */
 import { createWorkerHost, type WorkerHost } from "../core/worker-host.js";
+import { isCompound, isZip } from "./zip.js";
 
 /** What the converter reads. */
 export type DocFormat = "doc" | "odt" | "fodt" | "rtf" | "wml2003" | "pages" | "html";
@@ -62,59 +63,76 @@ const contains = (bytes: Uint8Array, from: number, to: number, text: string) => 
   return false;
 };
 
-/**
- * Whether a compound file has a directory entry (stream or storage) called
- * `name`: its UTF-16LE name, padded to 64 bytes, then the name's length in
- * bytes with the terminator, then the entry's type (1 storage, 2 stream, 5
- * root).
- */
-const hasEntry = (bytes: Uint8Array, name: string) => {
-  const fold = (c: number) => (c >= 0x61 && c <= 0x7a ? c - 32 : c);
-  for (let i = 0; i + 67 <= bytes.length; i += 2) {
-    if (bytes[i + 1] !== 0 || fold(bytes[i]!) !== fold(name.charCodeAt(0))) continue;
-    let k = 1;
-    while (k < name.length && fold(bytes[i + 2 * k]!) === fold(name.charCodeAt(k)) && bytes[i + 2 * k + 1] === 0) k++;
-    if (k !== name.length) continue;
-    const size = (name.length + 1) * 2;
-    if (bytes[i + 64] === size && bytes[i + 65] === 0 && [1, 2, 5].includes(bytes[i + 66]!)) return true;
-  }
-  return false;
+const indexOf = (bytes: Uint8Array, from: number, to: number, text: string) => {
+  for (let i = from; i <= to - text.length; i++) if (ascii(bytes, i, text)) return i;
+  return -1;
 };
 
 /**
- * What the bytes are: a document the converter reads, a DOCX shown as it is,
- * or `null` for anything else (the external converter gets those).
+ * The name of an XML file's root element, from its first 4 KiB: after a byte
+ * order mark, white space, the declaration, processing instructions, comments
+ * and a document type. `null` when the bytes do not get there.
  */
-export function sniffDocs(bytes: Uint8Array): DocFormat | "docx" | null {
-  // A compound file with a Word document stream (Word 6 to 2003).
-  if (bytes[0] === 0xd0 && bytes[1] === 0xcf && bytes[2] === 0x11 && bytes[3] === 0xe0) {
-    return hasEntry(bytes, "WordDocument") ? "doc" : null;
+export function xmlRoot(bytes: Uint8Array): string | null {
+  const end = Math.min(bytes.length, 4096);
+  let i = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 3 : 0;
+  const space = (c: number | undefined) => c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d;
+  while (i < end) {
+    if (space(bytes[i])) {
+      i++;
+      continue;
+    }
+    if (bytes[i] !== 0x3c) return null;
+    let close: string | null = null;
+    if (ascii(bytes, i, "<?")) close = "?>";
+    else if (ascii(bytes, i, "<!--")) close = "-->";
+    else if (ascii(bytes, i, "<!")) {
+      // A document type's internal subset, in brackets, holds `>` of its own.
+      const bracket = indexOf(bytes, i, end, "[");
+      close = bracket >= 0 && bracket < indexOf(bytes, i, end, ">") ? "]>" : ">";
+    }
+    if (close) {
+      const at = indexOf(bytes, i + 2, end, close);
+      if (at < 0) return null;
+      i = at + close.length;
+      continue;
+    }
+    let j = i + 1;
+    while (j < end && !space(bytes[j]) && bytes[j] !== 0x3e && bytes[j] !== 0x2f) j++;
+    return j > i + 1 ? String.fromCharCode(...bytes.subarray(i + 1, j)) : null;
   }
+  return null;
+}
+
+/** The formats `sniffDocs` takes from `officeKinds`, in the order it prefers them. */
+const FROM_KINDS = ["doc", "docx", "pages", "odt"] as const;
+
+/**
+ * What the bytes are: a document the converter reads, a DOCX shown as it is,
+ * or `null` for anything else (the external converter gets those). `kinds`
+ * are what the file's container says it may be (`officeKinds`): a compound
+ * file or a ZIP is told by them alone.
+ */
+export function sniffDocs(bytes: Uint8Array, kinds: readonly string[] | null): DocFormat | "docx" | null {
+  // A compound file too large to look into is taken as its name says.
+  if (kinds === null) return isCompound(bytes) ? "doc" : null;
+  if (isCompound(bytes) || isZip(bytes)) return FROM_KINDS.find((kind) => kinds.includes(kind)) ?? null;
   // RTF, after any white space or a byte order mark.
   let at = 0;
   if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) at = 3;
   while (at < 16 && (bytes[at] === 0x20 || bytes[at] === 0x0a || bytes[at] === 0x0d || bytes[at] === 0x09)) at++;
   if (ascii(bytes, at, "{\\rtf")) return "rtf";
-  if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
-    // OpenDocument: the stored "mimetype" member first.
-    if (ascii(bytes, 30, "mimetype")) return contains(bytes, 38, 120, "opendocument.text") ? "odt" : null;
-    const from = bytes.length - (1 << 20);
-    const has = (t: string) => contains(bytes, from, bytes.length, t);
-    if (has("[Content_Types].xml") && has("word/")) return "docx";
-    if (has("Index/Document.iwa") || has("Index.zip")) return has("Index/Tables/") || has("Slide") ? null : "pages";
-    // A mimetype member that is not first or not stored: told by the members.
-    if (has("content.xml") && has("styles.xml") && !has("ppt/") && !has("xl/")) return "odt";
-    return null;
-  }
   // Word's "Save as Web Page": an HTML page that declares Word's namespace,
   // alone or in the MIME message of "Single File Web Page". Before the XML
   // kinds, which look for the same namespace.
   const mime = ascii(bytes, at, "MIME-Version:") || ascii(bytes, at, "MIME-version:") || ascii(bytes, at, "Mime-Version:");
   const html = contains(bytes, 0, 4096, "<html") || contains(bytes, 0, 4096, "<HTML") || contains(bytes, 0, 4096, "<!DOCTYPE html") || contains(bytes, 0, 4096, "<!doctype html");
   if ((html || mime) && contains(bytes, 0, mime ? 16384 : 4096, "schemas-microsoft-com:office:word")) return "html";
-  // XML: flat ODF text, or Word 2003 XML.
+  // XML: flat ODF text, or Word 2003 XML, told by its root element: a schema,
+  // a stylesheet or a Word 2007 XML package (`pkg:package`, under the same
+  // `mso-application` instruction) only mentions its namespace.
   if (contains(bytes, 0, 2048, "office:document") && contains(bytes, 0, 4096, "opendocument.text")) return "fodt";
-  if (contains(bytes, 0, 4096, "w:wordDocument") || contains(bytes, 0, 4096, "schemas-microsoft-com:office:word")) return "wml2003";
+  if (/^(?:[^:]+:)?wordDocument$/.test(xmlRoot(bytes) ?? "")) return "wml2003";
   return null;
 }
 

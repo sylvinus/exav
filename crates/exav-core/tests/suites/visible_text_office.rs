@@ -52,6 +52,47 @@ fn the_words_of_a_doc_an_xls_and_a_ppt_are_matched() {
     assert!(!found("revenue up 12%", "deck.bin", PPT));
 }
 
+/// One compound file holding the streams of each of `files`.
+fn merged(files: &[&[u8]]) -> Vec<u8> {
+    use std::io::{Read, Write};
+    let mut out = cfb::CompoundFile::create(std::io::Cursor::new(Vec::new())).unwrap();
+    for data in files {
+        let mut c = cfb::CompoundFile::open(std::io::Cursor::new(*data)).unwrap();
+        let paths: Vec<_> = c
+            .walk()
+            .filter(|e| e.is_stream())
+            .map(|e| e.path().to_path_buf())
+            .collect();
+        for p in paths {
+            if out.exists(&p) {
+                continue;
+            }
+            if let Some(parent) = p.parent()
+                && !out.exists(parent)
+            {
+                out.create_storage_all(parent).unwrap();
+            }
+            let mut buf = Vec::new();
+            c.open_stream(&p).unwrap().read_to_end(&mut buf).unwrap();
+            out.create_stream(&p).unwrap().write_all(&buf).unwrap();
+        }
+    }
+    out.flush().unwrap();
+    out.into_inner().into_inner()
+}
+
+#[test]
+fn every_document_a_compound_file_holds_is_matched() {
+    let both = merged(&[DOC, PPT]);
+    for name in ["deck.ppt", "report.doc"] {
+        assert!(found("revenue up 12%", name, &both), "{name}");
+        assert!(
+            found("revenue grew by twelve percent", name, &both),
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn a_flat_opendocument_file_is_matched_without_its_markup() {
     let fodt = br#"<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:mimetype="application/vnd.oasis.opendocument.text"><office:body><office:text><text:p>Wire the <text:span>funds</text:span> <text:s/>today</text:p></office:text></office:body></office:document>"#;

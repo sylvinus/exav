@@ -85,6 +85,8 @@ pub enum Error {
     /// The file ends, or stops making sense, before its first section (DXF),
     /// or the sections its header locates are not there (DWG).
     Damaged(String),
+    /// A password-protected DWG: the sections it needs are encrypted.
+    Encrypted,
     /// The compressed sections of a DWG file expand past
     /// [`Limits::max_decompressed_bytes`].
     LimitExceeded(String),
@@ -100,6 +102,7 @@ impl std::fmt::Display for Error {
                 "DWG version {v} is not supported: R13 (AC1012) to 2018 (AC1032) are"
             ),
             Error::Damaged(why) => write!(f, "damaged drawing: {why}"),
+            Error::Encrypted => f.write_str("password-protected drawing"),
             Error::LimitExceeded(why) => write!(f, "drawing past the size limit: {why}"),
         }
     }

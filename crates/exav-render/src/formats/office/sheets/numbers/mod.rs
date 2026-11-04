@@ -29,7 +29,7 @@ use crate::formats::office::sheets::model::*;
 use formula::TableDims;
 use iwa::Store;
 use proto::Msg;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const DOCUMENT: u32 = 1;
 const SHEET: u32 = 2;
@@ -160,7 +160,9 @@ fn read_iwa<'a>(
     let mut store = Store::default();
     for (_, data) in files {
         let left = budget.limits.max_part.min(budget.limits.max_memory) as usize;
-        let used = store.add(data, left);
+        let used = store
+            .add(data, left)
+            .map_err(|_| Error::TooLarge("an IWA stream"))?;
         budget.alloc(used as u64 * 2)?;
     }
     let doc = store
@@ -185,12 +187,15 @@ struct TableRef {
     name: String,
 }
 
-/// The tables of a drawable, in drawing order: a table, or a group's.
+/// The tables of a drawable, in drawing order: a table, or a group's. A
+/// group is opened once in a document (`groups`): references that loop or
+/// repeat open nothing more.
 fn collect_tables(
     store: &Store,
     id: u64,
     out: &mut Vec<u64>,
     skipped: &mut Vec<&'static str>,
+    groups: &mut HashSet<u64>,
     depth: u32,
 ) {
     let Some((kind, m)) = store.get(id) else {
@@ -203,8 +208,11 @@ fn collect_tables(
             }
         }
         GROUP if depth < 16 => {
+            if !groups.insert(id) {
+                return;
+            }
             for c in m.references(2).take(4096) {
-                collect_tables(store, c, out, skipped, depth + 1);
+                collect_tables(store, c, out, skipped, groups, depth + 1);
             }
         }
         CHART => skipped.push("charts"),
@@ -229,29 +237,42 @@ fn convert(store: &Store, doc: Msg, budget: &mut Budget) -> Result<Workbook> {
     let mut tables: Vec<TableRef> = vec![];
     let mut sheet_names: Vec<(String, bool)> = vec![];
     let mut skipped = vec![];
+    let mut models = HashSet::new();
+    let mut groups = HashSet::new();
+    let mut sheets = HashSet::new();
+    let mut by_sheet: Option<HashMap<u64, Vec<u64>>> = None;
     for (si, sid) in doc.references(1).take(4096).enumerate() {
+        // A sheet listed again would add no table.
+        if !sheets.insert(sid) {
+            continue;
+        }
         let Some(sh) = store.typed(sid, SHEET) else {
             continue;
         };
         let name = sh.string(1).unwrap_or_else(|| format!("Sheet {}", si + 1));
         let mut ids = vec![];
         for d in sh.references(2).take(1 << 16) {
-            collect_tables(store, d, &mut ids, &mut skipped, 0);
+            collect_tables(store, d, &mut ids, &mut skipped, &mut groups, 0);
         }
         if ids.is_empty() {
             // Older documents list only some drawables: tables name their sheet.
-            for ti in store.ids_of(TABLE_INFO) {
-                if let Some(m) = store.typed(ti, TABLE_INFO)
-                    && m.msg(1).and_then(|s| s.reference(2)) == Some(sid)
-                {
-                    ids.extend(m.reference(2));
+            let by_sheet = by_sheet.get_or_insert_with(|| {
+                let mut map: HashMap<u64, Vec<u64>> = HashMap::new();
+                for ti in store.ids_of(TABLE_INFO) {
+                    if let Some(m) = store.typed(ti, TABLE_INFO)
+                        && let Some(s) = m.msg(1).and_then(|s| s.reference(2))
+                    {
+                        map.entry(s).or_default().extend(m.reference(2));
+                    }
                 }
-            }
+                map
+            });
+            ids.extend(by_sheet.get(&sid).into_iter().flatten());
         }
         let k = sheet_names.len();
         sheet_names.push((name, sh.boolean(25).unwrap_or(false)));
         for t in ids {
-            if tables.iter().any(|x| x.model == t) {
+            if !models.insert(t) {
                 continue;
             }
             let tname = store.get(t).and_then(|m| m.1.string(8)).unwrap_or_default();

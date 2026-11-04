@@ -2,7 +2,7 @@
 //!
 //! Names and documentation were reviewed repeatedly without anyone comparing the
 //! *parsers*, and the surface drifted underneath: `--max-object-bytes` took
-//! `45M` while `--icap-preview-bytes`, also a count of bytes, refused `4K`; five
+//! `45M` while the ICAP preview size, also a count of bytes, refused `4K`; five
 //! duration flags disabled themselves with `0` and refused `off` while two did
 //! the exact reverse. Every one of those reads as a bug in the flag someone
 //! happens to try second.
@@ -39,14 +39,14 @@ fn parses(flag: &str, value: &str) -> bool {
 
 /// Byte-valued flags all read the same size vocabulary.
 ///
-/// Two of these carry a plain integer default (`4096`, `65536`) and once had a
-/// plain integer parser to match, so `4K` was a parse error on them and fine on
-/// every other flag measured in bytes. The field's width is not something the
-/// person typing can see.
+/// The ICAP preview size and header limit carry a plain integer default
+/// (`4096`, `65536`) and once had a plain integer parser to match, so `4K` was
+/// a parse error on them and fine on every other flag measured in bytes. The
+/// field's width is not something the person typing can see. They are keys of
+/// the ICAP address now, read by the same parsers.
 ///
 /// `0` and `off` are where they differ, on purpose: a limit takes both; a size
-/// that is not a limit (`--spill-threshold-bytes`) takes `0` and refuses `off`;
-/// `--icap-max-header-bytes` has a floor of `1K` and no `off`.
+/// that is not a limit (`--spill-threshold-bytes`) takes `0` and refuses `off`.
 #[test]
 fn every_byte_flag_takes_the_same_sizes() {
     const LIMITS: &[&str] = &[
@@ -56,9 +56,8 @@ fn every_byte_flag_takes_the_same_sizes() {
         "--max-process-bytes",
         "--max-spill-bytes",
         "--max-total-spill-bytes",
-        "--icap-preview-bytes",
     ];
-    const SIZES: &[&str] = &["--spill-threshold-bytes", "--icap-max-header-bytes"];
+    const SIZES: &[&str] = &["--spill-threshold-bytes"];
     for flag in LIMITS {
         for good in ["0", "off"] {
             assert!(parses(flag, good), "{flag} must accept `{good}`");
@@ -68,10 +67,6 @@ fn every_byte_flag_takes_the_same_sizes() {
     for flag in SIZES {
         assert!(!parses(flag, "off"), "{flag} is a size, with no `off`");
     }
-    assert!(
-        !parses("--icap-max-header-bytes", "0"),
-        "below the 1K floor"
-    );
     for flag in LIMITS.iter().chain(SIZES) {
         for good in ["4096", "45K", "45M", "45G", "45m"] {
             assert!(parses(flag, good), "{flag} must accept `{good}`");
@@ -93,23 +88,17 @@ fn every_byte_flag_takes_the_same_sizes() {
 /// `off` reaches the disabled state on every one that can be disabled. `0`
 /// additionally works wherever zero is a meaningful bound, and is refused on the
 /// ones that describe a recurring interval, where a zero-second period is a loop
-/// rather than "never". `--icap-idle-secs` has neither: with no idle timeout a
-/// client could hold a connection forever, and with a zero one no request
-/// would get through.
+/// rather than "never".
 #[test]
 fn every_duration_flag_disables_with_off() {
-    const BOUNDS: &[&str] = &[
-        "--max-scan-secs",
-        "--startup-wait-secs",
-        "--icap-options-ttl-secs",
-    ];
+    const BOUNDS: &[&str] = &["--max-scan-secs", "--startup-wait-secs"];
     const PERIODS: &[&str] = &[
         "--metrics-secs",
         "--slow-scan-secs",
         "--update-interval-secs",
     ];
 
-    for flag in BOUNDS.iter().chain(PERIODS).chain(&["--icap-idle-secs"]) {
+    for flag in BOUNDS.iter().chain(PERIODS) {
         assert!(
             parses(flag, "120"),
             "{flag} must accept a number of seconds"
@@ -128,8 +117,6 @@ fn every_duration_flag_disables_with_off() {
             "{flag}: a zero-second period is a loop, not `off`"
         );
     }
-    assert!(!parses("--icap-idle-secs", "off"));
-    assert!(!parses("--icap-idle-secs", "0"));
 }
 
 /// Counting flags take counts, and nothing that looks like a size.
@@ -138,18 +125,21 @@ fn every_duration_flag_disables_with_off() {
 /// suffix means bytes. `--max-members 10K` quietly meaning ten thousand members
 /// would remove that signal from the whole surface.
 ///
-/// A limit on a count takes `0` and `off` for no limit. The nesting depth has
-/// no unlimited setting (each level costs stack), and a threshold of findings
-/// at `0` would fire on every file, so those refuse both.
+/// A limit on a count takes `0` and `off` for no limit. The nesting depth
+/// takes `0` for no container opened and has no `off` (each level costs
+/// stack); a threshold of findings at `0` would fire on every file, so those
+/// refuse both.
 #[test]
 fn every_counting_flag_refuses_size_suffixes() {
-    const LIMITS: &[&str] = &[
-        "--max-members",
-        "--max-jobs-per-worker",
-        "--icap-max-requests",
-    ];
-    const AT_LEAST_ONE: &[&str] = &["--max-unpack-depth", "--dlp-ssns", "--dlp-credit-cards"];
-    for flag in LIMITS.iter().chain(AT_LEAST_ONE) {
+    const LIMITS: &[&str] = &["--max-members", "--max-jobs-per-worker"];
+    const AT_LEAST_ONE: &[&str] = &["--dlp-ssns", "--dlp-credit-cards"];
+    assert!(parses("--max-unpack-depth", "0"));
+    assert!(!parses("--max-unpack-depth", "off"));
+    for flag in LIMITS
+        .iter()
+        .chain(AT_LEAST_ONE)
+        .chain(&["--max-unpack-depth"])
+    {
         for good in ["10", "10000"] {
             assert!(parses(flag, good), "{flag} must accept `{good}`");
         }

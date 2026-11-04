@@ -4,11 +4,26 @@
 #[path = "cad_common/mod.rs"]
 mod common;
 
-use exav_render::text::{visible_text, wants};
+use exav_render::text::visible_text;
 use exav_unpack::Limits;
+
+/// `text::wants` for a file known by its start alone.
+fn wants(name: &str, head: &[u8]) -> bool {
+    exav_render::text::wants(name, &head)
+}
 
 fn text(name: &str, data: &[u8]) -> Option<String> {
     visible_text(name, data, 1 << 20, &Limits::default()).map(|v| v.text)
+}
+
+/// One byte that is not UTF-8 makes the whole file windows-1252, as
+/// exav-unpack reads text.
+#[test]
+fn a_markdown_file_that_is_not_utf8_is_read_as_windows_1252() {
+    assert_eq!(
+        text("a.md", b"caf\xe9 *au* lait").unwrap(),
+        "caf\u{e9} au lait\n"
+    );
 }
 
 #[test]
@@ -64,6 +79,117 @@ fn a_binary_file_with_a_spreadsheet_marker_among_its_bytes_is_not_that_document(
     }
 }
 
+/// The streams of `a` and `b`, two compound files, in one.
+#[cfg(feature = "text-office")]
+fn merged(a: &[u8], b: &[u8]) -> Vec<u8> {
+    use exav_unpack::cfb::{Compound, build};
+    let mut streams: Vec<(String, Vec<u8>)> = Vec::new();
+    for data in [a, b] {
+        let c = Compound::open(data).expect("a compound file");
+        for s in c.streams() {
+            if !streams.iter().any(|(n, _)| n == s.name) {
+                streams.push((
+                    s.name.to_string(),
+                    c.read(s.index, u64::MAX).data.into_owned(),
+                ));
+            }
+        }
+    }
+    let refs: Vec<(&str, &[u8])> = streams
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    build(&refs)
+}
+
+#[cfg(feature = "text-office")]
+fn office_fixture(path: &str) -> Vec<u8> {
+    let p = format!(
+        "{}/tests/fixtures/office/{path}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    std::fs::read(&p).unwrap_or_else(|e| panic!("{p}: {e}"))
+}
+
+#[cfg(feature = "text-office")]
+#[test]
+fn a_compound_file_holding_several_documents_gives_the_text_of_each() {
+    let both = merged(
+        &office_fixture("docs/sample.doc"),
+        &office_fixture("slides/sample.ppt"),
+    );
+    let doc_alone = text("a.doc", &office_fixture("docs/sample.doc")).unwrap();
+    for name in ["a.ppt", "a.doc"] {
+        let t = text(name, &both).unwrap();
+        assert!(t.contains("Second slide text"), "{name}: {t}");
+        assert!(t.starts_with(&doc_alone), "{name}: {t}");
+    }
+}
+
+#[test]
+fn an_ooxml_packages_links_join_their_labels_to_their_targets() {
+    use std::io::Write;
+    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, data) in [
+        (
+            "word/document.xml",
+            r#"<w:document xmlns:w="w" xmlns:r="r"><w:hyperlink r:id="rId1"><w:r><w:t>www.bank.example</w:t></w:r></w:hyperlink></w:document>"#,
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            r#"<Relationships><Relationship Id="rId1" Type="x/hyperlink" Target="http://evil.example/" TargetMode="External"/></Relationships>"#,
+        ),
+    ] {
+        w.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        w.write_all(data.as_bytes()).unwrap();
+    }
+    let docx = w.finish().unwrap().into_inner();
+    let v = visible_text("a.docx", &docx, 1 << 20, &Limits::default()).unwrap();
+    assert_eq!(v.text, "www.bank.example (http://evil.example/)\n");
+    assert_eq!(
+        v.links,
+        [(
+            "www.bank.example".to_string(),
+            "http://evil.example/".to_string()
+        )]
+    );
+    assert!(wants("a.docx", &docx[..64]));
+}
+
+#[test]
+fn an_email_is_its_headers_and_a_body_that_is_html() {
+    let msg = b"From: =?UTF-8?Q?Caf=C3=A9?= <a@b.example>\r\nSubject: hi\r\n\r\n<p>body</p>";
+    assert!(wants("x", msg));
+    assert_eq!(
+        text("x", msg).unwrap(),
+        "From: Caf\u{e9} <a@b.example>\nSubject: hi\nbody\n"
+    );
+    // A body of another kind is a member of the message, not read here.
+    let plain = b"From: a@b.example\r\nSubject: hi\r\n\r\njust words";
+    assert_eq!(
+        text("x", plain).unwrap(),
+        "From: a@b.example\nSubject: hi\n"
+    );
+}
+
+#[test]
+fn an_ifc_model_is_the_strings_of_its_instances() {
+    let ifc = b"ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+                #1=IFCPROJECT('0YvctVUKr0kugbFTf53O9L',$,'Tower',$,$,$,$,$,$);\n\
+                #2=IFCCARTESIANPOINT((0.,0.,0.));\n\
+                #3=IFCPROPERTYSINGLEVALUE('Fire rating',$,IFCLABEL('R\\X2\\00E9\\X0\\sistant'),$);\n\
+                ENDSEC;\nEND-ISO-10303-21;\n";
+    assert!(wants("m.ifc", ifc));
+    assert_eq!(
+        text("m.ifc", ifc).unwrap(),
+        "Tower\nFire rating R\u{e9}sistant\n"
+    );
+    // Cut at the cap, and said.
+    let v = visible_text("m.ifc", ifc, 8, &Limits::default()).unwrap();
+    assert!(v.truncated);
+}
+
 #[test]
 fn what_has_no_text_gives_none() {
     assert_eq!(text("notes.txt", b"just some words"), None);
@@ -110,6 +236,126 @@ fn the_text_of_a_drawing_is_cut_at_the_cap() {
     let v = visible_text("all.dxf", &dxf, 64, &Limits::default()).unwrap();
     assert!(v.truncated);
     assert!(v.text.len() <= 64);
+}
+
+/// The drawing of exav-unpack's `fixtures/dwg/links/` (`make.py` there), in
+/// each version the converter writes: seven entities, six of which carry the
+/// hyperlink of AutoCAD's HYPERLINK command (the same one twice, a link to a
+/// view, three with a plain target, one described by its own address) and
+/// one the extended data of another application, which looks like a link.
+fn links_dwg(version: &str) -> Vec<u8> {
+    let path = format!(
+        "{}/../exav-unpack/tests/fixtures/dwg/links/{version}.dwg.gz",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    common::gunzip(&exav_unpack::read_fixture(&path).expect("fixture"))
+}
+
+const DWG_VERSIONS: [&str; 8] = [
+    "R13", "R14", "R2000", "R2004", "R2007", "R2010", "R2013", "R2018",
+];
+
+#[test]
+fn a_dwgs_hyperlinks_are_its_text_and_its_links() {
+    for v in DWG_VERSIONS {
+        let dwg = links_dwg(v);
+        let got = visible_text("plan.dwg", &dwg, 1 << 20, &Limits::default())
+            .unwrap_or_else(|| panic!("{v}: no text"));
+        let lines: Vec<&str> = got.text.lines().collect();
+        // The first lines are the links: a target, then its texts.
+        assert_eq!(
+            lines[..10],
+            [
+                "https://evil.example/steal",
+                "https://www.paypal.com/login",
+                "Detail text display",
+                "Detail 1",
+                "https://example.org/docs/a%20b",
+                "Docs",
+                "https://example.org/caf\u{e9}",
+                "Caf\u{e9}",
+                "https://example.org/same",
+                "https://example.org/same",
+            ][..],
+            "{v}"
+        );
+        // And the drawing's own text after them.
+        assert!(lines[10..].contains(&"hello"), "{v}: {}", got.text);
+        assert!(!got.text.contains("other.example"), "{v}: {}", got.text);
+        // A description that is not its target is a link to be judged, the
+        // view's (no target) is not.
+        assert_eq!(
+            got.links,
+            [
+                (
+                    "https://www.paypal.com/login".to_string(),
+                    "https://evil.example/steal".to_string()
+                ),
+                (
+                    "Docs".to_string(),
+                    "https://example.org/docs/a%20b".to_string()
+                ),
+                (
+                    "Caf\u{e9}".to_string(),
+                    "https://example.org/caf\u{e9}".to_string()
+                ),
+            ],
+            "{v}"
+        );
+        assert!(!got.truncated, "{v}");
+    }
+}
+
+/// The scanner asks `wants` with a kilobyte, which holds the file header of
+/// every version but R2007's (it ends at 0x480).
+#[test]
+fn a_dwg_of_every_version_is_wanted_from_its_first_kilobyte() {
+    for v in DWG_VERSIONS {
+        let dwg = links_dwg(v);
+        assert!(wants("plan.dwg", &dwg[..1024]), "{v}");
+        assert!(wants("plan", &dwg[..1024]), "{v}");
+    }
+    // Wanted is not read: the whole file has to be a drawing.
+    let shaped = b"AC1021\0\0\0\0\0\x19\x03 and nothing else";
+    assert!(wants("a.dwg", shaped));
+    assert_eq!(text("a.dwg", shaped), None);
+    assert!(!wants("a.dwg", b"AC1021 not really"));
+}
+
+/// The links come before the rest, so a text cut at the cap keeps the first.
+#[test]
+fn the_hyperlinks_of_a_dwg_are_cut_with_the_text() {
+    let dwg = links_dwg("R2018");
+    // 26 + 1 and 28 + 1 bytes: the spoofed link fits, "Detail text display"
+    // does not.
+    let got = visible_text("plan.dwg", &dwg, 60, &Limits::default()).unwrap();
+    assert!(got.truncated);
+    assert_eq!(
+        got.text,
+        "https://evil.example/steal\nhttps://www.paypal.com/login\n"
+    );
+    assert_eq!(got.links.len(), 1);
+}
+
+/// Hyperlinks are charged to the drawing's entity limit: past it the rest
+/// are dropped and a warning says so (which a scan reads as a text cut).
+#[test]
+fn a_dwg_with_more_hyperlinks_than_the_limit_says_so() {
+    let dwg = links_dwg("R2018");
+    let limits = exav_render::cad::Limits {
+        max_entities: 3,
+        ..exav_render::cad::Limits::default()
+    };
+    let d = exav_render::cad::read_dwg_with(&dwg, &limits).unwrap();
+    assert_eq!(d.hyperlinks.len(), 3);
+    assert!(
+        d.warnings
+            .iter()
+            .any(|w| w.kind == exav_render::cad::WarningKind::LimitReached
+                && w.message == "hyperlinks past the first 3 were dropped"),
+        "{:?}",
+        d.warnings
+    );
 }
 
 #[test]

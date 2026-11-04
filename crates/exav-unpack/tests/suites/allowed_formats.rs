@@ -4,7 +4,7 @@
 //! *call* may do, so one build serves a caller that accepts archives and a
 //! caller that does not, without either maintaining its own build.
 //!
-//! The property that matters is not that exclusion works — it is that an
+//! The property that matters is not that exclusion works: it is that an
 //! excluded container is REPORTED. "I declined to open this" and "there was
 //! nothing here" must never look the same to whatever reads the result.
 
@@ -98,7 +98,7 @@ fn an_allowed_format_extracts_normally() {
 }
 
 /// The one that matters. An excluded format yields a REPORTED entry, not an
-/// empty result — a caller that treats "no members" as "nothing to worry about"
+/// empty result: a caller that treats "no members" as "nothing to worry about"
 /// must not be able to reach that conclusion by excluding a format.
 #[test]
 #[cfg(feature = "zip")]

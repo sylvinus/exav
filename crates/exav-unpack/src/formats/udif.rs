@@ -81,8 +81,11 @@ impl Partition {
 /// between its B-tree nodes and the files' data.
 const RUN_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
-pub(crate) struct DmgReader<R: Read + Seek> {
-    inner: R,
+/// What a DMG is read from.
+pub(crate) type Source<'a> = Box<dyn crate::stream::Disk + 'a>;
+
+pub(crate) struct DmgReader<'a> {
+    inner: Source<'a>,
     sector_count: u64,
     file_size: u64,
     partitions: Vec<Partition>,
@@ -103,8 +106,8 @@ struct Run {
     damaged: bool,
 }
 
-impl<R: Read + Seek> DmgReader<R> {
-    fn open(mut reader: R) -> Result<Self, LimitHit> {
+impl<'a> DmgReader<'a> {
+    fn open(mut reader: Source<'a>) -> Result<Self, LimitHit> {
         let file_size = reader
             .seek(SeekFrom::End(0))
             .map_err(|e| LimitHit::corrupt(format!("UDIF: seek to end: {e}")))?;
@@ -199,7 +202,7 @@ impl<R: Read + Seek> DmgReader<R> {
     }
 }
 
-impl<R: Read + Seek> Read for DmgReader<R> {
+impl Read for DmgReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -295,7 +298,7 @@ impl<R: Read + Seek> Read for DmgReader<R> {
     }
 }
 
-impl<R: Read + Seek> Seek for DmgReader<R> {
+impl Seek for DmgReader<'_> {
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         let pos = match to {
             SeekFrom::Start(p) => Some(p),
@@ -310,12 +313,12 @@ impl<R: Read + Seek> Seek for DmgReader<R> {
 
 /// The disk a DMG holds, read on demand: a UDIF image's runs are decompressed
 /// as they are reached, and anything else is the disk itself.
-pub(crate) enum Disk<R: Read + Seek> {
-    Udif(DmgReader<R>),
-    Raw(R),
+pub(crate) enum Disk<'a> {
+    Udif(DmgReader<'a>),
+    Raw(Source<'a>),
 }
 
-pub(crate) fn disk<R: Read + Seek>(mut src: R) -> Result<Disk<R>, LimitHit> {
+pub(crate) fn disk(mut src: Source<'_>) -> Result<Disk<'_>, LimitHit> {
     let len = src
         .seek(SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("UDIF: seek to end: {e}")))?;
@@ -332,7 +335,7 @@ pub(crate) fn disk<R: Read + Seek>(mut src: R) -> Result<Disk<R>, LimitHit> {
     Ok(Disk::Raw(src))
 }
 
-impl<R: Read + Seek> Disk<R> {
+impl Disk<'_> {
     /// Set once a run read so far failed to decode part way: what was read
     /// from it may not be the disk's content, read on or not.
     pub(crate) fn damage(&self) -> Arc<AtomicBool> {
@@ -343,7 +346,7 @@ impl<R: Read + Seek> Disk<R> {
     }
 }
 
-impl<R: Read + Seek> Read for Disk<R> {
+impl Read for Disk<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Disk::Udif(d) => d.read(buf),
@@ -352,7 +355,7 @@ impl<R: Read + Seek> Read for Disk<R> {
     }
 }
 
-impl<R: Read + Seek> Seek for Disk<R> {
+impl Seek for Disk<'_> {
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         match self {
             Disk::Udif(d) => d.seek(to),
@@ -627,13 +630,13 @@ mod tests {
         (0..n).map(|i| b'a' + (i * 7 % 26) as u8).collect()
     }
 
-    fn open(image: Vec<u8>) -> Disk<Cursor<Vec<u8>>> {
-        let d = disk(Cursor::new(image)).unwrap();
+    fn open(image: Vec<u8>) -> Disk<'static> {
+        let d = disk(Box::new(Cursor::new(image))).unwrap();
         assert!(matches!(d, Disk::Udif(_)));
         d
     }
 
-    fn read_at(d: &mut Disk<Cursor<Vec<u8>>>, at: u64, n: usize) -> io::Result<Vec<u8>> {
+    fn read_at(d: &mut Disk<'_>, at: u64, n: usize) -> io::Result<Vec<u8>> {
         d.seek(SeekFrom::Start(at))?;
         let mut b = vec![0; n];
         d.read_exact(&mut b)?;

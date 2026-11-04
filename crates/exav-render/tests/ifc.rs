@@ -324,6 +324,7 @@ fn not_ifc_is_an_error() {
 #[test]
 fn the_demo_house_has_its_walls_and_slab() {
     // The viewer's browser tests open the same file (see the viewer's framing.test.ts).
+    // Nothing is far from the rest, so the view is framed on all of it.
     let bytes = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/viewer/house.ifc"
@@ -339,4 +340,40 @@ fn the_demo_house_has_its_walls_and_slab() {
     let st = stats(&scene);
     // 12 x 8 x 0.3 slab.
     assert!((st["Ground slab"].volume - 28.8).abs() < 1e-4);
+    assert!(scene.framing.is_some());
+    assert_eq!(scene.framing, scene.bounds);
+}
+
+#[test]
+fn is_ifc_names_a_step_header_with_an_ifc_schema_and_no_other_bytes() {
+    use exav_render::ifc::is_ifc;
+    let step = |schema: &str| {
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('x; y'),'2;1');\nFILE_NAME('a','',(''),(''),'','','');\n\
+             FILE_SCHEMA(({schema}));\nENDSEC;\nDATA;\n#1=IFCWALL($);\nENDSEC;\nEND-ISO-10303-21;\n"
+        )
+    };
+    for schema in ["'IFC2X3'", "'IFC4'", "'IFC4X3_ADD2'", "'ifc4'"] {
+        assert!(is_ifc(step(schema).as_bytes()), "{schema}");
+    }
+    // As the reader takes it: a byte order mark and blank space first.
+    assert!(is_ifc(format!("\u{FEFF}\n  {}", step("'IFC4'")).as_bytes()));
+    // Only the header is looked at.
+    let text = step("'IFC4'");
+    assert!(is_ifc(&text.as_bytes()[..text.find("DATA").unwrap()]));
+    // Not IFC: another schema, no schema before the data, a header cut
+    // before or inside the schema, STEP's magic not first, and no STEP.
+    assert!(!is_ifc(step("'CONFIG_CONTROL_DESIGN'").as_bytes()));
+    assert!(!is_ifc(
+        b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nFILE_SCHEMA(('IFC4'));\n"
+    ));
+    assert!(!is_ifc(
+        &text.as_bytes()[..text.find("FILE_SCHEMA").unwrap()]
+    ));
+    assert!(!is_ifc(&text.as_bytes()[..text.find("IFC4").unwrap() + 2]));
+    assert!(!is_ifc(format!("x{text}").as_bytes()));
+    assert!(!is_ifc(b""));
+    assert!(!is_ifc(b"FILE_SCHEMA(('IFC4'));"));
+    // The reader and the check agree on the same bytes.
+    assert!(read(text.as_bytes(), &Limits::default()).is_ok());
 }

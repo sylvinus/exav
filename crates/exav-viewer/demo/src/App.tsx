@@ -159,10 +159,16 @@ const SANDBOX = {
   origins: { media: [__DEMO_ORIGIN__], connect: [__DEMO_ORIGIN__] },
   delivery: DELIVERY,
   formats: BUILTIN_ORDER,
+  // `?sniffBytes=0`: files are told by their name and type alone (the browser tests).
+  ...(QUERY.get("sniffBytes") ? { sniffBytes: Number(QUERY.get("sniffBytes")) } : {}),
 };
 
 /** `?url=<address>`: a file by its address, opened first. */
 const LINKED = QUERY.get("url");
+
+/** `?highlight=<quote>`: the quote found and highlighted in the files opened, and gone to (the browser tests). */
+const HIGHLIGHT = QUERY.get("highlight");
+const HIGHLIGHTS = HIGHLIGHT ? { highlights: [{ id: "quote", text: HIGHLIGHT, label: HIGHLIGHT }] } : {};
 
 /** `?cad=monochrome`: drawings in ink, as plotted; `?rasterTile=64`: pictures drawn in small tiles (the browser tests). */
 const CAD = {
@@ -400,7 +406,7 @@ export function App() {
                 )}
               </div>
               <div className="demo-frame">
-                <ViewerBody key={current.id} file={current}>
+                <ViewerBody key={current.id} file={{ ...current, ...HIGHLIGHTS }}>
                   {({ session }) => <SessionOut session={session} onSession={setSession} />}
                 </ViewerBody>
               </div>

@@ -1,4 +1,4 @@
-//! Unix `compress` (`.Z`) — LZW as specified by the original `compress(1)`.
+//! Unix `compress` (`.Z`): LZW as specified by the original `compress(1)`.
 //!
 //! Every Unix reads `.Z`: libarchive/`bsdtar`, macOS, `gzip -d`, 7-Zip. It is
 //! also old enough that a lot of tooling treats it as inert, which is exactly
@@ -16,7 +16,7 @@
 //! implement, which is why this is written out rather than delegated:
 //!
 //! * **The code stream is written in groups of eight codes.** Whenever the code
-//!   width changes — on a table reset *and* on every width increase — the writer
+//!   width changes (on a table reset *and* on every width increase) the writer
 //!   pads to the next multiple of `width * 8` bits before continuing. A decoder
 //!   that skips the padding only on reset stays in step until the first width
 //!   change and then reads garbage. Verified against `compress -b16`/`-b12`
@@ -25,7 +25,7 @@
 //! * The width increases once the table reaches `1 << width` entries.
 //!
 //! The group boundary is measured from a base that MOVES to each padding point
-//! — the reference restarts its input buffer there — and from the start of the
+//! (the reference restarts its input buffer there) and from the start of the
 //! code stream, after the 3-byte header. Getting either of those wrong decodes
 //! the first few hundred bytes correctly and then silently produces garbage,
 //! which is why this is checked against real `compress` output rather than a
@@ -182,11 +182,11 @@ impl<B: Bytes> Lzw<B> {
 }
 
 /// Walk a `.Z` file: one member, decoded as it is read.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut crate::Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, crate::LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, crate::LimitHit> {
     use crate::stream::{emit_stream, single_meta};
     budget.count_entry()?;
     match content_reader(src) {

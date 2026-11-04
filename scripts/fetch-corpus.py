@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fetch a small targeted malware corpus from MalwareBazaar for differential
 validation of exav's bytecode interpreter. Samples are extracted (password
-"infected") into corpus/samples/<family>/. LIVE MALWARE — static scan only.
+"infected") into corpus/samples/<family>/. LIVE MALWARE: static scan only.
 """
 import io
 import os

@@ -103,14 +103,17 @@ serviceAccount:
   # Extra annotations for the ServiceAccount.
   annotations: {}
 
+# The image runs as uid and gid 65532. On OpenShift, set runAsUser, runAsGroup
+# and fsGroup to null so that the SCC assigns them.
 podSecurityContext:
   # Require the pod to run as a non-root user.
   runAsNonRoot: true
-  # User ID to run the container process as.
+  # User ID to run the container process as. The image's own user.
   runAsUser: 65532
   # Group ID to run the container process as.
   runAsGroup: 65532
-  # Group ID that owns mounted volumes.
+  # Group ID that owns mounted volumes. Kubernetes makes a volume that supports
+  # it writable by this group, which lets the pod write a PVC another user filled.
   fsGroup: 65532
   seccompProfile:
     # Seccomp profile type.

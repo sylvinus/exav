@@ -25,7 +25,7 @@
 
 use std::rc::Rc;
 
-use super::FieldName;
+use super::{Copies, FieldName};
 use crate::yara::error::{Error, Result};
 use crate::yara::ir::{Fields, Value};
 
@@ -96,8 +96,12 @@ fn le_u32(d: &[u8], off: usize) -> u32 {
 /// Parses `data` and returns the `dotnet` root value. Anything that is not a
 /// .NET assembly yields `is_dotnet: false` with no other field set, so each
 /// reads as undefined — YARA's behaviour — rather than as a wrong value.
-pub(crate) fn build(data: &[u8]) -> Value {
-    match Meta::parse(data) {
+///
+/// The strings and blobs of the heaps are charged to `copies` as they are
+/// copied for a row, and from the first that does not fit they read as empty:
+/// many rows can index one long string.
+pub(crate) fn build(data: &[u8], copies: &Copies) -> Value {
+    match Meta::parse(data, copies) {
         Some(m) => m.build(),
         None => {
             let mut f = Fields::new();
@@ -118,6 +122,7 @@ struct Stream {
 /// index sizes depend on.
 struct Meta<'a> {
     data: &'a [u8],
+    copies: &'a Copies,
     /// Offset of the metadata root within the file.
     root: usize,
     version: String,
@@ -137,14 +142,24 @@ struct Meta<'a> {
 }
 
 impl<'a> Meta<'a> {
-    fn parse(data: &'a [u8]) -> Option<Meta<'a>> {
-        let pe = goblin::pe::PE::parse(data).ok()?;
-        let (_, dd) =
-            pe.header.optional_header?.data_directories.data_directories[COM_DESCRIPTOR_DIR]?;
-        let cli = rva_to_offset(&pe, dd.virtual_address)?;
+    fn parse(data: &'a [u8], copies: &'a Copies) -> Option<Meta<'a>> {
+        let pe = crate::pe::headers(data)?;
+        let opt = pe.header.optional_header?;
+        let (_, dd) = opt.data_directories.data_directories[COM_DESCRIPTOR_DIR]?;
+        // yara-x converts RVAs here as in its `pe` module.
+        let rva_to_offset = |rva: u32| {
+            crate::pe::yarax_offset(
+                rva,
+                &pe.sections,
+                opt.windows_fields.file_alignment,
+                opt.windows_fields.section_alignment,
+            )
+            .map(|offset| offset as usize)
+        };
+        let cli = rva_to_offset(dd.virtual_address)?;
         // The CLI header's `MetaData` directory sits at offset 8.
         let md_rva = le_u32(data, cli + 8);
-        let root = rva_to_offset(&pe, md_rva)?;
+        let root = rva_to_offset(md_rva)?;
         if le_u32(data, root) != METADATA_MAGIC {
             return None;
         }
@@ -213,6 +228,7 @@ impl<'a> Meta<'a> {
 
         let mut m = Meta {
             data,
+            copies,
             root,
             version,
             streams,
@@ -410,19 +426,25 @@ impl<'a> Meta<'a> {
         }
     }
 
-    /// A NUL-terminated string from `#Strings`.
+    /// A NUL-terminated string from `#Strings`; empty once the copies have
+    /// used up their room.
     fn string(&self, i: u32) -> Vec<u8> {
         let i = i as usize;
         match self.strings.get(i..) {
             Some(s) => {
                 let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
-                s[..end].to_vec()
+                if self.copies.take(end) {
+                    s[..end].to_vec()
+                } else {
+                    Vec::new()
+                }
             }
             None => Vec::new(),
         }
     }
 
-    /// A length-prefixed blob from `#Blob`, minus its prefix.
+    /// A length-prefixed blob from `#Blob`, minus its prefix; empty once the
+    /// copies have used up their room.
     fn blob(&self, i: u32) -> Vec<u8> {
         let i = i as usize;
         let Some(s) = self.blobs.get(i..) else {
@@ -434,6 +456,7 @@ impl<'a> Meta<'a> {
         };
         hdr.checked_add(len as usize)
             .and_then(|end| s.get(hdr..end))
+            .filter(|blob| self.copies.take(blob.len()))
             .map(<[u8]>::to_vec)
             .unwrap_or_default()
     }
@@ -675,19 +698,6 @@ fn format_guid(g: &[u8]) -> String {
     )
 }
 
-fn rva_to_offset(pe: &goblin::pe::PE, rva: u32) -> Option<usize> {
-    for s in &pe.sections {
-        let start = s.virtual_address;
-        let end = start.saturating_add(s.virtual_size.max(s.size_of_raw_data));
-        if rva >= start && rva < end {
-            return (rva - start)
-                .checked_add(s.pointer_to_raw_data)
-                .map(|o| o as usize);
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Compile-time field validation
 // ---------------------------------------------------------------------------
@@ -872,6 +882,188 @@ mod tests {
                 "{n} is not implemented and must be rejected"
             );
         }
+    }
+
+    /// A PE32 of one section, a CLI header and metadata with a `ModuleRef`
+    /// table of `rows` rows that all name one string of `name_len` bytes.
+    fn assembly_with_module_refs(rows: usize, name_len: usize) -> Vec<u8> {
+        fn put(v: &mut [u8], at: usize, bytes: &[u8]) {
+            v[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        let mut strings = vec![0u8];
+        strings.extend(vec![b'A'; name_len]);
+        strings.push(0);
+        let mut tilde = vec![0u8; 24];
+        tilde[4] = 2; // major
+        tilde[7] = 1;
+        tilde[8..16].copy_from_slice(&(1u64 << T_MODULEREF).to_le_bytes());
+        tilde.extend((rows as u32).to_le_bytes());
+        for _ in 0..rows {
+            tilde.extend(1u16.to_le_bytes());
+        }
+        // A blob of the same length, at index 1: its length in two bytes.
+        let mut blob = vec![0u8, 0x80 | (name_len >> 8) as u8, name_len as u8];
+        blob.extend(vec![b'B'; name_len]);
+        // The streams follow their headers: 12, 20 and 16 bytes.
+        let root = 0x100;
+        let first = 32 + 12 + 20 + 16;
+        let mut meta = vec![0u8; first];
+        put(&mut meta, 0, &METADATA_MAGIC.to_le_bytes());
+        put(&mut meta, 4, &[1, 0, 1, 0]);
+        put(&mut meta, 12, &12u32.to_le_bytes());
+        put(&mut meta, 16, b"v4.0.30319\0\0");
+        put(&mut meta, 30, &3u16.to_le_bytes());
+        let mut at = first;
+        let mut p = 32;
+        for (name, data) in [
+            (&b"#~\0\0"[..], &tilde),
+            (b"#Strings\0\0\0\0", &strings),
+            (b"#Blob\0\0\0", &blob),
+        ] {
+            put(&mut meta, p, &(at as u32).to_le_bytes());
+            put(&mut meta, p + 4, &(data.len() as u32).to_le_bytes());
+            put(&mut meta, p + 8, name);
+            p += 8 + name.len();
+            at += data.len().next_multiple_of(4);
+        }
+        for data in [&tilde, &strings, &blob] {
+            meta.extend(data.iter());
+            meta.resize(meta.len().next_multiple_of(4), 0);
+        }
+        let size = root + meta.len();
+        let mut f = vec![0u8; 0x400 + size];
+        put(&mut f, 0, b"MZ");
+        put(&mut f, 0x3c, &0x40u32.to_le_bytes());
+        put(&mut f, 0x40, b"PE\0\0");
+        put(&mut f, 0x44, &0x14cu16.to_le_bytes());
+        put(&mut f, 0x46, &1u16.to_le_bytes());
+        put(&mut f, 0x54, &0xe0u16.to_le_bytes());
+        let opt = 0x58;
+        put(&mut f, opt, &0x10bu16.to_le_bytes());
+        put(&mut f, opt + 32, &0x1000u32.to_le_bytes());
+        put(&mut f, opt + 36, &0x200u32.to_le_bytes());
+        put(
+            &mut f,
+            opt + 56,
+            &(0x1000 + size.next_multiple_of(0x1000) as u32).to_le_bytes(),
+        );
+        put(&mut f, opt + 60, &0x200u32.to_le_bytes());
+        put(&mut f, opt + 92, &16u32.to_le_bytes());
+        // The CLI header is the 14th data directory.
+        put(
+            &mut f,
+            opt + 96 + 8 * COM_DESCRIPTOR_DIR,
+            &0x1000u32.to_le_bytes(),
+        );
+        put(
+            &mut f,
+            opt + 96 + 8 * COM_DESCRIPTOR_DIR + 4,
+            &72u32.to_le_bytes(),
+        );
+        let section = opt + 0xe0;
+        put(&mut f, section, b".text");
+        put(&mut f, section + 8, &(size as u32).to_le_bytes());
+        put(&mut f, section + 12, &0x1000u32.to_le_bytes());
+        put(&mut f, section + 16, &(size as u32).to_le_bytes());
+        put(&mut f, section + 20, &0x400u32.to_le_bytes());
+        put(&mut f, 0x400, &72u32.to_le_bytes());
+        put(&mut f, 0x400 + 8, &(0x1000 + root as u32).to_le_bytes());
+        put(&mut f, 0x400 + 12, &(meta.len() as u32).to_le_bytes());
+        put(&mut f, 0x400 + root, &meta);
+        f
+    }
+
+    /// Where `assembly_with_module_refs` puts its section header, and the
+    /// fields of it that the tests below change.
+    const SECTION_HEADER: usize = 0x58 + 0xe0;
+    const RAW_SIZE: usize = SECTION_HEADER + 16;
+    const RAW_POINTER: usize = SECTION_HEADER + 20;
+
+    fn parses(pe: &[u8]) -> bool {
+        Meta::parse(pe, &Copies::new(usize::MAX)).is_some()
+    }
+
+    /// An address past the raw size of its section is zeros in memory and
+    /// has no place in the file, as yara-x's `rva_to_offset` has it.
+    #[test]
+    fn metadata_past_the_raw_size_of_its_section_is_not_read() {
+        let mut pe = assembly_with_module_refs(1, 4);
+        assert!(parses(&pe));
+        // The CLI header is in the raw data, the metadata root is not.
+        pe[RAW_SIZE..RAW_SIZE + 4].copy_from_slice(&0x100u32.to_le_bytes());
+        assert!(!parses(&pe));
+    }
+
+    /// The pointer to the raw data is rounded down to the file alignment
+    /// (to 0x200 when the section alignment is 0x1000 or more), as in
+    /// yara-x.
+    #[test]
+    fn the_pointer_to_raw_data_is_rounded_down() {
+        let mut pe = assembly_with_module_refs(1, 4);
+        pe[RAW_POINTER..RAW_POINTER + 4].copy_from_slice(&0x5ffu32.to_le_bytes());
+        assert!(parses(&pe));
+    }
+
+    /// An address below the first section is the same offset in the file.
+    #[test]
+    fn a_cli_header_below_the_first_section_is_read() {
+        let mut pe = assembly_with_module_refs(1, 4);
+        let header = pe[0x400..0x400 + 72].to_vec();
+        pe[0x200..0x200 + 72].copy_from_slice(&header);
+        let dir = 0x58 + 96 + 8 * COM_DESCRIPTOR_DIR;
+        pe[dir..dir + 4].copy_from_slice(&0x200u32.to_le_bytes());
+        assert!(parses(&pe));
+    }
+
+    fn module_refs(root: &Value) -> Vec<Vec<u8>> {
+        let Value::Struct(f) = root else {
+            panic!("not a struct")
+        };
+        let Some(Value::Array(refs)) = f.get("modulerefs") else {
+            panic!("no module references: {:?}", f.keys().collect::<Vec<_>>())
+        };
+        refs.iter()
+            .map(|r| match r {
+                Value::Str(name) => name.clone(),
+                _ => panic!("not a string"),
+            })
+            .collect()
+    }
+
+    /// Each row copies the string it indexes, and a table of rows that all
+    /// index one long string asks for the string many times over: the copies
+    /// are charged, and stop where the room ends.
+    #[test]
+    fn a_string_many_rows_index_is_charged_for_each_copy() {
+        let pe = assembly_with_module_refs(2000, 1000);
+        let copies = Copies::new(usize::MAX);
+        let refs = module_refs(&build(&pe, &copies));
+        assert!(!copies.cut());
+        assert_eq!(refs.len(), 2000);
+        assert!(refs.iter().all(|name| name.len() == 1000));
+
+        // Room for 500 of the 2,000 copies of 1,000 bytes.
+        let copies = Copies::new(500_000);
+        let refs = module_refs(&build(&pe, &copies));
+        assert!(copies.cut());
+        let named = refs.iter().filter(|name| !name.is_empty()).count();
+        assert_eq!(named, 500);
+    }
+
+    /// A blob is charged as a string is.
+    #[test]
+    fn a_blob_many_rows_index_is_charged_for_each_copy() {
+        let pe = assembly_with_module_refs(1, 1000);
+        let copies = Copies::new(2500);
+        let meta = Meta::parse(&pe, &copies).unwrap();
+        assert_eq!(meta.blob(1), vec![b'B'; 1000]);
+        assert_eq!(meta.blob(1), vec![b'B'; 1000]);
+        assert!(!copies.cut());
+        assert!(meta.blob(1).is_empty());
+        assert!(copies.cut());
+        // From then on nothing is copied, whatever its size.
+        assert!(meta.blob(0).is_empty());
+        assert!(meta.string(1).is_empty());
     }
 
     #[test]

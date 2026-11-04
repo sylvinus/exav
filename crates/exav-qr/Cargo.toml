@@ -1,0 +1,17 @@
+[package]
+name = "exav-qr"
+description = "QR code detection and decoding: rqrr 0.11.0, a port of quirc, with its lru and g2p dependencies replaced by safe code of its own."
+version.workspace = true
+edition.workspace = true
+# rqrr's: MIT or Apache-2.0 for the Rust, ISC for the parts that are quirc's.
+license = "(MIT OR Apache-2.0) AND ISC"
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["qr", "qrcode", "detection", "quirc"]
+categories = ["multimedia::images", "encoding"]
+readme = "README.md"
+
+[dev-dependencies]
+# The PNG files of the capstone tests.
+image = { version = "=0.25.9", default-features = false, features = ["png"] }

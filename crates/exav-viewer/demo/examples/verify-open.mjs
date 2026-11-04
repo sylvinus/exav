@@ -62,8 +62,8 @@ const READ = {
   async image(name, bytes) {
     const e = ext(name);
     if (["png", "jpg", "jpeg", "gif", "webp"].includes(e)) {
-      const type = detector.sniff(bytes.subarray(0, 512));
-      if (!type.startsWith("image/")) throw new Error(`sniffed as "${type}"`);
+      const type = (await engine("sniff")).contentType(bytes.subarray(0, 65536), bytes.length);
+      if (!type.startsWith("image/")) throw new Error(`detected as "${type}"`);
       return `browser draws it (${type})`;
     }
     if (e === "svg") {
@@ -152,11 +152,19 @@ const READ = {
     return `${a.format()}, ${list.length} member(s)${list.some((m) => m.encrypted) ? ", encrypted" : ""}`;
   },
   async media(name, bytes) {
-    // The browser's players decode them; here only that the head is a media container's or an MP3 frame's.
-    const type = detector.sniff(bytes.subarray(0, 512));
-    const mp3Frame = bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0;
-    if (!/^(audio|video|application\/ogg)/.test(type) && !mp3Frame) throw new Error(`sniffed as "${type}"`);
-    return `plays in the browser (${type || "MP3 frames"})`;
+    // The browser's players decode them, and no detection of exav's names them: here only that
+    // the head is a media container's, or an MP3 frame's.
+    const text = (at, s) => [...s].every((c, i) => bytes[at + i] === c.charCodeAt(0));
+    const container =
+      (text(4, "ftyp") && "ISO base media") ||
+      (bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3 && "Matroska or WebM") ||
+      (text(0, "ID3") && "MP3 with tags") ||
+      (text(0, "fLaC") && "FLAC") ||
+      (text(0, "OggS") && "Ogg") ||
+      (text(0, "RIFF") && text(8, "WAVE") && "WAVE") ||
+      (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0 && "MP3 frames");
+    if (!container) throw new Error("the head is no media container's");
+    return `plays in the browser (${container})`;
   },
 };
 

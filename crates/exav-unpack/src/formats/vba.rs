@@ -219,7 +219,7 @@ fn parse_dir(d: &[u8]) -> DirInfo {
             }
             0x0009 => {
                 // PROJECTVERSION: Reserved u32 (==4), VersionMajor u32,
-                // VersionMinor u16 — the 32-bit field here is Reserved, not size.
+                // VersionMinor u16; the 32-bit field here is Reserved, not size.
                 let major = read_u32(d, body).unwrap_or(0);
                 let minor = read_u16(d, body + 4).unwrap_or(0);
                 headers.push(format!("REM PROJECTVERSION: {major}.{minor}"));
@@ -242,7 +242,7 @@ fn parse_dir(d: &[u8]) -> DirInfo {
                 p = body + size;
             }
             0x0019 => {
-                // MODULENAME — begins a new module record group.
+                // MODULENAME: begins a new module record group.
                 if let Some(m) = cur.take() {
                     modules.push(m);
                 }
@@ -302,18 +302,18 @@ fn parse_dir(d: &[u8]) -> DirInfo {
                 p = body;
             }
             0x0025 => {
-                // MODULEREADONLY — Reserved u32 (0), no payload.
+                // MODULEREADONLY: Reserved u32 (0), no payload.
                 p = body;
             }
             0x0028 => {
-                // MODULEPRIVATE — Reserved u32 (0), no payload.
+                // MODULEPRIVATE: Reserved u32 (0), no payload.
                 if let Some(m) = cur.as_mut() {
                     m.private = true;
                 }
                 p = body;
             }
             0x002B => {
-                // Module terminator — Reserved u32 (0).
+                // Module terminator: Reserved u32 (0).
                 if let Some(m) = cur.take() {
                     modules.push(m);
                 }

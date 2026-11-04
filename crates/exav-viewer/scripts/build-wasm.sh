@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Build the WebAssembly modules into wasm/: exav_viewer_image (raster
 # decoders), exav_viewer_dwg (DWG and DXF) and exav_viewer_model (IFC, STL,
-# OBJ, PLY and glTF), exav_viewer_text (Markdown), exav_viewer_sheets (XLS,
+# OBJ, PLY and glTF), exav_viewer_text (how a file is read as text, Markdown, JSON, XML, diffs), exav_viewer_sheets (XLS,
 # ODS and Numbers to XLSX), exav_viewer_slides (PPT, ODP, Keynote, ODG and
-# VSDX to PPTX), exav_viewer_docs (DOC, ODT, RTF and Pages to DOCX), and the
-# two decoders pdf.js
+# VSDX to PPTX), exav_viewer_docs (DOC, ODT, RTF and Pages to DOCX),
+# exav_viewer_table (CSV and TSV to XLSX), exav_viewer_sniff (what a file is,
+# from its first bytes, a ZIP's central directory, for the Office page and the
+# limits on a ZIP's directory, and which Office formats a file is), and the two decoders pdf.js
 # loads in place of its C and C++ ones, each embedded in its fallback module
 # (openjpeg_nowasm_fallback.js, jbig2_nowasm_fallback.js; see
 # build-pdf-decoders.mjs). Needs the wasm32-unknown-unknown target and
@@ -41,7 +43,14 @@ optimise() {
 # - model: 3 GiB. The file, its index, and the meshes twice (the scene and
 #   the buffers handed over) for the default 6 million triangles fit in 1.5.
 # - text: 256 MiB. A file read is at most 2 MiB; its tree is bounded at
-#   100000 nodes and is written out once as JSON.
+#   100000 nodes and is written out once as JSON; so are the lines of a JSON,
+#   XML or diff file, at most 50000 of them.
+# - sniff: 256 MiB. It gets the first 64 KiB of a file, or the end of one (its
+#   central directory mostly), and lists the members; and a compound file
+#   whole, its directory being anywhere in it: one that does not fit is not
+#   recognised and goes to the external converter.
+# - table: 256 MiB. A CSV, at most 64 MiB (ts/office/table.ts), with the text
+#   and the XLSX made of it.
 # - sheets: 2 GiB. The file, and the workbook and the XLSX the converter
 #   counts against its own limit (1 GiB by default, ts/office/sheets.ts).
 # - slides: 2 GiB. The file, and the presentation and the PPTX the
@@ -52,7 +61,7 @@ optimise() {
 # - pdf-jpx, pdf-jbig2: 1 GiB for one image of a PDF.
 cap() {
   case "$1" in
-    text) echo $((256 * 1024 * 1024)) ;;
+    text | sniff | table) echo $((256 * 1024 * 1024)) ;;
     image) echo $((1024 * 1024 * 1024)) ;;
     dwg) echo $((2048 * 1024 * 1024)) ;;
     sheets) echo $((2048 * 1024 * 1024)) ;;
@@ -64,7 +73,7 @@ cap() {
 }
 
 mkdir -p "$OUT" "$PDF"
-for feature in image dwg model text sheets slides docs pdf-jpx pdf-jbig2; do
+for feature in image dwg model text sheets slides docs table sniff pdf-jpx pdf-jbig2; do
   # The cdylib's file has no hash in its name, so every feature writes the
   # same one, and a feature cargo finds up to date would leave the module
   # another feature built last: it is removed, so that it is linked again.

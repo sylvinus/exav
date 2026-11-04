@@ -1,14 +1,14 @@
 //! The `dotnet` YARA module, checked against yara-x.
 //!
 //! Every expected value here is `yr dump --module dotnet` output from the
-//! yara-x CLI 1.19.0 — the reference implementation's, not this crate's. A
+//! yara-x CLI 1.19.0, the reference implementation's, not this crate's. A
 //! module validated against its own parser can agree with itself on a
 //! misreading of the metadata format, and several of these fields are exactly
 //! the kind that invites one:
 //!
 //! * `number_of_classes` excludes the `<Module>` pseudo-type that occupies
 //!   TypeDef row 0, so it is the row count minus one;
-//! * `constants` is only the *string* rows of the Constant table — on
+//! * `constants` is only the *string* rows of the Constant table: on
 //!   Newtonsoft.Json that is 95 of 568;
 //! * `field_offsets` comes from **FieldRVA**, not the similarly-named
 //!   FieldLayout table, which is usually empty;
@@ -20,8 +20,8 @@
 //! The fixture is `System.Buffers.dll` from the NuGet package (MIT). It is small
 //! and exercises the container, the streams, the GUID heap and the assembly
 //! tables. The count-heavy paths were additionally diffed against
-//! Newtonsoft.Json 13.0.3 — 493 classes, 783 user strings, 95 constants, 22
-//! field offsets, 22 assembly refs — which is too large to commit;
+//! Newtonsoft.Json 13.0.3 (493 classes, 783 user strings, 95 constants, 22
+//! field offsets, 22 assembly refs), which is too large to commit;
 //! `scripts/yara-dotnet-difftest.sh` reproduces that run.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
@@ -34,7 +34,7 @@ fn fixture() -> Vec<u8> {
     exav_core::unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
-/// Compile one rule into a scanner, via a temporary `.yar` file — the same path
+/// Compile one rule into a scanner, via a temporary `.yar` file: the same path
 /// the CLI takes for a rule set.
 fn scanner_for(condition: &str) -> Result<Scanner, String> {
     let src = format!("import \"dotnet\"\nrule t {{ condition: {condition} }}\n");
@@ -92,7 +92,7 @@ fn arrays_and_nested_structs_match_yara_x() {
         r#"dotnet.assembly_refs[0].name == "System.Runtime""#,
         // A subscript followed by two more field steps. The parser groups the
         // tail into a nested field access, which the compiler used to reject
-        // outright — so every `pe` and `dotnet` rule shaped like this was
+        // outright, so every `pe` and `dotnet` rule shaped like this was
         // dropped, not just this one.
         "dotnet.assembly_refs[0].version.major > 0",
     ] {

@@ -19,7 +19,7 @@
  * sandboxed frame turns into the host's question.
  */
 import { onDemand, writable } from "../core/store.js";
-import type { DragController, OutlineEntry, PagesController, RasterRect, Viewport, ViewportController, ZoomController, OutlineController } from "../core/types.js";
+import type { DragController, OutlineEntry, PagesController, PlacedHighlight, RasterRect, Viewport, ViewportController, ZoomController, OutlineController } from "../core/types.js";
 import { renderDpr, type LoadedPdf, type PageRegion, type PdfLink } from "./engine.js";
 
 export interface ReaderOptions {
@@ -86,6 +86,10 @@ export interface Reader {
    * position. The old `doc` is the caller's to destroy afterwards.
    */
   replace(doc: LoadedPdf, sizes: { width: number; height: number }[]): void;
+  /** Draws `items` over their pages in place of those drawn; `current` is outlined. */
+  highlight(items: readonly PlacedHighlight[], current: string | null): void;
+  /** Brings `area` of `page` (fractions of it) to the middle of the view, or the page's top without one. */
+  reveal(page: number, area: RasterRect | null, smooth: boolean): void;
   resize(): void;
   destroy(): void;
 }
@@ -146,6 +150,12 @@ export function createReader(
   let pinch: Pinch | null = null;
   let detailTimer: ReturnType<typeof setTimeout> | undefined;
   let destroyed = false;
+  /**
+   * The last highlight revealed, revealed again when the pages are laid out
+   * at another width (the viewer's box took its size after the file opened),
+   * until the user moves the view.
+   */
+  let held: { page: number; area: RasterRect | null } | null = null;
   const near = new Set<number>([0]);
   const drawnAt = new Map<number, number>();
 
@@ -358,6 +368,7 @@ export function createReader(
     if (w === fitWidth) return;
     fitWidth = w;
     layout();
+    if (held) reveal(held.page, held.area, false);
     refresh();
     scheduleDetail();
   };
@@ -443,6 +454,7 @@ export function createReader(
     const p = pinch;
     pinch = null;
     if (!p) return;
+    held = null;
     zoom = Math.min(options.maxZoom, Math.max(options.minZoom, zoom * p.scale));
     // Laid out now, so the transform goes and the scroll is set before paint.
     layout();
@@ -608,7 +620,12 @@ export function createReader(
   loadOutline();
   updateDrag();
 
+  /** A page, a link's or a heading's place: the view no longer holds a highlight. */
   const goTo = (page: number, offset: number | null, smooth: boolean) => {
+    held = null;
+    scrollToPage(page, offset, smooth);
+  };
+  const scrollToPage = (page: number, offset: number | null, smooth: boolean) => {
     const box = boxes[page - 1];
     if (!box) return;
     const pageTop = scroller.scrollTop + box.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
@@ -625,6 +642,71 @@ export function createReader(
     begin(mid);
     update(mid, scale / zoom);
     end();
+  };
+
+  // ── highlights: boxes in fractions of their page, so a zoom moves them with it ──
+  let highlights: { items: readonly PlacedHighlight[]; current: string | null } = { items: [], current: null };
+  const highlightLayers: HTMLDivElement[] = [];
+  const drawHighlights = () => {
+    for (const layer of highlightLayers.splice(0)) layer.remove();
+    const byPage = new Map<number, PlacedHighlight[]>();
+    for (const item of highlights.items) {
+      if (item.state !== "shown" || item.page === null || !boxes[item.page - 1]) continue;
+      byPage.set(item.page, [...(byPage.get(item.page) ?? []), item]);
+    }
+    for (const [page, items] of byPage) {
+      const box = boxes[page - 1]!;
+      const layer = document.createElement("div");
+      layer.className = "exav-viewer-highlights";
+      for (const item of items) {
+        const group = document.createElement("div");
+        group.className = `exav-viewer-highlight${item.id === highlights.current ? " exav-viewer-highlight-current" : ""}`;
+        group.dataset.highlight = item.id;
+        const name = item.label ?? item.text;
+        if (name) {
+          group.setAttribute("role", "img");
+          group.setAttribute("aria-label", name);
+          group.title = item.label ?? "";
+        } else group.setAttribute("aria-hidden", "true");
+        // A custom property takes any value; the box's background takes only a colour from it.
+        if (item.color) group.style.setProperty("--exav-viewer-highlight", item.color);
+        for (const r of item.rects) {
+          const mark = document.createElement("div");
+          mark.className = "exav-viewer-highlight-box";
+          mark.style.left = `${r.x * 100}%`;
+          mark.style.top = `${r.y * 100}%`;
+          mark.style.width = `${r.width * 100}%`;
+          mark.style.height = `${r.height * 100}%`;
+          group.append(mark);
+        }
+        layer.append(group);
+      }
+      // Above the drawing, below the text layer and the links, which are added after.
+      box.querySelector(".exav-viewer-pdf-detail")!.after(layer);
+      highlightLayers.push(layer);
+    }
+  };
+
+  const letGo = () => void (held = null);
+  for (const type of ["wheel", "touchstart", "mousedown", "keydown"]) scroller.addEventListener(type, letGo, { passive: true, capture: true });
+
+  const reveal = (page: number, area: RasterRect | null, smooth: boolean) => {
+    const box = boxes[page - 1];
+    if (!box || destroyed) return;
+    held = { page, area };
+    if (!area) return scrollToPage(page, null, smooth);
+    const view = scroller.getBoundingClientRect();
+    const b = box.getBoundingClientRect();
+    const middle = (from: number, size: number, start: number, length: number, room: number) =>
+      // In the middle, or its start at the top when it is taller than the view.
+      size * length > room - 2 * JUMP_MARGIN ? from + start * size - JUMP_MARGIN : from + (start + length / 2) * size - room / 2;
+    const top = scroller.scrollTop + b.top - view.top;
+    const left = scroller.scrollLeft + b.left - view.left;
+    scroller.scrollTo({
+      top: Math.max(0, middle(top, b.height, area.y, area.height, scroller.clientHeight)),
+      left: Math.max(0, middle(left, b.width, area.x, area.width, scroller.clientWidth)),
+      behavior: smooth ? "smooth" : "auto",
+    });
   };
 
   const replace = (next: LoadedPdf, nextSizes: { width: number; height: number }[]) => {
@@ -648,6 +730,7 @@ export function createReader(
     aspects = sizes.map((s) => s.width / s.height);
     build();
     layout();
+    drawHighlights();
     for (const box of boxes) io.observe(box);
     // The same zoom, at the same place: what the reader was checking stays under the eye.
     scroller.scrollLeft = left;
@@ -679,6 +762,12 @@ export function createReader(
       once: measureViewport,
     }),
     replace,
+    highlight(items, current) {
+      if (destroyed) return;
+      highlights = { items, current };
+      drawHighlights();
+    },
+    reveal,
     resize: measure,
     destroy() {
       destroyed = true;

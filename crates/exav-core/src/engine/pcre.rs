@@ -1781,6 +1781,87 @@ mod tests {
         assert!(matches(r"\bword\t\x00", "", b"\\b\x9aword\t\x00\\b\x9a\x9ac$abc\n\x9aa \x8e"));
     }
 
+    /// Two repeats of one atom around an optional item keep the minimum of
+    /// both: the optimizer once turned `a+b?a+` into `a+(?:ba+)?`.
+    #[test]
+    fn two_repeats_around_an_optional_item_keep_both_minimums() {
+        assert!(!matches(r"a+b?a+", "", b"a"));
+        assert!(matches(r"a+b?a+", "", b"aa"));
+        assert!(matches(r"a+b?a+", "", b"aba"));
+        assert!(!matches(r"^-+a?-+$", "", b"-"));
+        assert!(matches(r"^-+a?-+$", "", b"--"));
+    }
+
+    /// `(?:a+b?a*)+` cannot match two b in a row: folding it into
+    /// `a+(?:ba*)*` could.
+    #[test]
+    fn a_repeated_block_with_a_required_start_does_not_repeat_its_middle() {
+        assert!(!matches(r"^(?:a+b?a*)+$", "", b"abba"));
+        assert!(matches(r"^(?:a+b?a*)+$", "", b"abaab"));
+        assert!(matches(r"^(?:a*b?a*)+$", "", b"abba"));
+    }
+
+    /// A repeat whose body can match empty keeps where each iteration of the
+    /// current run started: a second run of the loop at the same position
+    /// must not inherit the first run's value and end below its minimum.
+    #[test]
+    fn a_repeat_with_an_empty_body_counts_each_run_from_zero() {
+        assert!(!matches(r"(?:(?=(?:a|(?=b)){2,})a){2}", "", b"aa"));
+        assert!(matches(r"(?:(?=(?:a|(?=b)){2,})a){2}", "", b"aab"));
+        assert!(!matches(r"(?:(?=(?:a|(?=b)){3,})a){2}", "", b"aaa"));
+        assert!(matches(r"(?:(?=(?:a|(?=b)){3,})a){2}", "", b"aaab"));
+        assert!(matches(r"(?:(?=^)a*){2,}b", "", b"aab"));
+        assert!(!matches(r"^(?:(?(1)a|())){3,}$", "", b"a"));
+    }
+
+    /// A lookahead is atomic: a later failure does not backtrack into it to
+    /// find another capture.
+    #[test]
+    fn a_lookahead_does_not_backtrack_into_another_capture() {
+        assert!(!matches(r"(?=x|(x))\1x", "", b"xx"));
+        assert!(matches(r"(?=(x)|x)\1x", "", b"xx"));
+    }
+
+    /// A condition that fails must not leave its atomic marker for an
+    /// enclosing atomic group or possessive repeat to pop as its own.
+    #[test]
+    fn a_failed_condition_inside_an_atomic_group_leaves_nothing_behind() {
+        assert!(!matches(r"(z)?(?>a*(?(1)x))a", "", b"aaa"));
+        assert!(!matches(r"(z)?(?:a(?(1)x))*+a", "", b"aaa"));
+        assert!(matches(r"(z)?(?:a(?(1)x))*a", "", b"aaa"));
+    }
+
+    /// The true branch of a conditional can be a group of alternatives: the
+    /// `|` inside it does not start the false branch.
+    #[test]
+    fn a_conditional_true_branch_can_be_a_group_of_alternatives() {
+        assert!(matches(r"^(x)?(?(1)(?:a|b))$", "", b"\n"));
+        assert!(!matches(r"^(x)?(?(1)(?:a|b))$", "", b"b"));
+        assert!(matches(r"^(x)?(?(1)(?:a|b))$", "", b"xb"));
+        assert!(!matches(r"^(x)?(?(1)(?:a|b))$", "", b"x"));
+    }
+
+    /// A back reference or a condition inside the group it refers to reads
+    /// the group's previous capture. It once read a start past the end and
+    /// panicked on the slice.
+    #[test]
+    fn a_back_reference_inside_its_own_group_reads_the_previous_capture() {
+        assert!(matches(r"(?:(\1|a)b){2}", "", b"abab"));
+        assert!(matches(r"^((?(1)b|a))$", "", b"a"));
+        assert!(!matches(r"^((?(1)b|a))$", "", b"b"));
+        assert!(matches(r"^(a|\1b)+$", "", b"aab"));
+    }
+
+    /// A lookbehind of variable length reads its classes as bytes: its reverse
+    /// automaton once read them as the code points U+0000 to U+00FF in UTF-8.
+    #[test]
+    fn a_variable_lookbehind_reads_classes_as_bytes() {
+        assert!(matches(r"(?<=[\xe9\xea]{1,2})x", "", b"\xe9\xe9x"));
+        assert!(!matches(r"(?<=[\xe9\xea]{1,2})x", "", b"\xc3\xa9x"));
+        assert!(matches(r"(?<=[^a]{1,3})x", "", b"\xff\xfe\xfdx"));
+        assert!(!matches(r"(?<=[^a]{1,3})x", "", b"aax"));
+    }
+
     /// The start-of-pattern items that only tune PCRE2 are dropped.
     #[test]
     fn drops_tuning_items() {

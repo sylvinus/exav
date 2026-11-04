@@ -4,6 +4,8 @@
 
 #[cfg(feature = "dmg")]
 mod apfs;
+#[cfg(feature = "applesingle")]
+pub(crate) mod applesingle;
 #[cfg(feature = "ar")]
 pub(crate) mod ar;
 #[cfg(feature = "arj")]
@@ -19,7 +21,8 @@ pub(crate) mod bzip2;
     feature = "nsis",
     feature = "alz",
     feature = "egg",
-    feature = "dmg"
+    feature = "dmg",
+    feature = "inno"
 ))]
 mod bzip2_rs;
 #[cfg(feature = "cab")]
@@ -29,7 +32,7 @@ pub(crate) mod cab_join;
 #[cfg(feature = "cab")]
 mod cab_parse;
 #[cfg(feature = "chm")]
-mod chm;
+pub(crate) mod chm;
 #[cfg(feature = "cpio")]
 pub(crate) mod cpio;
 #[cfg(feature = "dmg")]
@@ -54,6 +57,8 @@ pub mod dxf;
 pub(crate) mod egg;
 #[cfg(feature = "email")]
 mod email;
+#[cfg(feature = "email")]
+pub(crate) mod email_stream;
 #[cfg(feature = "gzip")]
 pub(crate) mod gzip;
 #[cfg(feature = "iso")]
@@ -78,19 +83,28 @@ pub mod cfb;
     feature = "swf",
     feature = "nsis",
     feature = "egg",
-    feature = "upx"
+    feature = "upx",
+    feature = "inno"
 ))]
 pub(crate) mod lzma;
 #[cfg(feature = "offcrypto")]
 pub mod offcrypto;
+#[cfg(feature = "zip")]
+pub(crate) mod office_package;
 #[cfg(feature = "ole")]
-mod ole;
+pub mod old_ppt;
+#[cfg(feature = "ole")]
+pub(crate) mod ole;
 #[cfg(all(feature = "ole", feature = "decrypt"))]
 mod ole_crypto;
 #[cfg(feature = "pdf")]
 pub(crate) mod pdf;
 #[cfg(feature = "pdf")]
+mod pdf_objstm;
+#[cfg(feature = "pdf")]
 pub(crate) mod pdf_parse;
+#[cfg(feature = "pdf")]
+mod pdf_raster;
 #[cfg(feature = "ole")]
 mod xlm;
 #[cfg(feature = "zstd")]
@@ -111,9 +125,10 @@ pub(crate) mod azo;
 #[cfg(feature = "egg")]
 pub(crate) mod azo_tables;
 #[cfg(feature = "binhex")]
-mod binhex;
+pub mod binhex;
 #[cfg(feature = "cramfs")]
 pub(crate) mod cramfs;
+pub(crate) mod cryptff;
 #[cfg(feature = "ishieldz")]
 mod dcl_explode;
 #[cfg(feature = "erofs")]
@@ -122,12 +137,18 @@ pub(crate) mod erofs;
 pub(crate) mod exfat;
 #[cfg(feature = "ext")]
 pub(crate) mod ext;
+// The superblock check of `ext`, which `detect` makes in every build.
+pub(crate) mod ext_super;
 #[cfg(feature = "fat")]
 pub(crate) mod fat;
 #[cfg(feature = "hwp3")]
 pub(crate) mod hwp3;
 #[cfg(feature = "inno")]
 pub(crate) mod inno;
+#[cfg(feature = "ishieldcab")]
+pub(crate) mod ishield_cab;
+#[cfg(feature = "ishieldmsi")]
+pub(crate) mod ishield_msi;
 #[cfg(feature = "ishieldz")]
 pub(crate) mod ishield_z;
 #[cfg(feature = "lnk")]
@@ -159,7 +180,7 @@ pub(crate) mod ppmd8;
 #[cfg(feature = "diskimage")]
 pub(crate) mod qcow2;
 #[cfg(feature = "rar")]
-mod rar;
+pub(crate) mod rar;
 #[cfg(all(feature = "rar", feature = "decrypt"))]
 mod rar3_crypt;
 #[cfg(feature = "rar")]
@@ -293,13 +314,17 @@ pub(crate) use aimodel::{extract_aimodel, is_aimodel};
 #[cfg(feature = "arj")]
 pub(crate) use arj::extract_arj;
 #[cfg(feature = "autoit")]
-pub(crate) use autoit::{MARKER_EA05, MARKER_EA06, extract_autoit, is_autoit};
+pub(crate) use autoit::{
+    GUID_EA05, GUID_EA06, extract_autoit, is_autoit, starts_with_marker as autoit_marker_first,
+};
 #[cfg(feature = "binhex")]
-pub(crate) use binhex::{extract_binhex, looks_like_binhex};
-#[cfg(feature = "chm")]
-pub(crate) use chm::extract_chm;
+pub(crate) use binhex::{
+    extract_binhex, looks_like_binhex, starts_with_marker as binhex_marker_first,
+};
 #[cfg(feature = "dmg")]
 pub(crate) use dmg::is_dmg;
+#[cfg(feature = "email")]
+pub use email::MULTIPART_NOT_FOUND;
 #[cfg(feature = "email")]
 pub(crate) use email::extract_email;
 #[cfg(feature = "javaclass")]
@@ -339,7 +364,7 @@ pub(crate) use upx::{extract_upx, find_packheader, has_packheader_layout};
 #[cfg(feature = "uuencode")]
 pub(crate) use uuencode::{extract_uuencode, looks_like_uuencode};
 #[cfg(feature = "xdp")]
-pub(crate) use xdp::{extract_xdp, looks_like_xdp};
+pub(crate) use xdp::{extract_xdp, has_adobe_root, looks_like_xdp};
 #[cfg(feature = "zip")]
 pub(crate) use zip::extract_zip;
 // Exposed for the rar5_check example / integration tests.

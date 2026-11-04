@@ -114,13 +114,16 @@ const { assets, manifest } = collectAssets(root);
 const WORKERS = [
   ["cad.worker.js", path.join(root, "ts", "cad", "cad.worker.ts")],
   ["decode.worker.js", path.join(root, "ts", "image", "decode.worker.ts")],
-  ["markdown.worker.js", path.join(root, "ts", "text", "markdown.worker.ts")],
+  ["text.worker.js", path.join(root, "ts", "text", "text.worker.ts")],
   ["model.worker.js", path.join(root, "ts", "model", "model.worker.ts")],
   ["pdfjs.worker.js", path.join(root, "ts", "pdf", "pdfjs.worker.ts")],
   ["ranges.worker.js", path.join(root, "ts", "archive", "ranges.worker.ts")],
   ["sheets.worker.js", path.join(root, "ts", "office", "sheets.worker.ts")],
   ["slides.worker.js", path.join(root, "ts", "office", "slides.worker.ts")],
   ["docs.worker.js", path.join(root, "ts", "office", "docs.worker.ts")],
+  ["zip.worker.js", path.join(root, "ts", "office", "zip.worker.ts")],
+  ["table.worker.js", path.join(root, "ts", "office", "table.worker.ts")],
+  ["sniff.worker.js", path.join(root, "ts", "core", "sniff.worker.ts")],
   ["worker.js", path.join(pkg("@exav/unpack-wasm"), "js", "worker.js")],
   ...fs
     .readdirSync(path.join(ooxml, "dist", "assets"))

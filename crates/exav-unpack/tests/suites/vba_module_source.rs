@@ -1,4 +1,4 @@
-//! The VBA macro SOURCE must reach the `vba_project` artifact — not merely a
+//! The VBA macro SOURCE must reach the `vba_project` artifact, not merely a
 //! header block describing that a module exists.
 //!
 //! Every other macro fixture in the tree stops at record 0x0019 (MODULENAME), so
@@ -8,7 +8,7 @@
 //! and decompressing the MS-OVBA container holding the code.
 //!
 //! That decompressed text is what `Target:2` `Doc.*` signatures match against. A
-//! regression in it is silent in the worst way — the artifact is still emitted
+//! regression in it is silent in the worst way: the artifact is still emitted
 //! and the ContainsMacros heuristic still fires, while every macro-content
 //! signature quietly matches nothing.
 
@@ -18,7 +18,7 @@ use std::io::Write;
 /// An MS-OVBA CompressedContainer holding `payload` in one UNCOMPRESSED chunk.
 ///
 /// [MS-OVBA] 2.4.1: a 0x01 signature byte, then chunks. The chunk header is a
-/// u16 — bit 15 the compressed flag, bits 14..12 the chunk signature 0b011, bits
+/// u16: bit 15 the compressed flag, bits 14..12 the chunk signature 0b011, bits
 /// 11..0 the size minus one. An uncompressed chunk is as legal as a compressed
 /// one and needs no compressor to produce, which is the only reason this fixture
 /// is writable by hand.
@@ -172,7 +172,7 @@ fn the_macro_source_is_assembled_through_the_lenient_reader() {
 #[test]
 fn a_module_whose_stream_is_absent_still_yields_a_project() {
     // The counterweight: the `dir` stream promises a module that is not there.
-    // exav must still report the project rather than dropping it — a document
+    // exav must still report the project rather than dropping it: a document
     // that declares macros is worth reporting even when the code is missing.
     let mut dir = Vec::new();
     dir.extend_from_slice(&record(0x0019, b"Ghost"));

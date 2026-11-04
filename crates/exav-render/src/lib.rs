@@ -25,10 +25,15 @@
 //!   presentations (PowerPoint 95 to 2003, ODP, FODP, Keynote) to PPTX, and
 //!   text documents (Word 6 to 2003, ODT, FODT, RTF, Word 2003 XML, Pages) to
 //!   DOCX, for an Open XML renderer to draw. Features `office-sheets`,
-//!   `office-slides`, `office-docs` (`office` for all three).
+//!   `office-slides`, `office-docs` (`office` for all three). Feature
+//!   `office-csv` adds CSV and TSV to XLSX in `sheets`, alone with the XLSX
+//!   writer and none of the readers.
 //! - [`text`]: the text a reader sees in a document, for a scanner or a
 //!   search: Markdown, HTML, Office and OpenDocument XML parts, PDF, and
 //!   AutoCAD drawings. Feature `text`.
+//! - [`text_view`]: JSON and XML indented and a diff's lines marked, as
+//!   lines of coloured pieces for a page. Feature `text-view`.
+//! - [`qr`]: the payloads of the QR codes in an image. Feature `qr`.
 //!
 //! Every decoder is safe Rust: this crate is `forbid(unsafe_code)`, so are
 //! exav-unpack's DXF and DWG readers and the hayro decoders, and
@@ -63,7 +68,7 @@ pub use formats::mesh;
 pub use formats::obj;
 #[cfg(feature = "office-docs")]
 pub use formats::office::docs;
-#[cfg(feature = "office-sheets")]
+#[cfg(any(feature = "office-sheets", feature = "office-csv"))]
 pub use formats::office::sheets;
 #[cfg(feature = "office-slides")]
 pub use formats::office::slides;
@@ -71,10 +76,14 @@ pub use formats::office::slides;
 pub use formats::pdf_image;
 #[cfg(feature = "ply")]
 pub use formats::ply;
+#[cfg(feature = "qr")]
+pub use formats::qr;
 #[cfg(feature = "stl")]
 pub use formats::stl;
 #[cfg(feature = "text")]
 pub use formats::text;
+#[cfg(feature = "text-view")]
+pub use formats::text_view;
 
 #[cfg(feature = "image")]
 mod image_codecs;

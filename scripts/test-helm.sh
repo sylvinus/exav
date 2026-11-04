@@ -36,13 +36,19 @@ for f in "$chart"/ci/*-values.yaml; do
   helm lint --strict "$chart" -f "$f"
   rendered=$(helm template exav "$chart" -f "$f")
 
-  for want in 'readOnlyRootFilesystem: true' 'runAsUser: 65532' \
-    'automountServiceAccountToken: false' 'seccompProfile'; do
+  for want in 'readOnlyRootFilesystem: true' 'runAsNonRoot: true' \
+    'runAsUser: 65532' 'runAsGroup: 65532' 'fsGroup: 65532' \
+    'allowPrivilegeEscalation: false' 'automountServiceAccountToken: false' \
+    'seccompProfile' 'mountPath: /var/lib/exav' 'mountPath: /tmp'; do
     if ! grep -q -- "$want" <<< "$rendered"; then
       echo "rendered manifest is missing expected setting: $want" >&2
       exit 1
     fi
   done
+  if ! grep -A1 -- 'drop:$' <<< "$rendered" | grep -q -- '- ALL$'; then
+    echo "rendered manifest must drop ALL capabilities" >&2
+    exit 1
+  fi
 
   # Off, and fixed: an explicit env entry wins over envFrom, which can carry
   # either name from a ConfigMap or Secret the chart cannot see.

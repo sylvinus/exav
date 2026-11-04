@@ -63,6 +63,12 @@ export interface ModelMeta {
   origin: [number, number, number];
   /** min xyz, max xyz, relative to `origin`. */
   bounds: [number, number, number, number, number, number] | null;
+  /**
+   * IFC: the box to frame the view by, in the same terms as `bounds`: around
+   * the elements, less any left far from the rest. Null for the other
+   * formats, and for a model without elements.
+   */
+  framing: [number, number, number, number, number, number] | null;
   batches: BatchMeta[];
   elements: ElementMeta[];
   /** `elevation`: a storey's, in metres. */

@@ -2,7 +2,7 @@
 //!
 //! A compiled Java `.class` file begins with a fixed header
 //! (`0xCAFEBABE`, `minor`/`major` version, `constant_pool_count`) followed by
-//! the *constant pool* — a table that stores every class name, method name,
+//! the *constant pool*, a table that stores every class name, method name,
 //! field name, type descriptor and string literal used by the class. All of
 //! those human-readable names live in `CONSTANT_Utf8` entries, which is exactly
 //! where a malware signature matches (e.g. a suspicious class/method name or an
@@ -23,15 +23,11 @@ use crate::*;
 /// The constant-pool tag for a UTF-8 string entry (JVM spec: `CONSTANT_Utf8`).
 const TAG_UTF8: u8 = 1;
 
-/// Surface every `CONSTANT_Utf8` entry of a Java `.class` file — concatenated
-/// and newline-separated — as a single `java-class-strings` member. The output
+/// Surface every `CONSTANT_Utf8` entry of a Java `.class` file, concatenated
+/// and newline-separated, as a single `java-class-strings` member. The output
 /// is bounded by the budget cap as it is built. Truncated, malformed or hostile
 /// input yields at most the bytes parsed before the fault, and never panics.
-pub(crate) fn extract_javaclass<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_javaclass(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     // Reserve the output budget up front so we can bound the collected Utf8
     // bytes as we walk the pool (mirrors pyc.rs: count_entry then reserve).
     budget.count_entry()?;
@@ -83,7 +79,7 @@ pub(crate) fn extract_javaclass<R>(
                 pos += len;
                 // Bound the running output by the reserved cap. If appending this
                 // string (plus its newline separator) would exceed the cap, stop
-                // and emit what we have — treat the cap as a hard limit.
+                // and emit what we have: treat the cap as a hard limit.
                 let projected = out.len() as u64 + bytes.len() as u64 + 1;
                 if projected > cap {
                     break;
@@ -95,8 +91,8 @@ pub(crate) fn extract_javaclass<R>(
             }
             3 => 4,  // Integer
             4 => 4,  // Float
-            5 => 8,  // Long — consumes two slots
-            6 => 8,  // Double — consumes two slots
+            5 => 8,  // Long, consumes two slots
+            6 => 8,  // Double, consumes two slots
             7 => 2,  // Class
             8 => 2,  // String
             9 => 4,  // Fieldref
@@ -167,7 +163,7 @@ mod tests {
         let mut pool = Vec::new();
         // Slot 1: Utf8 marker.
         push_utf8(&mut pool, b"EICAR-JAVA-MARKER");
-        // Slots 2 & 3: Long (tag 5, 8 payload bytes) — consumes two slots.
+        // Slots 2 & 3: Long (tag 5, 8 payload bytes), consumes two slots.
         pool.push(5);
         pool.extend_from_slice(&0x0102030405060708u64.to_be_bytes());
         // Slot 4: another Utf8, to prove parsing resumed correctly after the

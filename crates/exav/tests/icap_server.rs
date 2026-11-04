@@ -3,7 +3,7 @@
 //!
 //! Two things make this the shape these answers need. The bytes on the wire are
 //! the only thing a c-icap client or Squid ever sees, so the client below parses
-//! them with its own code rather than the server's — a framing bug both sides
+//! them with its own code rather than the server's: a framing bug both sides
 //! share would otherwise cancel itself out. And the server is the shipped
 //! binary, started from a command line, so the flag parsing, the database load
 //! and the listener are the ones an operator gets.
@@ -39,7 +39,7 @@ const REQ_HDR: &[u8] = b"POST /upload HTTP/1.1\r\nHost: example.test\r\n\r\n";
 /// in hand, and some of these properties are about what happens when it does.
 fn encrypted_zip() -> Vec<u8> {
     const NAME: &str = "secret.bin";
-    // Anything at all — the general-purpose bit flag is what marks the member
+    // Anything at all: the general-purpose bit flag is what marks the member
     // encrypted, and no reader gets past that without a password.
     const DATA: &[u8] = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0cciphertext";
     /// Bit 0 of the general-purpose bit flag: the member is encrypted.
@@ -52,7 +52,7 @@ fn encrypted_zip() -> Vec<u8> {
     out.extend_from_slice(&0u16.to_le_bytes()); // stored
     out.extend_from_slice(&0u16.to_le_bytes()); // time
     out.extend_from_slice(&0u16.to_le_bytes()); // date
-    out.extend_from_slice(&0u32.to_le_bytes()); // crc — unchecked, nothing decodes this
+    out.extend_from_slice(&0u32.to_le_bytes()); // crc, unchecked: nothing decodes this
     out.extend_from_slice(&(DATA.len() as u32).to_le_bytes());
     out.extend_from_slice(&(DATA.len() as u32).to_le_bytes());
     out.extend_from_slice(&(NAME.len() as u16).to_le_bytes());
@@ -128,7 +128,7 @@ impl Server {
         Server::start_at("icap://127.0.0.1:0", db, extra)
     }
 
-    /// The same, with the listen address spelled out — for the settings that
+    /// The same, with the listen address spelled out, for the settings that
     /// ride on it (`?mode=`, `?max-connections=`) rather than on a flag.
     fn start_at(listen: &str, db: TempDir, extra: &[&str]) -> Server {
         let dir = TempDir::new().unwrap();
@@ -155,6 +155,11 @@ impl Server {
             _db: db,
             _dir: dir,
         }
+    }
+
+    /// What the server has written to its stderr so far.
+    fn log(&self) -> String {
+        std::fs::read_to_string(self._dir.path().join("stderr.log")).unwrap_or_default()
     }
 
     fn connect(&self) -> Conn {
@@ -224,7 +229,7 @@ fn start_default() -> Server {
 }
 
 /// A port nothing is listening on, for the tests that need the clamd listener
-/// alongside the ICAP one. Racy in principle, free of coordination in practice —
+/// alongside the ICAP one. Racy in principle, free of coordination in practice,
 /// and the ICAP side already asks the kernel for its own.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -530,27 +535,28 @@ fn options_advertises_everything_a_client_needs() {
     assert!(istag.len() <= 32, "{istag}");
 }
 
-/// `off` leaves the header out of `OPTIONS`, which RFC 3507 reads as "do not
-/// preview" and "never expires", while `0` is a value a client acts on: a
-/// headers-only preview, and asking again every time.
+/// `off` on the address leaves the header out of `OPTIONS`, which RFC 3507
+/// reads as "do not preview" and "never expires", while `0` is a value a
+/// client acts on: a headers-only preview, and asking again every time.
 #[test]
 fn off_leaves_preview_and_options_ttl_out_where_0_sends_them() {
-    let options = |extra: &[&str]| {
-        let s = Server::start(TempDir::new().unwrap(), extra);
+    let options = |query: &str| {
+        let at = format!("icap://127.0.0.1:0{query}");
+        let s = Server::start_at(&at, TempDir::new().unwrap(), &[]);
         let mut c = s.connect();
         c.send(b"OPTIONS icap://127.0.0.1/avscan ICAP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
         c.recv()
     };
-    let r = options(&[
-        "--icap-preview-bytes",
-        "off",
-        "--icap-options-ttl-secs",
-        "off",
-    ]);
+    let r = options("");
+    assert_eq!(r.header("Preview"), Some("4096"), "{r:?}");
+    assert_eq!(r.header("Options-TTL"), Some("3600"), "{r:?}");
+    assert_eq!(r.header("Transfer-Preview"), Some("*"), "{r:?}");
+    let r = options("?preview-bytes=off&options-ttl-secs=off&transfer-preview=off");
     assert_eq!(r.code, 200, "{r:?}");
     assert!(!r.has_header("Preview"), "{r:?}");
     assert!(!r.has_header("Options-TTL"), "{r:?}");
-    let r = options(&["--icap-preview-bytes", "0", "--icap-options-ttl-secs", "0"]);
+    assert!(!r.has_header("Transfer-Preview"), "{r:?}");
+    let r = options("?preview-bytes=0&options-ttl-secs=0");
     assert_eq!(r.header("Preview"), Some("0"), "{r:?}");
     assert_eq!(r.header("Options-TTL"), Some("0"), "{r:?}");
 }
@@ -592,7 +598,7 @@ fn every_configured_service_alias_answers() {
 /// for one name must not keep answering on three it never configured.
 ///
 /// The address is the ICAP URL a proxy is pointed at, so this is the same string
-/// on both sides — what a `squid.conf` contains is what exav is started with.
+/// on both sides: what a `squid.conf` contains is what exav is started with.
 #[test]
 fn the_path_of_the_address_replaces_the_default_services() {
     let s = Server::start_at(
@@ -846,8 +852,8 @@ fn an_object_past_the_size_limit_blocks_rather_than_passing() {
 #[test]
 fn every_block_is_legible_to_a_client_that_reads_only_x_infection_found() {
     // A whole class of ICAP client decides clean-or-not from that header alone
-    // — a script that hands a file to `c-icap-client` and greps the response,
-    // for one. Such a client reads a 200 without the header as a pass, so
+    // (a script that hands a file to `c-icap-client` and greps the response,
+    // for one). Such a client reads a 200 without the header as a pass, so
     // withholding it from a partial block would turn exav's fail-closed
     // answer into a fail-open one.
     let s = Server::start(TempDir::new().unwrap(), &["--max-input-bytes", "1024"]);
@@ -872,7 +878,7 @@ fn every_block_is_legible_to_a_client_that_reads_only_x_infection_found() {
     );
 
     // An object nobody examined, reported under a name that cannot be mistaken
-    // for one — no database ships `Heuristics.Exav.*`.
+    // for one: no database ships `Heuristics.Exav.*`.
     let mut c = s.connect();
     c.send(&request(
         "RESPMOD",
@@ -907,16 +913,12 @@ fn every_block_is_legible_to_a_client_that_reads_only_x_infection_found() {
 #[test]
 fn the_detections_policy_keeps_the_infection_header_for_database_hits_alone() {
     // The opt-out, for a deployment that wants `X-Infection-Found` to mean a
-    // database hit and nothing else. The block itself does not change — only
+    // database hit and nothing else. The block itself does not change, only
     // how it is spelled for a client that reads that header.
-    let s = Server::start(
+    let s = Server::start_at(
+        "icap://127.0.0.1:0?infection-header=detections",
         TempDir::new().unwrap(),
-        &[
-            "--max-input-bytes",
-            "1024",
-            "--icap-infection-header",
-            "detections",
-        ],
+        &["--max-input-bytes", "1024"],
     );
     let mut c = s.connect();
     c.send(&request(
@@ -1024,7 +1026,7 @@ fn a_deployment_can_take_delivery_of_what_exav_could_not_examine() {
 
     assert_eq!(r.code, 204, "the object is delivered, not blocked: {r:?}");
     // Delivered, but not passed off as clean: the client is told what was
-    // skipped, and never told it was an infection — that would be false, and it
+    // skipped, and never told it was an infection: that would be false, and it
     // would make the header-only client this setting exists for block anyway.
     assert_eq!(r.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
     assert!(r.has_header("X-Exav-Reason"), "{r:?}");
@@ -1106,7 +1108,7 @@ fn a_pass_still_hands_back_a_whole_message_when_the_client_wants_one() {
 fn an_over_limit_object_cannot_be_passed_to_a_client_that_wants_it_back() {
     // The one object no policy can pass. Its tail was read and discarded to
     // reach the next request boundary, so the bytes needed to hand the message
-    // back are gone — and handing back the head alone would deliver a truncated
+    // back are gone, and handing back the head alone would deliver a truncated
     // object as though it were the whole one. The block stands.
     let s = Server::start(
         TempDir::new().unwrap(),
@@ -1156,7 +1158,7 @@ fn nothing_is_passed_unless_a_deployment_asks_for_it() {
 #[test]
 fn a_misspelled_pass_policy_stops_the_server_rather_than_never_firing() {
     // A policy that parsed but matched nothing would leave an operator believing
-    // they had opened a hole they had not — found out from traffic, months on.
+    // they had opened a hole they had not, found out from traffic, months on.
     let dir = TempDir::new().unwrap();
     let out = Command::new(exav_bin())
         .arg("--listen")
@@ -1178,7 +1180,7 @@ fn a_misspelled_pass_policy_stops_the_server_rather_than_never_firing() {
 fn an_object_too_big_to_scan_is_the_same_object_on_either_listener() {
     // The ICAP listener has no size ceiling of its own, so an object's size is
     // one setting with one answer. Before, a 50 MB upload was scanned normally
-    // over clamd and blocked over ICAP — the same file, two verdicts, decided by
+    // over clamd and blocked over ICAP: the same file, two verdicts, decided by
     // which port it arrived at.
     //
     // Both listeners in one process, so the comparison is between two surfaces
@@ -1289,7 +1291,7 @@ fn no_spill_keeps_scanned_bytes_off_the_disk() {
     // For a read-only root filesystem, or a deployment that would rather refuse
     // a large object than let a scanned payload touch a disk. The threshold
     // becomes a hard per-object memory ceiling, and past it there is nowhere
-    // left to put the object — which is a verdict, not a silent pass.
+    // left to put the object, which is a verdict, not a silent pass.
     let s = Server::start(
         TempDir::new().unwrap(),
         &["--spill-dir", "off", "--spill-threshold-bytes", "8192"],
@@ -1401,7 +1403,7 @@ fn icap_scans_are_counted_and_reported_through_stats() {
         &[
             // The thread model, so both listeners share one process and one set
             // of counters. Under the worker pool ICAP is a forked child and its
-            // scans are its own — which `STATS` says rather than hides.
+            // scans are its own, which `STATS` says rather than hides.
             "--workers",
             "threads",
             "--listen",
@@ -1714,11 +1716,45 @@ fn connection_close_is_honoured() {
     assert!(rest.is_empty(), "server kept the connection open");
 }
 
+/// A client that sends its object and never reads the answer is cut once one
+/// write has waited `?idle-secs=`, or once the writes of the answer have waited
+/// `?reply-secs=` in all, and the log says so, as for a clamd client.
+#[test]
+fn a_client_that_never_reads_its_answer_is_cut_and_logged() {
+    for listen in [
+        "icap://127.0.0.1:0?idle-secs=1",
+        "icap://127.0.0.1:0?reply-secs=1",
+    ] {
+        let s = Server::start_at(listen, TempDir::new().unwrap(), &[]);
+        let mut c = s.connect();
+        // Sent back whole, without `Allow: 204`: more than the sockets of both
+        // ends hold.
+        let payload = vec![b'a'; 32 << 20];
+        c.send(&request(
+            "RESPMOD",
+            "avscan",
+            Some(REQ_HDR),
+            Some(RES_HDR),
+            Some(&payload),
+            &[],
+        ));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !s.log().contains("did not read its reply") {
+            assert!(Instant::now() < deadline, "{listen}: {}", s.log());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 #[test]
 fn the_keepalive_request_count_is_honoured() {
     // c-icap's MaxKeepAliveRequests: a connection serves that many and then
     // closes, so no client can hold one open indefinitely.
-    let s = Server::start(TempDir::new().unwrap(), &["--icap-max-requests", "2"]);
+    let s = Server::start_at(
+        "icap://127.0.0.1:0?max-requests=2",
+        TempDir::new().unwrap(),
+        &[],
+    );
     let mut c = s.connect();
     for _ in 0..2 {
         c.send(b"OPTIONS icap://127.0.0.1/avscan ICAP/1.0\r\n\r\n");

@@ -28,6 +28,10 @@ pub struct Scene {
     pub nodes: Vec<Node>,
     /// Smallest and largest corner of the triangles, relative to `origin`.
     pub bounds: Option<[[f32; 3]; 2]>,
+    /// The box to frame the model by, relative to `origin`: around its
+    /// elements, less those far from the rest. Set by the IFC reader only;
+    /// `None` for the others and for a model without elements.
+    pub framing: Option<[[f32; 3]; 2]>,
     pub warnings: Warnings,
 }
 

@@ -12,15 +12,25 @@
 //! This is the only compound file reader of the workspace: the scanner walks
 //! [`Compound::streams`] and reads each with a cap, the converters of
 //! exav-render ask for the streams they know by name.
+//!
+//! The file is in memory ([`Compound::open`]) or read through a source
+//! ([`Compound::open_source`]). Either way the FAT, the miniFAT and the mini
+//! stream are not copied: what is held is the list of the FAT's sectors, the
+//! sectors of the miniFAT's and the mini stream's chains, and the directory.
+//! A chain is followed by reading the FAT where it is, and a stream can be
+//! read as it goes ([`Compound::reader`]).
 
+use crate::source::ByteSource;
 use std::borrow::Cow;
 
 /// The first eight bytes of a compound file.
 pub const SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
 const MAXREGSECT: u32 = 0xFFFF_FFFA;
-#[cfg(any(test, feature = "test-util"))]
 const ENDOFCHAIN: u32 = 0xFFFF_FFFE;
+/// The most a [`StreamReader`] reads from the file at once, over sectors
+/// that follow each other.
+const RUN_BYTES: usize = 64 * 1024;
 #[cfg(any(test, feature = "test-util"))]
 const NOSTREAM: u32 = 0xFFFF_FFFF;
 /// Streams under this size live in the mini stream ([MS-CFB] 2.2: the header
@@ -44,19 +54,156 @@ struct Entry {
     size: u64,
 }
 
-/// A compound file in memory.
+/// Where a compound file's bytes are.
+#[derive(Clone, Copy)]
+enum Data<'a> {
+    Mem(&'a [u8]),
+    Src(&'a dyn ByteSource),
+}
+
+impl<'a> Data<'a> {
+    fn len(self) -> usize {
+        match self {
+            Data::Mem(d) => d.len(),
+            Data::Src(s) => s.len(),
+        }
+    }
+
+    /// Up to `len` bytes from `off`, fewer where the file ends.
+    fn window(self, off: usize, len: usize) -> Cow<'a, [u8]> {
+        match self {
+            Data::Mem(d) => {
+                let end = off.saturating_add(len).min(d.len());
+                Cow::Borrowed(d.get(off..end).unwrap_or(&[]))
+            }
+            Data::Src(s) => s.window(off, len),
+        }
+    }
+}
+
+/// One bit per sector, for following a chain once.
+struct Seen(Vec<u64>);
+
+impl Seen {
+    fn new(n: usize) -> Seen {
+        Seen(vec![0; n.div_ceil(64)])
+    }
+
+    fn has(&self, i: usize) -> bool {
+        self.0.get(i / 64).is_some_and(|w| w & (1 << (i % 64)) != 0)
+    }
+
+    /// Marks `i`, false when it was marked already.
+    fn mark(&mut self, i: usize) -> bool {
+        let had = self.has(i);
+        if let Some(w) = self.0.get_mut(i / 64) {
+            *w |= 1 << (i % 64);
+        }
+        !had
+    }
+}
+
+/// A compound file.
 pub struct Compound<'a> {
-    data: &'a [u8],
+    data: Data<'a>,
     sector_size: usize,
     mini_size: usize,
-    fat: Vec<u32>,
-    minifat: Vec<u32>,
-    mini: Vec<u8>,
+    /// The FAT's sectors, in order, and the index of the first entry each
+    /// holds.
+    fat_sectors: Vec<u32>,
+    fat_starts: Vec<usize>,
+    /// Entries in the FAT, no more than the file has sectors.
+    fat_len: usize,
+    /// The sectors of the miniFAT's chain, and the entries it has.
+    minifat_chain: Vec<u32>,
+    minifat_len: usize,
+    /// The sectors of the mini stream's chain, and its length.
+    mini_chain: Vec<u32>,
+    mini_len: u64,
     entries: Vec<Entry>,
     /// The path of each entry from the root (`/Macros/VBA/dir`) where the tree
     /// reaches it, else its bare name.
     paths: Vec<String>,
     root: usize,
+    /// The directory or the mini stream is longer than the cap the file was
+    /// opened with, and was read only up to it.
+    cut: bool,
+}
+
+/// A stream read as it goes ([`Compound::reader`]): a run of sectors at a
+/// time, the FAT read where it is.
+pub struct StreamReader<'c, 'a> {
+    comp: &'c Compound<'a>,
+    next: u32,
+    left: u64,
+    seen: Seen,
+    buf: Cow<'a, [u8]>,
+    at: usize,
+}
+
+impl std::io::Read for StreamReader<'_, '_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.at >= self.buf.len() {
+            if self.left == 0 {
+                return Ok(0);
+            }
+            match self.next_run() {
+                Some(run) if !run.is_empty() => {
+                    self.buf = run;
+                    self.at = 0;
+                }
+                _ => {
+                    self.left = 0;
+                    return Ok(0);
+                }
+            }
+        }
+        let n = (self.buf.len() - self.at).min(out.len());
+        out[..n].copy_from_slice(&self.buf[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
+}
+
+impl<'a> StreamReader<'_, 'a> {
+    /// The next sectors of the chain that follow each other in the file, read
+    /// in one window, no more than what is left of the stream.
+    fn next_run(&mut self) -> Option<Cow<'a, [u8]>> {
+        let c = self.comp;
+        let ss = c.sector_size;
+        let valid = |s: u32, seen: &Seen| {
+            s <= MAXREGSECT && (s as usize) < c.fat_len && !seen.has(s as usize)
+        };
+        let first = self.next;
+        if !valid(first, &self.seen) {
+            return None;
+        }
+        self.seen.mark(first as usize);
+        let mut last = first;
+        let mut count = 1usize;
+        let mut next = c.fat_entry(first as usize).unwrap_or(ENDOFCHAIN);
+        while count * ss < RUN_BYTES
+            && ((count * ss) as u64) < self.left
+            && next == last.wrapping_add(1)
+            && valid(next, &self.seen)
+        {
+            self.seen.mark(next as usize);
+            last = next;
+            count += 1;
+            next = c.fat_entry(next as usize).unwrap_or(ENDOFCHAIN);
+        }
+        self.next = next;
+        let want = ((count * ss) as u64).min(self.left) as usize;
+        let run = c.data.window(c.sector_offset(first)?, want);
+        // Short only where the file ends or the source failed: nothing
+        // further of the chain is there.
+        if run.len() < want {
+            self.left = 0;
+        } else {
+            self.left -= want as u64;
+        }
+        Some(run)
+    }
 }
 
 /// One stream of the directory.
@@ -94,68 +241,82 @@ impl<'a> Compound<'a> {
     /// `None` when `data` is not a compound file or nothing of its directory
     /// can be read.
     pub fn open(data: &'a [u8]) -> Option<Compound<'a>> {
-        if data.len() < 512 || data[..8] != SIGNATURE {
+        Self::open_in(Data::Mem(data), u64::MAX)
+    }
+
+    /// As [`Compound::open`], over a source, holding no more than `cap` bytes
+    /// of the directory and no more of the mini stream than `cap` bytes reach
+    /// ([`Compound::cut`] says when one was longer).
+    pub fn open_source(src: &'a dyn ByteSource, cap: u64) -> Option<Compound<'a>> {
+        Self::open_in(Data::Src(src), cap)
+    }
+
+    fn open_in(data: Data<'a>, cap: u64) -> Option<Compound<'a>> {
+        let header = data.window(0, 512);
+        if data.len() < 512 || header.len() < 512 || header[..8] != SIGNATURE {
             return None;
         }
-        let shift = u16_at(data, 30);
+        let shift = u16_at(&header, 30);
         if !(7..=24).contains(&shift) {
             return None;
         }
-        let mini_shift = u16_at(data, 32);
+        let mini_shift = u16_at(&header, 32);
         if !(3..=12).contains(&mini_shift) {
             return None;
         }
         let sector_size = 1usize << shift;
-        let v4 = u16_at(data, 26) >= 4;
+        let v4 = u16_at(&header, 26) >= 4;
         let mut c = Compound {
             data,
             sector_size,
             mini_size: 1usize << mini_shift,
-            fat: vec![],
-            minifat: vec![],
-            mini: vec![],
+            fat_sectors: vec![],
+            fat_starts: vec![],
+            fat_len: 0,
+            minifat_chain: vec![],
+            minifat_len: 0,
+            mini_chain: vec![],
+            mini_len: 0,
             entries: vec![],
             paths: vec![],
             root: 0,
+            cut: false,
         };
         let sectors = c.sector_count();
 
-        // The FAT's sectors: the header's 109, then the DIFAT chain.
-        let mut fat_sectors: Vec<u32> = (0..109)
-            .map(|i| u32_at(data, 76 + i * 4))
-            .filter(|&s| s <= MAXREGSECT && (s as usize) < sectors)
-            .collect();
-        let mut seen = vec![false; sectors];
-        let mut difat = u32_at(data, 68);
+        // The FAT's sectors: the header's 109, then the DIFAT chain, until
+        // they hold an entry for every sector of the file.
+        let mut fat_len = 0usize;
+        let mut add = |c: &mut Compound<'a>, s: u32| {
+            if s <= MAXREGSECT && (s as usize) < sectors {
+                c.fat_sectors.push(s);
+                c.fat_starts.push(fat_len);
+                fat_len += c.sector_len(s) / 4;
+            }
+            fat_len >= sectors
+        };
+        let mut full = (0..109).any(|i| add(&mut c, u32_at(&header, 76 + i * 4)));
+        let mut seen = Seen::new(sectors);
+        let mut difat = u32_at(&header, 68);
         let per = sector_size / 4;
-        while difat <= MAXREGSECT && (difat as usize) < sectors && !seen[difat as usize] {
-            seen[difat as usize] = true;
-            let Some(sec) = c.sector(difat) else { break };
-            for i in 0..per - 1 {
-                let s = u32_at(sec, i * 4);
-                if s <= MAXREGSECT && (s as usize) < sectors {
-                    fat_sectors.push(s);
-                }
-            }
-            difat = u32_at(sec, (per - 1) * 4);
-        }
-        fat_sectors.truncate(sectors);
-        let mut fat = Vec::with_capacity(fat_sectors.len().min(sectors) * per);
-        for &s in &fat_sectors {
-            if let Some(sec) = c.sector(s) {
-                fat.extend((0..sec.len() / 4).map(|i| u32_at(sec, i * 4)));
-            }
-            if fat.len() >= sectors {
+        while !full && difat <= MAXREGSECT && (difat as usize) < sectors {
+            if !seen.mark(difat as usize) {
                 break;
             }
+            let Some(sec) = c.sector(difat) else { break };
+            full = (0..per - 1).any(|i| add(&mut c, u32_at(&sec, i * 4)));
+            difat = u32_at(&sec, (per - 1) * 4);
         }
-        fat.truncate(sectors);
-        if fat.is_empty() {
+        c.fat_len = fat_len.min(sectors);
+        if c.fat_len == 0 {
             return None;
         }
-        c.fat = fat;
 
-        let dir = c.read_chain(u32_at(data, 48), u64::MAX);
+        let mut dir = c.read_chain(u32_at(&header, 48), cap.saturating_add(1), false);
+        if dir.len() as u64 > cap {
+            c.cut = true;
+            dir.truncate(cap as usize);
+        }
         for e in dir.as_chunks::<128>().0 {
             let units = (usize::from(u16_at(e, 64)) / 2).min(NAME_UNITS);
             let name: Vec<u16> = (0..units)
@@ -183,67 +344,156 @@ impl<'a> Compound<'a> {
             .iter()
             .position(|e| e.kind == ROOT)
             .or((!c.entries.is_empty()).then_some(0))?;
-        let minifat = c.read_chain(u32_at(data, 60), u64::MAX);
-        c.minifat = (0..minifat.len() / 4)
-            .map(|i| u32_at(&minifat, i * 4))
-            .collect();
-        let root = &c.entries[c.root];
-        c.mini = c.read_chain(root.start, root.size);
+        // The mini stream and the miniFAT entries that index it, as the
+        // sectors of their chains.
+        let (start, size) = (c.entries[c.root].start, c.entries[c.root].size);
+        let (chain, held) = c.chain_sectors(start, size.min(cap.saturating_add(1)));
+        c.mini_len = held.min(size);
+        if c.mini_len > cap {
+            c.cut = true;
+            c.mini_len = cap;
+        }
+        c.mini_chain = chain;
+        let mini_sectors = c.mini_len.div_ceil(c.mini_size as u64);
+        let (chain, held) = c.chain_sectors(u32_at(&header, 60), mini_sectors.saturating_mul(4));
+        c.minifat_len = usize::try_from((held / 4).min(mini_sectors)).unwrap_or(usize::MAX);
+        c.minifat_chain = chain;
         c.paths = c.tree_paths();
         Some(c)
+    }
+
+    /// The directory or the mini stream was longer than the cap given to
+    /// [`Compound::open_source`]: what is past it was not read.
+    pub fn cut(&self) -> bool {
+        self.cut
     }
 
     fn sector_count(&self) -> usize {
         (self.data.len() - 1) / self.sector_size
     }
 
+    /// Where sector `s` starts in the file.
+    fn sector_offset(&self, s: u32) -> Option<usize> {
+        (s as usize).checked_add(1)?.checked_mul(self.sector_size)
+    }
+
+    /// The bytes of sector `s` the file has, `s` one of its sectors.
+    fn sector_len(&self, s: u32) -> usize {
+        let off = self.sector_offset(s).unwrap_or(usize::MAX);
+        self.sector_size.min(self.data.len().saturating_sub(off))
+    }
+
     /// Sector `s`, cut short at the end of the file.
-    fn sector(&self, s: u32) -> Option<&'a [u8]> {
-        let off = (s as usize).checked_add(1)?.checked_mul(self.sector_size)?;
+    fn sector(&self, s: u32) -> Option<Cow<'a, [u8]>> {
+        let off = self.sector_offset(s)?;
         if off >= self.data.len() {
             return None;
         }
-        Some(&self.data[off..(off + self.sector_size).min(self.data.len())])
+        Some(self.data.window(off, self.sector_size))
+    }
+
+    /// Entry `i` of the FAT, read where it is in the file.
+    fn fat_entry(&self, i: usize) -> Option<u32> {
+        if i >= self.fat_len {
+            return None;
+        }
+        let k = self
+            .fat_starts
+            .partition_point(|&s| s <= i)
+            .checked_sub(1)?;
+        let off = self.sector_offset(self.fat_sectors[k])? + (i - self.fat_starts[k]) * 4;
+        let w = self.data.window(off, 4);
+        (w.len() == 4).then(|| u32_at(&w, 0))
+    }
+
+    /// Entry `i` of the miniFAT, read where it is in the file.
+    fn minifat_entry(&self, i: usize) -> Option<u32> {
+        if i >= self.minifat_len {
+            return None;
+        }
+        let at = i * 4;
+        let s = *self.minifat_chain.get(at / self.sector_size)?;
+        let w = self
+            .data
+            .window(self.sector_offset(s)? + at % self.sector_size, 4);
+        (w.len() == 4).then(|| u32_at(&w, 0))
+    }
+
+    /// Mini sector `i`, cut short at the end of the mini stream.
+    fn mini_sector(&self, i: usize) -> Option<Cow<'a, [u8]>> {
+        let off = (i as u64).checked_mul(self.mini_size as u64)?;
+        if off >= self.mini_len {
+            return None;
+        }
+        let ss = self.sector_size as u64;
+        let s = *self.mini_chain.get(usize::try_from(off / ss).ok()?)?;
+        let len = (self.mini_size as u64).min(self.mini_len - off) as usize;
+        Some(
+            self.data
+                .window(self.sector_offset(s)? + (off % ss) as usize, len),
+        )
+    }
+
+    /// The sectors of the chain from `start`, until they hold `size` bytes or
+    /// the chain ends, and the bytes they hold.
+    fn chain_sectors(&self, start: u32, size: u64) -> (Vec<u32>, u64) {
+        let mut out = vec![];
+        let mut held = 0u64;
+        let mut seen = Seen::new(self.fat_len);
+        let mut s = start;
+        while s <= MAXREGSECT && held < size {
+            let i = s as usize;
+            if i >= self.fat_len || !seen.mark(i) {
+                break;
+            }
+            out.push(s);
+            held += self.sector_len(s) as u64;
+            s = self.fat_entry(i).unwrap_or(ENDOFCHAIN);
+        }
+        (out, held)
     }
 
     /// The stream's bytes in the file when its sectors follow each other
     /// there, as writers lay streams out.
-    fn contiguous(&self, start: u32, size: u64) -> Option<&'a [u8]> {
+    fn contiguous(&self, start: u32, size: u64) -> Option<Cow<'a, [u8]>> {
         let size = usize::try_from(size).ok()?;
         let count = size.div_ceil(self.sector_size);
-        let first = (start as usize)
-            .checked_add(1)?
-            .checked_mul(self.sector_size)?;
+        let first = self.sector_offset(start)?;
         if first.checked_add(size)? > self.data.len() {
             return None;
         }
         let mut s = start as usize;
         for _ in 1..count {
-            let next = *self.fat.get(s)? as usize;
+            let next = self.fat_entry(s)? as usize;
             if next != s + 1 {
                 return None;
             }
             s = next;
         }
-        Some(&self.data[first..first + size])
+        let w = self.data.window(first, size);
+        (w.len() == size).then_some(w)
     }
 
-    fn read_chain(&self, start: u32, size: u64) -> Vec<u8> {
+    /// The chain from `start`, up to `size` bytes. `presize` reserves them
+    /// first, for a size the caller bounded.
+    fn read_chain(&self, start: u32, size: u64, presize: bool) -> Vec<u8> {
         // Sized once: no stream is longer than the file holds, and growing
         // a large one would hold two copies for a while.
-        let cap = size.min(self.data.len() as u64) as usize + self.sector_size;
+        let cap = match presize {
+            true => size.min(self.data.len() as u64) as usize + self.sector_size,
+            false => 0,
+        };
         let mut out = Vec::with_capacity(cap);
-        let mut seen = vec![false; self.fat.len()];
+        let mut seen = Seen::new(self.fat_len);
         let mut s = start;
         while s <= MAXREGSECT && (out.len() as u64) < size {
             let i = s as usize;
-            if i >= self.fat.len() || seen[i] {
+            if i >= self.fat_len || !seen.mark(i) {
                 break;
             }
-            seen[i] = true;
             let Some(sec) = self.sector(s) else { break };
-            out.extend_from_slice(sec);
-            s = self.fat[i];
+            out.extend_from_slice(&sec);
+            s = self.fat_entry(i).unwrap_or(ENDOFCHAIN);
         }
         if (out.len() as u64) > size {
             out.truncate(size as usize);
@@ -253,26 +503,21 @@ impl<'a> Compound<'a> {
 
     fn read_mini_chain(&self, start: u32, size: u64) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut seen = vec![false; self.minifat.len()];
+        let mut seen = Seen::new(self.minifat_len);
         let mut s = start;
         while s <= MAXREGSECT && (out.len() as u64) < size {
             let i = s as usize;
-            if i >= self.minifat.len() || seen[i] {
+            if i >= self.minifat_len || !seen.mark(i) {
                 break;
             }
-            seen[i] = true;
-            let off = i * self.mini_size;
-            let Some(sec) = self
-                .mini
-                .get(off..(off + self.mini_size).min(self.mini.len()))
-            else {
+            let Some(sec) = self.mini_sector(i) else {
                 break;
             };
             if sec.is_empty() {
                 break;
             }
-            out.extend_from_slice(sec);
-            s = self.minifat[i];
+            out.extend_from_slice(&sec);
+            s = self.minifat_entry(i).unwrap_or(ENDOFCHAIN);
         }
         if (out.len() as u64) > size {
             out.truncate(size as usize);
@@ -361,14 +606,38 @@ impl<'a> Compound<'a> {
         let data = if e.size < MINI_CUTOFF {
             Cow::Owned(self.read_mini_chain(e.start, want))
         } else if let Some(d) = self.contiguous(e.start, want) {
-            Cow::Borrowed(d)
+            d
         } else {
-            Cow::Owned(self.read_chain(e.start, want))
+            Cow::Owned(self.read_chain(e.start, want, true))
         };
         // A chain that ends early is short of the size, not cut by the cap:
         // there is nothing more of it in the file.
         let truncated = e.size > cap && (data.len() as u64) < e.size;
         Stream { data, truncated }
+    }
+
+    /// The stream at `index`, read as it goes: as far as its chain goes and
+    /// no further than its size, without holding it.
+    pub fn reader(&self, index: usize) -> StreamReader<'_, 'a> {
+        let mut r = StreamReader {
+            comp: self,
+            next: ENDOFCHAIN,
+            left: 0,
+            seen: Seen::new(0),
+            buf: Cow::Borrowed(&[]),
+            at: 0,
+        };
+        let Some(e) = self.entries.get(index) else {
+            return r;
+        };
+        if e.size < MINI_CUTOFF {
+            r.buf = Cow::Owned(self.read_mini_chain(e.start, e.size));
+        } else {
+            r.next = e.start;
+            r.left = e.size;
+            r.seen = Seen::new(self.fat_len);
+        }
+        r
     }
 
     /// The first of `names` that names a stream at the root (else anywhere),
@@ -421,6 +690,39 @@ impl<'a> Compound<'a> {
             .filter(|e| e.kind == STORAGE || e.kind == STREAM)
             .map(|e| e.name.as_str())
     }
+}
+
+/// A document a compound file holds, by the stream it is in. A compound file
+/// may hold several (a Word document, a workbook, a presentation), each one
+/// an application could show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    /// `WordDocument`: Word 6 to 2003.
+    Word,
+    /// `Workbook` or `Book`: Excel 5 to 2003.
+    Workbook,
+    /// `PowerPoint Document` or `PP40`: PowerPoint 95 to 2003.
+    Presentation,
+}
+
+/// The documents the compound file `data` holds: Word, workbook,
+/// presentation, in that order. None when it is not a compound file.
+pub fn compound_kinds(data: &[u8]) -> Vec<Kind> {
+    let Some(c) = Compound::open(data) else {
+        return Vec::new();
+    };
+    let has = |n: &str| c.names().any(|s| s.eq_ignore_ascii_case(n));
+    let mut kinds = Vec::new();
+    if has("WordDocument") {
+        kinds.push(Kind::Word);
+    }
+    if has("Workbook") || has("Book") {
+        kinds.push(Kind::Workbook);
+    }
+    if has("PowerPoint Document") || has("PP40") {
+        kinds.push(Kind::Presentation);
+    }
+    kinds
 }
 
 /// A version 3 compound file holding `streams` at its root, each in the FAT
@@ -680,5 +982,141 @@ mod tests {
         assert_eq!(paths, ["/Macros/VBA/dir", "/top"]);
         assert_eq!(c.stream(&["top"]).unwrap(), b"y");
         assert_eq!(c.stream(&["dir"]).unwrap(), b"x");
+    }
+
+    fn cache(file: &[u8]) -> crate::source::BlockCache<std::io::Cursor<Vec<u8>>> {
+        crate::source::BlockCache::with_sizes(std::io::Cursor::new(file.to_vec()), 512, 4096)
+            .unwrap()
+    }
+
+    fn read_all(mut r: impl std::io::Read) -> Vec<u8> {
+        let mut v = vec![];
+        r.read_to_end(&mut v).unwrap();
+        v
+    }
+
+    /// Over a source as in memory: the same streams, read whole or as they
+    /// go, in a file large enough that its FAT continues in the DIFAT.
+    #[test]
+    fn a_source_reads_as_memory_does() {
+        let mut w = ::cfb::CompoundFile::create_with_version(
+            ::cfb::Version::V3,
+            std::io::Cursor::new(Vec::new()),
+        )
+        .unwrap();
+        let big: Vec<u8> = (0..8_000_000u32).map(|i| (i % 253) as u8).collect();
+        w.create_storage("/S").unwrap();
+        for (path, body) in [
+            ("/small", &b"hello"[..]),
+            ("/S/mid", &big[..5000]),
+            ("/big", &big[..]),
+            ("/S/tiny", &b"x"[..]),
+        ] {
+            std::io::Write::write_all(&mut w.create_stream(path).unwrap(), body).unwrap();
+        }
+        w.flush().unwrap();
+        let file = w.into_inner().into_inner();
+        // 109 FAT sectors hold 13,952 sectors of 512 bytes: past that, the
+        // DIFAT.
+        assert!(file.len() > 109 * 128 * 512);
+        let src = cache(&file);
+        let mem = Compound::open(&file).unwrap();
+        let s = Compound::open_source(&src, u64::MAX).unwrap();
+        assert!(!s.cut());
+        let a: Vec<_> = mem
+            .streams()
+            .map(|x| (x.path.to_string(), x.size))
+            .collect();
+        let b: Vec<_> = s.streams().map(|x| (x.path.to_string(), x.size)).collect();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 4);
+        for info in mem.streams() {
+            let whole = mem.read(info.index, u64::MAX).data.into_owned();
+            assert_eq!(whole.len() as u64, info.size, "{}", info.path);
+            assert_eq!(s.read(info.index, u64::MAX).data, whole, "{}", info.path);
+            assert_eq!(read_all(s.reader(info.index)), whole, "{}", info.path);
+            assert_eq!(read_all(mem.reader(info.index)), whole, "{}", info.path);
+        }
+        assert_eq!(s.stream(&["big"]).unwrap(), big);
+    }
+
+    /// A stream read as it goes follows its chain as a whole read does: out of
+    /// order, and ending where it loops.
+    #[test]
+    fn a_reader_follows_chains_out_of_order_and_stops_at_a_cycle() {
+        let big: Vec<u8> = (0..10_000u32).map(|i| (i % 13) as u8).collect();
+        let mut file = build(&[("Pictures", &big)]);
+        let fat_sector = u32_at(&file, 76) as usize;
+        let off = (fat_sector + 1) * 512;
+        file[off..off + 4].copy_from_slice(&2u32.to_le_bytes());
+        file[off + 8..off + 12].copy_from_slice(&1u32.to_le_bytes());
+        file[off + 4..off + 8].copy_from_slice(&3u32.to_le_bytes());
+        let src = cache(&file);
+        let c = Compound::open_source(&src, u64::MAX).unwrap();
+        let i = c.streams().next().unwrap().index;
+        let whole = c.read(i, u64::MAX).data.into_owned();
+        assert_eq!(whole.len(), big.len());
+        assert_eq!(read_all(c.reader(i)), whole);
+        // Sector 3 back to sector 0.
+        file[off + 12..off + 16].copy_from_slice(&0u32.to_le_bytes());
+        let src = cache(&file);
+        let c = Compound::open_source(&src, u64::MAX).unwrap();
+        let got = read_all(c.reader(i));
+        assert_eq!(got, c.read(i, u64::MAX).data.into_owned());
+        assert_eq!(got.len(), 2048);
+    }
+
+    /// A directory longer than the cap is read up to it, and says so.
+    #[test]
+    fn a_directory_past_the_cap_is_cut() {
+        let names: Vec<String> = (0..40).map(|i| format!("s{i:02}")).collect();
+        let streams: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"x"[..])).collect();
+        let file = build(&streams);
+        let src = cache(&file);
+        let c = Compound::open_source(&src, 128 * 10).unwrap();
+        assert!(c.cut());
+        assert!(c.streams().count() < 40);
+        let c = Compound::open_source(&src, 1 << 20).unwrap();
+        assert!(!c.cut());
+        assert_eq!(c.streams().count(), 40);
+    }
+
+    #[test]
+    fn each_document_of_a_compound_file_is_named() {
+        let both = build(&[
+            ("WordDocument", &[0u8; 64][..]),
+            ("PowerPoint Document", &[0u8; 64][..]),
+        ]);
+        assert_eq!(compound_kinds(&both), [Kind::Word, Kind::Presentation]);
+        let book = build(&[("Book", &[0u8; 64][..])]);
+        assert_eq!(compound_kinds(&book), [Kind::Workbook]);
+        assert!(compound_kinds(b"not a compound file").is_empty());
+    }
+
+    /// The kinds come in one order, whatever the order of the directory.
+    #[test]
+    fn a_workbook_and_a_word_stream_are_named_word_first() {
+        let file = build(&[
+            ("Workbook", &[0u8; 64][..]),
+            ("WordDocument", &[0u8; 64][..]),
+        ]);
+        assert_eq!(compound_kinds(&file), [Kind::Word, Kind::Workbook]);
+        // Names compare without regard to ASCII case.
+        let file = build(&[("pp40", &[0u8; 64][..]), ("BOOK", &[0u8; 64][..])]);
+        assert_eq!(compound_kinds(&file), [Kind::Workbook, Kind::Presentation]);
+    }
+
+    /// A stream's name written inside another stream is not a stream of the
+    /// directory.
+    #[test]
+    fn a_name_quoted_in_a_stream_is_not_a_document() {
+        let mut quote = Vec::new();
+        for c in "WordDocument".encode_utf16() {
+            quote.extend_from_slice(&c.to_le_bytes());
+        }
+        quote.resize(64, 0);
+        quote.extend_from_slice(&[26, 0, 2, 0]);
+        let file = build(&[("Notes", &quote[..])]);
+        assert!(compound_kinds(&file).is_empty());
     }
 }

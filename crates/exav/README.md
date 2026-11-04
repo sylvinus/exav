@@ -32,6 +32,10 @@ naming a `clamd://` and an `icap://` address on `--listen` replaces a
 exav ships **no signatures** (the ClamAV database is GPL). Fetch them with
 `freshclam` or `cvd`, or let `--auto-update` keep a directory current.
 
+`cargo install` builds with fat LTO and one codegen unit, which needs about
+3 GiB of memory; `--profile fast-build` is a shorter build that needs less, for
+a larger and slower binary.
+
 Full documentation, including the ClamAV flag matrix and the migration guide, is
 at **[exav.org](https://exav.org)**.
 

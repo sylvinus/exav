@@ -98,28 +98,26 @@ impl Gost40 {
         cipher
     }
 
+    /// The password goes into the first 5 bytes of the key (40 bits), the
+    /// words read little-endian.
     fn build_key_from_password(password: &str) -> [u32; 8] {
-        let mut key = [0u32; 8];
+        let mut key = [0u8; 32];
         let pwd_bytes = password.as_bytes();
         if pwd_bytes.is_empty() {
-            return key;
+            return [0; 8];
         }
 
         let mut pwd_idx = 0;
         for round in 0..64 {
             let byte_idx = round % 5;
-            let word = &mut key[byte_idx];
-            let bytes = word.to_le_bytes();
-            let mut new_bytes = bytes;
-            new_bytes[0] = new_bytes[0].wrapping_add(pwd_bytes[pwd_idx] << (round % 7));
-            *word = u32::from_le_bytes(new_bytes);
+            key[byte_idx] = key[byte_idx].wrapping_add(pwd_bytes[pwd_idx] << (round % 7));
             pwd_idx += 1;
             if pwd_idx >= pwd_bytes.len() {
                 pwd_idx = 0;
             }
         }
 
-        key
+        Self::bytes_to_u32s(&key)
     }
 
     fn encrypt_block(&self, block: &[u32; 2]) -> [u32; 2] {
@@ -275,5 +273,37 @@ pub fn decrypt_arj_data(
             gost.decrypt(data);
         }
         Some(ArjEncryption::Gost256) | Some(ArjEncryption::Unknown) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Gost40;
+
+    fn gost40_decrypt(password: &str, data: &[u8], chunk_len: usize) -> Vec<u8> {
+        let mut gost = Gost40::new(password, 0x9C, 0x5A3C_1234);
+        let mut out = data.to_vec();
+        for chunk in out.chunks_mut(chunk_len) {
+            gost.decrypt(chunk);
+        }
+        out
+    }
+
+    /// The vector of unarc-rs 0.8.1's `test_gost40_known_output`: the password
+    /// is added to the first 5 bytes of the key, not to the low byte of
+    /// each of its first 5 words.
+    #[test]
+    fn a_gost40_key_takes_the_password_in_its_first_five_bytes() {
+        let data: Vec<u8> = (0..29u8)
+            .map(|b| b.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let expected = [
+            0x39, 0xB2, 0xA0, 0x07, 0xA6, 0xC6, 0x64, 0x71, 0x2D, 0x58, 0x69, 0x69, 0xBD, 0x14,
+            0x00, 0x88, 0x5E, 0x97, 0x54, 0xE7, 0x3F, 0x3F, 0x80, 0x41, 0x3C, 0xBF, 0x15, 0xA4,
+            0x39,
+        ];
+        assert_eq!(gost40_decrypt("pässwörd", &data, data.len()), expected);
+        assert_eq!(gost40_decrypt("pässwörd", &data[..24], 8), expected[..24]);
+        assert_eq!(gost40_decrypt("pässwörd", &data, 3), expected);
     }
 }

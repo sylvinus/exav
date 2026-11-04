@@ -4,7 +4,7 @@
 // archive readers read by offset, synchronously, and meeting them on their own
 // terms is what lets a browser build share them instead of carrying a second
 // set. Synchronous reads of a `File` need `FileReaderSync`, which exists only
-// inside a Worker — so this file routes a `File` to a Worker and presents the
+// inside a Worker, so this file routes a `File` to a Worker and presents the
 // async API a page actually wants.
 //
 // Bytes already in memory take no Worker at all, so that path runs in-process
@@ -19,8 +19,16 @@ import init, {
   volumeSet,
   joinSet,
 } from "../pkg/exav_unpack_wasm.js";
+// By namespace: a build without the `zip` feature has no `zipTail`, and a
+// named import of it would fail the whole module at load.
+import * as pkg from "../pkg/exav_unpack_wasm.js";
 
 export { detectFormat, joinVolumes, isVolumePart, volumeSet, joinSet };
+
+export function zipTail(tail, size) {
+  if (!("zipTail" in pkg)) throw new Error("zipTail needs a build with the zip feature");
+  return pkg.zipTail(tail, size);
+}
 
 /**
  * Instantiate the module, once.
@@ -40,7 +48,7 @@ export default ready;
 /**
  * Run something against the in-process module, surviving a trap.
  *
- * `wasm32-unknown-unknown` is a `panic = "abort"` target — the `catch_unwind`
+ * `wasm32-unknown-unknown` is a `panic = "abort"` target: the `catch_unwind`
  * that turns a decoder panic into a returned limit everywhere else in exav
  * catches nothing here. A panic traps the module, its memory is gone, and every
  * later call into that instance fails. Left alone that makes ONE hostile
@@ -54,14 +62,14 @@ function inProcess(fn) {
     return fn();
   } catch (e) {
     // Only a TRAP poisons the instance. An ordinary `Err` from the Rust side
-    // arrives here as a thrown value too — "index out of bounds", "no password"
-    // — and those leave the module perfectly healthy. Treating them alike would
+    // arrives here as a thrown value too ("index out of bounds", "no password"),
+    // and those leave the module perfectly healthy. Treating them alike would
     // throw away a working instance on every routine error, and would report a
     // caller's own mistake as a decoder crash.
     //
     // A trap does not arrive under one name. A panic or a failed allocation
     // aborts and surfaces as `WebAssembly.RuntimeError`, but an exhausted stack
-    // surfaces as a plain `RangeError` — and it leaves the module just as
+    // surfaces as a plain `RangeError`, and it leaves the module just as
     // unusable, mid-frame with Rust's invariants broken. Matching only the
     // obvious name left that one running on a poisoned instance.
     const poisoned = e instanceof WebAssembly.RuntimeError || e instanceof RangeError;
@@ -96,7 +104,7 @@ function spawnWorker(override) {
   //
   // This is the containment `catch_unwind` cannot give here. A decoder panic
   // traps the module, and on a `panic = "abort"` target there is no catching
-  // it in Rust — but a Worker is disposable in a way a page is not. The trap
+  // it in Rust, but a Worker is disposable in a way a page is not. The trap
   // takes an instance the caller does not own, every request that instance held
   // is answered with an error rather than left unanswered, and the next archive
   // opens on a fresh one.
@@ -153,7 +161,7 @@ function presentEntry(raw) {
  * An open archive.
  *
  * Obtained from `Archive.open`. Members are listed without extracting them, and
- * extracted one at a time — for a `File` that means the archive is never held
+ * extracted one at a time: for a `File` that means the archive is never held
  * in memory whole.
  */
 export class Archive {
@@ -196,7 +204,7 @@ export class Archive {
 
     // Everything else runs in-process: bytes are already in memory, and a
     // caller-supplied `read` is synchronous, so neither needs a Worker. What
-    // counts as a valid source is decided in one place, in the wasm module —
+    // counts as a valid source is decided in one place, in the wasm module:
     // duplicating that test here is how the two come to disagree.
     await ready();
     archive.#local = WasmArchive.open(
@@ -217,7 +225,7 @@ export class Archive {
     // A trapped Worker is replaced, not reused, so an archive opened on the old
     // one no longer refers to anything. `postMessage` to a dead Worker neither
     // throws nor arrives, which would leave the caller waiting on a promise
-    // that can never settle — worse than an error, because nothing ever says
+    // that can never settle, worse than an error, because nothing ever says
     // the scan did not happen.
     if (this.#worker && this.#worker !== sharedWorker) {
       throw new Error(
@@ -253,10 +261,10 @@ export class Archive {
   /**
    * Extract every member.
    *
-   * Bounded by one budget across the whole archive, so `maxMembers`,
-   * `maxExtractedBytes` and the compression-ratio guard apply to the archive
-   * rather than to each member. Where a limit stops the walk, the last entry
-   * says so instead of the list simply ending.
+   * Bounded by one budget across the whole archive, so `maxMembers` and
+   * `maxExtractedBytes` apply to the archive rather than to each member. Where
+   * a limit stops the walk, the last entry says so instead of the list simply
+   * ending.
    */
   async extractAll(passwords) {
     this.#check();

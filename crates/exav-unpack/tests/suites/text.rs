@@ -253,6 +253,201 @@ fn a_document_is_known_by_its_bytes_or_its_path() {
     assert_eq!(kind("x", b""), None);
 }
 
+// ── the hyperlinks of an Office Open XML package ─────────────────────────────
+
+#[cfg(feature = "zip")]
+mod package {
+    use super::*;
+    use std::io::Write;
+
+    pub(crate) fn zip_of(members: &[(&str, &str)]) -> Vec<u8> {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in members {
+            w.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            w.write_all(data.as_bytes()).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    const RELS: &str = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://evil.example/login" TargetMode="External"/><Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/a.png"/></Relationships>"#;
+
+    fn links(data: &[u8]) -> exav_unpack::text::Extracted {
+        assert_eq!(kind("a.docx", &data), Some(Kind::Package));
+        extract(Kind::Package, data, 1 << 20, &Limits::default())
+    }
+
+    #[test]
+    fn a_word_hyperlink_is_its_label_and_the_target_its_rels_give() {
+        let doc = r#"<w:document xmlns:w="w" xmlns:r="r"><w:body><w:p><w:r><w:t>Before</w:t></w:r><w:hyperlink r:id="rId5"><w:r><w:t>https://www.</w:t></w:r><w:r><w:t>bank.example</w:t></w:r></w:hyperlink><w:hyperlink w:anchor="top"><w:r><w:t>inside</w:t></w:r></w:hyperlink></w:p></w:body></w:document>"#;
+        let data = zip_of(&[
+            ("[Content_Types].xml", "<Types/>"),
+            ("word/document.xml", doc),
+            ("word/_rels/document.xml.rels", RELS),
+        ]);
+        let e = links(&data);
+        assert_eq!(
+            e.text,
+            "https://www.bank.example (http://evil.example/login)\n"
+        );
+        assert_eq!(
+            e.links,
+            vec![(
+                "https://www.bank.example".to_string(),
+                "http://evil.example/login".to_string()
+            )]
+        );
+        assert!(!e.truncated);
+    }
+
+    #[test]
+    fn a_field_code_hyperlink_is_read_simple_or_complex() {
+        let doc = r#"<w:document xmlns:w="w"><w:body><w:p><w:fldSimple w:instr=" HYPERLINK &quot;http://one.example/&quot; "><w:r><w:t>paypal.com</w:t></w:r></w:fldSimple></w:p><w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> HYPERLINK "http://two.example/x" \o "tip"</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>bank.example</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p></w:body></w:document>"#;
+        let data = zip_of(&[("word/document.xml", doc)]);
+        let e = links(&data);
+        assert_eq!(
+            e.text,
+            "paypal.com (http://one.example/)\nbank.example (http://two.example/x)\n"
+        );
+        assert_eq!(e.links.len(), 2);
+    }
+
+    #[test]
+    fn a_slide_link_is_its_run_and_a_shape_link_has_no_label() {
+        let slide = r#"<p:sld xmlns:p="p" xmlns:a="a" xmlns:r="r"><p:cSld><p:spTree><p:pic><p:nvPicPr><p:cNvPr id="2" name="P"><a:hlinkClick r:id="rId5"/></p:cNvPr></p:nvPicPr></p:pic><p:sp><p:txBody><a:p><a:r><a:rPr><a:hlinkClick r:id="rId5"/></a:rPr><a:t>Sign in to bank.example</a:t></a:r><a:r><a:t> now</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#;
+        let data = zip_of(&[
+            ("ppt/slides/slide1.xml", slide),
+            ("ppt/slides/_rels/slide1.xml.rels", RELS),
+        ]);
+        let e = links(&data);
+        assert_eq!(
+            e.text,
+            "(http://evil.example/login)\nSign in to bank.example (http://evil.example/login)\n"
+        );
+    }
+
+    #[test]
+    fn a_sheet_link_is_labelled_by_its_display_or_its_cell() {
+        let sheet = r#"<worksheet xmlns:r="r"><sheetData><row r="1"><c r="A1" t="s"><v>1</v></c><c r="B1" t="inlineStr"><is><t>inline.example</t></is></c></row></sheetData><hyperlinks><hyperlink ref="A1" r:id="rId5"/><hyperlink ref="B1:B2" r:id="rId5"/><hyperlink ref="C1" r:id="rId5" display="shown.example"/><hyperlink ref="D1" location="Sheet2!A1"/></hyperlinks></worksheet>"#;
+        let shared =
+            r#"<sst><si><t>zero</t></si><si><r><t>bank</t></r><r><t>.example</t></r></si></sst>"#;
+        let data = zip_of(&[
+            ("xl/sharedStrings.xml", shared),
+            ("xl/worksheets/sheet1.xml", sheet),
+            ("xl/worksheets/_rels/sheet1.xml.rels", RELS),
+        ]);
+        let e = links(&data);
+        assert_eq!(
+            e.text,
+            "bank.example (http://evil.example/login)\n\
+             inline.example (http://evil.example/login)\n\
+             shown.example (http://evil.example/login)\n"
+        );
+    }
+
+    #[test]
+    fn a_package_is_known_by_its_name_or_its_members() {
+        let word = [
+            ("[Content_Types].xml", "<Types/>"),
+            ("word/document.xml", "<w:document/>"),
+        ];
+        let data = zip_of(&word);
+        assert_eq!(kind("attachment.bin", &data), Some(Kind::Package));
+        // Whatever member a writer puts first.
+        let props_first = zip_of(&[&[("docProps/app.xml", "<Properties/>")][..], &word].concat());
+        for name in ["x.zip", "", "attachment.bin"] {
+            assert_eq!(kind(name, &props_first), Some(Kind::Package), "{name:?}");
+        }
+        let other = zip_of(&[("readme.txt", "hi")]);
+        assert_eq!(kind("a.zip", &other), None);
+        assert_eq!(kind("a.xlsx", &other), Some(Kind::Package));
+        // The names of parts written in a member are not members.
+        let quoted = zip_of(&[("notes.txt", "[Content_Types].xml word/document.xml")]);
+        assert_eq!(kind("a.zip", &quoted), None);
+        // A descriptor with no main part is another kind of package.
+        let descriptor = zip_of(&[("[Content_Types].xml", "<Types/>")]);
+        assert_eq!(kind("a.zip", &descriptor), None);
+        // A package with no links has no text.
+        assert_eq!(links(&other).text, "");
+    }
+
+    #[test]
+    fn a_package_past_the_limits_is_cut() {
+        let doc = r#"<w:document xmlns:w="w" xmlns:r="r"><w:hyperlink r:id="rId5"><w:t>x</w:t></w:hyperlink></w:document>"#;
+        let data = zip_of(&[
+            ("word/document.xml", doc),
+            ("word/_rels/document.xml.rels", RELS),
+        ]);
+        let mut limits = Limits::default();
+        limits.max_members = 1;
+        assert!(extract(Kind::Package, &data, 1 << 20, &limits).truncated);
+    }
+}
+
+// ── the targets of a PDF's links ─────────────────────────────────────────────
+
+#[test]
+fn the_targets_a_pdf_reader_gives_are_links_without_labels() {
+    let uris = b"https://a.example/x\n#local\nhttps://b.example/\n";
+    assert_eq!(kind("pdf-uris", uris), Some(Kind::Targets));
+    assert_eq!(kind("uris.txt", uris), None);
+    let e = extract(Kind::Targets, uris, 1 << 20, &Limits::default());
+    assert_eq!(e.text, "(https://a.example/x)\n(https://b.example/)\n");
+    assert_eq!(
+        e.links,
+        [
+            (String::new(), "https://a.example/x".to_string()),
+            (String::new(), "https://b.example/".to_string())
+        ]
+    );
+}
+
+// ── an email's headers ───────────────────────────────────────────────────────
+
+#[cfg(feature = "email")]
+#[test]
+fn an_email_is_its_headers_with_display_names_and_encoded_words_decoded() {
+    let msg = "Received: from x by y\r\n\
+               From: =?UTF-8?B?UGF5UGFsIFNlcnZpY2U=?= <alerts@evil.example>\r\n\
+               Reply-To: \"Support\" <help@other.example>\r\n\
+               To: you@corp.example, \"Boss\" <boss@corp.example>\r\n\
+               Subject: =?ISO-8859-1?Q?Votre_compte_est_bloqu=E9?=\r\n\
+               Date: Mon, 2 Nov 2026 10:00:00 +0100\r\n\
+               MIME-Version: 1.0\r\n\
+               Content-Type: text/html\r\n\r\n\
+               <html><body><p>Hello</p></body></html>\r\n";
+    assert_eq!(kind("x", &msg.as_bytes()), Some(Kind::Email));
+    let e = extract(Kind::Email, msg.as_bytes(), 1 << 20, &Limits::default());
+    assert_eq!(
+        e.text,
+        "From: PayPal Service <alerts@evil.example>\n\
+         Reply-To: Support <help@other.example>\n\
+         To: you@corp.example, Boss <boss@corp.example>\n\
+         Subject: Votre compte est bloqué\n\
+         Date: Mon, 2 Nov 2026 10:00:00 +0100\n\
+         Hello\n"
+    );
+}
+
+#[cfg(feature = "email")]
+#[test]
+fn html_after_header_lines_is_read_as_well_as_the_headers() {
+    let page = b"From: a@b.example\nTo: c@d.example\n\n<html><body><p>Pay <b>now</b> at \
+                 <a href=\"https://evil.example/\">bank.example</a></p></body></html>";
+    assert_eq!(kind("x.html", page), Some(Kind::Email));
+    let e = extract(Kind::Email, page, 1 << 20, &Limits::default());
+    assert_eq!(
+        e.text,
+        "From: a@b.example\nTo: c@d.example\nPay now at bank.example (https://evil.example/)\n"
+    );
+    assert_eq!(e.links.len(), 1);
+    // A multipart message's parts are its members, not read here.
+    let multi = b"From: a@b.example\nTo: c@d.example\nContent-Type: multipart/alternative; \
+                  boundary=x\n\n--x\nContent-Type: text/html\n\n<p>part</p>\n--x--\n";
+    let e = extract(Kind::Email, multi, 1 << 20, &Limits::default());
+    assert_eq!(e.text, "From: a@b.example\nTo: c@d.example\n");
+}
+
 // ── PDF ──────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "text-pdf")]

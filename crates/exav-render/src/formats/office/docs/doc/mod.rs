@@ -96,6 +96,8 @@ pub(crate) struct Reader<'a> {
     pub edn_ref: Vec<u32>,
     pub edn_txt: Vec<u32>,
     pub atn_ref: Vec<(u32, String, usize)>,
+    /// The first comment of `atn_ref` at each position.
+    pub atn_at: HashMap<u32, usize>,
     pub atn_txt: Vec<u32>,
     pub owners: Vec<String>,
     /// (cp, is end, id) of bookmark and comment-range marks, by cp.
@@ -203,6 +205,7 @@ impl<'a> Reader<'a> {
             edn_ref: vec![],
             edn_txt: vec![],
             atn_ref: vec![],
+            atn_at: HashMap::new(),
             atn_txt: vec![],
             owners: vec![],
             marks: vec![],
@@ -440,6 +443,7 @@ impl Reader<'_> {
             let cch = usize::from(u16_at(d, 0)).min(9);
             let initials = utf16(d.get(2..2 + cch * 2).unwrap_or(&[]));
             let ibst = usize::from(u16_at(d, 20));
+            self.atn_at.entry(plc.cps[i]).or_insert(self.atn_ref.len());
             self.atn_ref.push((plc.cps[i], initials, ibst));
         }
         let (o, l) = self.fib.at(idx::PLCFAND_TXT);

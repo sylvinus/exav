@@ -12,8 +12,8 @@ If a malicious file is involved, give its **SHA-256** and where it can be
 obtained (MalwareBazaar, VirusTotal, the vendor). Do not attach the file, paste
 its bytes, or link to a copy you are hosting.
 
-If the file is *not* malicious — a benign archive exav mishandles, a document
-that fails to parse — attaching it is fine and helps a great deal.
+If the file is *not* malicious (a benign archive exav mishandles, a document
+that fails to parse), attaching it is fine and helps a great deal.
 
 ## What happened
 
@@ -28,7 +28,7 @@ exav ...
 ## Verdict and output
 
 Paste the full output, including the verdict line. If the verdict was
-`UNSCANNABLE`, `LIMITS-EXCEEDED` or `PASSWORD-PROTECTED`, include the reason —
+`UNSCANNABLE`, `LIMITS-EXCEEDED` or `PASSWORD-PROTECTED`, include the reason:
 those are not errors, and the reason is the part that identifies the cause.
 
 ## Environment

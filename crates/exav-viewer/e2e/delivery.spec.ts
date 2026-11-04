@@ -32,20 +32,25 @@ interface Fetched {
   byFrame: boolean;
 }
 
-/** Every response for the path `pathname`, as it arrives. */
-function record(page: Page, pathname: string): Fetched[] {
-  const seen: Fetched[] = [];
+/**
+ * Every response for the path `pathname`, as it arrives, but the first
+ * request for its first 64 KiB, the page's or the frame's, which tells what
+ * the file is (`sniffBytes`): that one is in `sniffs`.
+ */
+function record(page: Page, pathname: string): Fetched[] & { sniffs: Fetched[] } {
+  const seen = Object.assign([] as Fetched[], { sniffs: [] as Fetched[] });
   page.on("response", async (r) => {
     if (new URL(r.url()).pathname !== pathname) return;
     const request = r.request();
     const headers = await request.allHeaders().catch(() => request.headers());
-    seen.push({
+    const fetched = {
       url: r.url(),
       status: r.status(),
       range: headers.range,
       length: Number(r.headers()["content-length"] ?? 0),
       byFrame: request.frame().url().includes("/frame/"),
-    });
+    };
+    (seen.sniffs.length === 0 && fetched.range === "bytes=0-65535" ? seen.sniffs : seen).push(fetched);
   });
   return seen;
 }
@@ -109,6 +114,8 @@ test.describe("media by URL", () => {
     expect(await frame.locator(".exav-viewer-media video").evaluate((v: HTMLVideoElement) => v.src)).toBe(new URL("/e2e/paced/clip.webm", page.url()).href);
     await playAndSeek(frame);
     expect(seen.length).toBeGreaterThan(0);
+    // The page asked for nothing: a video given by its address is told by its name and type.
+    expect(seen.sniffs).toHaveLength(0);
     for (const f of seen) {
       expect(f.byFrame, f.url).toBe(true);
       expect(new URL(f.url).origin).toBe(new URL(page.url()).origin);
@@ -293,6 +300,29 @@ test.describe("archives", () => {
     await expect(page.frameLocator(".demo-frame iframe.exav-viewer-sandbox").locator(".exav-viewer-image-picture")).toHaveCount(1);
     expect(total(seen)).toBeLessThan(size("big.zip") * 0.2);
     await expect(page.locator(".demo-frame .exav-viewer-warnings")).toHaveCount(0);
+  });
+
+  test("by ranges: a ZIP's local headers are fetched together, in few rounds, from its directory", async ({ page }) => {
+    // Each answer is held back, so that a round of requests is a burst
+    // separated from the next by at least the delay.
+    const DELAY = 400;
+    const asked: number[] = [];
+    await page.route("**/e2e/big.zip", async (route) => {
+      asked.push(Date.now());
+      await new Promise((r) => setTimeout(r, DELAY));
+      await route.continue();
+    });
+    await open(page, "url=/e2e/big.zip");
+    await expect(page.locator(".demo-frame .exav-viewer-archive-head")).toHaveText("16 files");
+    // The first request is the detection's, for the first bytes.
+    const reads = asked.slice(1);
+    const rounds = reads.filter((t, i) => i === 0 || t - reads[i - 1]! > DELAY / 2).length;
+    // Its start and end, the rest of its end if needed, the headers' blocks:
+    // one round per member's header without the directory. One more round
+    // than the reader needs: the limits on a ZIP's directory are checked on
+    // its end, before the reader starts.
+    expect(reads.length).toBeGreaterThanOrEqual(16);
+    expect(rounds).toBeLessThanOrEqual(7);
   });
 
   test("a ZIP the ranged reader cannot list is read whole instead, and listed", async ({ page }) => {

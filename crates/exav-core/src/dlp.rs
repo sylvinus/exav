@@ -3,13 +3,13 @@
 //! the `--structured-cc-count` / `--structured-ssn-count` thresholds.
 //!
 //! Written independently from public sources:
-//! - **Luhn checksum** — the ISO/IEC 7812-1 check-digit algorithm.
-//! - **Payment-card prefixes / lengths** — the public Issuer Identification
+//! - **Luhn checksum**: the ISO/IEC 7812-1 check-digit algorithm.
+//! - **Payment-card prefixes / lengths**: the public Issuer Identification
 //!   Number (IIN/BIN) ranges and lengths for the major networks (see e.g. the
 //!   "Payment card number" reference on Wikipedia): Visa, Mastercard (incl. the
 //!   2-series `2221–2720`), American Express, Discover, Diners Club, JCB, and
 //!   UnionPay.
-//! - **SSN validity** — the US Social Security Administration's public rules: a
+//! - **SSN validity**, from the US Social Security Administration's public rules: a
 //!   `AAA-GG-SSSS` number where the area is `001–899` but never `666`, the group
 //!   is `01–99`, and the serial is `0001–9999`. Areas `900–999` were never
 //!   issued, so the publicly reserved advertising block `987-65-43xx` is

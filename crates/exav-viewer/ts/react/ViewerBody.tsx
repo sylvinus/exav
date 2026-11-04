@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useImperativeHandle, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
 import { createPortal } from "react-dom";
 
 import type { Controllers, Session, Status, ViewerFile } from "../core/types.js";
-import { PanelContext, RAIL_FITS, useSession, useStore, type PanelInfo } from "./hooks.js";
+import { PanelContext, RAIL_FITS, shownSession, useSession, useStore, whenControllers, type PanelInfo } from "./hooks.js";
 import { Piece } from "./parts.js";
 
 export interface ViewerBodyProps {
@@ -20,6 +20,19 @@ export interface ViewerBodyProps {
    * follow `controllers.archive.opened.session` to reach the member's.
    */
   children?: ReactNode | ((state: { session: Session | null; status: Status; controllers: Controllers }) => ReactNode);
+  /** Moves the view from the host: to a page, to one of the file's `highlights`. */
+  ref?: Ref<ViewerBodyHandle>;
+}
+
+/**
+ * What `ref` gives. Each acts on the session on screen (an archive's member
+ * when one is open), once its document is shown if it is not yet.
+ */
+export interface ViewerBodyHandle {
+  /** 1-based. */
+  goToPage(page: number): void;
+  /** By its `id`. */
+  goToHighlight(id: string): void;
 }
 
 /**
@@ -105,10 +118,38 @@ function PagesOf({ session, onPages }: { session: Session; onPages: NonNullable<
  * previous session first, which is what frees its worker, WebGL context and
  * bitmaps.
  */
-export function ViewerBody({ file, chrome = "default", onStatus, onPages, className, children }: ViewerBodyProps) {
+export function ViewerBody({ file, chrome = "default", onStatus, onPages, className, children, ref: handle }: ViewerBodyProps) {
   const { session, status, controllers, ref } = useSession(file.source ? file : null);
   const [rails, setRails] = useState<HTMLDivElement | null>(null);
   const [bars, setBars] = useState<HTMLDivElement | null>(null);
+
+  // A call made before the document is shown waits for it, and ends with the session.
+  const waiting = useRef(new Set<() => void>());
+  useEffect(() => {
+    const pending = waiting.current;
+    return () => {
+      for (const stop of pending) stop();
+      pending.clear();
+    };
+  }, [session]);
+  useImperativeHandle(handle, () => {
+    const act = <T,>(pick: (c: Controllers) => T | undefined, run: (controller: T) => void) => {
+      if (!session) return;
+      // Unset while `whenControllers` runs: a controller already there is used before it returns.
+      let stop: (() => void) | undefined;
+      let done = false;
+      stop = whenControllers(shownSession(session), pick, (c) => {
+        done = true;
+        if (stop) waiting.current.delete(stop);
+        run(c);
+      });
+      if (!done) waiting.current.add(stop);
+    };
+    return {
+      goToPage: (page) => act((c) => c.pages?.goTo, (goTo) => goTo(page)),
+      goToHighlight: (id) => act((c) => c.highlights, (h) => h.goTo(id)),
+    };
+  }, [session]);
 
   // Block bodies: a host callback may return a value (`(s) => log.push(s)`),
   // which React would take for the effect's cleanup and call.

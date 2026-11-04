@@ -3,19 +3,33 @@
  * say `converter: "exav"`, or when no external converter is set; to the
  * external converter when one is, and what `docs` does not recognise.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { RenderContext } from "../core/types.js";
-import { DocConversionError, sniffDocs } from "./docs.js";
+import { compoundFile } from "../test/compound.js";
+import { officeKindsNow, start } from "../test/sniff.js";
+import { storedZip } from "../test/stored-zip.js";
+import { DocConversionError, sniffDocs as sniff } from "./docs.js";
 import type { ConversionOptions } from "./index.js";
+
+// The containers are read by exav's readers, which the tests run in this process.
+vi.mock("./zip-engine.js", () => import("../test/sniff.js"));
+beforeAll(start);
+const sniffDocs = (b: Uint8Array) => sniff(b, officeKindsNow(b));
 
 const bytes = (...parts: (string | number[])[]) =>
   new Uint8Array(parts.flatMap((p) => (typeof p === "string" ? [...p].map((c) => c.charCodeAt(0)) : p)));
 
 const utf16 = (s: string) => [...s].flatMap((c) => [c.charCodeAt(0), 0]);
 
-/** A ZIP's first local header (30 bytes), then `rest`. */
-const zip = (rest: string) => bytes([0x50, 0x4b, 0x03, 0x04, ...new Array(26).fill(0)], rest);
+/** A stored ZIP whose members are the words of `rest`; a first word `mimetype...` is the member of that name holding the rest of the word. */
+const zip = (rest: string): Uint8Array =>
+  storedZip(
+    rest
+      .split(/\s+/)
+      .filter((w) => w && w !== "...")
+      .map((w, i) => (i === 0 && w.startsWith("mimetype") ? ["mimetype", bytes(w.slice(8))] : [w, new Uint8Array()]) as [string, Uint8Array]),
+  );
 
 const CFB = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
 
@@ -25,16 +39,32 @@ const entry = (name: string, type = 2) => {
   return [...units, ...new Array(64 - units.length).fill(0), (name.length + 1) * 2, 0, type, 0];
 };
 
-const DOC = bytes(CFB, entry("1Table"), entry("WordDocument"));
+const DOC = compoundFile(["1Table", "WordDocument"]);
 
 describe("what the bytes are", () => {
   it("reads compound files with a Word document stream as DOC", () => {
     expect(sniffDocs(DOC)).toBe("doc");
-    expect(sniffDocs(bytes(CFB, entry("wordDOCUMENT")))).toBe("doc");
+    expect(sniffDocs(compoundFile(["wordDOCUMENT"]))).toBe("doc");
     // A workbook is not one, nor is a file that only mentions the name.
-    expect(sniffDocs(bytes(CFB, entry("Workbook")))).toBeNull();
+    expect(sniffDocs(compoundFile(["Workbook"]))).toBeNull();
     expect(sniffDocs(bytes(CFB, utf16("WordDocument")))).toBeNull();
-    expect(sniffDocs(bytes(CFB, entry("WordDocument", 0)))).toBeNull();
+    expect(sniffDocs(compoundFile([["WordDocument", new Uint8Array(), 0]]))).toBeNull();
+  });
+
+  it("tells a compound file by its directory, not by a stream name written in its content", () => {
+    // A stream whose bytes are a directory entry called WordDocument.
+    const quoted = compoundFile([["Notes", bytes(entry("WordDocument"))]]);
+    expect(sniffDocs(quoted)).toBeNull();
+  });
+
+  it("reads the Word document of a compound file that holds a workbook too", () => {
+    expect(sniffDocs(compoundFile(["Workbook", "WordDocument"]))).toBe("doc");
+  });
+
+  it("takes a compound file the reader could not look into as its name says", () => {
+    // `officeKinds` says `null` for one past the reader's memory.
+    expect(sniff(compoundFile(["Workbook"]), null)).toBe("doc");
+    expect(sniff(bytes("{\\rtf1"), null)).toBeNull();
   });
 
   it("reads RTF whatever the name, after white space or a byte order mark", () => {
@@ -59,12 +89,33 @@ describe("what the bytes are", () => {
     expect(sniffDocs(zip("content.xml styles.xml xl/workbook.xml"))).toBeNull();
   });
 
+  it("tells a package by the members of its directory, not by bytes inside a member", () => {
+    // A ZIP that holds a document, stored: the document's own directory is in the last bytes.
+    const inner = zip("[Content_Types].xml word/document.xml");
+    expect(sniffDocs(storedZip([["backup.zip", inner]]))).toBeNull();
+  });
+
   it("reads flat OpenDocument text and Word 2003 XML, and nothing else as text", () => {
     expect(sniffDocs(bytes('<?xml version="1.0"?>\n<office:document office:mimetype="application/vnd.oasis.opendocument.text">'))).toBe("fodt");
     expect(sniffDocs(bytes('<office:document office:mimetype="application/vnd.oasis.opendocument.spreadsheet">'))).toBeNull();
     expect(sniffDocs(bytes('<?xml version="1.0"?><w:wordDocument xmlns:w="http://schemas.microsoft.com/office/word/2003/wordml">'))).toBe("wml2003");
     expect(sniffDocs(bytes("<html><body>"))).toBeNull();
     expect(sniffDocs(new Uint8Array())).toBeNull();
+  });
+
+  it("reads Word 2003 XML by its root element, not by a mention of its namespace", () => {
+    const ns = 'xmlns:w="http://schemas.microsoft.com/office/word/2003/wordml" xmlns:w10="urn:schemas-microsoft-com:office:word"';
+    const word = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<?mso-application progid="Word.Document"?>\r\n<!-- saved by Word -->\r\n<w:wordDocument ${ns}><w:body>`;
+    expect(sniffDocs(bytes(word))).toBe("wml2003");
+    expect(sniffDocs(bytes([0xef, 0xbb, 0xbf], word))).toBe("wml2003");
+    expect(sniffDocs(bytes(`<!DOCTYPE w:wordDocument [<!ENTITY a "<b>">]>\n<w:wordDocument ${ns}>`))).toBe("wml2003");
+    // A schema and a stylesheet of the format, and a Word 2007 XML package, which shares the instruction.
+    expect(sniffDocs(bytes(`<?xml version="1.0"?><xsd:schema ${ns}><xsd:element name="wordDocument"/>`))).toBeNull();
+    expect(sniffDocs(bytes(`<xsl:stylesheet ${ns}><xsl:template match="w:wordDocument">`))).toBeNull();
+    expect(sniffDocs(bytes('<?xml version="1.0"?><?mso-application progid="Word.Document"?><pkg:package xmlns:pkg="http://schemas.microsoft.com/office/2006/xmlPackage">'))).toBeNull();
+    // Text that mentions it, and a root left unfinished.
+    expect(sniffDocs(bytes("Notes on w:wordDocument and urn:schemas-microsoft-com:office:word"))).toBeNull();
+    expect(sniffDocs(bytes("<?xml version="))).toBeNull();
   });
 
   it("reads Word's Web Page, alone or in its MIME message, and no other HTML", () => {

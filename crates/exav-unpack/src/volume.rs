@@ -2,7 +2,7 @@
 //!
 //! A multi-volume archive is one logical archive spread over several files, and
 //! a member's compressed stream can run off the end of one and continue in the
-//! next — so no single file decodes it. Scanned one at a time, the payload is
+//! next, so no single file decodes it. Scanned one at a time, the payload is
 //! never reassembled.
 //!
 //! This module answers only the naming question: *do these names look like one
@@ -14,19 +14,30 @@
 //! on a filesystem generates candidate names from a parsed pattern and looks
 //! them up in one directory; nothing a file *contains* can steer that. The
 //! format that inverts this is CAB, whose header names the next cabinet inside
-//! the file — that string must be matched against a listing, never opened.
+//! the file: that string must be matched against a listing, never opened.
+//!
+//! [`plan`], [`join`] and [`rejoin_byte_split`] go on from the names to the
+//! files, which a caller hands over as closures: they open nothing themselves.
+
+mod bytespan;
+mod sets;
+
+pub use bytespan::ByteSpan;
+pub use sets::{
+    Fetch, Open, Parts, Resolved, SetKind, SetPlan, State, join, plan, rejoin_byte_split, set_name,
+};
 
 /// How a set names its volumes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Scheme {
-    /// `stem.partN.rar` — RAR 3 and later. Digit width is fixed across a set.
+    /// `stem.partN.rar`: RAR 3 and later. Digit width is fixed across a set.
     RarPart { width: usize },
-    /// `stem.rar`, `stem.r00`, `stem.r01` … — the pre-RAR3 scheme.
+    /// `stem.rar`, `stem.r00`, `stem.r01` …: the pre-RAR3 scheme.
     RarOld,
-    /// `stem.7z.001`, `.002` … — also used by `zip.001`, `arj.001` and others,
+    /// `stem.7z.001`, `.002` …: also used by `zip.001`, `arj.001` and others,
     /// since it is the generic "split a finished file" convention.
     NumberedSuffix { base_ext: String, width: usize },
-    /// `stem.zip`, `stem.z01`, `stem.z02` … — the ZIP spanning convention,
+    /// `stem.zip`, `stem.z01`, `stem.z02` …: the ZIP spanning convention,
     /// where the LAST file is the one holding the central directory.
     ZipSplit,
 }
@@ -75,7 +86,7 @@ pub fn parse(name: &str) -> Option<VolumeName> {
     let (stem_l, ext) = lower.rsplit_once('.')?;
     let stem = &name[..stem_l.len()];
 
-    // `stem.rNN` — continuation of the old RAR scheme. `.r00` is volume 1.
+    // `stem.rNN`: continuation of the old RAR scheme. `.r00` is volume 1.
     if let Some(digits) = ext.strip_prefix('r')
         && digits.len() == 2
         && digits.bytes().all(|b| b.is_ascii_digit())
@@ -88,7 +99,7 @@ pub fn parse(name: &str) -> Option<VolumeName> {
         });
     }
 
-    // `stem.zNN` — ZIP spanning. `.z01` is volume 0; the bare `.zip` is LAST,
+    // `stem.zNN`: ZIP spanning. `.z01` is volume 0; the bare `.zip` is LAST,
     // because it carries the central directory.
     if let Some(digits) = ext.strip_prefix('z')
         && digits.len() == 2
@@ -102,7 +113,7 @@ pub fn parse(name: &str) -> Option<VolumeName> {
         });
     }
 
-    // `stem.<ext>.NNN` — the generic numbered split (7z, zip, arj, tar…).
+    // `stem.<ext>.NNN`: the generic numbered split (7z, zip, arj, tar…).
     if ext.len() >= 2 && ext.bytes().all(|b| b.is_ascii_digit()) {
         let n: usize = ext.parse().ok()?;
         let (base_l, base_ext) = stem_l.rsplit_once('.')?;
@@ -126,7 +137,7 @@ impl VolumeName {
     /// The filename of volume `index` in this set, or `None` when the scheme
     /// cannot express it.
     ///
-    /// Generated from the parsed pattern, never from file content — this is the
+    /// Generated from the parsed pattern, never from file content: this is the
     /// function a filesystem resolver uses, so it must not be able to name
     /// anything outside the set.
     pub fn name_at(&self, index: usize) -> Option<String> {
@@ -147,7 +158,7 @@ impl VolumeName {
     }
 
     /// Whether two names belong to the same set. Both the stem and the scheme
-    /// must agree — `a.part1.rar` and `a.7z.001` share a stem and are not one
+    /// must agree: `a.part1.rar` and `a.7z.001` share a stem and are not one
     /// archive.
     pub fn same_set_as(&self, other: &VolumeName) -> bool {
         self.stem.eq_ignore_ascii_case(&other.stem)
@@ -166,14 +177,37 @@ impl VolumeName {
 ///
 /// Returns `(representative_index, member_indices_in_volume_order)` per set,
 /// where the indices are positions in `names`. Names that are not volumes, and
-/// sets with only one member, are not returned — a lone volume is just a file.
+/// sets with only one member, are not returned: a lone volume is just a file.
+/// Nor are sets in which two names claim one position: see [`ambiguous`].
 ///
 /// The caller keeps its own data; this only decides grouping and order, so it
 /// works the same for a directory listing and for the member names of a
 /// container already held in memory.
 pub fn group(names: &[&str]) -> Vec<Vec<usize>> {
+    sets_of(names).0
+}
+
+/// Why [`ambiguous`] gives a set.
+pub const TWO_NAMES_AT_ONE_INDEX: &str = "part of a multi-volume set in which two names claim one \
+     volume (x.part1.rar and x.part01.rar do): the set was not joined";
+
+/// The sets [`group`] leaves out because two of their names claim one
+/// position (`x.part1.rar` and `x.part01.rar`), each as the indices of all its
+/// names in volume order, with the reason, so that a caller reports the set
+/// rather than scanning its parts as unrelated files.
+pub fn ambiguous(names: &[&str]) -> Vec<(Vec<usize>, &'static str)> {
+    sets_of(names)
+        .1
+        .into_iter()
+        .map(|s| (s, TWO_NAMES_AT_ONE_INDEX))
+        .collect()
+}
+
+/// The sets of `names`, and those refused for two names at one position.
+fn sets_of(names: &[&str]) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
     let parsed: Vec<Option<VolumeName>> = names.iter().map(|n| parse(n)).collect();
     let mut sets: Vec<Vec<usize>> = Vec::new();
+    let mut refused: Vec<Vec<usize>> = Vec::new();
     let mut claimed = vec![false; names.len()];
 
     for i in 0..names.len() {
@@ -201,11 +235,12 @@ pub fn group(names: &[&str]) -> Vec<Vec<usize>> {
         // Duplicate positions mean the names disagree about the set's shape;
         // concatenating them would splice bytes in an order nothing wrote.
         if members.array_windows().any(|[a, b]| a.0 == b.0) {
+            refused.push(members.into_iter().map(|(_, j)| j).collect());
             continue;
         }
         sets.push(members.into_iter().map(|(_, j)| j).collect());
     }
-    sets
+    (sets, refused)
 }
 
 impl Scheme {
@@ -213,10 +248,10 @@ impl Scheme {
     ///
     /// The two kinds of continuation need completely different handling:
     ///
-    /// * **Byte-split** (`.001`, `.002`) — produced by splitting an already
+    /// * **Byte-split** (`.001`, `.002`): produced by splitting an already
     ///   finished file, so concatenating the parts *is* the original. Format
     ///   agnostic: it works for `.7z`, `.zip`, `.arj` or anything else.
-    /// * **Format-aware volumes** (RAR `.partN`, ZIP `.zNN`) — each volume
+    /// * **Format-aware volumes** (RAR `.partN`, ZIP `.zNN`): each volume
     ///   carries its own headers, and a member's data resumes *past* the next
     ///   volume's header. Concatenating them produces garbage that still looks
     ///   like an archive, which is the worst kind of wrong.
@@ -228,7 +263,7 @@ impl Scheme {
 /// What to do with a member offered to a [`Collector`].
 #[derive(Debug)]
 pub enum Offer {
-    /// Not part of any set — scan it as usual.
+    /// Not part of any set: scan it as usual.
     PassThrough { name: String, data: Vec<u8> },
     /// Held as part of a possible set; nothing to scan yet.
     Held,
@@ -240,7 +275,7 @@ pub struct Finished {
     /// Reassembled files, each named for its set.
     pub joined: Vec<Joined>,
     /// Parts of sets that never completed. **These must still be scanned or
-    /// reported** — bytes withheld and then dropped would be the silent clean
+    /// reported**: bytes withheld and then dropped would be the silent clean
     /// this crate exists to prevent.
     pub unjoined: Vec<Unjoined>,
 }
@@ -264,7 +299,7 @@ impl Finished {
     ///
     /// The unjoined parts are in here deliberately. Bytes held back and then
     /// dropped would be a silent clean, so this returns the *whole* of what was
-    /// held — a caller that iterates it cannot skip them by forgetting a field.
+    /// held: a caller that iterates it cannot skip them by forgetting a field.
     pub fn into_scannable(self) -> impl Iterator<Item = (String, Vec<u8>, Option<&'static str>)> {
         self.joined
             .into_iter()
@@ -286,8 +321,8 @@ pub struct Unjoined {
     /// rejoined: its bytes are part of an archive nothing can now read, which a
     /// caller must not report clean.
     ///
-    /// `None` when it was a lone numbered file. One part is not a set — the
-    /// same rule [`group`] applies — and treating it as one would flag every
+    /// `None` when it was a lone numbered file. One part is not a set (the
+    /// same rule [`group`] applies), and treating it as one would flag every
     /// file that merely happens to end in `.001`.
     pub incomplete_set: Option<&'static str>,
 }
@@ -297,7 +332,7 @@ pub struct Unjoined {
 /// This implements *react, don't enumerate*: members arrive one at a time, and
 /// the only cost for a container with no volumes is one [`parse`] per name. A
 /// list of the container's members is never built, so the flat working set that
-/// [`crate::stream_members`] exists to preserve is untouched.
+/// [`crate::walk`] exists to preserve is untouched.
 ///
 /// Held bytes are bounded by `max_held_bytes`; past it, members are passed
 /// through individually rather than accumulated, so a container claiming a huge
@@ -318,6 +353,8 @@ struct Pending {
     /// never be joined whole. A lost last part leaves no gap in the indices, so
     /// this is the only record of it.
     lost_part: bool,
+    /// Parts too large to be held, scanned where they lie ([`Collector::lose`]).
+    unheld: Vec<String>,
 }
 
 impl Collector {
@@ -326,6 +363,34 @@ impl Collector {
             pending: Vec::new(),
             max_held_bytes,
             held_bytes: 0,
+        }
+    }
+
+    fn set_of(&mut self, vn: &VolumeName) -> &mut Pending {
+        let at = match self.pending.iter().position(|p| p.key.same_set_as(vn)) {
+            Some(at) => at,
+            None => {
+                self.pending.push(Pending {
+                    key: vn.clone(),
+                    parts: Vec::new(),
+                    lost_part: false,
+                    unheld: Vec::new(),
+                });
+                self.pending.len() - 1
+            }
+        };
+        &mut self.pending[at]
+    }
+
+    /// Note a member named like a part of a byte-split set that was not
+    /// offered because it is too large to hold, and was scanned where it lies.
+    /// The set can never be joined whole: if it has another part, held or not,
+    /// [`Self::finish`] reports it. A numbered file on its own is no set, and
+    /// is not.
+    pub fn lose(&mut self, name: &str) {
+        let Some(vn) = parse(name) else { return };
+        if vn.scheme.is_byte_split() {
+            self.set_of(&vn).unheld.push(name.to_string());
         }
     }
 
@@ -347,18 +412,7 @@ impl Collector {
             };
         }
         let over_budget = self.held_bytes.saturating_add(data.len() as u64) > self.max_held_bytes;
-        let slot = self.pending.iter_mut().find(|p| p.key.same_set_as(&vn));
-        let set = match slot {
-            Some(p) => p,
-            None => {
-                self.pending.push(Pending {
-                    key: vn.clone(),
-                    parts: Vec::new(),
-                    lost_part: false,
-                });
-                self.pending.last_mut().expect("just pushed")
-            }
-        };
+        let set = self.set_of(&vn);
         // Two members claiming the same position make the set's shape ambiguous,
         // so joining would splice bytes in an order nothing wrote.
         if over_budget || set.parts.iter().any(|(i, _, _)| *i == vn.index) {
@@ -368,10 +422,11 @@ impl Collector {
                 data,
             };
         }
-        self.held_bytes += data.len() as u64;
+        let held = data.len() as u64;
         set.parts.push((vn.index, name.to_string(), data));
+        self.held_bytes += held;
         // Never joined here. Nothing in the naming records how many parts a set
-        // has, so `.001`+`.002` looks contiguous even when `.003` follows —
+        // has, so `.001`+`.002` looks contiguous even when `.003` follows:
         // joining on arrival would emit a truncated prefix that still parses as
         // the archive. Completeness is only knowable once the container ends.
         Offer::Held
@@ -382,15 +437,24 @@ impl Collector {
         let mut out = Finished::default();
         for mut set in self.pending {
             set.parts.sort_by_key(|(i, _, _)| *i);
-            if set.lost_part {
+            if set.lost_part || (!set.unheld.is_empty() && set.parts.len() + set.unheld.len() > 1) {
+                const REASON: &str = "part of a multi-volume set one of whose volumes could not be \
+                                      held for rejoining";
+                // The parts scanned where they lie are not here to give back:
+                // with none held, a member without bytes carries the reason.
+                let bare = set.parts.is_empty().then(|| set.unheld.first().cloned());
                 for (_, name, data) in set.parts {
                     out.unjoined.push(Unjoined {
                         name,
                         data,
-                        incomplete_set: Some(
-                            "part of a multi-volume set one of whose volumes could not be \
-                             held for rejoining",
-                        ),
+                        incomplete_set: Some(REASON),
+                    });
+                }
+                if let Some(Some(name)) = bare {
+                    out.unjoined.push(Unjoined {
+                        name,
+                        data: Vec::new(),
+                        incomplete_set: Some(REASON),
                     });
                 }
                 continue;
@@ -576,6 +640,22 @@ mod tests {
         assert!(group(&names).is_empty(), "an ambiguous set must not group");
     }
 
+    /// `x.part1.rar` and `x.part01.rar` name one volume twice: the set is not
+    /// joined, and it is given back with the reason, every name in it, never
+    /// dropped. A set without a clash is not.
+    #[test]
+    fn a_set_with_two_names_at_one_index_is_given_back_with_the_reason() {
+        let names = ["x.part2.rar", "x.part01.rar", "notes.txt", "x.part1.rar"];
+        assert!(group(&names).is_empty());
+        let got = ambiguous(&names);
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (mut set, why) = got[0].clone();
+        set.sort();
+        assert_eq!(set, [0, 1, 3]);
+        assert_eq!(why, TWO_NAMES_AT_ONE_INDEX);
+        assert!(ambiguous(&["a.part1.rar", "a.part2.rar"]).is_empty());
+    }
+
     #[test]
     fn grouping_is_case_insensitive_but_names_are_preserved() {
         let names = ["A.Part1.RAR", "a.part2.rar"];
@@ -615,7 +695,7 @@ mod tests {
     #[test]
     fn a_set_is_never_joined_before_the_container_ends() {
         // The bug this pins: `.001`+`.002` are contiguous, so a collector that
-        // joins as soon as positions 0..n line up emits a TRUNCATED prefix —
+        // joins as soon as positions 0..n line up emits a TRUNCATED prefix,
         // which still parses as the archive, and is then scanned as if it were
         // the whole thing. Nothing in the naming says how many parts exist, so
         // completeness is only knowable once no more can arrive.
@@ -671,7 +751,7 @@ mod tests {
     #[test]
     fn a_lone_numbered_file_is_not_flagged_as_a_broken_set() {
         // Plenty of ordinary files end in `.001`. One part is not a set, so it
-        // comes back as an ordinary file — flagging it would fire on all of them.
+        // comes back as an ordinary file: flagging it would fire on all of them.
         let (out, left) = collect(&[("odd.dat.001", b"A")]);
         assert!(out.is_empty());
         assert_eq!(left.len(), 1);
@@ -765,6 +845,44 @@ mod tests {
         assert!(done.joined.is_empty(), "joined a set missing its last part");
         assert_eq!(done.unjoined.len(), 2);
         assert!(done.unjoined.iter().all(|u| u.incomplete_set.is_some()));
+    }
+
+    /// A part too large to hold is scanned where it lies, so the set is
+    /// missing it: whether the other parts were held or not, the set is
+    /// reported, and a numbered file on its own is not a set.
+    #[test]
+    fn a_set_with_a_part_too_large_to_hold_is_reported() {
+        let reason = "part of a multi-volume set one of whose volumes could not be held \
+                      for rejoining";
+        // No part held: a member without bytes carries the reason, once.
+        let mut c = Collector::new(8);
+        c.lose("s.7z.001");
+        c.lose("s.7z.002");
+        let done = c.finish();
+        assert!(done.joined.is_empty());
+        assert_eq!(done.unjoined.len(), 1, "{:?}", done.unjoined);
+        assert_eq!(done.unjoined[0].name, "s.7z.001");
+        assert!(done.unjoined[0].data.is_empty());
+        assert_eq!(done.unjoined[0].incomplete_set, Some(reason));
+        // One held, one not: the held part is given back, flagged.
+        let mut c = Collector::new(100);
+        assert!(matches!(c.offer("s.7z.001", b"AAA".to_vec()), Offer::Held));
+        c.lose("s.7z.002");
+        let done = c.finish();
+        assert!(done.joined.is_empty());
+        assert_eq!(done.unjoined.len(), 1, "{:?}", done.unjoined);
+        assert_eq!(done.unjoined[0].data, b"AAA");
+        assert_eq!(done.unjoined[0].incomplete_set, Some(reason));
+        // One numbered file on its own, and names that are not byte-split parts.
+        let mut c = Collector::new(8);
+        for name in ["log.txt.001", "a.rar", "x.part2.rar", "plain.txt"] {
+            c.lose(name);
+        }
+        let done = c.finish();
+        assert!(
+            done.joined.is_empty() && done.unjoined.is_empty(),
+            "{done:?}"
+        );
     }
 
     #[test]

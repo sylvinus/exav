@@ -40,8 +40,8 @@ pub(crate) enum RestoreMethod {
 /// is an `UnexpectedEof` error, one that goes inconsistent or ends before a
 /// declared size an `InvalidData` error, either after the bytes decoded
 /// before it.
-pub(crate) struct Ppmd8ZipReader<R: Read> {
-    inner: Option<R>,
+pub(crate) struct Ppmd8ZipReader<'a> {
+    inner: Option<Box<dyn Read + 'a>>,
     order: u32,
     mem_size: u32,
     restore: RestoreMethod,
@@ -56,12 +56,12 @@ pub(crate) struct Ppmd8ZipReader<R: Read> {
     done: bool,
 }
 
-impl<R: Read> Ppmd8ZipReader<R> {
+impl<'a> Ppmd8ZipReader<'a> {
     /// `size` is the uncompressed size, `None` when unknown. Parameters out of
     /// PPMd8's range are corrupt; a model larger than `max_buffer` is a
     /// resource limit, refused before anything is allocated.
     pub(crate) fn new(
-        inner: R,
+        inner: impl Read + 'a,
         order: u32,
         mem_size: u32,
         restore: RestoreMethod,
@@ -84,7 +84,7 @@ impl<R: Read> Ppmd8ZipReader<R> {
             )));
         }
         Ok(Self {
-            inner: Some(inner),
+            inner: Some(Box::new(inner)),
             order,
             mem_size,
             restore,
@@ -97,7 +97,7 @@ impl<R: Read> Ppmd8ZipReader<R> {
         })
     }
 
-    fn init(&mut self, inner: R) -> io::Result<Ppmd8<RarRangeDecoder>> {
+    fn init(&mut self, inner: Box<dyn Read + 'a>) -> io::Result<Ppmd8<RarRangeDecoder>> {
         let invalid = |e: LimitHit| io::Error::new(io::ErrorKind::InvalidData, e);
         let (buf, truncated) = crate::bounded_read(inner, self.max_buffer)
             .map_err(|e| invalid(LimitHit::corrupt(format!("zip: PPMd read: {e}"))))?;
@@ -124,7 +124,7 @@ impl<R: Read> Ppmd8ZipReader<R> {
     }
 }
 
-impl<R: Read> Read for Ppmd8ZipReader<R> {
+impl Read for Ppmd8ZipReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if let Some((kind, reason)) = self.pending.take() {
             return Err(io::Error::new(kind, reason));

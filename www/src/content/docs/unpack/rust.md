@@ -101,6 +101,26 @@ measured.
 A ZIP's walk runs past its central directory: members with a local header and
 no directory entry are visited too, after the directory's own.
 
+`MemberMeta::reason_kind` says what kind of reason `unsupported` is (a
+password, a method that is not decoded, damage, a limit and which one, ...), so
+a caller need not read the words of the reason. `Budget::set_rasters(true)`
+has a PDF's images described as pixels in `MemberMeta::raster` (width, height,
+bits, color space, `/Decode`, predictor, or the CCITT or JBIG2 codec still on
+the bytes): data only, for a consumer that reads them, such as exav-render's
+QR search.
+
+Nested containers are walked by the `tree` module, the walk the scanner,
+exav-grep and `exav-unpack -r` share. `Walker::run` goes down by itself and
+hands every `Node` to a `Visitor`; `Cx::members` and `Cx::child` let a consumer
+that scans in an order of its own enter one level at a time. `Typing` says
+which reader opens an object, and `type_object` types one that is not a member;
+`Hold` and `Large` say what is held of a member in memory and what becomes of
+one too large to hold. `derive` finds the objects inside one that are not its
+members (an appended ZIP, the payloads encoded in its text).
+`source::open_source` makes a reader the source of a walk, held in memory or
+read through a block cache, and `volume::ByteSpan` reads the parts of a
+byte-split set (`x.7z.001`, `.002`, ...) as one source without copying them.
+
 With the `dxf` feature, `exav_unpack::dxf` is the low layer of a DXF reader:
 `Tags` reads group code and value pairs (ASCII or binary), `Records` groups them
 by group code 0, `Parts` splits a record into subclasses, application groups and
@@ -144,21 +164,23 @@ zip · gzip · tar · bzip2 · xz · zstd · lzip · lzma · lzw · lz4 · rpm �
 rar · arj · arc · ace · lha · iso · ole · pdf · email · dmg · vhd · diskimage
 fat · exfat · ext · ntfs · squashfs · cramfs · romfs · erofs · wim · upx · inno · nsis · ar · cpio · xar · uuencode · xdp · szdd
 tnef · swf · binhex · lnk · partition · pyc · autoit · onenote · rtf
-machofat · sfx · stuffit · alz · egg · hwp3 · zoo · ishieldz · pepack
+machofat · sfx · stuffit · alz · egg · hwp3 · zoo · ishieldz · ishieldcab · ishieldmsi · applesingle · pepack
 javaclass · aimodel · screnc · base64scan · dxf · dwg · pe-emu
+```
 
 Not formats, and not in `all-formats`: `text` (the `exav_unpack::text` module,
 the text a reader sees in HTML and in the XML parts of Office and OpenDocument
 files: html5gum's tokenizer and quick-xml) and `text-pdf` (PDF's, through
 hayro, see [exav-render](/subprojects/exav-render/#text)).
-```
 
 A ZIP member compressed with bzip2, LZMA, zstd or XZ also needs that codec's
 feature (`bzip2`, `lzip`, `zstd`, `xz`); PPMd needs only `zip`. `diskimage`
 covers the virtual disks that need reconstruction (VHDX, QCOW2, VMDK); `vhd` is
 separate because the older format needs no decompressor. `pepack` is static
 unpacking; `pe-emu` runs the stub, so it is its own switch (and turns `pepack`
-on). `ace`, `stuffit` and `inno` only recognise their format and report it.
+on). `ishieldz` is InstallShield's `.z` archive, `ishieldcab` its `ISc(`
+cabinet and `ishieldmsi` its setup executables (the MSI and the files beside
+it). `ace` and `stuffit` only recognise their format and report it.
 [Supported formats](/unpack/formats/) says what each covers.
 
 Every name is forwarded through `exav-core` to the `exav` scanner, so each can

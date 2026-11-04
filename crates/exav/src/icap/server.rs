@@ -2,7 +2,7 @@
 //!
 //! Concurrency follows the clamd daemon's thread model: one thread per
 //! connection, with a hard cap on how many may be live at once. The prefork
-//! worker pool the daemon can also run is not reused here — it is built on
+//! worker pool the daemon can also run is not reused here: it is built on
 //! `fork`, signals and `setrlimit`, none of which this module is allowed to
 //! reach for, and its purpose (killing a job that will not stop) is answered on
 //! this path by the in-engine budgets.
@@ -19,12 +19,15 @@ use super::chunked::{Body, BodyEnd, BodyError, BodyOutcome, read_chunked_body};
 use super::config::IcapConfig;
 use super::response::{self, Decision};
 use super::wire::{Entity, IcapMethod, RequestHead, read_head};
-use crate::daemon::Held;
+use crate::daemon::{Clocked, Held, ReadClock, Replies, is_session_over};
+
+/// A connection's reads: buffered, under the clock of the request in progress.
+type ConnReader<'a> = BufReader<Clocked<'a, TcpStream>>;
 
 /// Supplies the signature database to scan the next request with.
 ///
 /// Indirected rather than handed over once, so that a signature reload is
-/// visible to in-flight connections — and, through the `ISTag` derived from it,
+/// visible to in-flight connections and, through the `ISTag` derived from it,
 /// to every client cache downstream.
 pub(super) trait Signatures: Send + Sync {
     /// The database for the request about to be scanned.
@@ -103,9 +106,13 @@ impl Server {
     ) -> std::io::Result<()> {
         let live = Arc::new(AtomicUsize::new(0));
         let idle = Arc::new(Idle::default());
+        let mut backoff = crate::daemon::AcceptBackoff::default();
         while wait(&self.listener) {
             let stream = match self.listener.accept() {
-                Ok((s, _)) => s,
+                Ok((s, _)) => {
+                    backoff.reset();
+                    s
+                }
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -115,9 +122,15 @@ impl Server {
                     continue;
                 }
                 // One failed accept (a client that vanished between the SYN and
-                // the accept, say) is not a reason to stop serving.
+                // the accept, say) is not a reason to stop serving. The pause
+                // keeps a listener out of descriptors from spinning on it.
                 Err(e) => {
-                    eprintln!("exav: icap: accept failed: {e}");
+                    let pause = backoff.pause();
+                    eprintln!(
+                        "exav: icap: accept failed, trying again in {} ms: {e}",
+                        pause.as_millis()
+                    );
+                    std::thread::sleep(pause);
                     continue;
                 }
             };
@@ -166,8 +179,8 @@ struct Idle {
 impl Idle {
     /// Block until the next request starts arriving on `reader`. `Ok(false)`
     /// at end of stream, or when the server is stopping.
-    fn next_request(&self, id: usize, reader: &mut BufReader<TcpStream>) -> std::io::Result<bool> {
-        if let Ok(s) = reader.get_ref().try_clone() {
+    fn next_request(&self, id: usize, reader: &mut ConnReader<'_>) -> std::io::Result<bool> {
+        if let Ok(s) = reader.get_ref().get_ref().try_clone() {
             self.lock().insert(id, s);
         }
         // After registering: either `close_all` sees this connection, or this
@@ -215,45 +228,73 @@ fn serve_connection(
     opts: &ScanOptions,
     idle: &Idle,
 ) {
-    let mut reader = BufReader::new(match stream.try_clone() {
-        Ok(s) => s,
+    let clock = ReadClock::new(cfg.request_read, cfg.idle_timeout).lasting(cfg.session);
+    let mut reader = BufReader::new(Clocked::new(
+        match stream.try_clone() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("exav: icap: cannot split connection: {e}");
+                return;
+            }
+        },
+        &clock,
+    ));
+    let mut writer = match Replies::new(&stream, cfg.reply) {
+        Ok(w) => w,
         Err(e) => {
-            eprintln!("exav: icap: cannot split connection: {e}");
+            eprintln!("exav: icap: cannot set the write wait: {e}");
             return;
         }
-    });
-    let mut writer = stream;
+    };
     let id = idle.next_id.fetch_add(1, Ordering::Relaxed);
     for _ in 0..cfg.keepalive_requests {
+        // Past the connection's lifetime no request is read, buffered or not.
+        if clock.lifetime_over() {
+            break;
+        }
+        // A request's time runs from its first byte; the wait for that byte is
+        // the idle timeout's, or what is left of the connection's lifetime.
+        clock.restart(!reader.buffer().is_empty());
+        writer.start_reply();
         let next = idle
             .next_request(id, &mut reader)
             .and_then(|more| match more {
-                true => handle_request(&mut reader, &mut writer, cfg, db, opts),
+                true => handle_request(&mut reader, &mut writer, cfg, db, opts, &clock),
                 false => Ok(Next::Close),
             });
         match next {
             Ok(Next::KeepAlive) => {}
             Ok(Next::Close) => break,
+            // The lifetime ran out while waiting for a request: an ordinary end.
+            Err(e) if is_session_over(&e) => break,
             Err(e) => {
-                if !is_benign_disconnect(&e) {
+                if crate::daemon::is_too_slow(&e) {
+                    // A limit, not a client that went away: logged, and the
+                    // client is told why its connection is closed.
+                    eprintln!("exav: icap: {e}");
+                    writer.start_reply();
+                    let _ = response::error(408, "Request Timeout")
+                        .closing()
+                        .write_to(&mut writer, &response::istag(&db.scanner()));
+                } else if !is_benign_disconnect(&e) {
                     eprintln!("exav: icap: connection error: {e}");
                 }
                 break;
             }
         }
     }
-    lingering_close(&writer, &mut reader);
+    lingering_close(&stream, &mut reader);
 }
 
 /// Close a connection without destroying the response just written to it.
 ///
 /// Closing a socket that still has unread bytes in its receive queue makes the
-/// kernel send an RST, and an RST discards whatever the peer has not read yet —
+/// kernel send an RST, and an RST discards whatever the peer has not read yet,
 /// including the block response that is the entire point of the exchange. So
 /// the write side is shut down first (the peer sees a clean end of response),
 /// then whatever the peer is still sending is read and dropped, bounded, before
 /// the socket goes away.
-fn lingering_close(stream: &TcpStream, reader: &mut BufReader<TcpStream>) {
+fn lingering_close(stream: &TcpStream, reader: &mut ConnReader<'_>) {
     /// Enough to cover a client finishing the request it was in the middle of;
     /// past this the RST is the lesser evil.
     const MAX_LINGER_BYTES: u64 = 4 * 1024 * 1024;
@@ -265,13 +306,21 @@ fn lingering_close(stream: &TcpStream, reader: &mut BufReader<TcpStream>) {
 }
 
 /// I/O errors that mean the client went away (or stopped talking long enough to
-/// hit the idle timeout), which is how connections normally end.
+/// hit the idle timeout), which is how connections normally end. A client that
+/// stops reading its answer is not one: a limit cut it, and that is logged, as
+/// on the clamd listener.
 fn is_benign_disconnect(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::*;
-    matches!(
-        e.kind(),
-        UnexpectedEof | BrokenPipe | ConnectionReset | ConnectionAborted | TimedOut | WouldBlock
-    )
+    !crate::daemon::is_not_reading(e)
+        && matches!(
+            e.kind(),
+            UnexpectedEof
+                | BrokenPipe
+                | ConnectionReset
+                | ConnectionAborted
+                | TimedOut
+                | WouldBlock
+        )
 }
 
 fn handle_request<R: BufRead, W: Write>(
@@ -280,6 +329,7 @@ fn handle_request<R: BufRead, W: Write>(
     cfg: &IcapConfig,
     db: &dyn Signatures,
     opts: &ScanOptions,
+    clock: &ReadClock,
 ) -> std::io::Result<Next> {
     let head = match read_head(reader, cfg.max_header_bytes)? {
         Some(h) => h,
@@ -317,7 +367,7 @@ fn handle_request<R: BufRead, W: Write>(
     let answer = match req.method {
         IcapMethod::Options => Some(response::options(cfg)),
         IcapMethod::ReqMod | IcapMethod::RespMod => {
-            modify(reader, writer, cfg, &req, &scanner, opts, &istag)?
+            modify(reader, writer, cfg, &req, &scanner, opts, &istag, clock)?
         }
         IcapMethod::Other(ref m) => {
             eprintln!("exav: icap: unsupported method {m}");
@@ -347,6 +397,7 @@ fn handle_request<R: BufRead, W: Write>(
 ///
 /// `Ok(None)` means the answer has already gone out and the connection must
 /// close.
+#[allow(clippy::too_many_arguments)]
 fn modify<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -355,6 +406,7 @@ fn modify<R: BufRead, W: Write>(
     scanner: &Scanner,
     opts: &ScanOptions,
     istag: &str,
+    clock: &ReadClock,
 ) -> std::io::Result<Option<response::Response>> {
     let enc = match req.encapsulated(cfg.max_header_bytes) {
         Ok(e) => e,
@@ -417,18 +469,21 @@ fn modify<R: BufRead, W: Write>(
             // the object is never requested. A *clean* preview is not: it is
             // the head of a file, and the head of a file being clean is exactly
             // the bypass that answering early would create. Nor is a
-            // partial verdict acted on here — a truncated archive is
+            // partial verdict acted on here: a truncated archive is
             // undecodable because it is truncated, which says nothing about the
             // whole one.
             // Scanned from the RAM head, which for any preview a client actually
-            // sends is the whole of it.
-            let early = scan_bytes(
-                scanner,
-                opts,
-                buf.head(),
-                &headers,
-                enc.span(Entity::ReqHdr),
-            );
+            // sends is the whole of it. The scan is the server's time, not the
+            // client's, so the request's read time does not run during it.
+            let early = clock.excluding(|| {
+                scan_bytes(
+                    scanner,
+                    opts,
+                    buf.head(),
+                    &headers,
+                    enc.span(Entity::ReqHdr),
+                )
+            });
             if matches!(early, Decision::Infected(_)) {
                 log_block(req, &early);
                 return Ok(Some(response::block(&early, cfg.infection_header)));
@@ -574,7 +629,7 @@ fn named_opts(
 /// Turn a scan result into a decision.
 ///
 /// A malicious object that panics a decoder must fail this one request, not the
-/// connection and not the process — the same containment the CLI and the daemon
+/// connection and not the process: the same containment the CLI and the daemon
 /// put around every file.
 fn decide(
     scanned: std::thread::Result<std::io::Result<(exav_core::ScanReport, Option<String>)>>,
@@ -592,7 +647,7 @@ fn decide(
 /// Turn a partial decision into a detection where `--partial-as` says `found`.
 ///
 /// `found` is settled here; `ok` is not, because whether this listener can
-/// honour a pass depends on whether it still holds the object's bytes — a
+/// honour a pass depends on whether it still holds the object's bytes, a
 /// question only the request loop can answer. `partial` and `error` change
 /// nothing: ICAP has no exit code, which is all those two differ in.
 ///
@@ -651,7 +706,7 @@ fn scan(
     decision
 }
 
-/// Scan bytes already in hand — the preview head, which is small by
+/// Scan bytes already in hand: the preview head, which is small by
 /// construction and never worth a round trip through a file.
 fn scan_bytes(
     scanner: &Scanner,
@@ -737,6 +792,7 @@ pub(crate) fn fuzz_exchange(input: &[u8], db: Arc<Scanner>, opts: &ScanOptions) 
     }
     let cfg = IcapConfig::default();
     let db = Fixed(db);
+    let clock = ReadClock::new(None, cfg.idle_timeout);
     let mut reader = std::io::Cursor::new(input);
     let mut out = Vec::new();
     for _ in 0..cfg.keepalive_requests {
@@ -744,7 +800,7 @@ pub(crate) fn fuzz_exchange(input: &[u8], db: Arc<Scanner>, opts: &ScanOptions) 
             Ok(false) => {}
             _ => break,
         }
-        match handle_request(&mut reader, &mut out, &cfg, &db, opts) {
+        match handle_request(&mut reader, &mut out, &cfg, &db, opts, &clock) {
             Ok(Next::KeepAlive) => {}
             _ => break,
         }
@@ -803,5 +859,186 @@ mod tests {
             before, after,
             "a signature reload must invalidate downstream ICAP caches"
         );
+    }
+
+    use std::io::Read;
+    use std::time::Duration;
+
+    /// A connection served by [`serve_connection`] under a request time of
+    /// `request_read`; the client's end of it.
+    fn connect(request_read: Option<Duration>) -> TcpStream {
+        connect_with(IcapConfig {
+            request_read,
+            ..IcapConfig::default()
+        })
+    }
+
+    /// [`connect`], under `cfg`.
+    fn connect_with(cfg: IcapConfig) -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        // What `run` does on accept.
+        server.set_write_timeout(Some(cfg.idle_timeout)).unwrap();
+        std::thread::spawn(move || {
+            let db = crate::daemon::SharedDb::new(Arc::new(Scanner::builtin()));
+            serve_connection(server, &cfg, &db, &ScanOptions::default(), &Idle::default());
+        });
+        client
+    }
+
+    /// Sends `bytes` one at a time, `gap` apart, from a thread of its own. The
+    /// thread ends when the server closes the connection.
+    fn drip(client: &TcpStream, bytes: Vec<u8>, gap: Duration) -> std::thread::JoinHandle<()> {
+        let mut w = client.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for b in bytes {
+                if w.write_all(&[b]).is_err() {
+                    return;
+                }
+                std::thread::sleep(gap);
+            }
+        })
+    }
+
+    /// What the server says first: its status line and headers, when the
+    /// answer has no body.
+    fn answer(client: &mut TcpStream) -> String {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 512];
+        while !out.windows(4).any(|w| w == b"\r\n\r\n") {
+            match client.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    const OPTIONS: &[u8] = b"OPTIONS icap://h/avscan ICAP/1.0\r\nHost: h\r\n\r\n";
+
+    #[test]
+    fn a_head_sent_a_byte_at_a_time_is_answered_408() {
+        let mut client = connect(Some(Duration::from_millis(300)));
+        let mut head = b"OPTIONS icap://h/avscan ICAP/1.0\r\nX-Slow: ".to_vec();
+        head.extend_from_slice(&[b'a'; 100]);
+        let sender = drip(&client, head, Duration::from_millis(50));
+        let said = answer(&mut client);
+        assert!(
+            said.starts_with("ICAP/1.0 408 Request Timeout\r\n"),
+            "{said}"
+        );
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn a_body_sent_a_byte_at_a_time_is_answered_408() {
+        let mut client = connect(Some(Duration::from_millis(300)));
+        let http = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
+        let head = format!(
+            "RESPMOD icap://h/avscan ICAP/1.0\r\nHost: h\r\n\
+             Encapsulated: res-hdr=0, res-body={}\r\n\r\n{http}3e8\r\n",
+            http.len()
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        let sender = drip(&client, vec![b'a'; 100], Duration::from_millis(50));
+        let said = answer(&mut client);
+        assert!(
+            said.starts_with("ICAP/1.0 408 Request Timeout\r\n"),
+            "{said}"
+        );
+        sender.join().unwrap();
+    }
+
+    /// The same server answers a request that arrives at once, and each of two
+    /// on one connection has its own time, however long the wait between them.
+    #[test]
+    fn requests_that_arrive_in_time_are_answered_and_each_has_its_own_time() {
+        let mut client = connect(Some(Duration::from_millis(300)));
+        client.write_all(OPTIONS).unwrap();
+        assert!(answer(&mut client).starts_with("ICAP/1.0 200 OK\r\n"));
+        std::thread::sleep(Duration::from_millis(600));
+        client.write_all(OPTIONS).unwrap();
+        let said = answer(&mut client);
+        assert!(said.starts_with("ICAP/1.0 200 OK\r\n"), "{said}");
+    }
+
+    /// On a kept-alive connection the lifetime ends the wait for the next
+    /// request, not a request whose first byte arrived before it.
+    #[test]
+    fn a_connection_past_its_lifetime_reads_no_new_request() {
+        // With and without a time limit on the request itself: the lifetime
+        // must not cut a request that began, whichever clock bounds it.
+        for request_read in [None, IcapConfig::default().request_read] {
+            let mut client = connect_with(IcapConfig {
+                session: Some(Duration::from_secs(2)),
+                request_read,
+                ..IcapConfig::default()
+            });
+            let start = std::time::Instant::now();
+            client.write_all(OPTIONS).unwrap();
+            assert!(answer(&mut client).starts_with("ICAP/1.0 200 OK\r\n"));
+            // A request begun in time, finished after the lifetime.
+            std::thread::sleep(Duration::from_millis(300));
+            let (begun, rest) = OPTIONS.split_at(OPTIONS.len() - 2);
+            client.write_all(begun).unwrap();
+            std::thread::sleep(Duration::from_millis(2200));
+            // With the next request right behind it, already buffered.
+            client.write_all(&[rest, OPTIONS].concat()).unwrap();
+            let said = answer(&mut client);
+            assert!(said.starts_with("ICAP/1.0 200 OK\r\n"), "{said}");
+            // The next one is not read, and the connection is closed without a
+            // word.
+            assert_eq!(said.matches("ICAP/1.0").count(), 1, "{said}");
+            assert_eq!(answer(&mut client), "");
+            assert!(start.elapsed() < Duration::from_secs(15), "never closed");
+        }
+    }
+
+    /// A client that does not read a large answer is cut by `reply`, though
+    /// every write is within the socket's own timeout.
+    #[test]
+    fn an_answer_the_client_does_not_read_is_cut_by_the_reply_budget() {
+        let mut client = connect_with(IcapConfig {
+            reply: Some(Duration::from_secs(1)),
+            ..IcapConfig::default()
+        });
+        // Far more than the two socket buffers hold.
+        let body = vec![b'a'; 64 * 1024 * 1024];
+        let http = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n";
+        let head = format!(
+            "RESPMOD icap://h/avscan ICAP/1.0\r\nHost: h\r\n\
+             Encapsulated: res-hdr=0, res-body={}\r\n\r\n{http}{:x}\r\n",
+            http.len(),
+            body.len()
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        client.write_all(&body).unwrap();
+        client.write_all(b"\r\n0\r\n\r\n").unwrap();
+        // Not reading: the answer fills the socket and the budget runs out.
+        std::thread::sleep(Duration::from_secs(3));
+        let mut got = 0;
+        let mut buf = vec![0u8; 1 << 20];
+        while let Ok(n) = client.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        assert!(got > 0, "no answer started");
+        assert!(got < body.len(), "the whole answer was delivered: {got}");
+    }
+
+    /// With no limit a slow head is read to its end.
+    #[test]
+    fn a_slow_head_is_answered_when_there_is_no_limit() {
+        let mut client = connect(None);
+        let sender = drip(&client, OPTIONS.to_vec(), Duration::from_millis(15));
+        let said = answer(&mut client);
+        assert!(said.starts_with("ICAP/1.0 200 OK\r\n"), "{said}");
+        sender.join().unwrap();
     }
 }

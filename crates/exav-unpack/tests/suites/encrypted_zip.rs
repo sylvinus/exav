@@ -5,10 +5,10 @@
 //! `eicar.txt` (the EICAR test string + padding), encrypted with password
 //! `secret`:
 //!
-//! * `zip_aes256_store.zip`   — AES-256, Store
-//! * `zip_aes256_deflate.zip` — AES-256, Deflate
-//! * `zip_zipcrypto_store.zip`   — PKWARE ZipCrypto, Store
-//! * `zip_zipcrypto_deflate.zip` — PKWARE ZipCrypto, Deflate
+//! * `zip_aes256_store.zip`: AES-256, Store
+//! * `zip_aes256_deflate.zip`: AES-256, Deflate
+//! * `zip_zipcrypto_store.zip`: PKWARE ZipCrypto, Store
+//! * `zip_zipcrypto_deflate.zip`: PKWARE ZipCrypto, Deflate
 //!
 //! With the right password the EICAR marker is recovered; with no password the
 //! member must surface as `unsupported(encrypted=true)` (→ `PasswordProtected`),
@@ -51,7 +51,7 @@ fn decrypts_with_password() {
         );
         // Decrypting does not un-encrypt the member it came from. The flag stays
         // set so `--alert-encrypted` still reports the fact, while `unsupported`
-        // stays clear so the recovered plaintext is scanned normally — the two
+        // stays clear so the recovered plaintext is scanned normally: the two
         // are independent, and tying them together meant that cracking a password
         // erased the report of there having been one.
         assert!(
@@ -78,7 +78,7 @@ fn decrypts_with_pool_second_password() {
 }
 
 /// Without a password (empty pool), every scheme yields a metadata-only,
-/// encrypted member — never silently clean.
+/// encrypted member, never silently clean.
 #[test]
 fn no_password_reports_encrypted() {
     for name in [
@@ -121,7 +121,7 @@ fn wrong_password_reports_encrypted() {
 /// Regression: a ZipCrypto archive written with a streaming **data descriptor**
 /// (general-purpose bit 3), as Info-ZIP's `zip -e`/`-P` emits by default. Here
 /// the one-byte password check is the high byte of the DOS mod-time, not the
-/// CRC-32 — checking only against the CRC byte would reject the correct password
+/// CRC-32: checking only against the CRC byte would reject the correct password
 /// and report the member password-protected even with `secret`. (The other
 /// `zip_zipcrypto_*` fixtures are `7z`-made with bit 3
 /// clear, so they never exercised this path.)
@@ -137,7 +137,7 @@ fn zipcrypto_data_descriptor_decrypts_with_password() {
         "data-descriptor ZipCrypto should decrypt with the right password, got unsupported={:?}",
         e.unsupported
     );
-    // Still flagged as having been encrypted — see the note in
+    // Still flagged as having been encrypted: see the note in
     // `decrypts_with_password`. Recovering the content does not unmake the fact.
     assert!(e.encrypted, "the member was encrypted and must say so");
     assert!(
@@ -147,7 +147,7 @@ fn zipcrypto_data_descriptor_decrypts_with_password() {
 }
 
 /// The same data-descriptor fixture with the wrong password must still report
-/// encrypted — the mod-time check byte widens acceptance but the full-payload
+/// encrypted: the mod-time check byte widens acceptance but the full-payload
 /// CRC check still rejects bad credentials (no false decrypt).
 #[test]
 fn zipcrypto_data_descriptor_wrong_password_reports_encrypted() {

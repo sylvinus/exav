@@ -14,7 +14,7 @@
 //!
 //! The encoded stream is a base-64-style 6-bit code over a fixed 64-character
 //! alphabet (RFC 1741); 4 encoded chars decode to 3 bytes. The decoded byte
-//! stream is then RLE90-compressed: the marker byte `0x90` introduces a run —
+//! stream is then RLE90-compressed: the marker byte `0x90` introduces a run;
 //! `x 0x90 n` expands to byte `x` repeated `n` times, and `0x90 0x00` is a
 //! literal `0x90`. After RLE the bytes are a header:
 //!
@@ -52,14 +52,69 @@ const ALPHABET: &[u8; 64] = b"!\"#$%&'()*+,-012345689@ABCDEFGHIJKLMNPQRSTUVXYZ[`
 const RLE_MARKER: u8 = 0x90;
 
 /// True if `data` looks like a BinHex 4.0 file: the marker line appears within
-/// the first kilobyte (conservative — the marker is highly specific).
+/// the first kilobyte (conservative: the marker is highly specific).
 pub(crate) fn looks_like_binhex(data: &[u8]) -> bool {
     let head = &data[..data.len().min(1024)];
     head.windows(MARKER.len()).any(|w| w == MARKER)
 }
 
+/// Whether the marker line is the start of `data`, as it is in a file saved
+/// by itself, not a line of a text or a mail.
+pub(crate) fn starts_with_marker(data: &[u8]) -> bool {
+    data.starts_with(MARKER)
+}
+
+/// The longest a header is before the data fork: a name of 255 bytes and the
+/// fixed fields after it.
+const MAX_HEADER: usize = 1 + 255 + 21;
+
+/// What a BinHex 4.0 file says of the file it holds.
+pub struct Header {
+    /// The Macintosh file type (`TEXT`, `SLDS`).
+    pub file_type: [u8; 4],
+    /// The Macintosh creator (`ttxt`, `PPNT`).
+    pub creator: [u8; 4],
+    /// The start of the data fork: as many bytes as asked for, fewer where
+    /// the file holds fewer.
+    pub fork: Vec<u8>,
+}
+
+/// The header of `text`, a BinHex 4.0 file that starts with its marker line,
+/// and the first `fork_bytes` of its data fork. Only the start of the encoded
+/// stream is decoded, so the cost does not grow with the file. `None` when
+/// the header is not all there. Lengths are not trusted: a fork the header
+/// declares longer than the stream is what the stream has.
+pub fn header(text: &[u8], fork_bytes: usize) -> Option<Header> {
+    if !starts_with_marker(text) {
+        return None;
+    }
+    let open = text.iter().position(|&b| b == b':')? + 1;
+    let stream = &text[open..];
+    let stream = &stream[..stream
+        .iter()
+        .position(|&b| b == b':')
+        .unwrap_or(stream.len())];
+    // The run-length coding only shortens, except an escaped 0x90 (two bytes
+    // for one): twice the bytes wanted is enough.
+    let cap = MAX_HEADER.saturating_add(fork_bytes);
+    let raw = sixbit_decode(stream, cap.saturating_mul(2));
+    let bytes = rle90_expand(&raw, cap);
+    let p = 1 + usize::from(*bytes.first()?);
+    let four = |at: usize| -> Option<[u8; 4]> { bytes.get(at..at + 4)?.try_into().ok() };
+    let file_type = four(p + 1)?;
+    let creator = four(p + 5)?;
+    let data_len = four(p + 11).map_or(0, |b| u32::from_be_bytes(b) as usize);
+    let fork = bytes.get(p + 21..).unwrap_or_default();
+    let fork = &fork[..fork.len().min(data_len).min(fork_bytes)];
+    Some(Header {
+        file_type,
+        creator,
+        fork: fork.to_vec(),
+    })
+}
+
 /// Build the reverse lookup: ASCII char -> 6-bit value, or 0xFF for chars not
-/// in the alphabet (whitespace, newlines, the framing `:` — all skipped).
+/// in the alphabet (whitespace, newlines, the framing `:`, all skipped).
 fn decode_table() -> [u8; 256] {
     let mut t = [0xFFu8; 256];
     let mut i = 0;
@@ -130,11 +185,7 @@ fn rle90_expand(input: &[u8], cap: usize) -> Vec<u8> {
     out
 }
 
-pub(crate) fn extract_binhex<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_binhex(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     // Locate the marker, then the opening ':' that begins the encoded stream.
     let marker_at = data
         .windows(MARKER.len())
@@ -198,32 +249,31 @@ pub(crate) fn extract_binhex<R>(
     // --- data fork: clamp to what's present ---
     let data_start = p.min(len);
     let data_end = data_start.saturating_add(data_len).min(len);
-    let data_fork = bytes[data_start..data_end].to_vec();
+    let data_fork = &bytes[data_start..data_end];
 
     budget.count_entry()?;
-    let cap = budget.reserve()?;
-    if data_fork.len() as u64 > cap {
-        return Err(LimitHit::new("binhex data fork exceeds budget".to_string()));
-    }
-    budget.commit(data_fork.len() as u64);
-    if let Some(r) = visit(Entry::new(name.clone(), data_fork), budget) {
-        return Ok(Some(r));
+    let shown = crate::tree::quoted(&name);
+    let fork = format_args!("binhex data fork of '{shown}'");
+    if budget.reserve_for(data_fork.len() as u64, fork)?.is_some() {
+        budget.commit(data_fork.len() as u64);
+        if let Some(r) = visit(Entry::new(name.clone(), data_fork.to_vec()), budget) {
+            return Ok(Some(r));
+        }
     }
 
     // --- resource fork: after data fork + u16 CRC ---
     let rsrc_start = data_end.saturating_add(2).min(len);
     let rsrc_end = rsrc_start.saturating_add(rsrc_len).min(len);
     if rsrc_end > rsrc_start {
-        let rsrc_fork = bytes[rsrc_start..rsrc_end].to_vec();
+        let rsrc_fork = &bytes[rsrc_start..rsrc_end];
         budget.count_entry()?;
-        let cap = budget.reserve()?;
-        if rsrc_fork.len() as u64 > cap {
-            return Err(LimitHit::new(
-                "binhex resource fork exceeds budget".to_string(),
-            ));
+        let fork = format_args!("binhex resource fork of '{shown}'");
+        if budget.reserve_for(rsrc_fork.len() as u64, fork)?.is_none() {
+            return Ok(None);
         }
         budget.commit(rsrc_fork.len() as u64);
-        if let Some(r) = visit(Entry::new(format!("{name}.rsrc"), rsrc_fork), budget) {
+        let fork = Entry::new(format!("{name}.rsrc"), rsrc_fork.to_vec());
+        if let Some(r) = visit(fork, budget) {
             return Ok(Some(r));
         }
     }
@@ -315,6 +365,59 @@ mod tests {
         );
     }
 
+    /// A BinHex 4.0 file of `name`, of `file_type` and `creator`, with `fork`
+    /// for its data fork, its header saying `declared` bytes (no byte of any of
+    /// them is 0x90).
+    fn typed(
+        name: &[u8],
+        file_type: &[u8; 4],
+        creator: &[u8; 4],
+        fork: &[u8],
+        declared: u32,
+    ) -> Vec<u8> {
+        let mut raw = vec![name.len() as u8];
+        raw.extend_from_slice(name);
+        raw.push(0);
+        raw.extend_from_slice(file_type);
+        raw.extend_from_slice(creator);
+        raw.extend_from_slice(&[0, 0]);
+        raw.extend_from_slice(&declared.to_be_bytes());
+        raw.extend_from_slice(&[0; 4]);
+        raw.extend_from_slice(&[0, 0]);
+        raw.extend_from_slice(fork);
+        raw.extend_from_slice(&[0, 0]);
+        let mut file = b"(This file must be converted with BinHex 4.0)\r\r:".to_vec();
+        file.extend_from_slice(&sixbit_encode(&raw));
+        file.push(b':');
+        file
+    }
+
+    #[test]
+    fn the_header_gives_the_type_the_creator_and_the_start_of_the_fork() {
+        let file = typed(b"deck", b"SLDS", b"PPNT", b"0123456789", 10);
+        let h = header(&file, 4).unwrap();
+        assert_eq!((&h.file_type, &h.creator), (b"SLDS", b"PPNT"));
+        assert_eq!(h.fork, b"0123");
+        // Fewer bytes than asked for where the fork is shorter.
+        assert_eq!(header(&file, 100).unwrap().fork, b"0123456789");
+        // A head that ends with the header (26 bytes, 35 characters): no fork.
+        let open = file.iter().position(|&b| b == b':').unwrap() + 1;
+        let h = header(&file[..open + 35], 4).unwrap();
+        assert_eq!((&h.creator, h.fork.len()), (b"PPNT", 0));
+        // Not the marker line first, or a header cut short.
+        assert!(header(&[&b"x "[..], &file].concat(), 4).is_none());
+        assert!(header(&file[..60], 4).is_none());
+        assert!(header(b"not binhex", 4).is_none());
+    }
+
+    #[test]
+    fn a_fork_longer_than_its_stream_is_what_the_stream_has() {
+        let file = typed(b"a", b"TEXT", b"ttxt", b"hello", u32::MAX);
+        let h = header(&file, 1 << 20).unwrap();
+        // The fork and the checksum that follows it: what the stream holds.
+        assert!(h.fork.starts_with(b"hello") && h.fork.len() <= 7);
+    }
+
     #[test]
     fn truncated_input_does_not_panic() {
         // Marker + opening ':' but a chopped stream with no closing ':' and a
@@ -345,7 +448,7 @@ mod tests {
         file.push(b':');
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Binhex, &file, &mut budget).unwrap();
-        // The data fork is clamped to EOF — never reads out of bounds.
+        // The data fork is clamped to EOF: never reads out of bounds.
         assert_eq!(entries.len(), 1);
         assert!(entries[0].data.len() <= file.len());
     }

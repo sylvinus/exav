@@ -275,3 +275,67 @@ fn a_string_whose_header_ends_its_record_takes_the_width_of_the_next() {
     };
     assert_eq!(r.rich().0, "abc");
 }
+
+/// A BIFF8 workbook of one sheet holding `body`.
+fn biff8(body: &[u8]) -> Vec<u8> {
+    let bof = |dt: u16| {
+        let mut b = vec![0x00, 0x06];
+        b.extend(dt.to_le_bytes());
+        b.extend([0; 12]);
+        rec(0x0809, &b)
+    };
+    let eof = rec(0x000A, &[]);
+    let boundsheet = |pos: u32| {
+        let mut b = pos.to_le_bytes().to_vec();
+        b.extend([0, 0, 1, 0, b'S']);
+        rec(0x0085, &b)
+    };
+    let head_len = bof(5).len() + boundsheet(0).len() + eof.len();
+    let mut g = bof(5);
+    g.extend(boundsheet(head_len as u32));
+    g.extend(&eof);
+    g.extend(bof(0x10));
+    g.extend(body);
+    g.extend(&eof);
+    g
+}
+
+#[test]
+fn notes_find_their_objects_in_one_pass() {
+    // Many objects, and many notes naming an object none of them is: one
+    // more than are kept, as in BIFF5.
+    let mut body = vec![];
+    for _ in 0..1 << 16 {
+        let mut o = vec![0x15, 0, 0x12, 0, 0x19, 0, 0, 0];
+        o.extend([0; 14]);
+        body.extend(rec(0x005D, &o));
+    }
+    for i in 0..=1u32 << 16 {
+        let mut n = (i as u16).to_le_bytes().to_vec();
+        n.extend([1, 0, 0, 0, 1, 0, 1, 0, 0, b'a']);
+        body.extend(rec(0x001C, &n));
+    }
+    let t = std::time::Instant::now();
+    let wb = read(&biff8(&body)).unwrap();
+    assert!(t.elapsed().as_secs() < 2, "took {:?}", t.elapsed());
+    assert_eq!(wb.sheets[0].comments.len(), 1 << 16);
+}
+
+#[test]
+fn comments_find_their_authors_in_one_pass() {
+    let mut wb = Workbook::new(Style::default());
+    let mut s = Sheet::new("S".into());
+    for i in 0..1u32 << 17 {
+        s.comments.push(Comment {
+            row: i,
+            col: 0,
+            author: i.to_string(),
+            text: String::new(),
+            visible: false,
+        });
+    }
+    wb.sheets.push(s);
+    let t = std::time::Instant::now();
+    crate::formats::office::sheets::xlsx::write(&wb, u64::MAX).unwrap();
+    assert!(t.elapsed().as_secs() < 2, "took {:?}", t.elapsed());
+}

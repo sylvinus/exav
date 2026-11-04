@@ -690,3 +690,36 @@ fn a_file_cut_anywhere_or_changed_anywhere_is_read_soundly() {
         sweep(&cube(enc), |b| read(b, 1000).ok());
     }
 }
+
+#[test]
+fn is_ply_names_the_headers_the_reader_reads_and_no_other_bytes() {
+    use exav_render::ply::is_ply;
+    for enc in [Enc::Ascii, Enc::Little, Enc::Big] {
+        let bytes = cube(enc);
+        assert!(is_ply(&bytes));
+        // Only the header is looked at.
+        let end = bytes
+            .windows(11)
+            .position(|w| w == b"end_header\n")
+            .unwrap();
+        assert!(is_ply(&bytes[..end]));
+    }
+    assert!(is_ply(
+        b"ply\r\ncomment made by hand\r\nformat ascii 1.0\r\n"
+    ));
+    assert!(is_ply(
+        b"ply\nobj_info a note\nformat ascii 1.0 { remark }\n"
+    ));
+    // Not PLY: another magic, a format the reader does not know, no format
+    // line before the elements, a format line cut short, text that only
+    // starts with the word.
+    assert!(!is_ply(b""));
+    assert!(!is_ply(b"ply"));
+    assert!(!is_ply(b"ply\n"));
+    assert!(!is_ply(b" ply\nformat ascii 1.0\n"));
+    assert!(!is_ply(b"ply\nformat utf8 1.0\n"));
+    assert!(!is_ply(b"ply\nelement vertex 3\nformat ascii 1.0\n"));
+    assert!(!is_ply(b"ply\nformat ascii 1.0"));
+    assert!(!is_ply(b"ply\nplums are good for you\n"));
+    assert!(!is_ply(b"ply\n\xFF\xFE\n"));
+}

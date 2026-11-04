@@ -17,14 +17,15 @@
 //! Under the pool the listeners are served by one child of their own, forked,
 //! reaped and re-forked with the workers; in the thread model by threads. Each
 //! connection gets a thread, up to `?max-connections=` (64 by default), and a
-//! client has [`CLIENT_TIMEOUT`] to say its piece, so a listener nobody
-//! authenticates cannot be used to hold threads.
+//! client has `?idle-secs=` ([`DEFAULT_CLIENT_TIMEOUT`] by default) to say its
+//! piece and take the reply, so a listener nobody authenticates cannot be used
+//! to hold threads.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::daemon;
 use crate::endpoint::{Addr, Endpoint, Proto};
@@ -32,8 +33,9 @@ use crate::endpoint::{Addr, Endpoint, Proto};
 /// Connections served at once unless the address says (`?max-connections=`).
 pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 64;
 
-/// How long a client has to send its request, and to take the reply.
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a client has to send its request and take the reply, unless the
+/// address says (`?idle-secs=`).
+const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The longest an ICAP request head is read.
 const ICAP_HEAD_MAX: u64 = 8192;
@@ -59,6 +61,8 @@ pub(crate) struct Listener {
     sock: Sock,
     proto: Proto,
     max: usize,
+    /// How long a connection is served.
+    within: Duration,
     /// For the log.
     name: String,
 }
@@ -87,6 +91,9 @@ impl Listener {
             sock,
             proto: e.proto,
             max: e.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            within: e
+                .idle_secs
+                .map_or(DEFAULT_CLIENT_TIMEOUT, Duration::from_secs),
             name: e.to_string(),
         })
     }
@@ -114,8 +121,8 @@ impl Listener {
                 let (s, _) = l.accept()?;
                 // An accepted socket can inherit the listener's non-blocking mode.
                 s.set_nonblocking(false)?;
-                s.set_read_timeout(Some(CLIENT_TIMEOUT))?;
-                s.set_write_timeout(Some(CLIENT_TIMEOUT))?;
+                s.set_read_timeout(Some(self.within))?;
+                s.set_write_timeout(Some(self.within))?;
                 let w = s.try_clone()?;
                 Ok((Box::new(s), Box::new(w)))
             }
@@ -123,8 +130,8 @@ impl Listener {
             Sock::Unix(l) => {
                 let (s, _) = l.accept()?;
                 s.set_nonblocking(false)?;
-                s.set_read_timeout(Some(CLIENT_TIMEOUT))?;
-                s.set_write_timeout(Some(CLIENT_TIMEOUT))?;
+                s.set_read_timeout(Some(self.within))?;
+                s.set_write_timeout(Some(self.within))?;
                 let w = s.try_clone()?;
                 Ok((Box::new(s), Box::new(w)))
             }
@@ -140,6 +147,7 @@ pub(crate) type Version = Arc<dyn Fn() -> String + Send + Sync>;
 /// limit; one past it is closed unanswered.
 fn serve(l: &Listener, version: &Version, retire: Option<i32>) {
     let live = Arc::new(AtomicUsize::new(0));
+    let mut backoff = daemon::AcceptBackoff::default();
     loop {
         #[cfg(unix)]
         if let Some(fd) = retire
@@ -151,13 +159,15 @@ fn serve(l: &Listener, version: &Version, retire: Option<i32>) {
         let _ = retire;
         match l.accept() {
             Ok((r, w)) => {
+                backoff.reset();
                 if live.fetch_add(1, Ordering::Relaxed) >= l.max {
                     live.fetch_sub(1, Ordering::Relaxed);
                     continue;
                 }
                 let (live, version, proto) = (Arc::clone(&live), Arc::clone(version), l.proto);
+                let within = l.within;
                 std::thread::spawn(move || {
-                    handle(proto, r, w, version.as_ref());
+                    handle(proto, r, w, version.as_ref(), within);
                     live.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -167,20 +177,50 @@ fn serve(l: &Listener, version: &Version, retire: Option<i32>) {
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) => {}
             Err(e) => {
-                eprintln!("exav: health: accept on {} failed: {e}", l.name);
-                std::thread::sleep(Duration::from_millis(50));
+                let pause = backoff.pause();
+                eprintln!(
+                    "exav: health: accept on {} failed, trying again in {} ms: {e}",
+                    l.name,
+                    pause.as_millis()
+                );
+                std::thread::sleep(pause);
             }
         }
     }
 }
 
-/// One connection, in the protocol of its listener.
+/// A connection's reads, which fail once its time is up: the socket's timeout
+/// bounds each read, this all of them, so a client that sends a byte at a
+/// time cannot hold the connection.
+struct Deadline<R> {
+    inner: R,
+    end: Instant,
+}
+
+impl<R: Read> Read for Deadline<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if Instant::now() >= self.end {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the client took too long",
+            ));
+        }
+        self.inner.read(buf)
+    }
+}
+
+/// One connection, in the protocol of its listener, read for `within`.
 fn handle(
     proto: Proto,
     r: Box<dyn Read + Send>,
     mut w: Box<dyn Write + Send>,
     version: &dyn Fn() -> String,
+    within: Duration,
 ) {
+    let r = Box::new(Deadline {
+        inner: r,
+        end: Instant::now() + within,
+    });
     match proto {
         Proto::Clamd => clamd(r, &mut w, version),
         Proto::Icap => icap(r, &mut w),
@@ -295,10 +335,50 @@ mod tests {
                 Ok(())
             }
         }
-        handle(proto, r, Box::new(Sink(Arc::clone(&out))), &|| {
-            "ClamAV test".to_string()
-        });
+        handle(
+            proto,
+            r,
+            Box::new(Sink(Arc::clone(&out))),
+            &|| "ClamAV test".to_string(),
+            DEFAULT_CLIENT_TIMEOUT,
+        );
         String::from_utf8_lossy(&out.lock().unwrap()).into_owned()
+    }
+
+    #[test]
+    fn a_client_that_sends_a_byte_at_a_time_is_cut_off() {
+        /// A byte every 2 ms, never a line's end, for `LEFT` reads.
+        struct Slow(Arc<AtomicUsize>);
+        const LEFT: usize = 500;
+        impl Read for Slow {
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(2));
+                if self.0.fetch_add(1, Ordering::Relaxed) >= LEFT {
+                    return Ok(0);
+                }
+                match b.first_mut() {
+                    Some(x) => {
+                        *x = b'x';
+                        Ok(1)
+                    }
+                    None => Ok(0),
+                }
+            }
+        }
+        for proto in [Proto::Clamd, Proto::Icap] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            handle(
+                proto,
+                Box::new(Slow(Arc::clone(&reads))),
+                Box::new(io::sink()),
+                &String::new,
+                Duration::from_millis(40),
+            );
+            // A read takes at least 2 ms, so 40 ms allow 20 of them, whatever
+            // the load; the client's 500 would take a second.
+            let reads = reads.load(Ordering::Relaxed);
+            assert!(reads <= 20, "{proto:?}: {reads} reads");
+        }
     }
 
     #[test]

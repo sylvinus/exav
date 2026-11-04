@@ -2,7 +2,7 @@
 //!
 //! Two of the three ways a decoder can fail are outside Rust's reach.
 //! `catch_unwind` catches unwinding and nothing else, so a panic is turned into
-//! a reported limit — but a failed allocation aborts and an exhausted stack
+//! a reported limit, but a failed allocation aborts and an exhausted stack
 //! faults, and both end the process where it stands. Nothing inside that process
 //! gets to report anything.
 //!
@@ -23,7 +23,7 @@ use tmpfile::TempDir;
 
 fn exav() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_exav"));
-    // Not about what the signatures say — about whether the run survives at all.
+    // Not about what the signatures say: about whether the run survives at all.
     c.env("EXAV_ALLOW_NO_DB", "1");
     c
 }
@@ -99,7 +99,7 @@ fn scan_with(marker: &[u8]) -> (Option<i32>, String) {
 ///
 /// Not `cfg!(feature = "testing-faults")`: that asks whether this test crate was
 /// compiled with the flag, and the thing being tested is a separate process. The
-/// two can disagree — the feature has to travel `exav → exav-core →
+/// two can disagree: the feature has to travel `exav → exav-core →
 /// exav-unpack` to reach a decoder, and if it does not arrive, the flag is on
 /// here and the fault is absent there. Asking the binary itself is the only
 /// question worth asking.
@@ -114,7 +114,7 @@ fn faults_available() -> bool {
 
 /// Skip when the whole build lacks the feature; fail when only the binary does.
 /// A test crate carrying the flag while the binary scans the probe clean means
-/// the feature no longer travels to a decoder the scan path uses — the exact
+/// the feature no longer travels to a decoder the scan path uses: the exact
 /// breakage that would otherwise turn both tests into silent no-ops.
 fn faults_available_or_skip() -> bool {
     if faults_available() {

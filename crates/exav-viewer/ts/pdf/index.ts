@@ -1,5 +1,5 @@
 /**
- * `@exav/viewer/pdf`: PDF on pdf.js (a peer dependency, `pdfjs-dist` 5 or 6).
+ * `@exav/viewer/pdf`: PDF on pdf.js (a peer dependency, `pdfjs-dist` 6.4.299 or later 6).
  *
  * Also exports the engine and the off-main-thread rasteriser for hosts that
  * draw pages themselves (thumbnails, sheets kept for offline use, a
@@ -35,7 +35,7 @@ export function pdf(options: PdfOptions = {}): FormatPlugin<PdfOptions> {
   return {
     id: "pdf",
     match: MATCHERS.pdf,
-    capabilities: ["pages", "zoom", "drag", "outline", "pictures", "viewport"],
+    capabilities: ["pages", "zoom", "drag", "outline", "pictures", "viewport", "highlights"],
     options,
     load: () => import("./renderer.js").then((m) => m.renderer),
     async prefetch(assetBase) {

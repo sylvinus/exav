@@ -46,11 +46,11 @@ pub struct PeImage {
     /// offset.
     pub file_align: u32,
     /// Whether the image is a DLL. Its entry point is `DllMain`, which takes
-    /// three arguments — a stub that reads them off an empty stack faults
+    /// three arguments: a stub that reads them off an empty stack faults
     /// immediately.
     pub is_dll: bool,
     /// Import directory (RVA, size). A packed image imports the two or three
-    /// functions its stub needs, and the *loader* — not the stub — fills those
+    /// functions its stub needs, and the *loader*, not the stub, fills those
     /// slots in. Emulating that binding is what lets the stub call them.
     pub import_dir: (u32, u32),
     /// TLS directory (RVA, size), data directory 9. Zero when absent. The run
@@ -193,8 +193,8 @@ impl PeImage {
             let addr = self.base.wrapping_add(s.vaddr);
             mem.map(addr, vlen).map_err(|_| MapFailed)?;
             // What the loader reads, not what the field says. It rounds
-            // `PointerToRawData` down to a **512-byte** boundary — the sector
-            // size, not the declared file alignment — and packers rely on it
+            // `PointerToRawData` down to a **512-byte** boundary (the sector
+            // size, not the declared file alignment), and packers rely on it
             // both ways: NSPack points its entry section at an unaligned offset
             // holding zeros (the code lives at the rounded-down offset), while
             // FSG declares a 4 KiB file alignment with a section at 0xe00 that
@@ -237,8 +237,8 @@ impl PeImage {
     pub fn dump(&self, mem: &mut Mem, file: &[u8], oep_rva: u32, cap: usize) -> Option<Vec<u8>> {
         // Only the part of the image that holds content is written out. A
         // packed file routinely declares a `SizeOfImage` far larger than
-        // anything it fills — the destination section is reserved at its
-        // uncompressed size — and copying tens of megabytes of never-touched
+        // anything it fills (the destination section is reserved at its
+        // uncompressed size), and copying tens of megabytes of never-touched
         // zeros costs memory and buys the scanner nothing.
         let total = self.content_end().min(self.size_of_image) as usize;
         if total > cap || total < 0x40 {
@@ -263,12 +263,61 @@ impl PeImage {
             }
             out[..hdr_len].copy_from_slice(&file[..hdr_len]);
         }
-        let opt = pe + 24;
-        // File alignment := section alignment, so raw offsets equal RVAs.
-        write_u32(&mut out, opt + 16, oep_rva); // AddressOfEntryPoint
-        write_u32(&mut out, opt + 36, self.section_align); // FileAlignment
-        write_u32(&mut out, opt + 56, self.size_of_image); // SizeOfImage
-        write_u32(&mut out, opt + 60, self.section_align); // SizeOfHeaders
+        self.restore_wiped_addresses(&mut out);
+        self.lay_out_as_memory(&mut out, oep_rva);
+        Some(out)
+    }
+
+    /// Put back the virtual addresses and sizes of the sections that the stub
+    /// zeroed in memory (Exe32pack zeroes both of every section), from the
+    /// section table of the file, so that every RVA of the dump maps.
+    ///
+    /// Only when the two tables are the same table: the image in memory has as
+    /// many sections, laid out at the same place, and every section whose
+    /// address is not zero has the address the file gives. A stub that
+    /// rebuilt the table as something else keeps what it wrote.
+    fn restore_wiped_addresses(&self, out: &mut [u8]) {
+        let pe = self.pe_off;
+        let in_memory = |out: &[u8], i: usize| -> Option<(u32, u32)> {
+            let at = self.sec_table_off.checked_add(i.checked_mul(40)?)?;
+            Some((u32_at(out, at + 12)?, u32_at(out, at + 8)?))
+        };
+        let same_place = u16_at(out, pe.saturating_add(6))
+            .is_some_and(|n| usize::from(n) == self.sections.len())
+            && u16_at(out, pe.saturating_add(20)).is_some_and(|size| {
+                pe.checked_add(24 + usize::from(size)) == Some(self.sec_table_off)
+            });
+        if !same_place {
+            return;
+        }
+        let mut wiped = Vec::new();
+        for (i, s) in self.sections.iter().enumerate() {
+            match in_memory(out, i) {
+                Some((0, 0)) => wiped.push(i),
+                Some((vaddr, _)) if vaddr == s.vaddr => {}
+                _ => return,
+            }
+        }
+        for i in wiped {
+            let s = &self.sections[i];
+            let at = self.sec_table_off + i * 40;
+            write_u32(out, at + 8, s.vsize); // VirtualSize
+            write_u32(out, at + 12, s.vaddr); // VirtualAddress
+        }
+    }
+
+    /// Rewrite the fields of the headers in `out`, the bytes of the image as
+    /// it lies in memory, so that a reader of files finds every section where
+    /// the memory has it: file alignment := section alignment, and the raw
+    /// pointer and size of every section := its address and its size
+    /// rounded up to the alignment. Nothing but those header fields (and the
+    /// entry point) changes.
+    pub fn lay_out_as_memory(&self, out: &mut [u8], oep_rva: u32) {
+        let opt = self.pe_off + 24;
+        write_u32(out, opt + 16, oep_rva); // AddressOfEntryPoint
+        write_u32(out, opt + 36, self.section_align); // FileAlignment
+        write_u32(out, opt + 56, self.size_of_image); // SizeOfImage
+        write_u32(out, opt + 60, self.section_align); // SizeOfHeaders
         for (i, s) in self.sections.iter().enumerate() {
             let off = self.sec_table_off + i * 40;
             if off + 40 > out.len() {
@@ -276,10 +325,9 @@ impl PeImage {
             }
             let vlen = align_up(s.vsize.max(s.raw_size), self.section_align);
             let vlen = vlen.min(self.size_of_image.saturating_sub(s.vaddr));
-            write_u32(&mut out, off + 16, vlen); // SizeOfRawData
-            write_u32(&mut out, off + 20, s.vaddr); // PointerToRawData
+            write_u32(out, off + 16, vlen); // SizeOfRawData
+            write_u32(out, off + 20, s.vaddr); // PointerToRawData
         }
-        Some(out)
     }
 }
 
@@ -389,6 +437,69 @@ mod tests {
         );
         let at = text.raw_ptr as usize;
         assert_eq!(&dump[at..at + 13], b"ORIGINAL CODE");
+    }
+
+    /// The image of two sections mapped, then its section table changed in
+    /// memory by `edit(mem, table_address)`, then dumped and read back.
+    fn dump_after_table_edit(edit: impl FnOnce(&mut Mem, u32)) -> PeImage {
+        let file = build_pe(&[b".text", b".data"], b"PAYLOAD", 1);
+        let pe = PeImage::parse(&file).unwrap();
+        let mut mem = Mem::new(256);
+        pe.map_into(&file, &mut mem).unwrap();
+        mem.write_bytes(0x0040_1000, b"ORIGINAL CODE").unwrap();
+        edit(&mut mem, 0x0040_0000 + pe.sec_table_off as u32);
+        let dump = pe.dump(&mut mem, &file, 0x1000, 1 << 20).unwrap();
+        PeImage::parse(&dump).expect("the dump re-parses as a PE")
+    }
+
+    fn wipe(mem: &mut Mem, table: u32, section: u32) {
+        mem.write_bytes(table + section * 40, &[0; 16]).unwrap();
+    }
+
+    #[test]
+    fn a_section_table_the_stub_zeroed_gets_its_addresses_back() {
+        let dump = dump_after_table_edit(|mem, table| {
+            wipe(mem, table, 0);
+            wipe(mem, table, 1);
+        });
+        assert_eq!(dump.sections[0].vaddr, 0x1000);
+        assert_eq!(dump.sections[0].vsize, 0x1000);
+        assert_eq!(dump.sections[1].vaddr, 0x2000);
+        assert_eq!(dump.sections[1].vsize, 0x1000);
+        assert_eq!(dump.sections[1].raw_ptr, 0x2000);
+    }
+
+    #[test]
+    fn a_zeroed_section_is_restored_beside_one_that_kept_its_address() {
+        let dump = dump_after_table_edit(|mem, table| wipe(mem, table, 1));
+        assert_eq!(dump.sections[0].vaddr, 0x1000);
+        assert_eq!(dump.sections[1].vaddr, 0x2000);
+    }
+
+    #[test]
+    fn a_section_table_of_another_length_is_not_restored() {
+        let dump = dump_after_table_edit(|mem, table| {
+            wipe(mem, table, 0);
+            wipe(mem, table, 1);
+            // NumberOfSections is at the start of the COFF header.
+            mem.write_bytes(0x0040_0000 + 0x80 + 6, &[1, 0]).unwrap();
+        });
+        assert_eq!(dump.sections.len(), 1, "the count in memory is the dump's");
+        assert_eq!(dump.sections[0].vaddr, 0);
+    }
+
+    #[test]
+    fn a_section_table_the_stub_rebuilt_is_left_as_written() {
+        let dump = dump_after_table_edit(|mem, table| {
+            mem.write_bytes(table + 12, &0x5000u32.to_le_bytes())
+                .unwrap();
+            wipe(mem, table, 1);
+        });
+        assert_eq!(dump.sections[0].vaddr, 0x5000);
+        assert_eq!(
+            dump.sections[1].vaddr, 0,
+            "no restore when the tables differ"
+        );
     }
 
     #[test]

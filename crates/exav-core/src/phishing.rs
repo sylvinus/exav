@@ -1,11 +1,11 @@
 //! Phishing heuristics (opt-in): flag the classic link-spoofing tricks in
-//! HTML/email bodies — the visible text names one domain while the `href` points
+//! HTML/email bodies: the visible text names one domain while the `href` points
 //! at another, the real host is hidden behind `user@host` userinfo, or the link
 //! resolves to a bare IP under a brand-looking display. A general anchor-analysis
 //! technique: parse each `<a>` element, compare the displayed registered domain
-//! to the href's, and report the mismatch class. Deliberately conservative — the
+//! to the href's, and report the mismatch class. Deliberately conservative: the
 //! *display* must itself look like a host/URL, so ordinary "click here" links
-//! never trip — and off unless `ScanOptions::alert_phishing` is set.
+//! never trip, and it is off unless `ScanOptions::alert_phishing` is set.
 //!
 //! When present, the ClamAV-compatible `.wdb`/`.pdb` databases (on-disk data
 //! formats) refine precision: `.wdb` allow-lists legitimate (real, displayed)
@@ -26,7 +26,7 @@ const MAX_ALLOW_CHECKS: usize = 4096;
 /// [`PhishingDb::from_cache_parts`].
 pub type PhishingParts = (Vec<String>, Vec<(String, String)>, Vec<(String, String)>);
 
-/// Phishing databases in the ClamAV `.wdb`/`.pdb` on-disk formats — an allow-list
+/// Phishing databases in the ClamAV `.wdb`/`.pdb` on-disk formats: an allow-list
 /// of legitimate (real, displayed) URL pairs and a monitored-brand domain-list.
 /// Precision-only: never adds a detection the raw heuristic wouldn't raise.
 #[derive(Default, Debug)]
@@ -166,7 +166,7 @@ pub enum Phish {
     CloakedUsername,
     CloakedIp,
     /// The visible text advertises `https://`, the `href` is plain `http://`.
-    /// The domains agree, so no other check fires — the lie is about transport,
+    /// The domains agree, so no other check fires: the lie is about transport,
     /// and transport is what the link is advertising.
     SslSpoof,
 }
@@ -236,7 +236,7 @@ pub(crate) fn scan_complete_source(
 /// [`scan_complete`] over links already read: `(display, href)` pairs, from a
 /// document that is not HTML (Markdown, a PDF) and has its own way of saying
 /// where a link goes. Judged as an anchor is, allow-list included.
-#[cfg(feature = "visible-text")]
+#[cfg(any(feature = "visible-text", feature = "qr"))]
 pub(crate) fn scan_links(links: &[(String, String)], db: &PhishingDb) -> (Option<Phish>, bool) {
     let mut allow_checks = 0usize;
     for (display, href) in links {
@@ -303,7 +303,7 @@ fn classify(href: &str, display: &str, db: &PhishingDb) -> Option<Phish> {
         return None;
     }
     let disp_host = display_host(display);
-    // Userinfo cloak: `http://paypal.com@evil/` — flag only when the userinfo
+    // Userinfo cloak (`http://paypal.com@evil/`): flag only when the userinfo
     // itself looks like a hostname of a different registered domain.
     if let Some(ui) = userinfo
         && ui.contains('.')
@@ -325,7 +325,7 @@ fn classify(href: &str, display: &str, db: &PhishingDb) -> Option<Phish> {
     // the transport lie below: a link that spoofs the domain *and* downgrades
     // the scheme is a domain spoof, the more specific finding. (Getting this
     // order wrong made a paypal.com-spoofing link report as a mere SSL
-    // mismatch — the existing `spoofed_domain` test caught it.)
+    // mismatch; the existing `spoofed_domain` test caught it.)
     if let Some(dh) = &disp_host
         && !dh.is_empty()
         && registered(dh) != registered(host)
@@ -336,7 +336,7 @@ fn classify(href: &str, display: &str, db: &PhishingDb) -> Option<Phish> {
         return Some(Phish::SpoofedDomain);
     }
     // Transport lie: the display promises https, the href is plain http, and the
-    // domains agree — the one phishing shape where everything except the scheme
+    // domains agree: the one phishing shape where everything except the scheme
     // matches, so no other check can catch it.
     if display
         .trim_start()

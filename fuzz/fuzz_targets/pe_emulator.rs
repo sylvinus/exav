@@ -9,8 +9,8 @@
 //!
 //! Two things are being looked for:
 //!
-//! * **Panics.** Every stop in `exav-pe-emu` is meant to be a value — a fault, an
-//!   unimplemented instruction, a budget — never an unwind. Release builds keep
+//! * **Panics.** Every stop in `exav-pe-emu` is meant to be a value (a fault, an
+//!   unimplemented instruction, a budget), never an unwind. Release builds keep
 //!   overflow checks on, so a single missed wrapping operation in the
 //!   interpreter is a panic, and a panic is a denial of service on a scanner
 //!   that is handed the file by an attacker.
@@ -23,7 +23,7 @@
 //! Budgets are tight on purpose: the point is coverage per second, not letting
 //! one input run a hundred million instructions.
 //!
-//! Seed corpus: `fuzz/corpus/pe_emulator/` — small packed PEs, so the mutator
+//! Seed corpus: `fuzz/corpus/pe_emulator/`, small packed PEs, so the mutator
 //! starts inside a stub rather than rediscovering the PE header.
 use exav_pe_emu::{EmuLimits, unpack};
 use libfuzzer_sys::fuzz_target;

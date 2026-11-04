@@ -713,6 +713,99 @@ mod tests {
         );
     }
 
+    /// A package past the buffer limit, read from a source that is not in
+    /// memory, would decrypt to its first part: it is reported as not
+    /// decrypted instead of handed over as a whole ZIP, and one within the
+    /// limit is decrypted by the same walk.
+    #[test]
+    fn an_encrypted_package_past_the_buffer_limit_is_reported_not_cut() {
+        use crate::source::BlockCache;
+        use crate::{Budget, Format, Limits, Member};
+        use std::io::{Cursor, Write};
+
+        let salt = [0x37u8; 16];
+        let key = ooxml_standard_key(&salt, "", 16);
+        let verifier = [0x19u8; 16];
+        let mut vhash_padded = sha1(&verifier).to_vec();
+        vhash_padded.resize(32, 0);
+        let mut info = Vec::new();
+        info.extend_from_slice(&3u16.to_le_bytes());
+        info.extend_from_slice(&2u16.to_le_bytes());
+        info.extend_from_slice(&0u32.to_le_bytes());
+        let mut hdr = vec![0u8; 32];
+        hdr[16..20].copy_from_slice(&128u32.to_le_bytes());
+        info.extend_from_slice(&(hdr.len() as u32).to_le_bytes());
+        info.extend_from_slice(&hdr);
+        info.extend_from_slice(&16u32.to_le_bytes());
+        info.extend_from_slice(&salt);
+        info.extend_from_slice(&aes_ecb_encrypt(&key, &verifier));
+        info.extend_from_slice(&20u32.to_le_bytes());
+        info.extend_from_slice(&aes_ecb_encrypt(&key, &vhash_padded));
+
+        let walk = |plain_len: usize| {
+            let mut plain: Vec<u8> = (0..plain_len as u32).map(|i| (i >> 3) as u8).collect();
+            plain.extend_from_slice(eicar());
+            let mut padded = plain.clone();
+            padded.resize(plain.len().next_multiple_of(16), 0);
+            let mut package = (plain.len() as u64).to_le_bytes().to_vec();
+            package.extend_from_slice(&aes_ecb_encrypt(&key, &padded));
+            let mut cf = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+            cf.create_stream("/EncryptionInfo")
+                .unwrap()
+                .write_all(&info)
+                .unwrap();
+            cf.create_stream("/EncryptedPackage")
+                .unwrap()
+                .write_all(&package)
+                .unwrap();
+            // Keeps the file past the limit when the package is not.
+            cf.create_stream("/Pad")
+                .unwrap()
+                .write_all(&[7u8; 100_000])
+                .unwrap();
+            cf.flush().unwrap();
+            let blob = cf.into_inner().into_inner();
+            let cache = BlockCache::with_sizes(Cursor::new(blob), 4096, 64 * 1024).unwrap();
+            let mut budget = Budget::new(Limits {
+                max_buffer_bytes: 128 * 1024,
+                ..Limits::default()
+            });
+            let mut got = Vec::new();
+            crate::walk(Format::Ole, &cache, &mut budget, &mut |meta, content, _| {
+                let mut data = Vec::new();
+                match content {
+                    Some(Member::Bytes(b)) => data = b,
+                    Some(Member::Stream(r)) => {
+                        r.read_to_end(&mut data).unwrap();
+                    }
+                    None => {}
+                }
+                got.push((meta.name.clone(), meta.unsupported, data));
+                None::<()>
+            })
+            .unwrap();
+            got
+        };
+        // 200,000 bytes of package: past the 131,072-byte limit.
+        let big = walk(200_000);
+        assert!(
+            !big.iter().any(|g| g.0 == "EncryptedPackage.zip"),
+            "{big:?}"
+        );
+        let reported = big.iter().find(|g| g.0 == "EncryptedPackage").unwrap();
+        assert!(
+            reported.1.is_some_and(|r| r.contains("buffer limit")),
+            "{reported:?}"
+        );
+        // A package within the limit, in a file past it, is decrypted.
+        let small = walk(50_000);
+        let zip = small
+            .iter()
+            .find(|g| g.0 == "EncryptedPackage.zip")
+            .unwrap_or_else(|| panic!("{small:?}"));
+        assert!(zip.1.is_none() && zip.2.ends_with(eicar()));
+    }
+
     fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
         use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::NoPadding};
         let mut out = data.to_vec();

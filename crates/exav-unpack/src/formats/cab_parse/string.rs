@@ -1,6 +1,6 @@
 use std::io::{self, Read};
 
-use byteorder::ReadBytesExt;
+use crate::formats::cab_parse::ReadLe;
 
 use crate::formats::cab_parse::consts;
 

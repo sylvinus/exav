@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 
+import { highlightId } from "../core/highlights.js";
 import { sameSource } from "../core/source.js";
 import type { Store } from "../core/store.js";
 import type { Controllers, FileSource, Session, Status, ViewerFile } from "../core/types.js";
@@ -34,6 +35,8 @@ export function useSession(file: ViewerFile | null) {
   // Bumped to start over when a document cannot be replaced in place.
   const [restarts, setRestarts] = useState(0);
   const shown = useRef<FileSource | null>(null);
+  /** The highlights the session was given (`marksOf`). */
+  const marked = useRef("");
   const key = file ? `${file.id}\u0000${file.source ? "s" : "n"}\u0000${restarts}` : "";
   useEffect(() => {
     if (!file || !host) {
@@ -42,6 +45,7 @@ export function useSession(file: ViewerFile | null) {
     }
     const s = viewer.mount(host, file);
     shown.current = file.source;
+    marked.current = marksOf(file);
     setSession(s);
     const ro = new ResizeObserver(() => s.resize());
     ro.observe(host);
@@ -66,9 +70,49 @@ export function useSession(file: ViewerFile | null) {
     };
     // Whatever else the file carries (its meta, say) is read when it is mounted or replaced.
   }, [session, source]);
+  // The highlights: the file's when it is mounted, then each new list or focus, which goes there.
+  const marks = file ? marksOf(file) : "";
+  useEffect(() => {
+    if (!session || !file || marks === marked.current) return;
+    marked.current = marks;
+    const list = file.highlights ?? [];
+    const focus = file.focusHighlight ?? (list[0] && highlightId(list[0], 0));
+    return whenControllers(session, (c) => c.highlights, (h) => {
+      h.set(list);
+      if (focus !== undefined) h.goTo(focus);
+    });
+  }, [session, marks]);
   const status = useStore(session?.status) ?? LOADING;
   const controllers: Controllers = useStore(session?.controllers) ?? {};
   return { session, status, controllers, ref: setHost };
+}
+
+/** What decides whether a file's highlights changed: a new literal with the same ones did not. */
+const marksOf = (file: ViewerFile) => (file.highlights || file.focusHighlight !== undefined ? JSON.stringify([file.highlights ?? [], file.focusHighlight ?? null]) : "");
+
+/**
+ * Runs `run` with the controller `pick` finds in the session's, at once or
+ * once the session publishes it. Returns what cancels the wait.
+ */
+export function whenControllers<T>(session: Session, pick: (c: Controllers) => T | undefined, run: (controller: T) => void): () => void {
+  const now = pick(session.controllers.get());
+  if (now) {
+    run(now);
+    return () => {};
+  }
+  const stop = session.controllers.subscribe((c) => {
+    const found = pick(c);
+    if (!found) return;
+    stop();
+    run(found);
+  });
+  return stop;
+}
+
+/** The session on screen: an archive's member's when one is open, and so on down. */
+export function shownSession(session: Session): Session {
+  const opened = session.controllers.get().archive?.get().opened;
+  return opened ? shownSession(opened.session) : session;
 }
 
 // ── The tools' state, for the default pieces and for a host's own ───────────

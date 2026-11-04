@@ -4,6 +4,7 @@
  */
 import type { PDFDocumentProxy } from "pdfjs-dist";
 
+import { clipRect, findQuote, fold } from "../core/highlights.js";
 import { throwIfAborted } from "../core/pictures.js";
 import { bitmapOf, createCanvas, release } from "../core/raster.js";
 import type { ByteRanges, RasterRect } from "../core/types.js";
@@ -96,6 +97,12 @@ export interface LoadedPdf {
   links(page: number): Promise<PdfLink[]>;
   /** Where a link's `dest` leads, or null. */
   destination(dest: unknown): Promise<PdfDestination | null>;
+  /**
+   * The boxes of `quote` on `page` (`findQuote` matching, a box per run of
+   * text it covers), or null when the page does not have it. Rejects when
+   * the page's text cannot be read.
+   */
+  findText(page: number, quote: string): Promise<PageArea[] | null>;
   destroy(): void;
 }
 
@@ -246,6 +253,21 @@ function wrap(doc: PDFDocumentProxy, pdfjs: Pdfjs): LoadedPdf {
     return { width, height };
   };
   const destination = destinationResolver(doc);
+  // Each page's text, read once, for the quotes looked for on it.
+  const texts = new Map<number, Promise<{ index: PageTextIndex; viewport: TextViewportLike }>>();
+  const pageText = (n: number) => {
+    let p = texts.get(n);
+    if (!p) {
+      p = (async () => {
+        const page = await doc.getPage(n);
+        const content = await page.getTextContent();
+        return { index: indexText(content.items, content.styles), viewport: page.getViewport({ scale: 1 }) };
+      })();
+      texts.set(n, p);
+      p.catch(() => texts.delete(n));
+    }
+    return p;
+  };
 
   return {
     numPages: doc.numPages,
@@ -379,9 +401,14 @@ function wrap(doc: PDFDocumentProxy, pdfjs: Pdfjs): LoadedPdf {
       }
     },
     destination,
+    async findText(n, quote) {
+      const { index, viewport } = await pageText(n);
+      return quoteAreas(index, viewport, quote);
+    },
     destroy() {
       for (const canvas of [...generation.keys()]) claim(canvas);
       generation.clear();
+      texts.clear();
       chain.clear();
       inFlight.clear();
       void doc.loadingTask.destroy();
@@ -468,6 +495,148 @@ function toArea(rect: unknown, viewport: ViewportLike): PageArea | null {
   const bottom = clip(Math.max(y1, y2) / viewport.height);
   if (right <= left || bottom <= top) return null;
   return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+/** What `indexText` reads of a pdf.js text item. */
+export interface TextItemLike {
+  str?: unknown;
+  transform?: unknown;
+  width?: unknown;
+  fontName?: unknown;
+}
+
+/** What `indexText` reads of a pdf.js font style. */
+export interface TextStyleLike {
+  fontFamily?: string;
+  ascent?: number;
+  descent?: number;
+  vertical?: boolean;
+}
+
+/** What `quoteAreas` needs of a pdf.js viewport at scale 1. */
+export interface TextViewportLike {
+  width: number;
+  height: number;
+  transform: number[];
+}
+
+interface TextRun {
+  str: string;
+  transform: number[];
+  width: number;
+  style: TextStyleLike;
+}
+
+/** A page's text folded for matching (`fold`), each character traced back to its run. */
+export interface PageTextIndex {
+  chars: string;
+  /** The run, and the character in it, of each folded character. */
+  run: number[];
+  offset: number[];
+  runs: TextRun[];
+}
+
+/** The text runs of a page, folded and joined, from `getTextContent`'s items and styles. */
+export function indexText(items: readonly unknown[], styles: Record<string, TextStyleLike | undefined>): PageTextIndex {
+  const out: PageTextIndex = { chars: "", run: [], offset: [], runs: [] };
+  for (const raw of items) {
+    const item = raw as TextItemLike;
+    if (typeof item.str !== "string" || !item.str || !Array.isArray(item.transform) || item.transform.length !== 6) continue;
+    if (!item.transform.every((v) => typeof v === "number" && Number.isFinite(v)) || typeof item.width !== "number" || !Number.isFinite(item.width)) continue;
+    const r = out.runs.length;
+    out.runs.push({ str: item.str, transform: item.transform as number[], width: item.width, style: (typeof item.fontName === "string" && styles[item.fontName]) || {} });
+    const f = fold(item.str);
+    out.chars += f.chars;
+    for (const i of f.from) {
+      out.run.push(r);
+      out.offset.push(i);
+    }
+  }
+  return out;
+}
+
+let measuring: CanvasRenderingContext2D | null | undefined;
+
+/** Width of `text` in `family`, in any unit; null without a canvas to measure on. */
+function measureText(text: string, family: string): number | null {
+  if (measuring === undefined) {
+    try {
+      measuring = typeof document === "undefined" ? null : document.createElement("canvas").getContext("2d");
+    } catch {
+      measuring = null;
+    }
+  }
+  if (!measuring) return null;
+  measuring.font = `100px ${family}`;
+  return measuring.measureText(text).width;
+}
+
+const multiply = (m: number[], n: number[]) => [
+  m[0]! * n[0]! + m[2]! * n[1]!,
+  m[1]! * n[0]! + m[3]! * n[1]!,
+  m[0]! * n[2]! + m[2]! * n[3]!,
+  m[1]! * n[2]! + m[3]! * n[3]!,
+  m[0]! * n[4]! + m[2]! * n[5]! + m[4]!,
+  m[1]! * n[4]! + m[3]! * n[5]! + m[5]!,
+];
+
+/**
+ * The box of characters `[from, to)` of a run, in fractions of the page
+ * shown. Placed as pdf.js's text layer places the run (its ascent above the
+ * baseline, its width along it), the characters' share of the width
+ * measured in the run's generic font, as the text layer draws it.
+ */
+function runArea(run: TextRun, from: number, to: number, viewport: TextViewportLike, measure: typeof measureText): PageArea | null {
+  const tx = multiply(viewport.transform, run.transform);
+  let angle = Math.atan2(tx[1]!, tx[0]!);
+  if (run.style.vertical) angle += Math.PI / 2;
+  const height = Math.hypot(tx[2]!, tx[3]!);
+  const ascent = height * (run.style.ascent ? run.style.ascent : run.style.descent ? 1 + run.style.descent : 0.8);
+  const descent = height - ascent;
+  const family = run.style.fontFamily ?? "sans-serif";
+  const whole = measure(run.str, family);
+  const share = (n: number) => (whole ? (measure(run.str.slice(0, n), family) ?? n) / whole : n / run.str.length);
+  const length = run.width * Math.hypot(viewport.transform[0]!, viewport.transform[1]!);
+  const x0 = share(from) * length;
+  const x1 = share(to) * length;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const along of [x0, x1]) {
+    for (const up of [ascent, -descent]) {
+      xs.push(tx[4]! + along * cos + up * sin);
+      ys.push(tx[5]! + along * sin - up * cos);
+    }
+  }
+  if (!(viewport.width > 0) || !(viewport.height > 0)) return null;
+  return clipRect({
+    x: Math.min(...xs) / viewport.width,
+    y: Math.min(...ys) / viewport.height,
+    width: (Math.max(...xs) - Math.min(...xs)) / viewport.width,
+    height: (Math.max(...ys) - Math.min(...ys)) / viewport.height,
+  });
+}
+
+/** The boxes of `quote` in a page's text (`findQuote`), a box per run it covers; null when not found. */
+export function quoteAreas(index: PageTextIndex, viewport: TextViewportLike, quote: string, measure: typeof measureText = measureText): PageArea[] | null {
+  const found = findQuote(index.chars, quote);
+  if (!found) return null;
+  const areas: PageArea[] = [];
+  for (const { start, end } of found) {
+    const first = index.run[start]!;
+    const last = index.run[end - 1]!;
+    for (let r = first; r <= last; r++) {
+      const run = index.runs[r]!;
+      const from = r === first ? index.offset[start]! : 0;
+      const to = r === last ? index.offset[end - 1]! + 1 : run.str.length;
+      // A run of spaces between two lines of the quote is no part of it.
+      if (!run.str.slice(from, to).trim()) continue;
+      const area = runArea(run, from, to, viewport, measure);
+      if (area) areas.push(area);
+    }
+  }
+  return areas.length ? areas : null;
 }
 
 /**

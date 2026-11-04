@@ -21,7 +21,7 @@
 //!
 //! Stubs defend themselves, and some will not run to completion here: an
 //! instruction the interpreter does not implement, a Windows API it does not
-//! provide, a deliberate fault. That is reported, not hidden — and if the run
+//! provide, a deliberate fault. That is reported, not hidden, and if the run
 //! still rewrote a meaningful part of the image, the partial reconstruction is
 //! offered separately from a clean one, because a half-decompressed image is
 //! worth scanning but is not the same claim as "this is the original program".
@@ -32,7 +32,7 @@
 //! because throwing an exception at itself and continuing from the handler is a
 //! standard anti-emulation move (PESpin, Yoda's Protector, tElock). The
 //! emulator builds the `EXCEPTION_RECORD` and `CONTEXT` on the stack, calls the
-//! handler, and resumes from the context the handler leaves behind — including
+//! handler, and resumes from the context the handler leaves behind, including
 //! any registers or instruction pointer it edited, which is exactly the
 //! mechanism those stubs are using.
 //!
@@ -77,13 +77,13 @@ const EXC_RECORD_SIZE: u32 = 0x50;
 const MIN_PARTIAL_DIRTY: u64 = 64 * 1024;
 
 /// How much of the image must have been rebuilt before a jump into it can be
-/// the original entry point. Obfuscated programs — not packed ones — write a
+/// the original entry point. Obfuscated programs (not packed ones) write a
 /// jump table into another section and transfer through it after a few hundred
 /// instructions; without a floor, that is indistinguishable from an unpack.
 const MIN_UNPACK_DIRTY: u64 = 32 * 1024;
 
 /// How long a run may go without writing a page it has not written before.
-/// Sized so a slow but genuine decompressor — which produces output steadily —
+/// Sized so a slow but genuine decompressor (which produces output steadily)
 /// never trips it, while a spin loop is cut off in a fraction of a second.
 const PROGRESS_WINDOW: u64 = 8_000_000;
 
@@ -118,8 +118,8 @@ const DLL_PROCESS_ATTACH: u32 = 1;
 /// Everything that bounds a run.
 ///
 /// This is the sandbox's contract. The emulator follows control flow supplied
-/// by the file being scanned — the one place in exav where hostile input
-/// decides what executes next rather than what gets parsed — so every way a
+/// by the file being scanned (the one place in exav where hostile input
+/// decides what executes next rather than what gets parsed), so every way a
 /// run can end is a number here, and a run that hits any of them stops and
 /// reports rather than continuing on a guess.
 ///
@@ -133,7 +133,7 @@ const DLL_PROCESS_ATTACH: u32 = 1;
 /// one of them. Raising a single limit rarely changes an outcome on its own.
 pub struct EmuLimits {
     /// Instruction budget. A `rep` counts its iterations, so this bounds work,
-    /// not instruction *count* — a stub cannot buy time with one long `rep`.
+    /// not instruction *count*: a stub cannot buy time with one long `rep`.
     pub max_ticks: u64,
     /// Resident-page cap for the whole address space.
     pub max_pages: usize,
@@ -209,7 +209,7 @@ pub struct Report {
     /// Comparisons and transcendentals are not emulated. A stub that computed
     /// with them reached its result by a path this run did not follow, so
     /// whatever it produced afterwards rests on registers that were never
-    /// updated. The dump is still offered — it is usually still the payload —
+    /// updated. The dump is still offered (it is usually still the payload),
     /// but a caller weighing how much to trust it, or triaging why an unpack
     /// came out wrong, needs to know the arithmetic was incomplete.
     pub fpu_approximated: bool,
@@ -306,8 +306,8 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
             break;
         }
         // A stub that is unpacking writes pages continuously. One that has not
-        // touched a new page in millions of instructions is spinning — an
-        // anti-emulation delay loop, or a decompressor that lost its way — and
+        // touched a new page in millions of instructions is spinning (an
+        // anti-emulation delay loop, or a decompressor that lost its way), and
         // running it to the full budget only spends scan time to reach the same
         // place. Checked on a coarse interval so the check itself is free.
         if ticks >= progress_deadline {
@@ -368,7 +368,7 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
             // Charged like any other step. Dispatching a handler runs no
             // instruction, so an SEH chain that keeps returning here would
             // otherwise advance neither the tick budget nor the progress
-            // window — a loop the emulator cannot see itself taking.
+            // window: a loop the emulator cannot see itself taking.
             ticks += 1;
             match seh.handler_returned(&mut cpu, &mut mem) {
                 Ok(SehOutcome::Resumed) => continue,
@@ -394,7 +394,7 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
                     // One tick for the call, plus one per page the call moved.
                     // `memcpy` and friends copy up to 64 MiB per call, so
                     // charging a flat tick would let a stub spend the whole
-                    // budget's worth of work on every single tick — the bound
+                    // budget's worth of work on every single tick: the bound
                     // has to be on work, not on how many calls it took.
                     ticks += 1 + env.take_bulk_bytes() / PAGE_SIZE as u64;
                     continue;
@@ -418,7 +418,7 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
                     continue;
                 }
                 Err(Stop::Fault(_)) => {
-                    // The stub passed a pointer that does not resolve — a
+                    // The stub passed a pointer that does not resolve: a
                     // buffer it never allocated, a string built from a value
                     // this environment answered differently. On Windows that is
                     // a failed call, not a dead process: the API returns an
@@ -453,8 +453,8 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
         //
         // The conditions are ordered cheapest-first: the watched-range count is
         // a field read, and until the stub has rebuilt `min_unpack_dirty` no
-        // jump can be the entry point, so most steps — every spinner, every
-        // stub that faults early — never reach the section lookup or the dirty
+        // jump can be the entry point, so most steps (every spinner, every
+        // stub that faults early) never reach the section lookup or the dirty
         // hash probe. Reordering is semantics-preserving: every condition is
         // side-effect free except `rebuilt`, which stays last under the same
         // call conditions as before (so its recheck throttle behaves identically).
@@ -544,14 +544,14 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
     report.tail = trace.into_iter().collect();
     report.api_calls = std::mem::take(&mut env.api_log);
 
-    // How much of the image the stub rewrote — the measure of whether anything
+    // How much of the image the stub rewrote: the measure of whether anything
     // was actually reconstructed.
     //
     // Counted in pages rather than walked by address: `ImageBase` has no upper
     // bound in the header, so `base + SizeOfImage` can pass 4 GiB, `image_end`
     // saturates, and a `u32` cursor stepping toward it wraps to zero and never
     // arrives. This runs after the emulation loop, where the tick budget, the
-    // progress window and the page cap are all already spent — a loop that does
+    // progress window and the page cap are all already spent: a loop that does
     // not end here does not end at all.
     let mut dirty = 0u64;
     let pages = (u64::from(image_end) - u64::from(image.base)) / PAGE_SIZE as u64;
@@ -566,10 +566,10 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
     // Images the stub built in memory it allocated. These are collected whether
     // or not the stub also rewrote its own image, because a loader that unfolds
     // the payload into fresh pages and runs it from there never touches the
-    // image at all — and that shape is a dropper, not an edge case.
+    // image at all, and that shape is a dropper, not an edge case.
     report.extra = allocated_payloads(&env, &mut mem, limits.max_dump, file);
 
-    // A run that stopped early having rewritten a page or two rebuilt nothing —
+    // A run that stopped early having rewritten a page or two rebuilt nothing:
     // that is a stub that faulted on its way in, and dumping its image would
     // hand the scanner the packed file back under a name that says "unpacked".
     if dirty == 0 || (oep.is_none() && dirty < limits.min_partial_dirty) {
@@ -715,7 +715,7 @@ fn next_tls_callback(mem: &mut Mem, cb_array: u32, idx: u32, image: &PeImage) ->
 /// Landing on a dirty page in another section is necessary but not sufficient:
 /// obfuscated (not packed) programs write a word into a data section and jump
 /// through it, which looks identical at one instruction's resolution. What
-/// separates the two is bulk — an unpacker rewrites the section it hands
+/// separates the two is bulk: an unpacker rewrites the section it hands
 /// control to, so a quarter of that section's pages, at minimum, carry bytes
 /// the stub produced.
 ///
@@ -758,7 +758,7 @@ fn rebuilt(
 }
 
 /// Regions the stub allocated that hold a PE image. Some packers rebuild the
-/// original program in fresh memory and only then map it over themselves — or
+/// original program in fresh memory and only then map it over themselves, or
 /// never do, and run it from there.
 fn allocated_payloads(env: &Env, mem: &mut Mem, cap: usize, file: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
@@ -770,12 +770,12 @@ fn allocated_payloads(env: &Env, mem: &mut Mem, cap: usize, file: &[u8]) -> Vec<
         if head.len() < 2 || &head[..2] != b"MZ" {
             continue;
         }
-        let body = mem.snapshot(base, size as usize);
-        if PeImage::parse(&body).is_none() {
+        let mut body = mem.snapshot(base, size as usize);
+        let Some(payload) = PeImage::parse(&body) else {
             continue;
-        }
-        // A stub that reads its own file into memory — Neolite does, and so do
-        // most self-extractors — leaves a copy of the input in an allocation.
+        };
+        // A stub that reads its own file into memory (Neolite does, and so do
+        // most self-extractors) leaves a copy of the input in an allocation.
         // Emitting that as a discovered payload feeds the file back into the
         // unpacker, which finds the same copy again, one nesting level deeper,
         // for as long as the recursion budget lasts.
@@ -783,6 +783,10 @@ fn allocated_payloads(env: &Env, mem: &mut Mem, cap: usize, file: &[u8]) -> Vec<
             && file.len() >= 0x200
             && body[..file.len().min(0x1000)] == file[..file.len().min(0x1000)];
         if !same_prefix {
+            // The bytes are memory, as Windows mapped the payload, and its
+            // section table still gives file offsets: put the raw pointers
+            // where the sections are, as the dump of the stub's own image has.
+            payload.lay_out_as_memory(&mut body, payload.entry_rva);
             out.push(body);
         }
         if out.len() >= 4 {
@@ -1019,7 +1023,7 @@ mod tests {
 
     /// Limits for the hand-written stubs below: they rebuild a few hundred
     /// bytes, where the shipping thresholds are sized for a real unpack of tens
-    /// of kilobytes. Both sides are covered — `a_small_rewrite_is_not_an_unpack`
+    /// of kilobytes. Both sides are covered: `a_small_rewrite_is_not_an_unpack`
     /// exercises the shipping value.
     fn tiny_limits() -> EmuLimits {
         EmuLimits {
@@ -1128,7 +1132,7 @@ mod tests {
     ///
     /// `ImageBase` is a header field with no upper bound, so `base +
     /// SizeOfImage` can pass 4 GiB. Any walk that steps a `u32` cursor toward a
-    /// saturated end address wraps to zero and never reaches it — and this walk
+    /// saturated end address wraps to zero and never reaches it, and this walk
     /// runs *after* the emulation loop, so the tick budget, the progress window
     /// and the page cap are all already spent. Nothing else would stop it.
     ///
@@ -1217,7 +1221,7 @@ mod tests {
     #[test]
     fn a_fault_is_delivered_to_the_stubs_own_seh_handler() {
         // Install a handler, fault, and have the handler rewrite the context's
-        // EIP so execution continues — the anti-emulation pattern.
+        // EIP so execution continues: the anti-emulation pattern.
         //
         //   68 <handler>      push handler
         //   64 ff 35 00 00 00 00   push fs:[0]
@@ -1349,5 +1353,48 @@ mod tests {
             found, 0x7c80_0000,
             "the walk reached the synthetic kernel32"
         );
+    }
+
+    /// A payload as a stub leaves it in memory it allocated: the headers of a
+    /// PE whose section table gives file offsets, and each section's bytes at
+    /// its address.
+    fn payload_in_memory(mem: &mut Mem, base: u32) {
+        let file = packed_pe(&[0xc3], 0x1000);
+        mem.map(base, 0x3000).unwrap();
+        mem.write_bytes(base, &file[..0x400]).unwrap();
+        mem.write_bytes(base + 0x1000, b"PAYLOAD AT ITS RVA")
+            .unwrap();
+        mem.write_bytes(base + 0x2000, &[0xc3]).unwrap();
+    }
+
+    #[test]
+    fn an_allocated_payload_has_its_raw_pointers_at_its_addresses() {
+        let mut mem = Mem::new(4096);
+        let own = packed_pe(&[0xc3], 0x1000);
+        let mut env = Env::new(&mut mem, 0x0040_0000, 0x3000, &own).unwrap();
+        let base = 0x0100_0000;
+        payload_in_memory(&mut mem, base);
+        env.allocations.push((base, 0x3000));
+        let found = allocated_payloads(&env, &mut mem, 1 << 20, &[]);
+        assert_eq!(found.len(), 1);
+        let pe = PeImage::parse(&found[0]).unwrap();
+        for s in &pe.sections {
+            assert_eq!(s.raw_ptr, s.vaddr, "a raw pointer is the address");
+        }
+        let at = pe.sections[0].raw_ptr as usize;
+        assert_eq!(&found[0][at..at + 18], b"PAYLOAD AT ITS RVA");
+        assert_eq!(pe.entry_rva, 0x2000, "the payload keeps its entry point");
+    }
+
+    #[test]
+    fn a_copy_of_the_stubs_own_file_is_not_a_payload() {
+        let mut mem = Mem::new(4096);
+        let own = packed_pe(&[0xc3], 0x1000);
+        let mut env = Env::new(&mut mem, 0x0040_0000, 0x3000, &own).unwrap();
+        let base = 0x0100_0000;
+        mem.map(base, 0x3000).unwrap();
+        mem.write_bytes(base, &own[..0x1000]).unwrap();
+        env.allocations.push((base, 0x3000));
+        assert!(allocated_payloads(&env, &mut mem, 1 << 20, &own).is_empty());
     }
 }

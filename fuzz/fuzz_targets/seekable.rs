@@ -2,7 +2,7 @@
 //! `scan_seekable` over a reader that behaves as a socket or a disk does: it
 //! returns a few bytes a call, and it fails part way. Every input to the
 //! scanner but a buffer in memory comes through this function, and an object
-//! over `deep_analysis_max` is read through a block cache by offset instead of
+//! over `limits.max_buffer_bytes` is read through a block cache by offset instead of
 //! being held, which is another set of code than `analyze`'s.
 //!
 //! The input is `[bits: u16 LE] [piece: u8] [fail: u8] [data]`: `bits` are
@@ -18,7 +18,7 @@
 //!   read, which a limit never outranks (invariant 1) and which `analyze` of
 //!   the whole object then also finds: a scan that fails to read must not
 //!   report what it did not see as clean (invariant 3);
-//! * an object over `deep_analysis_max` that is read whole and found nothing
+//! * an object over `limits.max_buffer_bytes` that is read whole and found nothing
 //!   is not `Clean`: the checks that parse an object whole did not run on it,
 //!   and the report says so (the crate docs).
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
@@ -70,7 +70,8 @@ fuzz_target!(|input: &[u8]| {
 
     match (fail_at, answer) {
         (None, Ok(report)) => {
-            let held = len <= opts.deep_analysis_max && opts.max_scan_size.is_none_or(|m| len <= m);
+            let held =
+                len <= opts.limits.max_buffer_bytes && opts.max_scan_size.is_none_or(|m| len <= m);
             if held {
                 let direct = analyze(db::scanner(), data, &opts);
                 assert_eq!(

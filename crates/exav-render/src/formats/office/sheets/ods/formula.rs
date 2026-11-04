@@ -5,6 +5,7 @@
 //! union operator and `!` the intersection; array constants use `;` and `|`.
 
 use crate::formats::office::sheets::xls::formula::{quote_external, quote_sheet};
+use std::collections::HashMap;
 
 /// Function names that differ between OpenFormula and Excel.
 const RENAME: &[(&str, &str)] = &[
@@ -170,7 +171,8 @@ const MAX_LEN: usize = 65_536;
 /// externalLink parts are numbered.
 #[derive(Default)]
 pub struct Converter {
-    external: Vec<String>,
+    /// Each external document's number, from 1 in the order first named.
+    external: HashMap<String, usize>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -233,13 +235,12 @@ fn ref_part(s: &str) -> (Option<String>, String) {
 
 impl Converter {
     fn external_index(&mut self, doc: &str) -> usize {
-        match self.external.iter().position(|d| d == doc) {
-            Some(i) => i + 1,
-            None => {
-                self.external.push(doc.to_string());
-                self.external.len()
-            }
+        if let Some(&n) = self.external.get(doc) {
+            return n;
         }
+        let n = self.external.len() + 1;
+        self.external.insert(doc.to_string(), n);
+        n
     }
 
     /// `[...]` reference contents to Excel text.
@@ -574,6 +575,20 @@ fn func_name(n: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::Converter;
+
+    #[test]
+    fn external_documents_are_numbered_in_one_pass() {
+        let mut c = Converter::default();
+        let f = |i: u32| format!("of:=['file:///d{i}.ods'#$Sheet1.A1]");
+        let first = c.convert(&f(0)).unwrap();
+        let t = std::time::Instant::now();
+        for i in 1..1 << 16 {
+            c.convert(&f(i)).unwrap();
+        }
+        assert!(t.elapsed().as_secs() < 2, "took {:?}", t.elapsed());
+        assert_eq!(c.convert(&f(0)).unwrap(), first);
+        assert_ne!(c.convert(&f(1)).unwrap(), first);
+    }
 
     #[test]
     fn refs() {

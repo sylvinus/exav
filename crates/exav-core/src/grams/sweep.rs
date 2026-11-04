@@ -3,6 +3,7 @@
 
 use super::{GRAM, Grams, Scan};
 use crate::byte_source::ByteSource;
+use crate::pass::Fed;
 
 /// Bytes of the object [`sweep`] reads at a time; in memory, a slice of it.
 /// Small in tests, so their haystacks cross windows.
@@ -50,29 +51,104 @@ pub(crate) fn sweep<H: ByteSource + ?Sized>(
     hay: &H,
     f: &mut impl FnMut(usize, u32, usize, usize, usize) -> bool,
 ) -> bool {
+    sweep_fed(g, active, hay, None, f)
+}
+
+/// [`sweep`], handing every byte it reads of `hay` to `tap` as well, once and
+/// in order: those it skips inside a run of one byte included. A sweep that
+/// `f` stops, or an index with nothing in it, leaves the rest of `hay` unread
+/// and unfed.
+pub(crate) fn sweep_fed<H: ByteSource + ?Sized>(
+    g: &Grams,
+    active: &[bool],
+    hay: &H,
+    mut tap: Option<&mut Fed>,
+    f: &mut impl FnMut(usize, u32, usize, usize, usize) -> bool,
+) -> bool {
     if g.is_empty() {
         return true;
     }
-    let mut sc = g.start(active, hay);
-    let collapse = run_collapse_enabled();
-    let mut skips = Vec::new();
-    let mut at = 0;
-    while at < hay.len() {
-        let buf = hay.window(at, (hay.len() - at).min(SWEEP_WINDOW));
+    let mut sw = Sweeper::new(g, active, hay);
+    while sw.next < hay.len() {
+        let buf = hay.window(sw.next, (hay.len() - sw.next).min(SWEEP_WINDOW));
         if buf.is_empty() {
             break;
         }
-        skips.clear();
-        let next = match collapse {
-            true => plan_skips(&buf, at, hay, &mut skips),
-            false => at + buf.len(),
-        };
-        if !sweep_window(g, &mut sc, &buf, at, next, &skips, f) {
+        if let Some(t) = tap.as_deref_mut() {
+            t.feed(sw.next, &buf);
+        }
+        if !sw.feed(sw.next, &buf, tap.as_deref_mut(), f) {
             return false;
         }
-        at = next;
     }
     true
+}
+
+/// A sweep of one object that is handed its bytes a window at a time, by a
+/// read that serves other searches too: the state [`sweep`] carries from one
+/// window to the next.
+pub(crate) struct Sweeper<'a, H: ?Sized> {
+    g: &'a Grams,
+    sc: Scan<'a, H>,
+    hay: &'a H,
+    collapse: bool,
+    skips: Vec<Skip>,
+    /// Where the next window starts: past what was swept, and past the run of
+    /// one byte a window ended in.
+    next: usize,
+}
+
+impl<'a, H: ByteSource + ?Sized> Sweeper<'a, H> {
+    pub(crate) fn new(g: &'a Grams, active: &'a [bool], hay: &'a H) -> Self {
+        Sweeper {
+            g,
+            sc: g.start(active, hay),
+            hay,
+            collapse: run_collapse_enabled(),
+            skips: Vec::new(),
+            next: 0,
+        }
+    }
+
+    /// Sweep the window `w`, which starts at `at` in the object, handing `f`
+    /// each anchor found. The windows come in order and touch: each starts
+    /// where the last ended, or inside it, and one that lies within a run
+    /// already swept is passed over. `false` when `f` asks to stop.
+    ///
+    /// A run of one byte that ends past `w` is read on to its end from the
+    /// object, into `tap` if there is one.
+    pub(crate) fn feed(
+        &mut self,
+        at: usize,
+        w: &[u8],
+        tap: Option<&mut Fed>,
+        f: &mut impl FnMut(usize, u32, usize, usize, usize) -> bool,
+    ) -> bool {
+        if at + w.len() <= self.next {
+            return true;
+        }
+        // A window that starts past the end of the last leaves positions
+        // nobody swept: read them, so no anchor is missed.
+        if at > self.next {
+            let gap = self.hay.window(self.next, at - self.next);
+            let from = self.next;
+            if !self.feed(from, &gap, None, f) {
+                return false;
+            }
+            if self.next < at {
+                return true;
+            }
+        }
+        let (at, w) = (at.max(self.next), &w[self.next.saturating_sub(at)..]);
+        self.skips.clear();
+        let next = match self.collapse {
+            true => plan_skips(w, at, self.hay, &mut self.skips, tap),
+            false => at + w.len(),
+        };
+        let ok = sweep_window(self.g, &mut self.sc, w, at, next, &self.skips, f);
+        self.next = next;
+        ok
+    }
 }
 
 /// [`sweep`] over the window `buf` at `at`, the next one starting at `next`,
@@ -116,19 +192,24 @@ struct Skip {
 
 /// The runs to skip in `buf`, at `at` in `hay`; returns where in `hay` the
 /// next window starts, past the end of a run that goes on beyond this one.
+/// What is read of such a run past `buf` goes to `tap`.
 #[inline(never)]
 fn plan_skips<H: ByteSource + ?Sized>(
     buf: &[u8],
     at: usize,
     hay: &H,
     skips: &mut Vec<Skip>,
+    mut tap: Option<&mut Fed>,
 ) -> usize {
     let mut from = 0;
     while let Some((r, n)) = next_long_run(buf, from) {
         let b = buf[r];
         let mut end = at + r + n;
         if r + n == buf.len() {
-            hay.chunks(end, hay.len(), &mut |_, c| {
+            hay.chunks(end, hay.len(), &mut |chunk_at, c| {
+                if let Some(t) = tap.as_deref_mut() {
+                    t.feed(chunk_at, c);
+                }
                 let same = c.iter().take_while(|&&x| x == b).count();
                 end += same;
                 same == c.len()

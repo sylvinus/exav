@@ -17,6 +17,8 @@
   --exav-viewer-error: #b91c1c;
   --exav-viewer-warning: #b45309;
   --exav-viewer-media-bg: #0f172a;
+  --exav-viewer-highlight: rgb(250 204 21 / 0.45);
+  --exav-viewer-highlight-current: #ca8a04;
   --exav-viewer-model-bg: radial-gradient(circle at 50% 30%, #ffffff 0%, #e2e8f0 55%, #cbd5e1 100%);
   --exav-viewer-radius: 0.375rem;
   --exav-viewer-rail-width: 15rem;
@@ -368,6 +370,13 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* A name from the file is set apart from the text around it: its direction
+   cannot reorder that text (bidirectional controls are already replaced). */
+.exav-viewer-truncate,
+.exav-viewer-outline-entry,
+.exav-viewer-dialog-title {
+  unicode-bidi: isolate;
 }
 .exav-viewer-strong {
   color: var(--exav-viewer-text-strong);
@@ -755,6 +764,32 @@
 }
 .exav-viewer-pdf-link:focus-visible {
   outline: 2px solid var(--exav-viewer-accent);
+}
+/* Highlights (pdf/reader.ts): boxes in fractions of the page, under the text
+   layer and the links, letting the pointer through to select. */
+.exav-viewer-highlights {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.exav-viewer-highlight-box {
+  position: absolute;
+  border-radius: 2px;
+  background-color: var(--exav-viewer-highlight);
+  mix-blend-mode: multiply;
+}
+.exav-viewer-highlight-current .exav-viewer-highlight-box {
+  outline: 2px solid var(--exav-viewer-highlight-current);
+  outline-offset: 1px;
+}
+/* In a text or Markdown document (text/highlights.ts). */
+.exav-viewer-highlight-text {
+  border-radius: 2px;
+  background-color: var(--exav-viewer-highlight);
+  color: inherit;
+}
+.exav-viewer-highlight-text.exav-viewer-highlight-current {
+  outline: 2px solid var(--exav-viewer-highlight-current);
 }
 .exav-viewer-image {
   position: absolute;

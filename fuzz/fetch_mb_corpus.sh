@@ -7,7 +7,7 @@
 # size, and a later `cargo fuzz run` starts from a richer seed set.
 #
 # Safety: the samples are live malware. They are only ever read as bytes by the
-# fuzz target (static parsing — NEVER executed), are stored solely in the
+# fuzz target (static parsing, NEVER executed), are stored solely in the
 # gitignored work dir, and the downloaded archives are deleted after extraction.
 #
 # Requires the MalwareBazaar Auth-Key in the environment (do NOT hard-code or
@@ -51,7 +51,7 @@ while read -r h; do
   [ "$(head -c2 "$z" 2>/dev/null)" = "PK" ] || { rm -f "$z"; continue; }
   # The sample zips are WinZip-AES encrypted (password 'infected'); Info-ZIP
   # `unzip` can't do AES, so use 7z. The sample is only ever read as bytes by the
-  # fuzz target — never executed.
+  # fuzz target, never executed.
   7z x -pinfected -y -o"$STAGE/ex" "$z" >/dev/null 2>&1 && got=$((got+1)) || true
   rm -f "$z"
 done < "$STAGE/hashes.txt"

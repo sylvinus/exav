@@ -251,6 +251,7 @@ impl Compiler {
             imported: self.imported,
             uses_entrypoint: self.uses_entrypoint,
             gate,
+            feed_plan: OnceLock::new(),
         }
     }
 

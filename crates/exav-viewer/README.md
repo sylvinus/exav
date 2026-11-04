@@ -9,8 +9,10 @@ host lists are ever bundled.
 
 - A hostile file reaches nothing of the host: in the sandboxed mode each
   file opens in an `<iframe sandbox="allow-scripts">` of its own, in an
-  opaque origin, under a policy that lets nothing in or out, and the host
-  checks every message the frame sends. See
+  opaque origin, under a policy that lets nothing in, and the host
+  checks every message the frame sends. Nothing goes out either when the
+  host page's own Content-Security-Policy has `frame-src` and `child-src`
+  naming the frame's origin and nothing else. See
   [Security](https://exav.org/viewer/security/).
 - Formats browsers do not draw (TIFF, BMP variants, ICO, PNM, QOI, DDS,
   farbfeld, HDR, JPEG 2000, JBIG2, JPEG XL, camera RAW files, shown by the
@@ -25,6 +27,13 @@ host lists are ever bundled.
   Content-Security-Policy and offline.
 - Archives open in place, an archive inside an archive included, with the
   same plugins.
+- What a file is comes from its first bytes where the viewer holds them (a
+  Blob, bytes, or a file read by ranges, and every member of an archive), by
+  the detection exav's scanner uses, compiled to WebAssembly: a PDF named
+  `.png` opens as a PDF, and a ZIP named `.txt` as an archive, in the page
+  and in the sandboxed frame (the host page tells the frame). A file given by
+  an address is told by its name and type, and by its engine when that finds
+  the bytes are another format (an image that is a PDF).
 - Whatever draws something can be exported as a picture: a page, a region of
   it in the format's own coordinates (a fraction of a page, pixels of an
   image, drawing units, a 3D camera), or what the user sees now
@@ -47,15 +56,15 @@ then the engines of the formats you open (all optional peer dependencies):
 
 | Format | Plugin | Install beside it |
 |---|---|---|
-| PDF | `pdf()` from `@exav/viewer/pdf` | `pdfjs-dist` (5 or 6) |
+| PDF | `pdf()` from `@exav/viewer/pdf` | `pdfjs-dist` (6.4.299 or later 6) |
 | Images, SVG, camera RAW (DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF, PEF, SRW, 3FR, IIQ, X3F and more: the largest embedded preview) | `image({ wasmDecoders: true })` from `@exav/viewer/image` | nothing |
 | DWG, DXF | `dwg()`, `dxf()` from `@exav/viewer/cad` | nothing |
-| Word, Excel, PowerPoint, CSV | `docx()`, `xlsx()`, `pptx()`, `csv()` from `@exav/viewer/office` | `@silurus/ooxml` |
+| Word, Excel, PowerPoint, CSV | `docx()`, `xlsx()`, `pptx()`, `csv()` from `@exav/viewer/office` | `@silurus/ooxml` (a ZIP's central directory is read first by exav-unpack's ZIP reader, and a CSV or TSV is read into an XLSX by exav-render, in a small wasm module of the package) |
 | RTF, DOC, ODT | `rtf()`, `doc()`, `odt()` from `@exav/viewer/office`, beside `docx()` | `@silurus/ooxml` (read by exav-render's `docs`, a prototype; an external converter and `pdf()` do better) |
 | XLS, ODS, Numbers | `xls()`, `ods()`, `numbers()` from `@exav/viewer/office`, beside `xlsx()` | `@silurus/ooxml` (an external converter for the files exav-render's `sheets` does not recognise) |
 | PPT, ODP, Keynote, ODG, Visio (VSDX) | `ppt()`, `odp()`, `keynote()`, `odg()`, `visio()` from `@exav/viewer/office`, beside `pptx()` | `@silurus/ooxml` (an external converter and `pdf()` for the files exav-render's `slides` does not recognise, such as the binary .vsd) |
 | Binary Visio (VSD), CorelDRAW, Publisher, PageMaker, FreeHand, QuarkXPress, Zoner Draw, WPG | `visio()`, `coreldraw()`, `publisher()`, `pagemaker()`, `freehand()`, `quarkxpress()`, `zonerdraw()`, `wpg()` from `@exav/viewer/office`, beside `pdf()` | an external converter (see below) |
-| Text, Markdown, JSON, XML, source code | `text()` from `@exav/viewer/text` | nothing (Markdown is read by a small wasm module, loaded when one is opened) |
+| Text, Markdown, JSON, XML, source code | `text()` from `@exav/viewer/text` | nothing (a small wasm module, loaded when a text file is opened, says with the scanner's rule how it is read, and reads Markdown, JSON, XML and diffs) |
 | IFC | `ifc()` from `@exav/viewer/ifc` | `three` |
 | STL, OBJ, PLY, glTF | `stl()`, `obj()`, `ply()`, `gltf()` from `@exav/viewer/model` | `three` |
 | Video, audio | `video()`, `audio()` from `@exav/viewer/media` | nothing |
@@ -176,6 +185,29 @@ export function Preview({ file }: { file: File }) {
 `ViewerDialog` shows a list of files in a modal with previous and next,
 download and "open in a new tab".
 
+Passages can be shown highlighted, in a PDF and in text, Markdown, JSON or
+XML: boxes on a page, or a quote the viewer finds in the text (case, accents,
+spaces, punctuation and words cut at the end of a line do not matter). The
+view goes to `focusHighlight`, or the first, on open; the `ref` goes to
+another from the host. See
+[Highlights](https://exav.org/viewer/api/#highlights).
+
+```tsx
+const viewer = useRef<ViewerBodyHandle>(null);
+const file = {
+  id: "rc-42",
+  name: "rc.pdf",
+  source: { url: "/files/rc.pdf" },
+  highlights: [
+    { id: "deadline", page: 4, text: "Date limite de réception des offres", label: "Deadline" },
+    { id: "price", page: 7, rects: [{ x: 0.12, y: 0.41, width: 0.5, height: 0.018 }] },
+  ],
+  focusHighlight: "deadline",
+};
+<ViewerBody ref={viewer} file={file} />;
+viewer.current?.goToHighlight("price");
+```
+
 The sandboxed mode: publish the frame app the package ships, and give
 `sandbox` instead of `plugins`. The engines are the frame's own, so no peer
 dependency is needed. Serve the frame with the headers the
@@ -256,7 +288,8 @@ referenced with `new URL("...", import.meta.url)`, which Vite, webpack 5 and
 Parcel follow and emit; Rollup and esbuild need a plugin for it.
 
 Content-Security-Policy, for every format in the page (in the sandboxed
-mode the page needs only `frame-src` for the frame, which has its own):
+mode the page needs only `frame-src` and `child-src` naming the frame's
+origin, which has its own policy):
 
 ```
 default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline';

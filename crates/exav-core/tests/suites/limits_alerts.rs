@@ -1,7 +1,7 @@
 //! `--alert-exceeds-max`: report a budget stop as a ClamAV-named detection.
 //!
 //! exav and ClamAV model the same condition in two vocabularies. exav says
-//! "this scan did not finish" with a `LIMITS-EXCEEDED` verdict — honest, but it
+//! "this scan did not finish" with a `LIMITS-EXCEEDED` verdict. That is honest, but it
 //! needs the clamd `ERROR` reply shape, which most clients read as *the scanner
 //! broke* rather than *this file is interesting*. ClamAV says
 //! `Heuristics.Limits.Exceeded.MaxFiles FOUND`, an ordinary detection that fits
@@ -179,6 +179,32 @@ fn the_emulation_budget_reports_its_own_name() {
             assert_eq!(signature, "Heuristics.Limits.Exceeded.MaxScanTime")
         }
         other => panic!("expected MaxScanTime, got {other:?}"),
+    }
+}
+
+/// A bound a reader notes on a member, here an SWF movie whose LZMA dictionary
+/// is over the object limit, is reported as the walk's own stops are.
+#[test]
+fn a_bound_a_reader_notes_on_a_member_is_its_alert() {
+    let mut swf = b"ZWS\x0d".to_vec();
+    swf.extend_from_slice(&(1u32 << 20).to_le_bytes()); // FileLength
+    swf.extend_from_slice(&16u32.to_le_bytes()); // the LZMA data's length
+    swf.push(0x5d); // lc, lp, pb
+    swf.extend_from_slice(&(1u32 << 20).to_le_bytes()); // the dictionary
+    swf.extend_from_slice(&[0; 16]);
+    let db = scanner();
+    let mut opts = ScanOptions::default();
+    opts.limits.max_buffer_bytes = 64 * 1024;
+    match analyze(&db, &swf, &opts).verdict {
+        Verdict::LimitsExceeded { reason } => assert!(reason.contains("dictionary"), "{reason}"),
+        other => panic!("expected LIMITS-EXCEEDED, got {other:?}"),
+    }
+    opts.alert_exceeds_max = true;
+    match analyze(&db, &swf, &opts).verdict {
+        Verdict::Infected { signature, .. } => {
+            assert_eq!(signature, "Heuristics.Limits.Exceeded.MaxFileSize")
+        }
+        other => panic!("expected the MaxFileSize alert, got {other:?}"),
     }
 }
 

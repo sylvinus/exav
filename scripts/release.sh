@@ -2,7 +2,7 @@
 # Gate, review, then publish the workspace to crates.io.
 #
 # WHY: publishing is irreversible. A crates.io version can be yanked but never
-# replaced, and the crates go up one at a time — so a manifest error found on
+# replaced, and the crates go up one at a time, so a manifest error found on
 # crate five leaves four already published against a version that no longer
 # builds. Everything that can be checked is therefore checked BEFORE the first
 # `cargo publish`, and the run stops for a human in between.
@@ -48,10 +48,50 @@ done
 
 # Publish order. Each crate needs the ones before it already on crates.io, so
 # this list is a dependency topological sort, not an alphabetical one.
-CRATES=(exav-x86 exav-update exav-pe-emu exav-unpack exav-render exav-imagehash exav-core exav-grep exav)
+CRATES=(exav-x86 exav-update exav-qr exav-pe-emu exav-unpack exav-render exav-imagehash exav-core exav-grep exav)
+
+# The packages with a binary, which `cargo install` builds with their own
+# `[profile]`: the workspace's is not packaged, so its two are copied into these
+# manifests for the packaging and the publish, and put back on exit.
+BINS=(exav-pe-emu exav-unpack exav-imagehash exav-grep exav)
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 fail() { printf '\033[31mFAILED: %s\033[0m\n' "$*" >&2; exit 1; }
+
+# `[profile.release]` and `[profile.fast-build]` of the root Cargo.toml, as
+# appended to a manifest.
+profile_block() {
+  awk '/^\[/ { on = ($0 == "[profile.release]" || $0 == "[profile.fast-build]"); if (on) print "" }
+       on && NF && !/^#/' Cargo.toml
+}
+
+# The keys of those two in manifest $1, one `[section] key = value` per line,
+# sorted: cargo reorders them when it packages.
+profile_keys() {
+  awk '/^\[/ { sec = $0; next }
+       (sec == "[profile.release]" || sec == "[profile.fast-build]") && NF && !/^#/ { print sec " " $0 }' "$1" | sort
+}
+
+saved=""
+tb=""
+cleanup() {
+  if [ -n "$saved" ]; then
+    for c in "${BINS[@]}"; do
+      [ ! -f "$saved/$c.toml" ] || cp "$saved/$c.toml" "crates/$c/Cargo.toml"
+    done
+    rm -rf "$saved"
+  fi
+  [ -z "$tb" ] || rm -rf "$tb"
+}
+trap cleanup EXIT
+
+# Once the profiles are in, the tree may differ by those manifests only.
+only_profiles_added() {
+  local want
+  want="$(for c in "${BINS[@]}"; do printf ' M crates/%s/Cargo.toml\n' "$c"; done | sort)"
+  [ "$(git status --porcelain | sort)" = "$want" ] \
+    || fail "the tree changed during the run: only the profiles of ${BINS[*]} may differ"
+}
 
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 MSRV="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
@@ -62,7 +102,7 @@ MSRV="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 
 step "Clean tree"
 # Publishing from a dirty tree ships bytes that are in nobody's git history.
-[ -z "$(git status --porcelain)" ] || fail "working tree is dirty — commit or stash first"
+[ -z "$(git status --porcelain)" ] || fail "working tree is dirty: commit or stash first"
 
 step "Version $VERSION is not already published"
 # crates.io answers 403 to a request with no User-Agent, so one is set here:
@@ -74,8 +114,8 @@ for c in "${CRATES[@]}"; do
             -w '%{http_code}' "https://crates.io/api/v1/crates/$c/$VERSION" || echo 000)"
   case "$code" in
     404) ;;
-    200) fail "$c $VERSION already exists on crates.io — bump the version" ;;
-    *)   fail "crates.io returned HTTP $code for $c $VERSION — cannot tell whether it is published" ;;
+    200) fail "$c $VERSION already exists on crates.io: bump the version" ;;
+    *)   fail "crates.io returned HTTP $code for $c $VERSION: cannot tell whether it is published" ;;
   esac
 done
 
@@ -102,7 +142,7 @@ step "MSRV $MSRV actually builds"
 #
 # Driven through `rustup run` rather than `cargo +$MSRV`: the `+toolchain`
 # prefix is understood by the rustup *shim*, so it fails with "no such command"
-# whenever `$CARGO` is a real cargo binary instead — which is what a toolchain
+# whenever `$CARGO` is a real cargo binary instead, which is what a toolchain
 # path in `CARGO`, or a non-rustup install, gives you.
 if command -v rustup >/dev/null 2>&1; then
   rustup toolchain install "$MSRV" --profile minimal >/dev/null 2>&1 || true
@@ -112,29 +152,55 @@ else
   echo "  SKIPPED: needs rustup to install and select the $MSRV toolchain"
 fi
 
+step "Build profiles in the manifests of ${BINS[*]}"
+# Added after the builds above, where cargo would warn that a member's profile
+# is ignored. These five are recorded `dirty` in their `.cargo_vcs_info.json`
+# and carry the profiles in their `Cargo.toml.orig`.
+PROFILES="$(profile_block)"
+[ -n "$PROFILES" ] || fail "no [profile.release] in Cargo.toml"
+saved="$(mktemp -d)"
+for c in "${BINS[@]}"; do
+  m="crates/$c/Cargo.toml"
+  ! grep -q '^\[profile\.' "$m" || fail "$m has a [profile] of its own, which the copy would duplicate"
+  cp "$m" "$saved/$c.toml"
+  printf '%s\n' "$PROFILES" >>"$m"
+done
+only_profiles_added
+
 step "Package contents"
 # What actually lands in the tarballs, which is not what `cargo build` sees:
-# `exclude` keys, missing files, and anything accidentally swept in.
-$CARGO package --workspace --no-verify || fail "cargo package"
+# `exclude` keys, missing files, and anything accidentally swept in. Dirty by
+# the profiles alone, which `only_profiles_added` checked.
+$CARGO package --workspace --no-verify --allow-dirty || fail "cargo package"
+
+step "The published manifests carry the build profiles"
+# Without them `cargo install` builds with cargo's default release profile: no
+# overflow checks, no LTO.
+want="$(profile_keys Cargo.toml)"
+for c in "${BINS[@]}"; do
+  got="$(profile_keys <(tar xzOf "target/package/$c-$VERSION.crate" "$c-$VERSION/Cargo.toml"))"
+  [ "$got" = "$want" ] || fail "$c-$VERSION.crate: its Cargo.toml does not carry the workspace's [profile.release] and [profile.fast-build]"
+done
 
 step "The published tarballs build on their own"
 # The check `cargo publish --dry-run` cannot do on a first release.
 #
 # A dry run builds each crate as crates.io would, resolving its dependencies
-# FROM crates.io — so on a first release every dependent fails with "no matching
+# FROM crates.io, so on a first release every dependent fails with "no matching
 # package named exav-…" and goes unverified. That is exactly when the risk is
 # highest: an `exclude` key that drops a file the library needs compiles fine
 # here, where the file is still on disk, and fails for the first person to run
 # `cargo install`.
 #
 # So the registry is reconstructed from the tarballs themselves and the binary
-# is built from those alone — the same thing `cargo install exav` does. Building
+# is built from those alone: the same thing `cargo install exav` does. Building
 # `exav` covers exav-core, exav-unpack, exav-render, exav-imagehash, exav-pe-emu
-# and exav-x86 transitively; `exav-grep` is the other dependent. exav-x86 and
-# exav-update have no internal dependencies, so their own dry runs verify them
-# completely.
+# and exav-x86 transitively; `exav-grep` is the other dependent. exav-x86,
+# exav-update and exav-qr have no internal dependencies, so their own dry runs
+# verify them completely (exav-qr, behind the `qr` feature, is only resolved
+# here). The members' profiles apply only at the root, so they are given to
+# this workspace's root.
 tb="$(mktemp -d)"
-trap 'rm -rf "$tb"' EXIT
 for c in "${CRATES[@]}"; do
   tar xzf "target/package/$c-$VERSION.crate" -C "$tb" || fail "extracting $c-$VERSION.crate"
 done
@@ -151,10 +217,12 @@ exav-render = { path = "exav-render-$VERSION" }
 exav-imagehash = { path = "exav-imagehash-$VERSION" }
 exav-core = { path = "exav-core-$VERSION" }
 exav-update = { path = "exav-update-$VERSION" }
+exav-qr = { path = "exav-qr-$VERSION" }
 exav-grep = { path = "exav-grep-$VERSION" }
+$PROFILES
 EOF
 ( cd "$tb" && $CARGO build --release ) \
-  || fail "the packaged crates do not build on their own — a published file is missing (check the \`exclude\` keys)"
+  || fail "the packaged crates do not build on their own: a published file is missing (check the \`exclude\` keys)"
 [ -x "$tb/target/release/exav" ] || fail "the packaged build produced no exav binary"
 # It has to answer, not just link: a binary that cannot start is not installable.
 "$tb/target/release/exav" --version >/dev/null || fail "the packaged exav binary does not run"
@@ -170,7 +238,7 @@ for c in "${CRATES[@]}"; do
   crate_file="target/package/$c-$VERSION.crate"
   [ -f "$crate_file" ] || fail "missing $crate_file"
   if tar xzOf "$crate_file" 2>/dev/null | grep -qF "$needle"; then
-    fail "$c-$VERSION.crate carries the EICAR test string — every scanner that sees this download will quarantine it"
+    fail "$c-$VERSION.crate carries the EICAR test string: every scanner that sees this download will quarantine it"
   fi
 done
 
@@ -180,7 +248,7 @@ step "No EICAR literal anywhere in the tracked tree"
 # repository quarantined on clone and stripped by an AV-scanned CI runner.
 #
 # Deterministic and dependency-free on purpose. Asking a real engine finds
-# strictly more — it is how the Mirai and dual-extension fixtures turned up —
+# strictly more (it is how the Mirai and dual-extension fixtures turned up),
 # but a check that needs a foreign scanner and a 110 MB database is a check
 # that skips on the machine releases are actually cut from, which is a green
 # gate that verified nothing. That sweep lives in `make av-audit`, to be run
@@ -188,7 +256,7 @@ step "No EICAR literal anywhere in the tracked tree"
 hits="$(git ls-files -z | xargs -0 grep -lF "$needle" 2>/dev/null || true)"
 if [ -n "$hits" ]; then
   printf '%s\n' "$hits" >&2
-  fail "a tracked file carries the EICAR test string — mask it (see exav_unpack::unmask_fixture)"
+  fail "a tracked file carries the EICAR test string: mask it (see exav_unpack::unmask_fixture)"
 fi
 echo "  clean across $(git ls-files | wc -l | tr -d ' ') tracked files"
 
@@ -210,7 +278,7 @@ step "Review before publishing"
 cat <<EOF
 Publishing is irreversible: a version can be yanked, never replaced or reused.
 The crates go up one at a time, in dependency order, and each is live the moment
-it lands — so a failure partway leaves the earlier ones published for good.
+it lands, so a failure partway leaves the earlier ones published for good.
 
 Read before continuing:
   * git log --oneline \$(git describe --tags --abbrev=0 2>/dev/null || echo HEAD~10)..HEAD
@@ -225,9 +293,10 @@ if [ "$DRY_RUN" = 1 ]; then
   # A dry run builds each crate as crates.io would, which means resolving its
   # dependencies FROM crates.io. On a first release the workspace siblings are
   # not there yet, so every dependent fails with "no matching package named
-  # exav-…" — a fact about publication order, not a defect in the crate. It is
+  # exav-…", a fact about publication order, not a defect in the crate. It is
   # reported rather than treated as a pass, because after the first release
   # those same crates should resolve and a real failure must not hide here.
+  only_profiles_added
   skipped=()
   for c in "${CRATES[@]}"; do
     log="$(mktemp)"
@@ -256,7 +325,7 @@ fi
 
 if [ "$ASSUME_YES" != 1 ]; then
   if [ ! -t 0 ]; then
-    fail "not a terminal and --yes was not given — refusing to publish unattended"
+    fail "not a terminal and --yes was not given: refusing to publish unattended"
   fi
   printf '\nType the version (%s) to publish, anything else to abort: ' "$VERSION"
   read -r reply
@@ -265,9 +334,11 @@ fi
 
 # ─── Publish ───────────────────────────────────────────────────────────────
 
+# Checked again: the pause above is time for an edit to land in the tree.
+only_profiles_added
 for c in "${CRATES[@]}"; do
   step "Publishing $c $VERSION"
-  $CARGO publish -p "$c" || fail "publish of $c — the crates before it are already live; fix, bump the version, and resume from here"
+  $CARGO publish -p "$c" --allow-dirty || fail "publish of $c: the crates before it are already live; fix, bump the version, and resume from here"
   # crates.io indexes asynchronously; the next crate's dependency resolution
   # fails if it runs before this one is queryable.
   echo "waiting for the index to catch up..."

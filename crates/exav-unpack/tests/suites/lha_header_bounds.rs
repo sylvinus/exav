@@ -29,7 +29,7 @@ fn a_header_larger_than_the_archive_is_rejected() {
     );
 }
 
-/// The same shape, reached through the fuzzer's other LHA finding — a header
+/// The same shape, reached through the fuzzer's other LHA finding: a header
 /// whose arithmetic overflows. It must be refused by the same gate rather than
 /// relying on the decoder to survive it.
 #[test]
@@ -78,7 +78,7 @@ fn a_header_that_fits_still_reaches_the_decoder() {
 /// and there a genuine archive's header can describe more than the slice holds.
 /// Refusing it would convert an archive that real extractors open into an
 /// `Unscannable`, and a member nobody scanned is worth more to an attacker than
-/// a member nobody could allocate — so over-declaring is only grounds for
+/// a member nobody could allocate, so over-declaring is only grounds for
 /// refusal once the size passes what any archiver would ever write.
 ///
 /// A level-3 header declaring 1 MiB inside a 64-byte slice is the shape that
@@ -98,4 +98,39 @@ fn an_embedded_archive_that_over_declares_is_not_refused() {
             e.reason
         );
     }
+}
+
+/// A level-0 member of `method` holding `body`, as the format lays it out.
+fn level0_member(method: &[u8; 5], name: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut h = method.to_vec();
+    h.extend_from_slice(&(body.len() as u32).to_le_bytes()); // compressed size
+    h.extend_from_slice(&(body.len() as u32).to_le_bytes()); // original size
+    h.extend_from_slice(&[0; 4]); // time
+    h.extend_from_slice(&[0x20, 0]); // attributes, level
+    h.push(name.len() as u8);
+    h.extend_from_slice(name);
+    h.extend_from_slice(&[0, 0]); // file CRC-16
+    let sum = h.iter().fold(0u8, |s, b| s.wrapping_add(*b));
+    let mut out = vec![h.len() as u8, sum];
+    out.extend_from_slice(&h);
+    out.extend_from_slice(body);
+    out.push(0); // end of archive
+    out
+}
+
+/// A member of a method no decoder reads is reported as a method not decoded,
+/// not as damage, and the walk reaches the end of the archive.
+#[test]
+fn an_unknown_method_is_reported_as_unsupported() {
+    use exav_unpack::tree::ReasonKind;
+    let data = level0_member(b"-lhz-", b"a.txt", b"payload");
+    let entries = extract(Format::Lha, &data, &mut Budget::new(Limits::default())).unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].name, "a.txt");
+    assert!(entries[0].data.is_empty(), "{entries:?}");
+    assert_eq!(
+        entries[0].unsupported,
+        Some("unsupported LHA compression method")
+    );
+    assert_eq!(entries[0].reason_kind, Some(ReasonKind::Unsupported));
 }

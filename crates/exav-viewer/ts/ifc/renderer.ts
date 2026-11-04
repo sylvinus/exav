@@ -3,7 +3,6 @@ import type { BufferGeometry, Mesh, Object3D } from "three";
 import { writable } from "../core/store.js";
 import type { GroundController, LayersController, Renderer, Selection } from "../core/types.js";
 import { createModelEngine, DEFAULT_MAX_TRIANGLES, DEFAULT_TIMEOUT_MS, modelWarnings, type ParsedModel } from "../model/engine.js";
-import { elementBoxes, framingBox } from "../model/framing.js";
 import { createModelRaster } from "../model/raster.js";
 import { createStoreys, storeyShown } from "../model/storeys.js";
 import type { IfcOptions } from "./index.js";
@@ -179,8 +178,8 @@ export const renderer: Renderer<IfcOptions> = {
       applyVisibility();
 
       // What the view is framed on, in model metres relative to its origin:
-      // the elements, less any left far from the rest.
-      const b = framingBox(elementBoxes(meta, model.positions, model.indices)) ?? meta.bounds ?? [0, 0, 0, 1, 1, 1];
+      // the elements, less any left far from the rest (the reader's `framing`).
+      const b = meta.framing ?? meta.bounds ?? [0, 0, 0, 1, 1, 1];
       const box = new three.Box3(new three.Vector3(b[0], b[2], -b[4]), new three.Vector3(b[3], b[5], -b[1]));
       const sphere = box.getBoundingSphere(new three.Sphere());
       const radius = Math.max(sphere.radius, 0.5);

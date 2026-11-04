@@ -4,7 +4,8 @@
 //!
 //! * a text file is matched lowercased and whitespace-collapsed by 0 and 7,
 //!   its raw bytes by 0 alone; its HTML entities are not decoded;
-//! * an HTML file is matched through its HTML view by 0 and 3, never by 7;
+//! * an HTML file is matched through its HTML view by 0 and 3, and its
+//!   scripts, lowercased and normalised as script, by 0, 3 and 7;
 //! * a mail's raw bytes are matched by 4, which nothing else is;
 //! * an RTF is matched raw by 0 alone, with no normalised view. exav gives it
 //!   both views on purpose (see "A pure-ASCII RTF is text" in the quirks
@@ -73,6 +74,23 @@ fn text_signatures_see_the_words_of_an_html_file_by_default() {
     assert!(!found(7, "HELLO WORLD MARKER", HTML), "never the raw bytes");
 }
 
+/// The scripts of a page are matched as text and as HTML once normalised as
+/// script, as clamscan 1.4.3 matches them; the rest of the page is no text.
+#[test]
+fn text_signatures_match_the_scripts_of_a_page() {
+    // Only the script view joins the two strings and lowercases them.
+    let page: &[u8] = b"<html><body><p>plain words</p><script>var abcdef=\"Evil\"+\"Marker\";</script></body></html>\n";
+    for found in [found, found_compat] {
+        assert!(found(7, "\"evilmarker\"", page));
+        assert!(found(3, "\"evilmarker\"", page));
+        assert!(!found(7, "var abcdef", page), "not the script as written");
+    }
+    assert!(
+        !found_compat(7, "plain words", page),
+        "nor the rest of the page"
+    );
+}
+
 #[test]
 fn html_signatures_match_the_html_view_alone() {
     let lower = "hello world marker";
@@ -87,6 +105,32 @@ fn mail_signatures_match_a_mails_raw_bytes() {
     assert!(found(4, "HELLO WORLD MARKER", MAIL));
     assert!(!found(4, "hello world marker", MAIL), "not a view");
     assert!(!found(4, "HELLO WORLD MARKER", TEXT), "nor a text file");
+}
+
+/// A message by its first line alone, as clamscan types it, with no blank line
+/// after its one header, so that nothing of it is a part of its own.
+const HEADER_HTML: &[u8] = b"Date: Mon, 1 Jan 2024\n<html><body>HELLO WORLD MARKER</body></html>\n";
+const HEADER_TEXT: &[u8] = b"To: a note\nSome text HELLO WORLD MARKER here\n";
+
+/// Its raw bytes meet `Target:4`, and it keeps the views it had as markup or as
+/// text before its first line made it a message.
+#[test]
+fn a_file_that_starts_with_a_mail_header_keeps_its_views() {
+    let (lower, upper) = ("hello world marker", "HELLO WORLD MARKER");
+    for compat in [false, true] {
+        let find = |target, body, file| {
+            if compat {
+                found_compat(target, body, file)
+            } else {
+                found(target, body, file)
+            }
+        };
+        assert!(find(4, upper, HEADER_HTML), "a message's raw bytes");
+        assert!(find(3, lower, HEADER_HTML), "its HTML view");
+        assert!(find(4, upper, HEADER_TEXT), "a message's raw bytes");
+        assert!(find(7, lower, HEADER_TEXT), "its text view");
+        assert!(!find(3, lower, HEADER_TEXT), "no HTML view for text");
+    }
 }
 
 /// Wider than clamscan, on purpose: an RTF's views are matched as well.

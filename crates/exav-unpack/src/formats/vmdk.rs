@@ -1,9 +1,9 @@
-//! VMDK — VMware's virtual disk.
+//! VMDK: VMware's virtual disk.
 //!
 //! Two shapes matter here. A **sparse** VMDK maps the guest disk through a grain
 //! directory and grain tables, much like QCOW2's two-level lookup. A
 //! **streamOptimized** VMDK additionally deflate-compresses each grain and is
-//! the format inside an OVA/OVF appliance — the usual way a VM image is
+//! the format inside an OVA/OVF appliance, the usual way a VM image is
 //! distributed, and therefore a plausible delivery container whose payload
 //! appears nowhere in the file's bytes.
 //!
@@ -140,7 +140,7 @@ struct Stream<'a> {
 impl<'a> Stream<'a> {
     /// Walk the markers from where the grain data begins.
     ///
-    /// Grain data begins after the header's declared `overhead` — the sectors
+    /// Grain data begins after the header's declared `overhead`: the sectors
     /// taken by the embedded descriptor and the redundant grain tables.
     /// Starting at the end of the header instead lands in the middle of that
     /// metadata and finds no grains at all.
@@ -397,19 +397,19 @@ fn open(src: &dyn ByteSource, max_grains: usize) -> Opened<'_> {
 }
 
 /// Walk a VMDK's disk.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let max_grains =
         usize::try_from(budget.limits().max_buffer_bytes / INDEX_ENTRY_COST).unwrap_or(usize::MAX);
     let allowance = budget.remaining_scan();
     match open(src, max_grains) {
         Opened::No => Ok(None),
         Opened::Unread(size, why) => report(NAME, size, why, budget, visit),
-        Opened::Sparse(l) => vdisk::walk(VDisk::new(src, l, allowance), budget, visit),
-        Opened::Stream(l) => vdisk::walk(VDisk::new(src, l, allowance), budget, visit),
+        Opened::Sparse(l) => vdisk::walk(VDisk::new(src, Box::new(l), allowance), budget, visit),
+        Opened::Stream(l) => vdisk::walk(VDisk::new(src, Box::new(l), allowance), budget, visit),
     }
 }
 
@@ -441,7 +441,7 @@ mod tests {
         let Opened::Sparse(l) = open(src, usize::MAX) else {
             panic!("a sparse extent");
         };
-        let mut d = VDisk::new(src, l, u64::MAX);
+        let mut d = VDisk::new(src, Box::new(l), u64::MAX);
         let mut out = vec![0u8; n];
         d.read_exact(&mut out).unwrap();
         out
@@ -538,7 +538,7 @@ mod tests {
             return None;
         };
         let unplaced = l.unplaced;
-        let mut d = VDisk::new(src, l, u64::MAX);
+        let mut d = VDisk::new(src, Box::new(l), u64::MAX);
         let mut out = vec![0u8; 4 * 512];
         d.seek(SeekFrom::Start(0)).unwrap();
         d.read_exact(&mut out).unwrap();

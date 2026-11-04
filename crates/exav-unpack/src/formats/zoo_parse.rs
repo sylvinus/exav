@@ -26,7 +26,8 @@ pub(crate) const DIRENT_HEADER_SIZE: usize = 5   // tag + dir_type
     + 8                                          // offsets
     + 24                                         // through cmt_size
     + FNAMESIZE
-    + 8;
+    + 5                                          // var_dir_len, tz, dir_crc
+    + 2; // namlen, dirlen
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Method {
@@ -101,8 +102,9 @@ pub(crate) struct DirEntry {
     pub size_now: u32,
     /// The DOS 8.3 name.
     pub name: String,
-    /// Total length of the variable part that follows the fixed header.
-    pub var_dir_len: u8,
+    /// Length of the variable part, from `namlen` on; 0 in a type 1 entry,
+    /// which has none.
+    pub var_dir_len: u16,
     pub namlen: u8,
     pub dirlen: u8,
 }
@@ -115,12 +117,20 @@ impl DirEntry {
         }
         // 4: tag, 4: dir_type, 5: method, 6: next, 10: offset, 14: date/time,
         // 18: crc16, 20: org_size, 24: size_now, 28..31: versions/deleted/struc,
-        // 32: comment, 36: cmt_size, 38: 8.3 name.
+        // 32: comment, 36: cmt_size, 38: 8.3 name. A type 2 entry goes on
+        // (zoo.h, `SIZ_DIRL`): 51: var_dir_len, 53: tz, 54: dir_crc, 56:
+        // namlen, 57: dirlen, 58: the long name, then the directory name.
         //
         // The `deleted` byte at 30 is deliberately not read: ZOO leaves a
         // deleted member's bytes in the archive, and a scanner wants them. See
         // `formats/zoo.rs`.
         let name_off = 38;
+        let (var_dir_len, namlen, dirlen) = if u8_at(b, 4)? == 2 {
+            let at = name_off + FNAMESIZE;
+            (u16_at(b, at)?, u8_at(b, at + 5)?, u8_at(b, at + 6)?)
+        } else {
+            (0, 0, 0)
+        };
         Some(DirEntry {
             method: Method::from(u8_at(b, 5)?),
             next: u32_at(b, 6)?,
@@ -129,24 +139,24 @@ impl DirEntry {
             org_size: u32_at(b, 20)?,
             size_now: u32_at(b, 24)?,
             name: name_at(crate::bytes::at(b, name_off, FNAMESIZE)?),
-            var_dir_len: u8_at(b, name_off + FNAMESIZE)?,
-            namlen: u8_at(b, name_off + FNAMESIZE + 6)?,
-            dirlen: u8_at(b, name_off + FNAMESIZE + 7)?,
+            var_dir_len,
+            namlen,
+            dirlen,
         })
     }
 
     /// The member's full path, taking the long filename and directory name from
-    /// `var` — the variable-length part that follows the fixed header — when
-    /// they are there.
+    /// `var`, the bytes after `dirlen`, when they are there.
     ///
     /// Conservative by construction: anything that does not fit inside the
-    /// declared `var_dir_len` falls back to the 8.3 name rather than reading
-    /// whatever happens to be next in the file.
+    /// declared `var_dir_len` (which counts `namlen` and `dirlen` too) falls
+    /// back to the 8.3 name rather than reading whatever happens to be next in
+    /// the file.
     pub(crate) fn path(&self, var: &[u8]) -> String {
         let n = self.namlen as usize;
         let d = self.dirlen as usize;
         let want = n + d;
-        if want == 0 || want > var.len() || want > self.var_dir_len as usize {
+        if want == 0 || want > var.len() || want + 2 > self.var_dir_len as usize {
             return self.name.clone();
         }
         let long = name_at(&var[..n]);
@@ -212,5 +222,24 @@ mod tests {
             "SHORT.TXT",
             "a declared length longer than the data must not read past it"
         );
+    }
+
+    /// A type 1 entry ends after its 8.3 name: what follows is not a variable
+    /// part, whatever it holds.
+    #[test]
+    fn a_type_1_entry_has_no_long_name() {
+        let mut b = vec![0u8; DIRENT_HEADER_SIZE];
+        b[..4].copy_from_slice(&ZOO_TAG.to_le_bytes());
+        b[38..43].copy_from_slice(b"A.TXT");
+        b[51] = 40; // var_dir_len, in a type 2 entry
+        b[56] = 3; // namlen
+        b[57] = 4; // dirlen
+        b[4] = 2;
+        let two = DirEntry::parse(&b).unwrap();
+        assert_eq!((two.var_dir_len, two.namlen, two.dirlen), (40, 3, 4));
+        b[4] = 1;
+        let one = DirEntry::parse(&b).unwrap();
+        assert_eq!((one.var_dir_len, one.namlen, one.dirlen), (0, 0, 0));
+        assert_eq!(one.path(b"abcdefg"), "A.TXT");
     }
 }

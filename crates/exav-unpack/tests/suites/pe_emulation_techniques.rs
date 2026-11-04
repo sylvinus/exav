@@ -7,9 +7,9 @@
 //!
 //! So the mechanisms are tested directly. Each test here builds a PE whose stub
 //! is hand-assembled machine code using exactly one technique that real packers
-//! use — resolving imports through the IAT the loader filled in, reading its own
+//! use (resolving imports through the IAT the loader filled in, reading its own
 //! file, single-stepping itself through the trap flag, unfolding into memory it
-//! allocated, wiping its own headers — and asserts the payload comes back. The
+//! allocated, wiping its own headers) and asserts the payload comes back. The
 //! packed corpus then measures *coverage*; these tests pin *behaviour*.
 //!
 //! Every stub is written to be readable: the assembly is in a comment above the
@@ -56,7 +56,7 @@ struct Packed {
     stub: Vec<u8>,
     /// Bytes placed at `PAYLOAD_OFF` inside the stub section.
     section_payload: Vec<u8>,
-    /// Bytes appended after the last section — the overlay a self-reading stub
+    /// Bytes appended after the last section: the overlay a self-reading stub
     /// goes to the file for.
     overlay: Vec<u8>,
     /// Names imported from `kernel32`, in IAT order.
@@ -181,7 +181,7 @@ fn recovered(entries: &[Entry]) -> bool {
 }
 
 /// `mov esi, src ; mov edi, dst ; mov ecx, len ; lodsb ; xor al,0x5a ; stosb ;
-/// loop ; jmp dst` — the decrypt-and-transfer tail every test ends with.
+/// loop ; jmp dst`: the decrypt-and-transfer tail every test ends with.
 fn decrypt_tail(at_va: u32, src: u32, dst: u32, len: u32) -> Vec<u8> {
     let mut c: Vec<u8> = vec![0xbe];
     c.extend_from_slice(&src.to_le_bytes());
@@ -359,7 +359,7 @@ fn a_stub_single_stepping_itself_through_the_trap_flag() {
 #[test]
 fn a_loader_that_unfolds_into_memory_it_allocated() {
     // The dropper shape: nothing is written to the image at all. The stub
-    // allocates, builds a whole PE there, and runs it — so the only place the
+    // allocates, builds a whole PE there, and runs it, so the only place the
     // payload ever exists is memory the emulator handed out.
     //
     //   push 0x40 ; push 0x1000 ; push 0x20000 ; push 0
@@ -483,8 +483,8 @@ fn a_section_whose_raw_pointer_the_loader_rounds_down() {
 #[test]
 fn a_stub_that_uses_more_stack_than_the_initial_mapping() {
     // Windows commits stack pages on demand as the guard page is touched. A
-    // stub with a large frame — or a decompressor that keeps its window on the
-    // stack — walks past a fixed mapping and faults on an ordinary access.
+    // stub with a large frame (or a decompressor that keeps its window on the
+    // stack) walks past a fixed mapping and faults on an ordinary access.
     //
     //   sub esp, 0x110000 ; mov [esp], eax ; add esp, 0x110000
     //

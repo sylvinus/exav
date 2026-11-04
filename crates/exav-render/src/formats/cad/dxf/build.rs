@@ -362,6 +362,7 @@ pub(crate) fn build(mut raw: Raw, ctx: Ctx<'_>) -> Drawing {
         mline_styles: raw.mline_styles,
         mleader_styles: raw.mleader_styles,
         preview: raw.preview,
+        hyperlinks: Vec::new(),
         warnings: ctx.warnings,
         warnings_dropped: ctx.warnings_dropped,
     }

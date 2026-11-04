@@ -10,6 +10,7 @@
 //! [`Entry`]. Bounds are clamped and the decoders never index past the input, so
 //! hostile/truncated data cannot panic.
 
+use crate::tree::quoted;
 use crate::*;
 use base64::Engine;
 
@@ -68,7 +69,7 @@ fn parse_begin_name(rest: &[u8]) -> String {
     let name = name
         .trim()
         .trim_matches(|c| c == '/' || c == '\\' || c == '\0');
-    // Basename only — an attacker-supplied path must not escape.
+    // Basename only: an attacker-supplied path must not escape.
     let base = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
     if base.is_empty() {
         "uudecoded.bin".to_string()
@@ -83,13 +84,11 @@ fn lines(data: &[u8]) -> impl Iterator<Item = &[u8]> {
         .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
 }
 
-pub(crate) fn extract_uuencode<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_uuencode(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     let mut it = lines(data).peekable();
-    while let Some(line) = it.next() {
+    // A member past the object limit is left out; the lines of its body
+    // start no member, so the search goes on from where it stopped.
+    'members: while let Some(line) = it.next() {
         let trimmed = trim_ascii_start(line);
         let (base64, rest) = if let Some(r) = trimmed.strip_prefix(b"begin-base64 ") {
             (true, r)
@@ -115,18 +114,18 @@ pub(crate) fn extract_uuencode<R>(
                 }
                 b64.extend(t.iter().filter(|b| !b.is_ascii_whitespace()));
                 if b64.len() as u64 > cap.saturating_mul(2).saturating_add(64) {
-                    return Err(LimitHit::new(format!(
-                        "uuencode member '{name}' exceeds budget"
-                    )));
+                    let shown = quoted(&name);
+                    budget.over_cap(cap, 0, format_args!("uuencode member '{shown}'"))?;
+                    continue 'members;
                 }
             }
             out = base64::engine::general_purpose::STANDARD
                 .decode(&b64)
                 .map_err(|e| LimitHit::corrupt(format!("uuencode base64: {e}")))?;
             if out.len() as u64 > cap {
-                return Err(LimitHit::new(format!(
-                    "uuencode member '{name}' exceeds budget"
-                )));
+                let (spent, shown) = (out.len() as u64, quoted(&name));
+                budget.over_cap(cap, spent, format_args!("uuencode member '{shown}'"))?;
+                continue;
             }
         } else {
             // Classic body: decode each line until `end`, a blank/zero-length
@@ -143,9 +142,9 @@ pub(crate) fn extract_uuencode<R>(
                 }
                 decode_uu_line(t, &mut out);
                 if out.len() as u64 > cap {
-                    return Err(LimitHit::new(format!(
-                        "uuencode member '{name}' exceeds budget"
-                    )));
+                    let (spent, shown) = (out.len() as u64, quoted(&name));
+                    budget.over_cap(cap, spent, format_args!("uuencode member '{shown}'"))?;
+                    continue 'members;
                 }
             }
         }
@@ -160,7 +159,7 @@ pub(crate) fn extract_uuencode<R>(
 
 /// True if `data` (leading whitespace skipped) opens a uuencode stream: a
 /// `begin `/`begin-base64 ` line with a matching `end`/`====` terminator later.
-/// Conservative — used by [`crate::detect`], which is the single source of truth.
+/// Conservative: used by [`crate::detect`], which is the single source of truth.
 pub(crate) fn looks_like_uuencode(p: &crate::Probe) -> bool {
     let data = p.head;
     let head = trim_ascii_start(&data[..data.len().min(4096)]);

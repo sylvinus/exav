@@ -22,6 +22,7 @@ mod csg;
 mod curves;
 mod directrix;
 mod faces;
+mod framing;
 mod grid;
 mod items;
 mod math;
@@ -36,6 +37,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use self::math::{V3, Xf, cross, unit};
+pub use self::step::is_ifc;
 use self::step::{StepFile, Value};
 use super::mesh::{DEFAULT_MAX_TRIANGLES, Element, Node, Part, Scene, SceneBuilder, Warnings};
 
@@ -1039,6 +1041,7 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
         out.add(element, parts);
     }
     out.scene.origin = origin.unwrap_or([0.0; 3]);
+    out.scene.framing = framing::scene_framing(&out.scene);
     // A model of nothing else would show nothing and say nothing.
     if out.scene.elements.is_empty() {
         for _ in 0..alignments {

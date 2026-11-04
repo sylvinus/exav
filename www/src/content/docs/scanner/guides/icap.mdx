@@ -102,7 +102,7 @@ to the blocking side:
 |---|---|---|
 | `OK` | `204 No Content` when the client sent `Allow: 204`, else `200` echoing the message back unchanged | none |
 | `FOUND` | `200 OK` with a block page | `X-Infection-Found: Type=0; Resolution=2; Threat=<signature>;` |
-| `PARTIAL` | `200 OK` with a block page | `X-Exav-Status: PARTIAL`, `X-Exav-Category: <condition>`, `X-Exav-Reason: <detail>`, and `X-Infection-Found: … Threat=Heuristics.Exav.<Condition>;` under the default [`--icap-infection-header blocks`](#if-the-header-should-mean-a-database-hit-only) |
+| `PARTIAL` | `200 OK` with a block page | `X-Exav-Status: PARTIAL`, `X-Exav-Category: <condition>`, `X-Exav-Reason: <detail>`, and `X-Infection-Found: … Threat=Heuristics.Exav.<Condition>;` under the default [`?infection-header=blocks`](#if-the-header-should-mean-a-database-hit-only) |
 | `ERROR` (the scan failed) | `200 OK` with a block page | `X-Exav-Status: ERROR`, `X-Exav-Reason: <detail>`, and `X-Infection-Found: … Threat=Heuristics.Exav.ScanError;` under `blocks` |
 
 The threat name for a partial block follows the category:
@@ -132,8 +132,9 @@ delivers them instead. A detection is never delivered.
 
 ### If the header should mean a database hit only
 
-`--icap-infection-header detections` restricts `X-Infection-Found` to signature
-matches; a partial object then blocks with the `X-Exav-*` headers alone.
+`?infection-header=detections` on the address restricts `X-Infection-Found` to
+signature matches; a partial object then blocks with the `X-Exav-*` headers
+alone.
 
 <Aside type="danger" title="What that costs">
 The object is still blocked, but a client that reads only `X-Infection-Found` will
@@ -246,25 +247,27 @@ rest reported as a limit.
 | `Port 1344` | `--listen icap://0.0.0.0:1344` | *(nothing listens without it)* |
 | `Service` / `ServiceAlias` | the path of the `--listen` address, or a repeated `?service=` | `avscan`, `srv_clamav`, `virus_scan` |
 | `MaxServers` x `ThreadsPerChild` | `?max-connections=` on the address | `100` |
-| `MaxKeepAliveRequests` | `--icap-max-requests` | `100` |
-| `KeepAliveTimeout` | `--icap-idle-secs` | `600` |
+| `MaxKeepAliveRequests` | `?max-requests=` on the address | `100` |
+| `KeepAliveTimeout` | `?idle-secs=` on the address | `600` |
 | `virus_scan.MaxObjectSize`'s *size* | `--max-input-bytes` (all surfaces) | *(unset)* |
 | `virus_scan.MaxObjectSize`'s *pass* | `--partial-as` (all surfaces) | `partial` (block) |
-| *(preview size, per service)* | `--icap-preview-bytes` | `4096` |
-| *(none)* | `--icap-transfer-preview` | `*` |
-| *(none)* | `--icap-options-ttl-secs` | `3600` |
-| *(none)* | `--icap-max-header-bytes` | `64K` |
-| *(none)* | `--icap-infection-header` | `blocks` |
+| *(preview size, per service)* | `?preview-bytes=` on the address | `4096` |
+| *(none)* | `?transfer-preview=` on the address, `*` or `off` | `*` |
+| *(none)* | `?options-ttl-secs=` on the address | `3600` |
+| *(none)* | `?max-header-bytes=` on the address | `64K` |
+| *(none)* | `?request-secs=` on the address | `600` |
+| *(none)* | `?infection-header=` on the address | `blocks` |
 
-Every flag has an `EXAV_*` variable spelled the same way (`--icap-max-requests`
-reads `EXAV_ICAP_MAX_REQUESTS`); a flag beats the variable. `Pipelining on` needs
-no setting: several requests per connection always work.
+Every flag has an `EXAV_*` variable spelled the same way (`--max-input-bytes`
+reads `EXAV_MAX_INPUT_BYTES`), and `EXAV_LISTEN` carries the address with its
+options; a flag beats the variable. `Pipelining on` needs no setting: several
+requests per connection always work.
 
-The service names and the connection cap go on the address, since they belong to
-that listener (see [what belongs to one listener](/scanner/reference/cli/#what-belongs-to-one-listener)):
+The service names, what bounds the clients and what the service answers go on
+the address, since they belong to that listener (see [what belongs to one listener](/scanner/reference/cli/#what-belongs-to-one-listener)):
 
 ```sh
-exav --listen 'icap://0.0.0.0:1344/avscan?max-connections=200' -d /var/lib/exav
+exav --listen 'icap://0.0.0.0:1344/avscan?max-connections=200&max-requests=1000' -d /var/lib/exav
 ```
 
 <Aside type="note" title="What a connection costs">

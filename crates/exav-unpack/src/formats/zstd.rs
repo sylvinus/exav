@@ -9,11 +9,11 @@ use crate::source::{ByteSource, Reader};
 use crate::stream::{Visit, emit_stream, single_meta};
 use crate::{Budget, LimitHit};
 
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     budget.count_entry()?;
     emit_stream(
         &single_meta("zstd-content", src, None),
@@ -32,20 +32,20 @@ pub(crate) fn walk<T>(
 /// error the frame is ended here, with an empty last block, and what was
 /// decoded before the error is handed over first. The error is
 /// `UnexpectedEof` when the input ran out, `InvalidData` otherwise.
-pub(crate) struct ZstdReader<R> {
-    source: Tracked<BufReader<R>>,
+pub(crate) struct ZstdReader<'a> {
+    source: Tracked<'a>,
     decoder: FrameDecoder,
     in_frame: bool,
     failed: Option<io::Error>,
 }
 
 /// A reader that remembers it ran dry.
-struct Tracked<R> {
-    inner: R,
+struct Tracked<'a> {
+    inner: BufReader<Box<dyn Read + 'a>>,
     ended: bool,
 }
 
-impl<R: Read> Read for Tracked<R> {
+impl Read for Tracked<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.ended |= n == 0 && !buf.is_empty();
@@ -53,11 +53,11 @@ impl<R: Read> Read for Tracked<R> {
     }
 }
 
-impl<R: Read> ZstdReader<R> {
-    pub(crate) fn new(inner: R) -> Self {
+impl<'a> ZstdReader<'a> {
+    pub(crate) fn new(inner: impl Read + 'a) -> Self {
         ZstdReader {
             source: Tracked {
-                inner: BufReader::new(inner),
+                inner: BufReader::new(Box::new(inner)),
                 ended: false,
             },
             decoder: FrameDecoder::new(),
@@ -75,7 +75,7 @@ impl<R: Read> ZstdReader<R> {
     }
 }
 
-impl<R: Read> Read for ZstdReader<R> {
+impl Read for ZstdReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);

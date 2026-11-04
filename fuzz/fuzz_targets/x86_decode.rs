@@ -2,8 +2,8 @@
 //!
 //! WHY A FUZZER AND NOT JUST THE TESTS: the differential tests in
 //! `crates/exav-x86/tests/differential.rs` sweep the opcode maps exhaustively,
-//! but they hold the *body* of each instruction fixed — one ModRM byte, then a
-//! constant tail. A decoder's subtler mistakes live in the body: a SIB byte that
+//! but they hold the *body* of each instruction fixed (one ModRM byte, then a
+//! constant tail). A decoder's subtler mistakes live in the body: a SIB byte that
 //! changes whether a displacement is present, a `mod` that changes its width, a
 //! prefix run that pushes the instruction past fifteen bytes. Coverage-guided
 //! mutation reaches those combinations; a hand-written sweep does not.
@@ -16,7 +16,7 @@
 //! 2. **Agree on length.** A length that is off by one desynchronises every
 //!    instruction after it, so this is not a local error but a cascading one.
 //! 3. **Agree on the mnemonic**, which decides which semantics run.
-//! 4. **Agree on the memory operand** — base, index, scale, displacement —
+//! 4. **Agree on the memory operand** (base, index, scale, displacement),
 //!    which is where an emulated read or write lands, and on every register
 //!    operand: its register file, its number, and the order the two ModRM
 //!    fields appear in. `movdqa xmm1, xmm2` decoded backwards runs and produces
@@ -90,7 +90,7 @@ const MMX: [Register; 8] = [
     Register::MM7,
 ];
 
-/// iced's 32-bit GPR numbering, back to the encoding's own — used for the base
+/// iced's 32-bit GPR numbering, back to the encoding's own, used for the base
 /// and index of a memory operand, which are always 32-bit registers.
 fn reg_num(r: Register) -> Option<u8> {
     GPR32.iter().position(|x| *x == r).map(|i| i as u8)
@@ -166,7 +166,7 @@ fn check_memory(ours: &[Op; 3], iced: &Instruction, bytes: &[u8]) {
         );
     }
     // `ours` has to come from the decoder under test. Deriving both sides from
-    // `iced` makes this `iced == iced`, which is true of any decoder at all —
+    // `iced` makes this `iced == iced`, which is true of any decoder at all,
     // and it is the check that decides whether an emulated read or write lands
     // where the hardware would put it, so a vacuous one is worse than none.
     let iced_disp = iced.memory_displacement32();

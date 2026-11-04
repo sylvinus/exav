@@ -65,6 +65,7 @@ use crate::fancy_regex::parse_flags::*;
 #[cfg(false)]
 use crate::fancy_regex::vm::OPTION_LEFTMOST_LONGEST;
 use crate::fancy_regex::vm::{Prog, OPTION_FIND_NOT_EMPTY, OPTION_NOT_CONTINUED_FROM_PREVIOUS_MATCH};
+pub use crate::fancy_regex::vm::STEP_BYTES;
 
 pub use crate::fancy_regex::bytes::MatchBytes;
 pub use crate::fancy_regex::error::{CompileError, Error, ParseError, Result, RuntimeError};
@@ -2782,6 +2783,12 @@ impl Expr {
             stack.extend(expr.children_iter());
         }
         false
+    }
+
+    /// Returns `true` if this expression or any of its descendants satisfies the
+    /// given predicate.
+    pub fn has_descendant_or_self(&self, predicate: impl Fn(&Expr) -> bool) -> bool {
+        predicate(self) || self.has_descendant(predicate)
     }
 
     /// Returns an iterator over the immediate children of this expression.

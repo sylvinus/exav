@@ -136,11 +136,13 @@ concatenated members, and `gzip`/`zcat` decompress all of them, while Rust's
 `flate2::GzDecoder` stops after the first. A two-member gzip whose first member
 is a 1 KiB decoy and whose second holds the malware was a real false negative.
 
-**Appended archives** are carved too: ZIP, gzip, bzip2, xz, 7z, RAR and CAB
+**Appended archives** are carved too: ZIP, gzip, bzip2, xz, 7z, RAR, ARJ and CAB
 magics after offset 0 (self-extractors, PE overlays, droppers that staple an
 archive onto a carrier). A carve that fails to decode is usually a chance byte
-run and is dropped rather than making the carrier `UNSCANNABLE`. A file that
-the magic at its start types as an archive (a PDF, a tar, a gzip, a bzip2) is
+run and is dropped rather than making the carrier `UNSCANNABLE`. An ARJ is
+taken only where a main header (file type 2) has a CRC-32 that holds, when it
+is carved out of another file, so the headers of its files are not archives of
+their own. A file that the magic at its start types as an archive (a PDF, a tar, a gzip, a bzip2) is
 not carved for magics, but a ZIP behind it is found by the record at the end of
 the file, which is how `unzip` finds it, and is scanned as the ZIP it is. An
 ISO 9660 or ext image whose first bytes are an archive's magic, in the space
@@ -205,7 +207,8 @@ it needs the `checksums` feature of `exav-core` or `exav-unpack` and
 `ScanOptions::verify_checksums`, and a member failing its checksum is then
 `UNSCANNABLE`. The command line has no switch for it.) That holds in every
 container, a bzip2 block or an lzip member included: one failing its checksum
-does not stop the blocks or members after it from being decoded.
+does not stop the blocks or members after it from being decoded. The header
+checksums of an ARJ archive follow the same rule at the start of a file.
 
 Three cases still report a mismatch. An encrypted member (ZipCrypto, RAR, 7z)
 has its CRC checked because that is how a candidate password is confirmed. A
@@ -237,10 +240,17 @@ Two files can share nothing byte for byte and still be provably the same malware
 `dll_without_extension.function` in import order (the Mandiant definition).
 Recompile, repack, change every string: as long as the binary links the same
 functions in the same order, the imphash is identical. In `.imp` signatures
-(`PEImportTableHash:PEImportTableSize:MalwareName`) the "size" is not a byte
-count but the number of imports. The trap is ordinals: an import by ordinal
-contributes `dll.ord<n>`, and a parser that renders it as `ORDINAL 42`, or drops
-it, gets a different hash and misses every `.imp` signature.
+(`PEImportTableHash:PEImportTableSize:MalwareName`) the "size" is the length in
+bytes of the string that is hashed, not the number of imports (`clamscan
+--debug` prints both, as `IMP: <hash>:<size>`), and `*` matches any. The trap
+is ordinals: an import by ordinal from `ws2_32`, `wsock32` or `oleaut32`
+contributes the name of the function (`ws2_32.wsastartup`), and from any other
+library `dll.ord<n>`. A parser that renders it as `ORDINAL 42`, or drops it,
+gets a different hash and misses the `.imp` signatures. clamscan makes the
+hash of a 32-bit PE only, so under `--clamav-compat` a PE32+ matches no `.imp`
+signature. The `imphash:` lines of a `.fdb` file take the usual import hash
+instead, as `pe.imphash()` and pefile make it. The executable of an installer
+or self-extractor gets both lookups, after its members.
 
 **Section hashes** (`.mdb` MD5, `.msb` SHA) hash one PE section rather than the
 file, so an unchanged code section is recognised after the resources, overlay
@@ -346,8 +356,9 @@ collapsing; quote-aware comment stripping; and, for scripts, a JavaScript
 normaliser that decodes string escapes, folds `"ab"+"cd"`, evaluates
 `String.fromCharCode(<literals>)` and `unescape("…%XX…")`, and re-parses the
 argument of `eval("…")`, up to 32 nested layers. Nothing is executed. A single
-textual buffer can be scanned up to five times: raw, HTML-normalised,
-text-normalised, and through the light and heavy JavaScript normalisation.
+textual buffer can be scanned up to five times: raw, HTML- or text-normalised,
+through the light and heavy JavaScript normalisation and, for a page, its
+`script` elements alone, normalised as script.
 
 The detail that bites: a stripped comment must not leave a space behind.
 `EVAL(/* x */unescape('%61'))` has to normalise so that `eval(` is immediately
@@ -361,8 +372,9 @@ stripper tracks `'`, `"` and backticks.
 Which signatures meet which rendering follows clamscan, probed one signature
 at a time: `Target:3` and `Target:7` signatures match only the HTML and text
 renderings, never raw bytes; an HTML file has the HTML rendering and a text file
-the text one, not the other; `Target:4` (mail) signatures match a mail's raw
-bytes. The exception is the [visible text](/scanner/reference/feature-flags/) of
+the text one, not the other, but the scripts of a page (its `script` elements,
+lowercased and normalised as script) are matched by both; `Target:4` (mail)
+signatures match a mail's raw bytes. The exception is the [visible text](/scanner/reference/feature-flags/) of
 a document (the `visible-text` feature, off under `--clamav-compat`): the words
 of an HTML page, a Markdown file or an Office part are also a text view, which
 `Target:7` signatures see. An HTML signature on plain JavaScript is a match clamscan cannot make,
@@ -420,7 +432,8 @@ The `clamd` protocol itself has oddities:
 - **`INSTREAM` is `<u32 be len><data>` chunks ended by a zero length:** the only
   binary field in a text protocol. When exav has its answer before the stream
   ends, it still reads the remaining chunks, or the next command in an
-  `IDSESSION` would be parsed out of payload bytes.
+  `IDSESSION` would be parsed out of payload bytes. Past 64 MiB of them it
+  closes the session after the reply.
 - **The status vocabulary is closed.** A client reads anything but `OK`, `FOUND`
   and `ERROR` as `OK`, so a `PARTIAL` goes out as `ERROR` with the category just
   before it (`<reason> LIMITS-EXCEEDED ERROR`); exav's own client reads the

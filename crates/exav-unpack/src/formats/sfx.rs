@@ -61,7 +61,9 @@ fn plausible_arj_header(data: &[u8], off: usize) -> bool {
     };
     let basic_size = u16::from_le_bytes([h[2], h[3]]) as usize;
     let first_size = h[4] as usize;
-    let host_os = h[8];
+    // After the archiver version (5) and the minimum version to extract (6);
+    // byte 8 is the flags.
+    let host_os = h[7];
     (30..=2600).contains(&basic_size)
         && first_size >= 30
         && first_size <= basic_size
@@ -78,6 +80,19 @@ fn plausible_7z_header(data: &[u8], off: usize) -> bool {
     crc32fast::hash(&h[12..32]) == u32::from_le_bytes([h[8], h[9], h[10], h[11]])
 }
 
+/// Does a cabinet header start here? `MSCF` is in the data of programs that
+/// handle cabinets and in the names of C++ types. What the header says is
+/// checked as `is_cab_magic` does for a cabinet whose reserved field is not
+/// zero: version 1.3, a size, and the offset of the first file entry inside it.
+fn plausible_cab_header(data: &[u8], off: usize) -> bool {
+    let Some(h) = crate::bytes::at(data, off, 26) else {
+        return false;
+    };
+    let u32_at = |o: usize| u32::from_le_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]);
+    let (size, files) = (u32_at(8), u32_at(16));
+    h[24..26] == [3, 1] && size >= 36 && (36..=size).contains(&files)
+}
+
 fn find_embedded_archive(data: &[u8]) -> Option<(usize, &'static str)> {
     find_archive_from(data, 1)
 }
@@ -87,13 +102,14 @@ fn find_archive_from(data: &[u8], from: usize) -> Option<(usize, &'static str)> 
     let hay = data.get(from..)?;
     let mut best: Option<(usize, &'static str)> = None;
     for &(sig, name) in SIGS {
-        // ARJ's and 7z's matches are walked until one carries a header that
-        // checks out: ARJ's magic is weak enough that the first hit is often
-        // noise, and 7z's is in the code of tools that handle the format. The
-        // other signatures are taken as they come.
+        // ARJ's, 7z's and a cabinet's matches are walked until one carries a
+        // header that checks out: ARJ's magic is weak enough that the first
+        // hit is often noise, and the others are in the code of tools that
+        // handle the format. The other signatures are taken as they come.
         let plausible: fn(&[u8], usize) -> bool = match name {
             "arj" => plausible_arj_header,
             "7z" => plausible_7z_header,
+            "cab" => plausible_cab_header,
             _ => |_, _| true,
         };
         let found = memchr::memmem::find_iter(hay, sig)
@@ -214,14 +230,14 @@ pub(crate) fn payload_offset<R: Read + Seek>(
 }
 
 /// Walk a self-extractor: its appended archive, streamed from where it lies.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let mut source = crate::source::Reader::new(src);
     let members = stream_offsets(&mut source)?;
-    crate::stream::stream_stored(&mut source, budget, visit, members)
+    crate::stream::stream_stored_ranges(src, budget, visit, crate::stream::Region::list(members))
 }
 
 /// Find the appended archive's offset, searching as far as detection does (a
@@ -317,6 +333,23 @@ mod tests {
         assert!(entries[0].data.windows(11).any(|w| w == b"MALWARETEST"));
     }
 
+    /// What `arj a` writes on Unix: host OS 2 after the two version bytes, then
+    /// the flags byte (0x10). The check once read the flags as the host OS and
+    /// passed over every ARJ archive behind a stub whose flags were above 11.
+    #[test]
+    fn an_arj_header_is_judged_by_its_host_os_and_not_by_its_flags() {
+        let mut real = vec![
+            0x60, 0xEA, 0x29, 0x00, 0x22, 0x0B, 0x01, 0x02, 0x10, 0x00, 0x02,
+        ];
+        real.extend_from_slice(&[0; 40]);
+        assert!(plausible_arj_header(&real, 0));
+        assert!(looks_like_sfx(&mz_stub(&real, 512)));
+        // A host OS past the defined values still fails the check.
+        real[7] = 12;
+        assert!(!plausible_arj_header(&real, 0));
+        assert!(!looks_like_sfx(&mz_stub(&real, 512)));
+    }
+
     /// From a live installer: a tool that handles 7z holds the six-byte magic
     /// in its own data. Carved as a payload, it read as a broken 7z archive and
     /// made the executable `UNSCANNABLE`.
@@ -331,6 +364,83 @@ mod tests {
         assert_eq!(find_embedded_archive(&blob), Some((512 + junk.len(), "7z")));
     }
 
+    /// From a live installer: the executable of a cabinet tool holds `MSCF` and
+    /// four zeros in the names of its C++ types. Carved as a payload, it read as
+    /// a broken cabinet and made the executable `UNSCANNABLE`. A cabinet is
+    /// version 1.3, and its size and the offset of its first file are in order.
+    #[test]
+    fn a_cabinet_magic_without_the_rest_of_its_header_is_passed_over() {
+        use std::io::Write;
+        let mut junk = b"MSCF\0\0\0\0".to_vec();
+        junk.extend_from_slice(&[0xc4, 0x1f, 0x40, 0, 0, 0, 0, 0, 0x2e, 0x3f, 0x41, 0x56]);
+        junk.extend_from_slice(b"CNode@@\0\x65\x40\x40\0\0\0\0\0");
+        assert!(!looks_like_sfx(&mz_stub(&junk, 512)));
+
+        let mut builder = ::cab::CabinetBuilder::new();
+        builder
+            .add_folder(::cab::CompressionType::None)
+            .add_file("a.txt");
+        let mut w = builder.build(std::io::Cursor::new(Vec::new())).unwrap();
+        while let Some(mut f) = w.next_file().unwrap() {
+            f.write_all(b"MALWARETEST").unwrap();
+        }
+        let real = w.finish().unwrap().into_inner();
+        assert!(looks_like_sfx(&mz_stub(&real, 512)));
+        // The junk before the cabinet does not hide it.
+        let mut blob = mz_stub(&junk, 512);
+        blob.extend_from_slice(&real);
+        assert_eq!(
+            find_embedded_archive(&blob),
+            Some((512 + junk.len(), "cab"))
+        );
+    }
+
+    /// Each condition of the cabinet header is checked on its own: the version
+    /// (1.3), the size, and the offset of the first file entry. The magic and
+    /// the offsets are right in every case, so only the field changed turns the
+    /// header down.
+    #[test]
+    fn a_cabinet_header_is_turned_down_by_each_of_its_fields() {
+        use std::io::Write;
+        let mut builder = ::cab::CabinetBuilder::new();
+        builder
+            .add_folder(::cab::CompressionType::None)
+            .add_file("a.txt");
+        let mut w = builder.build(std::io::Cursor::new(Vec::new())).unwrap();
+        while let Some(mut f) = w.next_file().unwrap() {
+            f.write_all(b"MALWARETEST").unwrap();
+        }
+        let real = w.finish().unwrap().into_inner();
+        assert!(plausible_cab_header(&real, 0));
+        let size = u32::from_le_bytes([real[8], real[9], real[10], real[11]]);
+        let files = u32::from_le_bytes([real[16], real[17], real[18], real[19]]);
+        assert!((36..=size).contains(&files));
+        type Edit<'a> = (&'a str, &'a dyn Fn(&mut Vec<u8>));
+        let edits: [Edit; 6] = [
+            ("minor version", &|h| h[24] = 2),
+            ("major version", &|h| h[25] = 2),
+            ("size below a header", &|h| {
+                h[8..12].copy_from_slice(&35u32.to_le_bytes())
+            }),
+            ("first file before the header", &|h| {
+                h[16..20].copy_from_slice(&35u32.to_le_bytes())
+            }),
+            ("first file past the size", &|h| {
+                h[16..20].copy_from_slice(&(size + 1).to_le_bytes())
+            }),
+            ("cut short", &|h| h.truncate(25)),
+        ];
+        for (what, edit) in edits {
+            let mut h = real.clone();
+            edit(&mut h);
+            assert!(!plausible_cab_header(&h, 0), "{what}");
+        }
+        // A reserved field that is not zero does not turn it down.
+        let mut odd = real.clone();
+        odd[4] = 1;
+        assert!(plausible_cab_header(&odd, 0));
+    }
+
     /// The windowed search must answer what the whole-buffer one does, wherever
     /// the archive sits relative to a window seam.
     #[test]
@@ -341,12 +451,12 @@ mod tests {
         };
         let whole = |blob: &[u8]| find_embedded_archive(blob).map(|(o, _)| o as u64);
         // An ARJ main header that passes `plausible_arj_header`.
-        let arj = [0x60, 0xEA, 40, 0, 30, 0, 0, 0, 1, 0, 0];
+        let arj = [0x60, 0xEA, 40, 0, 30, 0, 0, 1, 0, 0, 0, 0];
         // The same header with a ZIP magic inside it. Cut by the seam, the ARJ
         // candidate fails its check while the ZIP fits, and a search taking
         // that answer would miss the earlier archive.
         let mut arj_zip = arj;
-        arj_zip[6..10].copy_from_slice(b"PK\x03\x04");
+        arj_zip[8..12].copy_from_slice(b"PK\x03\x04");
         let seven = sevenz_header();
         for at in (W - 40..W + 24).chain([100, 2 * W - 3]) {
             for magic in [&b"PK\x03\x04"[..], &arj[..], &arj_zip[..], &seven[..]] {

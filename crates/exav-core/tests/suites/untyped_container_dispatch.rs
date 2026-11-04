@@ -1,7 +1,7 @@
 //! Containers with no ClamAV `CL_TYPE_*` of their own must still be extracted.
 //!
 //! The scanner normally reaches an extractor through the file's [`FileType`],
-//! but a handful of formats — Unix `compress` and the disk images — have no
+//! but a handful of formats (Unix `compress` and the disk images) have no
 //! ClamAV type to map to and so are typed `Unknown`. Nothing then dispatches
 //! them, and the file is reported clean on the strength of a raw pattern scan
 //! that cannot see compressed content. That is a silent clean, the worst
@@ -65,7 +65,7 @@ fn an_rpm_payload_is_decompressed_and_scanned() {
 #[test]
 #[cfg(feature = "diskimage")]
 fn a_compressed_qcow2_is_reconstructed_and_scanned() {
-    // `qemu-img convert -c` — every cluster deflated.
+    // `qemu-img convert -c`: every cluster deflated.
     assert_found("compressed.qcow2");
 }
 
@@ -73,9 +73,9 @@ fn a_compressed_qcow2_is_reconstructed_and_scanned() {
 #[cfg(feature = "inno")]
 fn an_installer_embedded_in_an_executable_is_not_reported_clean() {
     // The second shape of the same routing bug. An installer *is* an executable,
-    // so `identify` answers `Pe` — correctly, the PE signature scan has to run —
-    // and `unpack_format` has no mapping from an executable to a container. So
-    // the extractor was never reached.
+    // so `identify` answers `Pe` (correctly, the PE signature scan has to run)
+    // and no type maps an executable to a container. So the extractor was
+    // never reached.
     //
     // Embedded-archive carving covers the case where the appended data is a
     // recognisable archive, but not where it is the installer's own format:
@@ -86,20 +86,67 @@ fn an_installer_embedded_in_an_executable_is_not_reported_clean() {
     //
     // Synthetic here rather than a shipped installer: the routing is what is
     // under test, and a real one would mean committing a multi-megabyte binary.
-    let mut pe = vec![0u8; 8192];
-    pe[0..2].copy_from_slice(b"MZ");
-    pe[4096..4102].copy_from_slice(b"rDlPtS");
-
+    // The executable has the loader table in its resources, as Setup looks for
+    // it, and nothing else of an installer; and it has them far enough into
+    // the file that detection cannot be reading them as part of its start.
     let db = Scanner::builtin();
-    match analyze(&db, &pe, &ScanOptions::default()).verdict {
-        Verdict::Unscannable { reason } => assert!(
-            reason.to_lowercase().contains("inno"),
-            "the reason should name what could not be read, got {reason:?}"
-        ),
-        other => {
-            panic!("an installer whose payload exav cannot read must not be clean, got {other:?}")
+    for resources_at in [0x400, 5 << 20] {
+        let pe = inno_stub(resources_at);
+        match analyze(&db, &pe, &ScanOptions::default()).verdict {
+            Verdict::Unscannable { reason } => assert!(
+                reason.to_lowercase().contains("inno"),
+                "the reason should name what could not be read, got {reason:?}"
+            ),
+            other => {
+                panic!(
+                    "an installer whose payload exav cannot read must not be clean, \
+                     resources at {resources_at}: {other:?}"
+                )
+            }
         }
     }
+}
+
+fn put(v: &mut [u8], at: usize, bytes: &[u8]) {
+    v[at..at + bytes.len()].copy_from_slice(bytes);
+}
+
+/// A PE32 whose one resource is RCDATA 11111, a loader table of Inno Setup
+/// with no setup data behind it, at `raw` bytes into the file.
+fn inno_stub(raw: usize) -> Vec<u8> {
+    let tree = 88;
+    let mut table = b"rDlPtS\xcd\xe6\xd7{\x0b*".to_vec();
+    table.resize(44, 0);
+    let size = tree + table.len();
+    let mut f = vec![0u8; raw + size];
+    put(&mut f, 0, b"MZ");
+    put(&mut f, 0x3c, &0x40u32.to_le_bytes());
+    put(&mut f, 0x40, b"PE\0\0");
+    put(&mut f, 0x44, &0x14cu16.to_le_bytes());
+    put(&mut f, 0x46, &1u16.to_le_bytes());
+    put(&mut f, 0x54, &0xe0u16.to_le_bytes());
+    let opt = 0x58;
+    put(&mut f, opt, &0x10bu16.to_le_bytes());
+    put(&mut f, opt + 92, &16u32.to_le_bytes());
+    put(&mut f, opt + 96 + 16, &0x1000u32.to_le_bytes());
+    put(&mut f, opt + 96 + 20, &(size as u32).to_le_bytes());
+    let section = opt + 0xe0;
+    put(&mut f, section, b".rsrc");
+    put(&mut f, section + 8, &(size as u32).to_le_bytes());
+    put(&mut f, section + 12, &0x1000u32.to_le_bytes());
+    put(&mut f, section + 16, &(size as u32).to_le_bytes());
+    put(&mut f, section + 20, &(raw as u32).to_le_bytes());
+    // Three directories of one entry, an id: the type, the name, the language.
+    let sub = 1u32 << 31;
+    for (at, id, target) in [(0, 10, sub | 24), (24, 11111, sub | 48), (48, 0x409, 72)] {
+        put(&mut f, raw + at + 14, &1u16.to_le_bytes());
+        put(&mut f, raw + at + 16, &(id as u32).to_le_bytes());
+        put(&mut f, raw + at + 20, &target.to_le_bytes());
+    }
+    put(&mut f, raw + 72, &(0x1000 + tree as u32).to_le_bytes());
+    put(&mut f, raw + 76, &(table.len() as u32).to_le_bytes());
+    put(&mut f, raw + tree, &table);
+    f
 }
 
 /// An ASCII DXF is text to ClamAV and stays so here, but the object an
@@ -231,6 +278,74 @@ fn a_macro_and_a_packaged_file_inside_a_dwg_are_scanned() {
                 other => panic!("{case} {v}: the embedded file must be reached, got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(any(feature = "dwg", feature = "all-formats"))]
+#[path = "../../../exav-unpack/tests/dwg_build/mod.rs"]
+mod dwg_build;
+
+/// A drawing that reads whole and holds nothing is clean: the builder's.
+#[test]
+#[cfg(any(feature = "dwg", feature = "all-formats"))]
+fn a_built_dwg_with_nothing_in_it_is_clean() {
+    let db = Scanner::builtin();
+    let blob = dwg_build::Drawing::standard().build().bytes;
+    assert!(matches!(
+        analyze(&db, &blob, &ScanOptions::default()).verdict,
+        Verdict::Clean
+    ));
+}
+
+/// A drawing whose VBA project is encrypted has code that was not examined:
+/// `PASSWORD-PROTECTED`, as an encrypted member of any container is.
+#[test]
+#[cfg(any(feature = "dwg", feature = "all-formats"))]
+fn a_dwg_with_an_encrypted_vba_project_is_password_protected() {
+    let mut project = vec![0u8; 16];
+    project.extend_from_slice(&dwg_build::OLE2);
+    project.extend_from_slice(b"the project");
+    let mut section = dwg_build::Section::new("AcDb:VBAProject", &project);
+    section.encrypted = 1;
+    let mut drawing = dwg_build::Drawing::standard();
+    drawing.sections.push(section);
+    let db = Scanner::builtin();
+    match analyze(&db, &drawing.build().bytes, &ScanOptions::default()).verdict {
+        Verdict::PasswordProtected { reason } => {
+            assert!(reason.contains("VBA project"), "got {reason:?}")
+        }
+        other => panic!("an encrypted VBA project must not scan clean, got {other:?}"),
+    }
+}
+
+/// A page of the drawing that cannot be read holds objects that were not
+/// examined: `UNSCANNABLE`, never clean. Each data page of the converted
+/// drawings of `fixtures/dwg/ole/` is destroyed in turn (found by its header,
+/// masked with its address, spec 4.6): the one holding the OLE2FRAME's
+/// object takes the infection with it, and must not take the verdict.
+#[test]
+#[cfg(any(feature = "dwg", feature = "all-formats"))]
+fn a_dwg_with_a_page_that_cannot_be_read_is_not_clean() {
+    for v in ["R2004", "R2010", "R2013", "R2018"] {
+        let blob = dwg_fixture(&format!("ole/{v}.dwg.gz"));
+        let db = Scanner::builtin();
+        let (mut infected, mut unscannable) = (0, 0);
+        for at in (0x100..blob.len() - 0x20).step_by(4) {
+            let word = u32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
+            // The page header's type, XORed with 0x4164536B and the address.
+            if word ^ 0x4164_536B ^ (at as u32) != 0x4163_043B {
+                continue;
+            }
+            let mut damaged = blob.clone();
+            damaged[at] ^= 0xFF;
+            match analyze(&db, &damaged, &ScanOptions::default()).verdict {
+                Verdict::Infected { .. } => infected += 1,
+                Verdict::Unscannable { .. } => unscannable += 1,
+                other => panic!("{v}: the page at {at:#X} gone, got {other:?}"),
+            }
+        }
+        assert!(infected > 0, "{v}: pages the infection does not depend on");
+        assert!(unscannable > 0, "{v}: no page took the infection with it");
     }
 }
 

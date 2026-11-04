@@ -1,8 +1,8 @@
 import { writable } from "../core/store.js";
-import type { ArchiveController, ArchiveMember, Renderer, Session, ViewerFile } from "../core/types.js";
+import type { ArchiveController, ArchiveMember, ByteRanges, RenderContext, Renderer, Session, ViewerFile } from "../core/types.js";
 import type { ArchiveOptions } from "./index.js";
-import { decompressedName, memberPath, STREAM_MEMBER } from "./names.js";
-import { isZip, openRanged, type RangedArchive } from "./ranged.js";
+import { decompressedName, memberPath } from "./names.js";
+import { openRanged, type RangedArchive } from "./ranged.js";
 import { volumesAround, type Volumes } from "./volumes.js";
 
 /**
@@ -10,9 +10,25 @@ import { volumesAround, type Volumes } from "./volumes.js";
  * untrusted, and a few kilobytes can decompress to a terabyte. These are far
  * above any real delivery and far below a bomb.
  */
-const DEFAULTS = { maxExtractedBytes: 512 * 1024 * 1024, maxMembers: 5_000, maxCompressionRatio: 200 };
+const DEFAULTS = { maxExtractedBytes: 512 * 1024 * 1024, maxMembers: 5_000 };
 
 type State = ArchiveController extends { get(): infer S } ? S : never;
+
+/**
+ * Whether exav's detection takes the file read by `ranges` for a ZIP, from
+ * its first bytes. A detection that fails says no: the file is read whole.
+ */
+async function startsAsZip(ranges: ByteRanges, ctx: RenderContext<ArchiveOptions>): Promise<boolean> {
+  if (ranges.size === 0 || ctx.detector.headBytes === 0) return false;
+  try {
+    const head = await ranges.read(0, Math.min(ctx.detector.headBytes, ranges.size), ctx.signal);
+    return (await ctx.detector.sniff(head, ranges.size, ctx.signal)) === "application/zip";
+  } catch (error) {
+    if (ctx.signal.aborted) throw error;
+    console.warn("archive: the first bytes could not be read to tell a ZIP", error);
+    return false;
+  }
+}
 
 export const renderer: Renderer<ArchiveOptions> = {
   async mount(host, ctx) {
@@ -23,15 +39,20 @@ export const renderer: Renderer<ArchiveOptions> = {
     const limits = {
       maxExtractedBytes: o.maxExtractedBytes ?? DEFAULTS.maxExtractedBytes,
       maxMembers: o.maxMembers ?? DEFAULTS.maxMembers,
-      maxCompressionRatio: o.maxCompressionRatio ?? DEFAULTS.maxCompressionRatio,
     };
+    // The members the library named itself: the one of a compressed stream.
+    const synthetic = new WeakSet<ArchiveMember>();
     const list = async (archive: RangedArchive): Promise<ArchiveMember[]> => {
       try {
         if (ctx.signal.aborted) throw new DOMException("aborted", "AbortError");
         // Directories are left out: the tree is in the names.
         return (await archive.list())
           .filter((m) => !m.name.endsWith("/"))
-          .map((m) => ({ index: m.index, name: memberPath(m.name), uncompressedSize: m.uncompressedSize, encrypted: m.encrypted }));
+          .map((m) => {
+            const member = { index: m.index, name: memberPath(m.name), uncompressedSize: m.uncompressedSize, encrypted: m.encrypted };
+            if (m.synthetic) synthetic.add(member);
+            return member;
+          });
       } catch (error) {
         // The archive and its worker are closed whatever went wrong.
         void archive.close();
@@ -62,7 +83,7 @@ export const renderer: Renderer<ArchiveOptions> = {
       const { Archive } = await import("@exav/unpack-wasm");
       chosen = await Archive.open(volumes.data, limits);
       members = await list(chosen);
-    } else if (ranges && isZip(await ranges.read(0, Math.min(4, ranges.size), ctx.signal))) {
+    } else if (ranges && (await startsAsZip(ranges, ctx))) {
       try {
         chosen = await openRanged(ranges, limits, ctx.signal);
         members = await list(chosen);
@@ -77,18 +98,18 @@ export const renderer: Renderer<ArchiveOptions> = {
       chosen = await Archive.open(await ctx.source.blob(), limits);
       members = await list(chosen);
       // A compressed stream holds one file, which the library names after the
-      // compression ("gzip-content"): it takes its own name back from the
-      // stream's. A tarball (.tar.gz, .tgz...) is shown as the tar inside,
-      // as an archive tool shows it, rather than as a list of one; any other
-      // stream is decompressed only when its file is opened.
+      // compression ("gzip-content") and marks synthetic: it takes its own
+      // name back from the stream's. A tarball (.tar.gz, .tgz...) is shown as
+      // the tar inside, as an archive tool shows it, rather than as a list of
+      // one; any other stream is decompressed only when its file is opened.
       const only = members.length === 1 ? members[0]! : null;
-      if (only && STREAM_MEMBER.test(only.name)) {
+      if (only && synthetic.has(only)) {
         const name = decompressedName(ctx.file.name, only.name);
         members = [{ ...only, name }];
         if (/\.tar$/i.test(name)) {
           try {
             const entry = await chosen.extract(only.index);
-            if (!entry.unsupported && ctx.detector.detectBytes(name, entry.bytes) === "archive") {
+            if (!entry.unsupported && (await ctx.detector.detectBytes(name, entry.bytes, entry.bytes.length, ctx.signal)) === "archive") {
               const inner = await Archive.open(entry.bytes, limits);
               const innerMembers = await list(inner);
               void chosen.close();
@@ -139,7 +160,8 @@ export const renderer: Renderer<ArchiveOptions> = {
           }
           // The member's listed name: the library's, or the one a compressed
           // stream's member took back from the stream above.
-          const format = ctx.detector.detectBytes(member.name, entry.bytes);
+          const format = await ctx.detector.detectBytes(member.name, entry.bytes, entry.bytes.length, ctx.signal);
+          if (destroyed) return;
           if (!format) {
             state.update((s) => ({ ...s, refused: { key: "archive_no_reader" } }));
             return;

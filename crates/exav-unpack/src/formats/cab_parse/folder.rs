@@ -1,6 +1,6 @@
 use std::io::{self, Read, Seek, SeekFrom};
 
-use byteorder::{LittleEndian, ReadBytesExt};
+use crate::formats::cab_parse::ReadLe;
 
 use crate::formats::cab_parse::ctype::{CompressionType, Decompressor};
 
@@ -51,9 +51,9 @@ impl<'a, R: Read + Seek> FolderReader<'a, R> {
         if self.blocks_left == 0 {
             return Ok(false);
         }
-        let _checksum = self.reader.read_u32::<LittleEndian>()?;
-        let compressed_size = self.reader.read_u16::<LittleEndian>()? as usize;
-        let uncompressed_size = self.reader.read_u16::<LittleEndian>()? as usize;
+        let _checksum = self.reader.read_u32_le()?;
+        let compressed_size = self.reader.read_u16_le()? as usize;
+        let uncompressed_size = self.reader.read_u16_le()? as usize;
         let mut compressed = Vec::new();
         (&mut *self.reader)
             .take(compressed_size as u64)

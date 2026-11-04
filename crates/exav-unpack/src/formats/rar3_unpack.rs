@@ -15,14 +15,248 @@
 //! Everything is bounds-checked and never panics on malformed input.
 
 use super::ppmd7::{
-    PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7,
+    PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7, RangeDec,
     RarRangeDecoder, SYM_END,
 };
 use crate::{Budget, LimitHit};
+use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::io::Read;
+use std::rc::Rc;
 
+/// A stream that does not decode: damage.
 fn err(reason: &str) -> LimitHit {
+    LimitHit::corrupt(format!("rar3: {reason}"))
+}
+
+/// A stream that asks for more than the scan's budget allows.
+fn over(reason: &str) -> LimitHit {
     LimitHit::new(format!("rar3: {reason}"))
+}
+
+// ---- streamed input ---------------------------------------------------------
+
+/// Bytes the feed keeps ahead of the decoder. One decode step (a symbol, a
+/// filter's data of at most 64 KiB, a block's tables, a PPMd symbol and its
+/// escape) reads far less.
+const LOOKAHEAD: usize = 128 * 1024;
+/// Bytes kept behind the position, for the bits the bit reader gives back.
+const KEEP_BEHIND: usize = 16;
+
+/// A member's packed bytes as the streaming decoder reads them: a bounded
+/// buffer topped up from the source between decode steps, shared by the bit
+/// reader and the PPMd range decoder. Past the source's end it gives
+/// [`MEMBER_PADDING`] zero bytes, as the whole-input path pads.
+struct Feed {
+    buf: Vec<u8>,
+    pos: usize,
+    ended: bool,
+    /// A read went past the buffered bytes before the source ended: the
+    /// lookahead was not enough, and the decode cannot be trusted.
+    overrun: bool,
+    /// [`MEMBER_PADDING`] follows the end of the source; not when the archive
+    /// ends inside the member, whose bytes stop where the decode must.
+    pad: bool,
+}
+
+impl Feed {
+    fn new(pad: bool) -> Self {
+        Feed {
+            buf: Vec::new(),
+            pos: 0,
+            ended: false,
+            overrun: false,
+            pad,
+        }
+    }
+
+    fn next(&mut self) -> Option<u8> {
+        match self.buf.get(self.pos) {
+            Some(&b) => {
+                self.pos += 1;
+                Some(b)
+            }
+            None => {
+                if !self.ended {
+                    self.overrun = true;
+                }
+                None
+            }
+        }
+    }
+
+    fn unread(&mut self, n: usize) {
+        self.pos = self.pos.saturating_sub(n);
+    }
+
+    /// Read from `src` until [`LOOKAHEAD`] bytes are ahead or it ends.
+    fn top_up(&mut self, src: &mut dyn Read) {
+        if self.ended || self.buf.len() - self.pos >= LOOKAHEAD {
+            return;
+        }
+        let drop = self.pos.saturating_sub(KEEP_BEHIND);
+        self.buf.drain(..drop);
+        self.pos -= drop;
+        while self.buf.len() - self.pos < 2 * LOOKAHEAD {
+            let at = self.buf.len();
+            self.buf.resize(at + LOOKAHEAD, 0);
+            let n = loop {
+                match src.read(&mut self.buf[at..]) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    // The walk reports a source that failed.
+                    Err(_) => break 0,
+                }
+            };
+            self.buf.truncate(at + n);
+            if n == 0 {
+                self.ended = true;
+                if self.pad {
+                    self.buf.extend_from_slice(&[0u8; MEMBER_PADDING]);
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// RAR's range decoder (the arithmetic of [`RarRangeDecoder`]) reading a
+/// [`Feed`] it shares with the bit reader.
+struct FeedRangeDecoder {
+    low: u32,
+    code: u32,
+    range: u32,
+    bottom: u32,
+    feed: Rc<RefCell<Feed>>,
+    consumed: usize,
+    out_of_data: bool,
+    init_ok: bool,
+}
+
+impl FeedRangeDecoder {
+    fn new(feed: Rc<RefCell<Feed>>) -> Self {
+        let mut dec = FeedRangeDecoder {
+            low: 0,
+            code: 0,
+            range: 0xFFFF_FFFF,
+            bottom: 0x8000,
+            feed,
+            consumed: 0,
+            out_of_data: false,
+            init_ok: false,
+        };
+        let mut code = 0u32;
+        for _ in 0..4 {
+            code = (code << 8) | dec.read_byte();
+        }
+        dec.code = code;
+        dec.init_ok = !dec.out_of_data && code != 0xFFFF_FFFF;
+        dec
+    }
+
+    fn read_byte(&mut self) -> u32 {
+        match self.feed.borrow_mut().next() {
+            Some(b) => {
+                self.consumed += 1;
+                b as u32
+            }
+            None => {
+                self.out_of_data = true;
+                0
+            }
+        }
+    }
+
+    fn normalize(&mut self) {
+        loop {
+            if (self.low ^ self.low.wrapping_add(self.range)) >= 1 << 24 {
+                if self.range >= self.bottom {
+                    break;
+                }
+                self.range = (0u32.wrapping_sub(self.low)) & (self.bottom - 1);
+            }
+            let b = self.read_byte();
+            self.code = (self.code << 8) | b;
+            self.range <<= 8;
+            self.low <<= 8;
+        }
+    }
+}
+
+/// The range decoder of a PPMd block: over the member's bytes in memory, or
+/// over the feed of a streamed member.
+enum Rc3 {
+    Mem(RarRangeDecoder),
+    Feed(FeedRangeDecoder),
+}
+
+impl Rc3 {
+    fn init_ok(&self) -> bool {
+        match self {
+            Rc3::Mem(r) => r.init_ok(),
+            Rc3::Feed(r) => r.init_ok,
+        }
+    }
+}
+
+impl RangeDec for Rc3 {
+    fn get_threshold(&mut self, total: u32) -> u32 {
+        match self {
+            Rc3::Mem(r) => r.get_threshold(total),
+            Rc3::Feed(r) => {
+                r.range /= total;
+                (r.code.wrapping_sub(r.low)) / r.range
+            }
+        }
+    }
+
+    fn decode(&mut self, start: u32, size: u32) {
+        match self {
+            Rc3::Mem(r) => r.decode(start, size),
+            Rc3::Feed(r) => {
+                r.low = r.low.wrapping_add(start.wrapping_mul(r.range));
+                r.range = r.range.wrapping_mul(size);
+                r.normalize();
+            }
+        }
+    }
+
+    fn decode_bit(&mut self, size0: u32) -> u32 {
+        match self {
+            Rc3::Mem(r) => r.decode_bit(size0),
+            Rc3::Feed(_) => {
+                let scale = super::ppmd7::common::PPMD_BIN_SCALE;
+                if self.get_threshold(scale) < size0 {
+                    self.decode(0, size0);
+                    0
+                } else {
+                    self.decode(size0, scale - size0);
+                    1
+                }
+            }
+        }
+    }
+
+    fn out_of_data(&self) -> bool {
+        match self {
+            Rc3::Mem(r) => r.out_of_data(),
+            Rc3::Feed(r) => r.out_of_data,
+        }
+    }
+
+    fn range(&self) -> u32 {
+        match self {
+            Rc3::Mem(r) => r.range(),
+            Rc3::Feed(r) => r.range,
+        }
+    }
+
+    fn bytes_consumed(&self) -> usize {
+        match self {
+            Rc3::Mem(r) => r.bytes_consumed(),
+            Rc3::Feed(r) => r.consumed,
+        }
+    }
 }
 
 // ---- bit reader (bit_reader.go) -------------------------------------------
@@ -34,6 +268,8 @@ struct BitReader {
     /// packed data: a solid group hands the same decoder a fresh input stream
     /// per member while keeping its window and tables.
     data: Vec<u8>,
+    /// For a streamed member, the input in place of `data`.
+    feed: Option<Rc<RefCell<Feed>>>,
     pos: usize, // next byte index
     v: u64,     // accumulated bits
     n: u32,     // number of valid bits in v
@@ -43,22 +279,56 @@ impl BitReader {
     fn new(data: Vec<u8>) -> Self {
         BitReader {
             data,
+            feed: None,
             pos: 0,
             v: 0,
             n: 0,
         }
     }
 
+    fn with_feed(feed: Rc<RefCell<Feed>>) -> Self {
+        BitReader {
+            feed: Some(feed),
+            ..BitReader::new(Vec::new())
+        }
+    }
+
+    /// Give the whole bytes still buffered back to the feed, for the PPMd
+    /// range decoder to read from the bit reader's byte position (call
+    /// `align_byte` first).
+    fn hand_back(&mut self) {
+        if let Some(f) = &self.feed {
+            f.borrow_mut().unread((self.n / 8) as usize);
+        }
+        self.v = 0;
+        self.n = 0;
+    }
+
     /// readBits: read n bits (n <= 32). Returns None if input is exhausted.
     fn read_bits(&mut self, n: u32) -> Option<u32> {
         while n > self.n {
-            let c = *self.data.get(self.pos)?;
+            let c = match &self.feed {
+                None => *self.data.get(self.pos)?,
+                Some(f) => f.borrow_mut().next()?,
+            };
             self.pos += 1;
             self.v = (self.v << 8) | c as u64;
             self.n += 8;
         }
         self.n -= n;
         Some(((self.v >> self.n) & ((1u64 << n) - 1)) as u32)
+    }
+
+    /// Whether every byte of the input has been read, so that a read that
+    /// fails now fails for want of input.
+    fn exhausted(&self) -> bool {
+        match &self.feed {
+            None => self.pos >= self.data.len(),
+            Some(f) => {
+                let f = f.borrow();
+                f.ended && f.pos >= f.buf.len()
+            }
+        }
     }
 
     /// unreadBits: put back n bits.
@@ -341,6 +611,9 @@ struct Window {
     w: usize, // write index
     l: usize, // pending copyBytes length
     o: usize, // pending copyBytes offset
+    z: bool,  // pending copyBytes writes zeros
+    /// Bytes decoded into the window since it was made.
+    written: u64,
 }
 
 impl Window {
@@ -356,6 +629,8 @@ impl Window {
             w: 0,
             l: 0,
             o: 0,
+            z: false,
+            written: 0,
         }
     }
 
@@ -370,15 +645,32 @@ impl Window {
     fn write_byte(&mut self, c: u8) {
         self.buf[self.w] = c;
         self.w = (self.w + 1) & self.mask;
+        self.written += 1;
     }
 
-    fn copy_bytes(&mut self, mut len: usize, off: usize) {
+    fn copy_bytes(&mut self, len: usize, off: usize) {
+        // A distance past the start of the stream: unrar writes the whole
+        // match as zeros, the part past the start included.
+        self.copy(len, off, off as u64 > self.written);
+    }
+
+    fn copy(&mut self, mut len: usize, off: usize, zeros: bool) {
         len &= self.mask;
         let n = self.available();
         if len > n {
             self.l = len - n;
             self.o = off;
+            self.z = zeros;
             len = n;
+        }
+        self.written += len as u64;
+        if zeros {
+            while len > 0 {
+                self.buf[self.w] = 0;
+                self.w = (self.w + 1) & self.mask;
+                len -= 1;
+            }
+            return;
         }
         let mut i = (self.w.wrapping_sub(off)) & self.mask;
         while len > 0 {
@@ -408,7 +700,7 @@ impl Window {
         if self.l > 0 && n > 0 {
             let l = self.l;
             self.l = 0;
-            self.copy_bytes(l, self.o);
+            self.copy(l, self.o, self.z);
         }
         n
     }
@@ -521,6 +813,7 @@ impl Lz29 {
         } else if n == 8 {
             n = br.read_bits(16).ok_or_else(|| err("eof"))? as i32;
         }
+        // Rules of the format, which unrar refuses too: damage, not a limit.
         if !(0..=0x10000).contains(&n) {
             return Err(err("filter data too large"));
         }
@@ -672,7 +965,7 @@ struct FilterBlock {
 /// math is the vendored `Ppmd7`; the RAR-specific escape handling lives in the
 /// PPMd decode loop in `unpack29`.
 struct PpmdState {
-    model: Ppmd7<RarRangeDecoder>,
+    model: Ppmd7<Rc3>,
     /// Escape symbol: when a decoded byte equals this, the next symbol selects a
     /// control action (new table / EOD / match / literal).
     escape: u8,
@@ -704,6 +997,8 @@ struct Decoder29 {
     /// The PPMd escape symbol: 2 until a block header sets another, then kept
     /// by the blocks after it that set none.
     ppmd_escape: u8,
+    /// A PPMd block asked for more memory than `ppmd_mem_limit`.
+    over_limit: bool,
     #[allow(dead_code)] // tracked during decode; not consumed by the caller
     eof: bool,
     fnum: usize,
@@ -720,6 +1015,7 @@ impl Decoder29 {
             ppmd_mem: 0,
             ppmd_mem_limit: u64::MAX,
             ppmd_escape: 2,
+            over_limit: false,
             eof: false,
             fnum: 0,
             flen: Vec::new(),
@@ -776,8 +1072,14 @@ impl Decoder29 {
             0 => {
                 // New table / next block: resume the shared bit reader where the
                 // PPMd range decoder left off and read the next block header.
-                let resume = st.model_consumed();
-                br.seek_byte(resume);
+                // A streamed member's range decoder read the shared feed, which
+                // is already where it left off.
+                if br.feed.is_some() {
+                    br.hand_back();
+                } else {
+                    let resume = st.model_consumed();
+                    br.seek_byte(resume);
+                }
                 self.read_block_header(br)?;
                 Ok(DecodeStep::Continue)
             }
@@ -813,6 +1115,11 @@ impl Decoder29 {
                 Ok(DecodeStep::Continue)
             }
         }
+    }
+
+    /// Whether the PPMd block being decoded has read past its input.
+    fn ppmd_out_of_data(&self) -> bool {
+        self.decode_is_ppm && self.ppmd.as_ref().is_some_and(|st| st.model.out_of_data())
     }
 
     /// readBlockHeader: choose ppm or lz for the next block.
@@ -859,9 +1166,13 @@ impl Decoder29 {
         // The remaining member bytes feed the RAR range decoder (byte-aligned).
         br.align_byte();
         let base_off = br.byte_pos();
-        let bytes = br.remaining_bytes();
-
-        let rc = RarRangeDecoder::new(bytes);
+        let rc = match br.feed.clone() {
+            Some(feed) => {
+                br.hand_back();
+                Rc3::Feed(FeedRangeDecoder::new(feed))
+            }
+            None => Rc3::Mem(RarRangeDecoder::new(br.remaining_bytes())),
+        };
         if !rc.init_ok() {
             return Err(err("ppmd range init"));
         }
@@ -878,9 +1189,10 @@ impl Decoder29 {
                 return Err(err("invalid ppmd params"));
             }
             if u64::from(mem) > self.ppmd_mem_limit {
-                return Err(err("PPMd memory exceeds max-buffer"));
+                self.over_limit = true;
+                return Err(over("PPMd memory exceeds max-buffer"));
             }
-            let model = Ppmd7::new(rc, maxorder, mem).ok_or_else(|| err("ppmd alloc"))?;
+            let model = Ppmd7::new(rc, maxorder, mem).ok_or_else(|| over("ppmd alloc"))?;
             self.ppmd = Some(PpmdState {
                 model,
                 escape,
@@ -1019,6 +1331,11 @@ impl Decoder29 {
 
 const MAX_QUEUED_FILTERS: usize = 8192;
 
+/// The most bytes a standard filter transforms together: an Itanium bundle
+/// (an x86 address is 4). The last of a block cut by the end of the archive
+/// may need bytes past it.
+const FILTER_UNIT: usize = 16;
+
 /// The streaming decode reader, ported from `decodeReader`.
 struct DecodeReader {
     win: Window,
@@ -1033,6 +1350,10 @@ struct DecodeReader {
     /// reads its own block header.
     tables_read: bool,
     err: Option<LimitHit>,
+    /// The archive ends inside the member being decoded.
+    cut: bool,
+    /// It ended there, short of its size: what is missing is absent.
+    cut_short: bool,
     // queued filterBlocks; offsets relative to previous filter in list.
     filters: VecDeque<QueuedFilter>,
 }
@@ -1072,13 +1393,44 @@ impl DecodeReader {
         Ok(())
     }
 
-    /// fill: decode into the window, queueing any filters produced.
-    fn fill(&mut self) {
+    /// A decode step failed with `e`. When the archive ends inside the member
+    /// and every byte of it was read, it failed for want of the bytes the end
+    /// took: the member ends here.
+    fn fail(&mut self, e: LimitHit) {
+        let exhausted = self.br.exhausted() || self.dec.ppmd_out_of_data();
+        if self.cut && e.is_corrupt() && exhausted {
+            self.eof = true;
+            self.cut_short = true;
+        } else {
+            self.err = Some(e);
+        }
+    }
+
+    /// Read the block header a member starts with, an error of it taken as
+    /// [`Self::fail`] takes one.
+    fn block_header(&mut self) -> Result<(), LimitHit> {
+        if let Err(e) = self.dec.read_block_header(&mut self.br) {
+            self.fail(e);
+            if let Some(e) = self.err.take() {
+                return Err(e);
+            }
+        }
+        self.tables_read = true;
+        Ok(())
+    }
+
+    /// fill: decode into the window, queueing any filters produced. A
+    /// streamed member's feed is topped up from `src` before each step.
+    fn fill(&mut self, src: &mut dyn Read) {
         if self.err.is_some() || self.eof {
             return;
         }
         let mut produced: Vec<FilterBlock> = Vec::new();
+        let feed = self.br.feed.clone();
         while self.win.available() > 0 {
+            if let Some(f) = &feed {
+                f.borrow_mut().top_up(src);
+            }
             let step = self.dec.decode(&mut self.win, &mut self.br);
             match step {
                 Ok(DecodeStep::Continue) => continue,
@@ -1089,7 +1441,7 @@ impl DecodeReader {
                             produced.push(fb);
                         }
                         Err(e) => {
-                            self.err = Some(e);
+                            self.fail(e);
                             break;
                         }
                     }
@@ -1097,13 +1449,16 @@ impl DecodeReader {
                 }
                 Ok(DecodeStep::EndOfBlock) => {
                     if let Err(e) = self.dec.read_block_header(&mut self.br) {
-                        self.err = Some(e);
+                        self.fail(e);
                         break;
                     }
                     continue;
                 }
                 Ok(DecodeStep::EndOfFile) => {
                     self.eof = true;
+                    // PPMd's model ends a stream its input ran out of, before
+                    // any symbol made of bytes that are not there.
+                    self.cut_short = self.cut && self.dec.ppmd_out_of_data();
                     // PPMd's end of data ends its block as well as the file:
                     // the next member of a solid group starts with a header.
                     if self.dec.decode_is_ppm {
@@ -1117,10 +1472,14 @@ impl DecodeReader {
                     break;
                 }
                 Err(e) => {
-                    self.err = Some(e);
+                    self.fail(e);
                     break;
                 }
             }
+        }
+        if feed.is_some_and(|f| f.borrow().overrun) {
+            self.err = Some(err("a decode step read past the input lookahead"));
+            return;
         }
         for fb in produced {
             if let Err(e) = self.queue_filter(fb) {
@@ -1137,8 +1496,14 @@ impl DecodeReader {
         if first_off > 0 {
             return Ok(());
         }
-        let f = self.filters.pop_front().unwrap();
-        if self.win.buffered() < f.length {
+        let mut f = self.filters.pop_front().unwrap();
+        // The archive ends inside the block: the filters are causal, so the
+        // bytes present filter to the start of what the block would, but for
+        // the unit the end cuts.
+        let cut_block = self.win.buffered() < f.length && self.cut_short && self.err.is_none();
+        if cut_block {
+            f.length = self.win.buffered();
+        } else if self.win.buffered() < f.length {
             // fill() didn't return enough bytes.
             return match self.err.take() {
                 Some(e) => Err(e),
@@ -1173,18 +1538,21 @@ impl DecodeReader {
             }
             cur = self.filters.pop_front().unwrap();
         }
+        if cut_block {
+            outbuf.truncate(outbuf.len().saturating_sub(FILTER_UNIT));
+        }
         self.outbuf = outbuf;
         self.outbuf_pos = 0;
         Ok(())
     }
 
     /// Read decoded/filtered bytes into p; returns bytes written (0 at EOF).
-    fn read(&mut self, p: &mut [u8]) -> Result<usize, LimitHit> {
+    fn read(&mut self, p: &mut [u8], src: &mut dyn Read) -> Result<usize, LimitHit> {
         if self.outbuf_pos >= self.outbuf.len() {
             self.outbuf.clear();
             self.outbuf_pos = 0;
             if self.win.buffered() == 0 {
-                self.fill();
+                self.fill(src);
                 if self.win.buffered() == 0 {
                     return match self.err.take() {
                         Some(e) => Err(e),
@@ -1195,7 +1563,7 @@ impl DecodeReader {
                 && f.offset == 0
                 && f.length > self.win.buffered()
             {
-                self.fill();
+                self.fill(src);
             }
             if !self.filters.is_empty() {
                 self.process_filters()?;
@@ -1233,13 +1601,22 @@ impl DecodeReader {
 /// therefore does not fail — it produces plausible-looking wrong bytes, which
 /// is why every member's output is checked against the CRC the archive records.
 pub struct Unpacker29 {
-    dr: DecodeReader,
+    /// Boxed: the tables and the PPMd model are about 50 KiB, and the walk
+    /// that holds this decoder across the visitor must not carry them in its
+    /// stack frame.
+    dr: Box<DecodeReader>,
+    /// Bytes the streamed member declares that are not out yet.
+    left: u64,
 }
 
 impl Unpacker29 {
     /// `win_bits` is the window log2 size from the file header (typically
     /// 16..23). All members of a solid group share the window, so it is sized
     /// once, from the first member.
+    ///
+    /// Not inlined: the decoder is built in this call's frame, which a caller
+    /// that recurses into the visitor must not inherit.
+    #[inline(never)]
     pub fn new(win_bits: u32, budget: &mut Budget) -> Result<Self, LimitHit> {
         // The LZ sliding window is a whole-buffer allocation (RAR3 permits up to
         // a 1 GiB dictionary). Bound it by the global peak-buffer limit so it
@@ -1248,14 +1625,14 @@ impl Unpacker29 {
         // --max-object-bytes).
         let win_bytes = 1u64 << win_bits.min(30);
         if win_bytes > budget.limits.max_buffer_bytes {
-            return Err(err("RAR window exceeds max-buffer"));
+            return Err(over("RAR window exceeds max-buffer"));
         }
         let mut dec = Decoder29::new();
         dec.ppmd_mem_limit = budget.limits.max_buffer_bytes;
         dec.init_filters();
         dec.lz.reset();
         Ok(Unpacker29 {
-            dr: DecodeReader {
+            dr: Box::new(DecodeReader {
                 win: Window::new(win_bits),
                 dec,
                 br: BitReader::new(Vec::new()),
@@ -1265,13 +1642,27 @@ impl Unpacker29 {
                 eof: false,
                 tables_read: false,
                 err: None,
+                cut: false,
+                cut_short: false,
                 filters: VecDeque::new(),
-            },
+            }),
+            left: 0,
         })
     }
 
-    /// Decode one member. `solid` says the member continues the previous one's
-    /// stream, in which case the window and tables are kept.
+    /// Say whether the archive ends inside the next member, before
+    /// [`Self::member`] or [`Self::start_member`]: a decode that runs out of
+    /// its bytes then ends the member short, the missing tail absent, as the
+    /// RAR5 decoder ends one, instead of failing it.
+    pub fn cut_by_archive_end(&mut self, cut: bool) {
+        self.dr.cut = cut;
+    }
+
+    /// Decode one member, to its end-of-file code: the bytes it holds past
+    /// its declared size too, and as far as it goes when it ends before. Past its declared size, a stream that fails ends there.
+    /// `solid` says the member continues the previous one's stream, in which
+    /// case the window and tables are kept. A declared size, or output, over
+    /// what the budget has left is a limit.
     pub fn member(
         &mut self,
         packed: &[u8],
@@ -1281,19 +1672,23 @@ impl Unpacker29 {
     ) -> Result<Vec<u8>, LimitHit> {
         let cap = budget.reserve()?;
         if unpacked_size > cap {
-            return Err(err("declared size exceeds budget"));
+            return Err(over("declared size exceeds budget"));
         }
         // Pad the input with a few zero bytes: RAR's LZSS/PPMd encoders don't
         // pad the bitstream, so decoding the final symbols of the last block can
-        // require reading a bit or two past the packed data. Output is bounded
-        // by `unpacked_size`, so the trailing zeros are never actually emitted.
-        // Mirrors the RAR5 unpacker's input padding.
+        // require reading a bit or two past the packed data. A whole stream
+        // reaches its end-of-file code before the zeros are read as symbols.
+        // Mirrors the RAR5 unpacker's input padding. Not for a member the
+        // archive ends inside: its decode stops where its bytes do.
         let mut padded = Vec::with_capacity(packed.len() + MEMBER_PADDING);
         padded.extend_from_slice(packed);
-        padded.extend_from_slice(&[0u8; MEMBER_PADDING]);
+        if !self.dr.cut {
+            padded.extend_from_slice(&[0u8; MEMBER_PADDING]);
+        }
         self.dr.br = BitReader::new(padded);
         self.dr.eof = false;
         self.dr.err = None;
+        self.dr.cut_short = false;
         // The x86 and Itanium filters convert addresses relative to the start
         // of the member, solid or not; counting from an earlier member's start
         // corrupted every executable after the first decoded member.
@@ -1308,36 +1703,80 @@ impl Unpacker29 {
         // its predecessor was in the middle of, and reading a header here would
         // consume symbols as if they were table data.
         if !solid || !self.dr.tables_read {
-            self.dr.dec.read_block_header(&mut self.dr.br)?;
-            self.dr.tables_read = true;
+            self.dr.block_header()?;
         }
 
         let mut out: Vec<u8> = Vec::with_capacity(unpacked_size.min(1 << 20) as usize);
         let mut buf = [0u8; 16 * 1024];
-        while (out.len() as u64) < unpacked_size {
-            let want = (unpacked_size - out.len() as u64).min(buf.len() as u64) as usize;
-            let n = self.dr.read(&mut buf[..want])?;
-            if n == 0 {
-                break;
-            }
+        loop {
+            let n = match self.dr.read(&mut buf, &mut std::io::empty()) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.is_corrupt() && out.len() as u64 >= unpacked_size => break,
+                Err(e) => return Err(e),
+            };
             if out.len() as u64 + n as u64 > cap {
-                return Err(err("output exceeds budget"));
+                return Err(over("output exceeds budget"));
             }
             out.extend_from_slice(&buf[..n]);
         }
-
-        if (out.len() as u64) < unpacked_size {
-            return Err(err("decoded fewer bytes than declared"));
-        }
-        // Read on to the member's end-of-file code, which the next member of
-        // a solid group starts after. A member with nothing to output, an
-        // empty file, never reached it, and the next one began mid-stream.
-        if !self.dr.eof && self.dr.err.is_none() && self.dr.win.buffered() == 0 {
-            self.dr.fill();
-        }
-        out.truncate(unpacked_size as usize);
         budget.commit(out.len() as u64);
         Ok(out)
+    }
+
+    /// Whether a PPMd block asked for a model over the buffer limit.
+    pub fn over_limit(&self) -> bool {
+        self.dr.dec.over_limit
+    }
+
+    /// Start a member whose packed bytes `src` gives as they are needed, to
+    /// be read with [`Self::read_member`]: the streaming form of
+    /// [`Self::member`], holding the window and a bounded lookahead of input.
+    pub fn start_member(
+        &mut self,
+        unpacked_size: u64,
+        solid: bool,
+        src: &mut dyn Read,
+    ) -> Result<(), LimitHit> {
+        let feed = Rc::new(RefCell::new(Feed::new(!self.dr.cut)));
+        feed.borrow_mut().top_up(src);
+        self.dr.br = BitReader::with_feed(Rc::clone(&feed));
+        self.dr.eof = false;
+        self.dr.err = None;
+        self.dr.cut_short = false;
+        self.dr.tot = 0;
+        self.left = unpacked_size;
+        if !solid {
+            self.dr.filters.clear();
+            self.dr.dec.init_filters();
+        }
+        if !solid || !self.dr.tables_read {
+            self.dr.block_header()?;
+        }
+        if feed.borrow().overrun {
+            return Err(err("a block header read past the input lookahead"));
+        }
+        Ok(())
+    }
+
+    /// The next decoded bytes of the member [`Self::start_member`] started, 0
+    /// at its end-of-file code, as [`Self::member`] reads it. What reads it
+    /// bounds its output.
+    pub fn read_member(&mut self, buf: &mut [u8], src: &mut dyn Read) -> Result<usize, LimitHit> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        match self.dr.read(buf, src) {
+            Ok(n) => {
+                self.left = self.left.saturating_sub(n as u64);
+                Ok(n)
+            }
+            Err(e) if e.is_corrupt() && self.left == 0 => {
+                self.dr.eof = true;
+                Ok(0)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1859,6 +2298,28 @@ mod tests {
     use super::*;
     use crate::Limits;
 
+    /// A stream that does not decode is damage; a member that declares more
+    /// than the scan's budget allows, or a window past the buffer limit, is a
+    /// limit.
+    #[test]
+    fn a_stream_that_does_not_decode_is_damage_and_a_huge_member_is_a_limit() {
+        let mut budget = Budget::new(Limits::default());
+        let e = unpack29(&[0xff; 4], 1000, 20, &mut budget).expect_err("not a stream");
+        assert!(e.is_corrupt(), "{}", e.reason);
+        let mut budget = Budget::new(Limits {
+            max_extracted_bytes: 10,
+            ..Limits::default()
+        });
+        let e = unpack29(&[0; 8], 1000, 20, &mut budget).expect_err("over the budget");
+        assert!(!e.is_corrupt(), "{}", e.reason);
+        let mut budget = Budget::new(Limits {
+            max_buffer_bytes: 1 << 10,
+            ..Limits::default()
+        });
+        let e = unpack29(&[0; 8], 10, 20, &mut budget).expect_err("window over the buffer limit");
+        assert!(!e.is_corrupt(), "{}", e.reason);
+    }
+
     /// The filter's registers come from the archive: one that is `i32::MIN`
     /// after the subtraction of 3 leaves the data as it was, not a panic.
     /// The channel count is a 32-bit register of the archive's: one far past
@@ -1939,5 +2400,37 @@ mod tests {
         assert!(w.buf.len() >= MIN_WINDOW_SIZE);
         let w = Window::new(22);
         assert_eq!(w.buf.len(), 1 << 22);
+    }
+
+    /// A match from before the start of the stream is all zeros, the bytes
+    /// that would come from the start included, as unrar writes it.
+    #[test]
+    fn a_match_from_before_the_start_writes_zeros() {
+        let mut w = Window::new(10);
+        for &c in b"mjof " {
+            w.write_byte(c);
+        }
+        w.copy_bytes(8, 5);
+        w.copy_bytes(9, 15);
+        let mut out = vec![0u8; 64];
+        let n = w.read(&mut out);
+        assert_eq!(&out[..n], b"mjof mjof mjo\0\0\0\0\0\0\0\0\0");
+    }
+
+    /// The part of such a match the window had no room for is zeros too,
+    /// though the window holds that far back by then.
+    #[test]
+    fn the_rest_of_a_match_from_before_the_start_is_zeros() {
+        let mut w = Window::new(18);
+        let size = w.buf.len();
+        for _ in 0..size - 4 {
+            w.write_byte(b'a');
+        }
+        w.copy_bytes(9, size - 2);
+        let mut out = vec![0u8; size];
+        assert_eq!(w.read(&mut out), size - 1);
+        assert_eq!(&out[size - 4..size - 1], [0; 3]);
+        assert_eq!(w.read(&mut out), 6);
+        assert_eq!(&out[..6], [0; 6]);
     }
 }

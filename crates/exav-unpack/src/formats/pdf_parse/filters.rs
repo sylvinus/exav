@@ -1,12 +1,12 @@
 //! Pure PDF stream filter decoders (PDF 32000-1:2008 §7.4).
 //!
-//! Every decoder here is a total function over `&[u8]` — bounds-checked,
+//! Every decoder here is a total function over `&[u8]`: bounds-checked,
 //! panic-free, and self-terminating. Each takes a `cap` (the per-member output
 //! budget from `Budget::reserve`) and returns `(bytes, truncated)`: once more
 //! than `cap` bytes would be produced it stops and flags `truncated`, so a
 //! malformed or deliberately bombing stream can neither exhaust memory nor loop
 //! forever. On malformed input a decoder returns whatever it managed to decode
-//! rather than erroring — signatures can still match a partial result.
+//! rather than erroring: signatures can still match a partial result.
 //!
 //! These are the standard non-Flate PDF stream filters: ASCIIHexDecode,
 //! ASCII85Decode, RunLengthDecode and LZWDecode. FlateDecode stays on the
@@ -118,7 +118,7 @@ pub(crate) fn ascii85_decode(data: &[u8], cap: u64) -> (Vec<u8>, bool) {
     // Flush a final partial group (1 char is invalid and dropped per spec).
     if count >= 2 {
         for slot in group.iter_mut().skip(count) {
-            *slot = 84; // 'u' - '!' — pad with the max digit
+            *slot = 84; // 'u' - '!': pad with the max digit
         }
         let mut val = 0u32;
         for &g in &group {
@@ -133,7 +133,7 @@ pub(crate) fn ascii85_decode(data: &[u8], cap: u64) -> (Vec<u8>, bool) {
     (out, false)
 }
 
-/// RunLengthDecode (§7.4.5): a length byte L drives each run —
+/// RunLengthDecode (§7.4.5): a length byte L drives each run.
 /// `0..=127` copies the next `L + 1` literal bytes, `129..=255` repeats the
 /// next byte `257 - L` times, and `128` is the end-of-data marker.
 pub(crate) fn run_length_decode(data: &[u8], cap: u64) -> (Vec<u8>, bool) {
@@ -227,7 +227,7 @@ pub(crate) fn lzw_decode(data: &[u8], early_change: bool, cap: u64) -> (Vec<u8>,
         let entry: Vec<u8> = if (code as usize) < dict.len() {
             dict[code as usize].clone()
         } else if code as usize == dict.len() {
-            // KwKwK: code not yet in the table — reconstruct from prev.
+            // KwKwK: code not yet in the table, reconstruct from prev.
             match prev {
                 Some(p) if (p as usize) < dict.len() => {
                     let mut e = dict[p as usize].clone();
@@ -239,7 +239,7 @@ pub(crate) fn lzw_decode(data: &[u8], early_change: bool, cap: u64) -> (Vec<u8>,
                 _ => break, // malformed
             }
         } else {
-            break; // code out of range — malformed
+            break; // code out of range: malformed
         };
 
         out.extend_from_slice(&entry);
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn ascii_hex_whitespace_and_odd_nibble() {
-        // "48 65 6C 6C 6F 7" — trailing single nibble 7 -> 0x70.
+        // "48 65 6C 6C 6F 7": trailing single nibble 7 -> 0x70.
         let (out, _) = ascii_hex_decode(b"48 65\n6C\t6C 6F 7>", CAP);
         assert_eq!(out, b"Hello\x70");
     }

@@ -9,8 +9,12 @@
 // and kept. A ZIP needs few rounds: its start and end, the chunks of its
 // local headers (fetched together, from its central directory), then one or
 // two per member opened.
-import { Archive, type MemberInfo } from "@exav/unpack-wasm";
+import init, { Archive, type MemberInfo } from "@exav/unpack-wasm";
+// By namespace: @exav/unpack-wasm 0.0.3 has no `zipTail`, and a named import
+// of it would fail this worker at load. Without it, the rounds find the headers.
+import * as unpack from "@exav/unpack-wasm";
 
+import { END_TAIL, readFromTail } from "../core/zip-tail.js";
 import { RANGED_ARCHIVE, type RangedReply, type RangedRequest } from "./ranged-protocol.js";
 
 const { chunk: CHUNK, maxRounds: MAX_ROUNDS, keepBytes: KEEP_BYTES, maxOpBytes: MAX_OP_BYTES } = RANGED_ARCHIVE;
@@ -123,73 +127,34 @@ function chunksOf(offset: number, length: number): number[] {
   return out;
 }
 
-/** `length` bytes here at `offset`, or null. */
-function here(offset: number, length: number): DataView | null {
-  const { bytes } = gather(offset, length);
-  return bytes.length === length ? new DataView(bytes.buffer, bytes.byteOffset, length) : null;
-}
-
 /**
- * Where a ZIP's members' local headers are, read from its central directory,
- * so that their chunks are fetched in one go rather than one round each: the
- * library reads every local header to list the members. A hint only: what it
+ * Where a ZIP's members' local headers are, read from its central directory
+ * by the library's ZIP reader (`zipTail`), so that their chunks are fetched
+ * in one go rather than one round each: the library reads every local
+ * header to list the members. The reader says which bytes before the end it
+ * needs, and only those are fetched (`readFromTail`). A hint only: what it
  * gets wrong is fetched by the rounds, and the library reads the archive
  * itself.
  */
 async function zipHeaders(): Promise<number[]> {
-  const tail = Math.min(size, 65_557);
-  await fetchChunks(chunksOf(size - tail, tail));
-  const end = here(size - tail, tail);
-  if (!end) return [];
-  let at = -1;
-  for (let i = tail - 22; i >= 0; i--) {
-    if (end.getUint32(i, true) === 0x06054b50) {
-      at = i;
-      break;
-    }
-  }
-  if (at < 0) return [];
-  let entries = end.getUint16(at + 10, true);
-  let cdSize = end.getUint32(at + 12, true);
-  let cdOffset = end.getUint32(at + 16, true);
-  if ((entries === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) && at >= 20 && end.getUint32(at - 20, true) === 0x07064b50) {
-    const z = Number(end.getBigUint64(at - 12, true));
-    await fetchChunks(chunksOf(z, 56));
-    const z64 = here(z, 56);
-    if (!z64 || z64.getUint32(0, true) !== 0x06064b50) return [];
-    entries = Number(z64.getBigUint64(32, true));
-    cdSize = Number(z64.getBigUint64(40, true));
-    cdOffset = Number(z64.getBigUint64(48, true));
-  }
-  if (cdOffset + cdSize > size || cdSize > 64 * 1024 * 1024) return [];
-  await fetchChunks(chunksOf(cdOffset, cdSize));
-  const cd = here(cdOffset, cdSize);
-  if (!cd) return [];
-  const offsets: number[] = [];
-  for (let p = 0, n = 0; n < entries && p + 46 <= cdSize; n++) {
-    if (cd.getUint32(p, true) !== 0x02014b50) break;
-    const nameLength = cd.getUint16(p + 28, true);
-    const extraLength = cd.getUint16(p + 30, true);
-    let offset = cd.getUint32(p + 42, true);
-    if (offset === 0xffffffff) {
-      // The zip64 field holds the sizes first, those that overflowed.
-      let q = p + 46 + nameLength;
-      const stop = q + extraLength;
-      while (q + 4 <= stop && q + 4 <= cdSize) {
-        const id = cd.getUint16(q, true);
-        const length = cd.getUint16(q + 2, true);
-        if (id === 1) {
-          const skip = (cd.getUint32(p + 24, true) === 0xffffffff ? 8 : 0) + (cd.getUint32(p + 20, true) === 0xffffffff ? 8 : 0);
-          if (skip + 8 <= length && q + 4 + skip + 8 <= cdSize) offset = Number(cd.getBigUint64(q + 4 + skip, true));
-          break;
-        }
-        q += 4 + length;
-      }
-    }
-    if (offset < size) offsets.push(offset);
-    p += 46 + nameLength + extraLength + cd.getUint16(p + 32, true);
-  }
-  return offsets;
+  const zipTail = (unpack as Partial<typeof unpack>).zipTail;
+  if (!zipTail) return [];
+  await init();
+  const found = await readFromTail<number[]>(
+    END_TAIL,
+    async (length) => {
+      const from = Math.max(0, size - length);
+      await fetchChunks(chunksOf(from, size - from));
+      const { bytes } = gather(from, size - from);
+      return bytes.length === size - from ? { bytes, size } : null;
+    },
+    async ({ bytes }) => {
+      const read = zipTail(bytes, size);
+      if (!read) return { done: true, value: [] };
+      return "headers" in read ? { done: true, value: read.headers.filter((o) => o < size) } : { done: false, needs: read.needs };
+    },
+  );
+  return found ?? [];
 }
 
 /** Fetches the chunks of every member's local header, once. */

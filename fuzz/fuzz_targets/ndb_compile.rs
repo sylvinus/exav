@@ -14,7 +14,7 @@ fuzz_target!(|data: &[u8]| {
         b.add_ndb(text, false);
         // Feed the same text as LDB lines (different parser, different panics).
         b.add_ldb(text, false);
-        // Build the engine — exercises AC construction from whatever compiled.
+        // Build the engine: exercises AC construction from whatever compiled.
         let _ = b.build();
     }
 });

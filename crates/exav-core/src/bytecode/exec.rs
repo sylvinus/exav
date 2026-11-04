@@ -350,12 +350,24 @@ pub struct Outcome {
 pub struct PdfCtx {
     pub objs: Vec<(u32, u32)>,
     pub size: u32,
+    /// The table lacks objects the file has: past the room it was given, or at
+    /// an offset a `u32` cannot hold. A program that reads it sees a part of
+    /// the file.
+    pub truncated: bool,
 }
 
 /// Scan a PDF for `id gen obj` markers, returning a [`PdfCtx`] (objects sorted
 /// by offset). This mirrors what the PDF parser feeds the bytecode.
 pub fn pdf_ctx(data: &dyn ByteSource) -> PdfCtx {
+    pdf_ctx_within(data, usize::MAX)
+}
+
+/// [`pdf_ctx`] with a table of at most `max_bytes` bytes: the first objects of
+/// the file, and [`PdfCtx::truncated`] when there are more.
+pub fn pdf_ctx_within(data: &dyn ByteSource, max_bytes: usize) -> PdfCtx {
+    let room = max_bytes / std::mem::size_of::<(u32, u32)>();
     let mut objs = Vec::new();
+    let mut truncated = false;
     let mut from = 0;
     // " obj" cannot overlap itself, so one byte on finds every occurrence.
     while let Some(pos) = data.find(b" obj", from, data.len()) {
@@ -370,15 +382,21 @@ pub fn pdf_ctx(data: &dyn ByteSource) -> PdfCtx {
         if i == id_end {
             continue;
         }
-        objs.push((id, i as u32));
-        if objs.len() >= 8192 {
-            break;
+        // Found with the table full, or where an offset does not fit: the
+        // table stops here and says so.
+        match u32::try_from(i) {
+            Ok(start) if objs.len() < room => objs.push((id, start)),
+            _ => {
+                truncated = true;
+                break;
+            }
         }
     }
     objs.sort_by_key(|&(_, start)| start);
     PdfCtx {
         objs,
         size: data.len().min(u32::MAX as usize) as u32,
+        truncated,
     }
 }
 
@@ -910,6 +928,21 @@ impl<'a> Machine<'a> {
         self.flag();
         Vec::new()
     }
+
+    /// How many bytes a write at `p` takes before the end of its region; none
+    /// for a region that cannot be written.
+    fn room(&self, p: i64) -> usize {
+        let (region, off) = (ptr_region(p), ptr_off(p) as usize);
+        let len = if (R_HEAP..R_GLOBAL).contains(&region) {
+            self.heaps.get((region - R_HEAP) as usize).map(Vec::len)
+        } else if (R_STACK..R_HEAP).contains(&region) {
+            self.frames.get((region - R_STACK) as usize).map(|f| f.stack.len())
+        } else {
+            None
+        };
+        len.unwrap_or(0).saturating_sub(off)
+    }
+
     fn write_region(&mut self, p: i64, bytes: &[u8]) {
         self.charge_bytes(bytes.len());
         // Within one region, in a piece: a program that asks for megabytes
@@ -996,10 +1029,15 @@ impl<'a> Machine<'a> {
                 let size = self
                     .value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0)))
                     .max(0) as usize;
-                let avail = self.ctx.file.len().saturating_sub(self.cursor).min(size);
+                let dest = args.first().map(|op| self.ptr(fi, op));
+                // The first byte past the buffer ends the run (`write_region`),
+                // so no more than that is read: `size` is the program's and may
+                // be a number from the file, and `window` copies out what it is
+                // asked for when the object is read through a cache.
+                let room = dest.map_or(usize::MAX, |p| self.room(p).saturating_add(1));
+                let avail = self.ctx.file.len().saturating_sub(self.cursor).min(size).min(room);
                 let bytes = self.ctx.file.window(self.cursor, avail);
-                if let Some(op) = args.first() {
-                    let p = self.ptr(fi, op);
+                if let Some(p) = dest {
                     self.write_region(p, &bytes);
                 }
                 self.cursor += bytes.len();
@@ -2411,6 +2449,52 @@ mod tests {
         assert!(!m.unsupported && !m.gap);
     }
 
+    /// An object that is not in memory is copied out by the span asked of it.
+    /// A `read` of a length the file declared, into a buffer that cannot take
+    /// it, ends the run at the byte past the buffer: the object is not asked
+    /// for more than that.
+    // The object is 1 TiB: a 32-bit `usize` cannot hold its length.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_read_asks_the_object_for_no_more_than_its_buffer_takes() {
+        struct Spy {
+            asked: std::cell::Cell<usize>,
+        }
+        impl ByteSource for Spy {
+            fn len(&self) -> usize {
+                1 << 40
+            }
+            fn window(&self, _: usize, len: usize) -> std::borrow::Cow<'_, [u8]> {
+                self.asked.set(self.asked.get().max(len));
+                std::borrow::Cow::Owned(vec![0; len.min(4096)])
+            }
+            fn identity(&self) -> (usize, usize) {
+                (0, 0)
+            }
+        }
+        let (apis, globals, types) = (apis(), Globals::default(), TypeTable::default());
+        let spy = Spy {
+            asked: std::cell::Cell::new(0),
+        };
+        let c = ctx(&spy, &apis, &globals, &types);
+        let mut m = machine(&c);
+        let p = m.call_api(0, Api::Malloc, &[Operand::Const(16)]);
+        m.frames[0] = Frame {
+            vtypes: &[0],
+            slots: Rc::from([Slot { off: 0, w: 8 }]),
+            stack: p.to_le_bytes().to_vec(),
+        };
+        let read = |m: &mut Machine, n: u64| {
+            m.call_api(0, Api::Read, &[Operand::Reg(0), Operand::Const(n)])
+        };
+        assert_eq!(read(&mut m, 16), 16);
+        assert!(!m.halt);
+        read(&mut m, 1 << 39);
+        assert!(m.halt, "17 bytes do not fit a buffer of 16");
+        let asked = spy.asked.get();
+        assert!(asked <= 17, "the object was asked for {asked} bytes");
+    }
+
     /// A program frees nothing, so allocations that each fit are held until
     /// the run ends: past a total the run stops as incomplete, rather than the
     /// host running out of memory first.
@@ -2688,6 +2772,78 @@ mod tests {
             .unwrap();
         assert_eq!(pdf_ctx(&d).objs, want);
         assert_eq!(pdf_ctx(&cache).objs, want);
+    }
+
+    /// `n` objects, one to a line.
+    fn pdf_of(n: usize) -> Vec<u8> {
+        let mut d = b"%PDF-1.7\n".to_vec();
+        for i in 1..=n {
+            d.extend_from_slice(format!("{i} 0 obj\n<<>>\nendobj\n").as_bytes());
+        }
+        d
+    }
+
+    /// The table holds the objects of the file past the 8,192 it once stopped
+    /// at, and stops only where the room it was given does, saying so.
+    #[test]
+    fn the_pdf_object_table_is_cut_only_by_its_room_and_says_so() {
+        let d = pdf_of(10_000);
+        let all = pdf_ctx(&d);
+        assert_eq!((all.objs.len(), all.truncated), (10_000, false));
+        let entry = std::mem::size_of::<(u32, u32)>();
+        for (room, held, cut) in [
+            (usize::MAX, 10_000, false),
+            (10_000 * entry, 10_000, false),
+            (10_000 * entry + entry - 1, 10_000, false),
+            (10_000 * entry - 1, 9_999, true),
+            (3 * entry, 3, true),
+            (entry - 1, 0, true),
+            (0, 0, true),
+        ] {
+            let t = pdf_ctx_within(&d, room);
+            assert_eq!((t.objs.len(), t.truncated), (held, cut), "room {room}");
+            assert!(t.objs.windows(2).all(|w| w[0].1 < w[1].1), "sorted by offset");
+        }
+        // An object count below the room is never a cut.
+        let t = pdf_ctx_within(&pdf_of(2), 3 * entry);
+        assert_eq!((t.objs.len(), t.truncated), (2, false));
+    }
+
+    /// An object that starts past what a `u32` holds cannot be in the table:
+    /// that is a cut, not a wrapped offset.
+    // A 32-bit `usize` cannot address an object of 5 GiB.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_pdf_object_past_four_gib_is_a_cut() {
+        /// Zeros for 5 GiB, with one object at the end.
+        struct Huge;
+        const AT: usize = 5 << 30;
+        const TAIL: &[u8] = b"7 0 obj";
+        impl ByteSource for Huge {
+            fn len(&self) -> usize {
+                AT + TAIL.len()
+            }
+            fn window(&self, off: usize, len: usize) -> std::borrow::Cow<'_, [u8]> {
+                let end = off.saturating_add(len).min(self.len());
+                let mut w = vec![0u8; end.saturating_sub(off)];
+                for (i, b) in TAIL.iter().enumerate() {
+                    if (AT + i) >= off && (AT + i) < end {
+                        w[AT + i - off] = *b;
+                    }
+                }
+                std::borrow::Cow::Owned(w)
+            }
+            fn find(&self, needle: &[u8], from: usize, to: usize) -> Option<usize> {
+                // The " obj" of "7 0 obj".
+                let at = AT + 3;
+                (needle == b" obj" && from <= at && at + needle.len() <= to).then_some(at)
+            }
+            fn identity(&self) -> (usize, usize) {
+                (0, self.len())
+            }
+        }
+        let t = pdf_ctx(&Huge);
+        assert!(t.objs.is_empty() && t.truncated, "{:?}", t.objs);
     }
 
     /// `read_number` as it was over a slice.

@@ -498,6 +498,10 @@ impl<R: Read> Read for LZWReader<R> {
 #[cfg(true)]
 impl<R: Read> LZWReader<R> {
     fn decode_into(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // exav: weezl makes no progress into no room, which is not the end.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         loop {
             let result = self.decoder.decode_bytes(self.reader.fill_buf()?, buf);
             self.reader.consume(result.consumed_in);
@@ -523,7 +527,6 @@ impl<R: Read> LZWReader<R> {
                     if result.consumed_in > 0 {
                         continue;
                     }
-                    assert!(self.reader.buffer().is_empty());
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "no lzw end code found",
@@ -733,5 +736,23 @@ mod test {
             0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
         ];
         assert_eq!(decoded, expected);
+    }
+
+    /// A read into no room, between two others, reads nothing and loses
+    /// nothing.
+    #[test]
+    fn an_lzw_read_into_no_room_is_empty() {
+        let plain = vec![b'a'; 300];
+        let encoded = weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
+            .encode(&plain)
+            .unwrap();
+        let len = encoded.len();
+        let mut r = LZWReader::new(io::Cursor::new(encoded), len);
+        let mut first = [0u8; 1];
+        assert_eq!(r.read(&mut first).unwrap(), 1);
+        assert_eq!(r.read(&mut []).unwrap(), 0);
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert_eq!([&first[..], &rest[..]].concat(), plain);
     }
 }

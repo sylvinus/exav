@@ -1,25 +1,25 @@
 # Fuzzing exav
 
 Coverage-guided fuzzing is how we hold the line on exav's core promise: **the
-scanner must never crash, hang, or corrupt memory on the files it scans** —
+scanner must never crash, hang, or corrupt memory on the files it scans**,
 and those files are, by definition, hostile.
 
 ## Why fuzz a `#![forbid(unsafe_code)]` codebase?
 
-`forbid(unsafe_code)` removes *undefined behaviour* (the memory-corruption class
-— buffer overflows, use-after-free, type confusion that turn into RCE/info-leak).
+`forbid(unsafe_code)` removes *undefined behaviour* (the memory-corruption class:
+buffer overflows, use-after-free, type confusion that turn into RCE/info-leak).
 It does **not** make the process unkillable. Safe Rust still terminates on:
 
-- **Panics** — out-of-bounds indexing (`s[i]`), integer overflow (in debug /
+- **Panics**: out-of-bounds indexing (`s[i]`), integer overflow (in debug /
   `-Cdebug-assertions` builds), `unwrap()`/`expect()`, `assert!`, division by
   zero, slice-range start > end. A panic that reaches the top of a thread with no
   catcher kills the process.
-- **Aborts** — OOM (`Vec::with_capacity(attacker_huge)` → `handle_alloc_error`),
+- **Aborts**: OOM (`Vec::with_capacity(attacker_huge)` → `handle_alloc_error`),
   stack overflow from unbounded recursion (guard-page `SIGSEGV`), double-panic,
   `panic = "abort"`.
-- **Hangs** — infinite loops or super-linear algorithms (algorithmic DoS).
+- **Hangs**: infinite loops or super-linear algorithms (algorithmic DoS).
 
-These are all **denial-of-service, not memory corruption** — far less severe (no
+These are all **denial-of-service, not memory corruption**: far less severe (no
 code execution, no out-of-bounds disclosure), but the scanner must still
 contain them. That reframing is what memory safety buys: the *same* logic error
 that is a silent out-of-bounds read in a C parser (potential RCE) is a
@@ -44,14 +44,15 @@ panic instead of wrapping). Targets in `fuzz/fuzz_targets/`:
 | `vdisk`         | `unpack::walk()` of QCOW2, VMDK, VHD, VHDX, NTFS, FAT and partition tables | the virtual disks and the volume walker, with a buffer limit of 64 KiB so any image of a few KiB declares a disk walked in place: the tables read as units are reached, compressed units and their cache, the filesystems read through a `Read + Seek`. The first byte picks the format. Each image is walked from memory and through a block cache of 512-byte blocks, which must find the same members and end the same way, and no member held whole may pass the buffer limit. |
 | `fsimage`       | `unpack::walk()` of ext, exFAT, SquashFS, cramfs, romfs, EROFS, 7z, WIM, xar and partition tables | the filesystem readers on hostile images, and the archives read where they lie on a seekable source: the superblocks, the directories and their loops, extent trees and block maps, chunk maps, the sparse and the compressed blocks, a 7z's header and folders, a WIM's chunk tables and a xar's table of contents, with a buffer limit of 64 KiB so a volume of a few KiB declares more. A file past the limit is read as it goes, up to the 4 MiB the scan budget gives. The first byte picks the format. Each image is walked from memory and through a block cache of 512-byte blocks, and again from memory: the three must find the same members, the first two must end the same way, and no member held whole may pass the buffer limit. |
 | `lzo`           | the LZO1X decoder (`exav_unpack::lzo_decompress`) | SquashFS's LZO blocks: the decoder never panics, never writes past the size it is given, and gives the same bytes twice; a stream of literals made from the input must come back as it is. |
-| `analyze`       | `analyze()` — the whole scanner   | format detection → every extractor (recursively) → pattern/hash matching → PE/ML/fuzzy heuristics → bytecode, against the signature files of `fuzz/db/` (every signature kind, the YARA rules, a bytecode program), under options the input's last two bytes choose (`fuzz/options.rs`: the heuristics, every `alert_*`, the structured-data and phishing checks, tight or production bounds, an object read in memory or through the block cache). **Broadest; the primary target.** |
+| `installers`    | `unpack::walk()` of AppleSingle, InstallShield cabinets and Inno Setup | the headers and descriptor tables, the file records of each InstallShield layout, deflated chunks and obfuscated data, and what is reported instead of read, under small budgets. The first byte picks the format. Each file is walked from memory and through a block cache of 512-byte blocks, which must find the same members and end the same way. Seeds: `fuzz/seeds/installers/make.py`. |
+| `analyze`       | `analyze()`, the whole scanner   | format detection → every extractor (recursively) → pattern/hash matching → PE/ML/fuzzy heuristics → bytecode, against the signature files of `fuzz/db/` (every signature kind, the YARA rules, a bytecode program), under options the input's last two bytes choose (`fuzz/options.rs`: the heuristics, every `alert_*`, the structured-data and phishing checks, tight or production bounds, an object read in memory or through the block cache). **Broadest; the primary target.** |
 | `full_pipeline` | the scanner as a deployment builds it | up to eight database files (a kind byte, bit 7 official, and their text) go through `loader::Builder::add_named_bytes` as the CLI does, so every kind the loader reads is reached (signatures, hashes, container and file-type rules, YARA, bytecode, phishing and allow-lists, `.crb`, passwords); then the scan, held to what the entry points promise each other: the same bytes scanned twice agree, `analyze_all` is a superset of `analyze` and a clean scan lists nothing, a stream read in pieces answers what a buffer did, and a database written out and read back scans as the one it came from. **Widest single target.** |
-| `seekable`      | `scan_seekable()` over a reader that returns a few bytes a call and fails part way | the block-cache read of an object over `deep_analysis_max`, which no other target reaches. Checked: a reader and a buffer give one answer, a reader that fails is an error unless a detection was already made, and an object read through the cache that found nothing is not `Clean`. |
+| `seekable`      | `scan_seekable()` over a reader that returns a few bytes a call and fails part way | the block-cache read of an object over `limits.max_buffer_bytes`, which no other target reaches. Checked: a reader and a buffer give one answer, a reader that fails is an error unless a detection was already made, and an object read through the cache that found nothing is not `Clean`. |
 | `yara`          | `yara::compile()` + `Scanner::scan()` | exav's native YARA engine: the rule text through the compiler, then the rules over fuzzed data (the `pe`, `elf`, `dotnet`, `math`, `hash` and `string` modules, which parse the scanned file; hex, regular-expression, `xor` and `base64` patterns). Checked: a scan twice agrees, every match lies in the data. |
 | `pcre`          | `engine::compare_engines()`       | a PCRE subsignature rewritten for the two Rust engines (vendored fancy-regex and `regex`): neither panics or hangs, and where the translation is in the linear engine's subset the two answer the same. |
 | `clamd`         | the daemon's command loop, over memory (`exav::fuzzing::clamd`) | the clamd protocol as any client of the socket speaks it: NUL or newline terminated lines, `IDSESSION`, and the `INSTREAM`, `EXINSTREAM` and `EXINSTREAM MULTI` framings, with lying chunk lengths and missing terminators. Paths are refused in this build. Checked: a plain `INSTREAM` or `EXINSTREAM` answers what `analyze` says of the same bytes. |
 | `icap`          | the ICAP request loop, over memory (`exav::fuzzing::icap`) | RFC 3507 as a proxy sends it: the head, `Encapsulated` offsets, `Preview`, `Allow: 204`, the chunked body with its extensions, `ieof` and trailers. Checked: a plain `REQMOD` is blocked exactly when `analyze` calls the bytes anything but clean. |
-| `volumes`       | `volume::Collector`, `join_rar_volumes` | multi-volume names, the collector that holds and joins the parts of a split archive (it loses nothing: every offered name comes out once, the bytes add up) and the RAR joiner with the extraction of what it joins. |
+| `volumes`       | `volume::Collector`, `join_rar_volumes` | multi-volume names, the collector that holds and joins the parts of a split archive (it loses nothing: every offered name comes out once, the bytes add up) and the RAR joiner (a `RarSpan` over the volumes) with the extraction of what it joins. |
 | `authenticode`  | `authenticode::analyze_pe()`      | the PE certificate table, the PKCS#7 `SignedData` and each certificate's DER. Checked: a `.crb` list naming a certificate's subject (with or without its serial) blocks it, and one naming another subject does not. |
 | `database`      | `database::read()` / `write()`    | the prebuilt `.exavdb`: MessagePack whose lengths size allocations. Checked: what reads writes back to something that reads and scans the same. |
 | `unpack`        | `unpack::extract()`               | every container format with tight budgets; every parser exercised on every input |
@@ -62,6 +63,7 @@ panic instead of wrapping). Targets in `fuzz/fuzz_targets/`:
 | `sigs`          | signature compilation             | DB rule parsing                          |
 | `bytecode`      | `.cbc` bytecode loader            | bytecode verification                    |
 | `rar3_ppmd`     | RAR3 PPMd decompression          | PPMd/LZSS conversion path               |
+| `rar_walk`      | `unpack::walk()` of RAR4 and RAR5 | the streaming RAR reader the scanner takes: headers read from the source, members decoded as they are read (LZ, PPMd and the switches between them, the filters, solid groups sharing one window), the CRC checked at each member's end, with a buffer limit of 1 MiB so a dictionary past it is reported. Each archive is walked from memory and through a block cache of 512-byte blocks, its members read a few bytes at a time: the two must find the same members with the same bytes and end the same way. Seeds: the RAR fixtures, from `scripts/fuzz-seeds.sh`. The encrypted ones derive keys, which is slow under the sanitizer: run with a longer `-timeout`. |
 | `pe_emulator`   | `exav_pe_emu::unpack()`               | the x86 emulator that runs packer stubs: instruction decode + semantics, the emulated Windows environment, SEH, and the dump path. **The only target where the input supplies control flow rather than data.** Its decoder, `exav-x86`, is hand-written and `forbid(unsafe_code)` like the emulator (`x86_decode` checks it against `iced-x86`); the target goes through the entry point the scanner uses. Asserts the invariant the scanner relies on: anything emitted parses as a PE. |
 | `imagehash`     | `exav_imagehash::Hasher::hash()`, `exav_render::image::decode_any()`, `exav_render::pdf_image` | every image decoder behind `fuzzy_img#` (PNG, GIF, JPEG, TIFF, BMP, WebP, ICO, PNM, QOI, DDS, farbfeld, HDR, and JPEG 2000 and JBIG2 through hayro-jpeg2000 and hayro-jbig2, and JPEG XL through zenjxl-decoder (the `jxl` feature, which the scanner's builds leave off)), then the grey conversion, resize and DCT of both presets, with a 4 MiB decode budget (64 MiB for the other decoders). The scan reaches these only when a database has a `fuzzy_img#` signature, so `analyze` rarely does. Then the JPXDecode, JBIG2Decode and CCITTFaxDecode decoders `@exav/viewer` puts in place of pdf.js's, their parameters taken from the input's length. Those do not catch panics: in the browser a panic traps the wasm instance. |
 | `raw_preview`   | `exav_render::image::raw::detect()` + `preview()`, `decode_any()` | camera RAW files as `@exav/viewer` opens them: detection by the bytes (TIFF-structured files told from plain TIFFs, ISO base media, Fujifilm, Sigma, CIFF and Minolta signatures), the TIFF directories (chains, SubIFDs, Exif pointers, strips, JPEGInterchangeFormat, 8 and 16-bit samples), the JPEG stream search over the whole file, the Exif orientation of the files and of the streams, and the budgets, with a 16 MiB decode budget. The scanner does not read RAW files, so no other target reaches it. A panic `preview` would catch counts: in the browser it traps the wasm instance. |
@@ -87,12 +89,12 @@ panic instead of wrapping). Targets in `fuzz/fuzz_targets/`:
 | `docs_pages` | `exav_render::docs::convert(.., Format::Pages, ..)` | Apple Pages: the input is an IWA stream the target stores as `Index/Document.iwa`, or a whole document when it is a ZIP, so the mutations reach the Snappy blocks, the protobuf archives and the text storages, not the ZIP around them. Same limits and checks. |
 | `visible_text`  | `exav_render::text::visible_text()` | The text of a document as a reader sees it, for the scanner and `exav-grep --text`: the first byte picks the reader (Markdown, HTML, each Office and OpenDocument XML part, PDF through hayro, DXF, DWG, and with `text-office` DOC, XLS, PPT, RTF, Word 2003 XML, SYLK, the flat OpenDocument files, Numbers, Pages, Keynote), the rest is hostile bytes. Checks the text stays within its cap, the links within their bound, the sections in order on character boundaries, and that `wants` announces whatever is read. The PDF path takes every stream through exav-unpack's budget first, so a decompression bomb is refused rather than inflated. |
 | `cad_dwg`       | `exav_render::cad::read_dwg_with()` + `to_json()`, `cad::preview()` | DWG, R13 to R2018, into the drawing model: exav-unpack's `dwg` bit codes, the sections the file header locates (R2004 on: the encrypted file header, the page and section maps, page checksums and the LZ77 decompression; R2007: the Reed-Solomon coded file header, maps and pages, their CRCs and copies, and its own LZ77 variant), the classes, the object map and each object's common data and string stream, then the header variables, the tables and the blocks with their entities, each entity type's own data and the proxy graphics streams of the others, and the thumbnail read alone. `unpack` and `analyze` reach the file header, the preview images and, opening the drawing, the OLE2FRAME objects. |
-| `parser_recursion` | nesting depth, constructed        | Builds deep nesting from a couple of input bytes rather than waiting for the mutator to find it — every extra level needs another well-formed delimiter pair, so byte mutation stalls at two or three while this reaches thousands. Targets the failure the panic boundary cannot contain: `catch_unwind` catches a bounds check, not a stack overflow, and `max_recursion` bounds containers-inside-containers rather than a grammar that nests into itself. A finding looks like a crash with **no panic message**. |
-| `x86_decode`    | `exav_x86::decode()`                  | **differential against `iced-x86`**, which is compiled in as the oracle. Asserts six properties per input: never claim an encoding iced rejects; agree on length; agree on mnemonic; agree on the memory operand's base/index/scale/displacement and on every register operand's file, number and position; re-decoding from exactly the reported length gives the same answer; and no proper prefix of an instruction decodes. Declining is not a failure — `None` means "not an encoding this decoder claims", which the caller reports as unsupported. |
+| `parser_recursion` | nesting depth, constructed        | Builds deep nesting from a couple of input bytes rather than waiting for the mutator to find it: every extra level needs another well-formed delimiter pair, so byte mutation stalls at two or three while this reaches thousands. Targets the failure the panic boundary cannot contain: `catch_unwind` catches a bounds check, not a stack overflow, and `max_recursion` bounds containers-inside-containers rather than a grammar that nests into itself. A finding looks like a crash with **no panic message**. |
+| `x86_decode`    | `exav_x86::decode()`                  | **differential against `iced-x86`**, which is compiled in as the oracle. Asserts six properties per input: never claim an encoding iced rejects; agree on length; agree on mnemonic; agree on the memory operand's base/index/scale/displacement and on every register operand's file, number and position; re-decoding from exactly the reported length gives the same answer; and no proper prefix of an instruction decodes. Declining is not a failure: `None` means "not an encoding this decoder claims", which the caller reports as unsupported. |
 
 `x86_decode` earns its place beside the crate's own differential tests because
-those sweep the opcode maps with a **fixed instruction body** — one ModRM byte
-and a constant tail. The mistakes that survive a sweep live in the body: a SIB
+those sweep the opcode maps with a **fixed instruction body** (one ModRM byte
+and a constant tail). The mistakes that survive a sweep live in the body: a SIB
 byte that decides whether a displacement exists, a `mod` field that changes its
 width, a prefix run that pushes the instruction past fifteen bytes. Mutation
 reaches those combinations; enumeration does not. A wrong length is the failure
@@ -274,7 +276,7 @@ magic.
 
 Seeds and fuzzer-discovered inputs live in a **gitignored** work dir
 (`tmp/data/fuzzwork_analyze`), never the committed corpus, so a run never bloats
-the tree. The corpus accumulates across runs — coverage climbs monotonically.
+the tree. The corpus accumulates across runs: coverage climbs monotonically.
 
 > One pitfall: don't seed a deliberately-pathological input. The
 > `ppmd_lzss_conversion.rar` fixture decodes ~241 MB (its real test is
@@ -417,7 +419,7 @@ faster fuzzing.
   ```
 - **Fork mode** (collect *many* distinct crashes without rebuilding between
   them): the parent keeps fuzzing after each child crash/timeout/OOM. This is
-  the efficient campaign mode — one run yields a batch of distinct artifacts to
+  the efficient campaign mode: one run yields a batch of distinct artifacts to
   triage, so we rebuild once per batch instead of once per bug.
   ```sh
   cargo +nightly fuzz run analyze tmp/data/fuzzwork_analyze -- \
@@ -452,7 +454,7 @@ For each artifact (`fuzz/artifacts/<target>/{crash,timeout,oom}-*`):
 3. **Lock it** with a regression test in `crates/exav-unpack/tests/
    panic_containment.rs` (or the relevant crate), embedding the minimal
    artifact as a committed fixture (these are tiny, malformed-but-benign inputs,
-   safe to commit — unlike the malware corpus).
+   safe to commit, unlike the malware corpus).
 4. **Rebuild** the fuzz binary and resume; the prior corpus is reused, so the
    fuzzer doesn't re-discover fixed paths and pushes into new ones.
 
@@ -465,13 +467,13 @@ Even with every known panic fixed, new ones can hide in deps. The layers:
 | Root-cause fixes in our parsers | our own panics | bounds checks, saturating math |
 | `walk` `catch_unwind` | third-party decoder panics | panic → `LimitHit` (never a silent Clean) |
 | Daemon prefork pool | OOM, stack overflow, hangs | per-job `RLIMIT_AS` / `RLIMIT_CPU` / `SIGALRM` → worker `_exit`, recycled |
-| Verdict taxonomy | "couldn't fully scan" | `LimitsExceeded`/`Unscannable` — a not-fully-scanned file is never reported Clean |
+| Verdict taxonomy | "couldn't fully scan" | `LimitsExceeded`/`Unscannable`: a not-fully-scanned file is never reported Clean |
 
 The `catch_unwind` boundary protects the **library/CLI** path (which has no
 process-level backstop); the prefork pool protects the **daemon** path against
 the aborts `catch_unwind` can't catch (OOM, stack overflow). Note that libFuzzer
 installs its own abort-on-panic hook, so the fuzzer surfaces *every* reachable
-panic even ones `catch_unwind` would contain — which is what we want: the
+panic even ones `catch_unwind` would contain, which is what we want: the
 boundary is a backstop, not an excuse to leave our own parsers panicky.
 
 ## Findings log
@@ -482,7 +484,7 @@ boundary is a backstop, not an excuse to leave our own parsers panicky.
 | `0o070707` cpio  | `formats/cpio.rs` (bin/newc/odc)  | `data_start` from attacker `namesize`, unclamped → `data[start..end]` with start > len | clamp `data_start` to `data.len()` (all 3 variants) |
 | ISO9660          | `formats/iso.rs:54/57`            | dir record's self-declared `rec_len < 33`, then `rec[2..32]` indexed | require `rec_len >= 33` before slicing |
 | UPX (NRV2B/D/E)  | `formats/upx.rs` (4 gamma loops)  | corrupt bitstream doubles the gamma value until `usize` overflow (and downstream `(m-3)*256`) | cap gamma at `NRV_GAMMA_MAX` (`u32::MAX`) → `Unscannable` |
-| `fuzzy_img#` sig | `engine.rs` `parse_fuzzy_subsig`  | multi-byte UTF-8 chars in hash field caused `&hash[i*2..]` to slice inside char boundary | `hash.is_ascii()` guard — reject non-ASCII hash fields |
+| `fuzzy_img#` sig | `engine.rs` `parse_fuzzy_subsig`  | multi-byte UTF-8 chars in hash field caused `&hash[i*2..]` to slice inside char boundary | `hash.is_ascii()` guard: reject non-ASCII hash fields |
 | NDB anchor sig   | `engine.rs` `pick_anchor`         | `fixed += w` overflowed on crafted input | `fixed = fixed.saturating_add(w)` |
 | truncated CAB (LZX) | `cab` → `lzxd` `bitstream.rs:37` | dep reads `buffer[1]` when buffer has 1 byte | `catch_unwind` boundary → `Unscannable` |
 | LHA level 3      | `delharc` `header/parser.rs:265`  | dep adds `parser.len + first_header_len` which overflows u32 | `catch_unwind` boundary → `Unscannable` |
@@ -527,11 +529,12 @@ boundary is a backstop, not an excuse to leave our own parsers panicky.
 | a ZIP in a ZIP, 15 levels (a CLI run under `ulimit -s`, then `scripts/stack-frames.py`) | `formats/zip.rs` `walk`, `formats/xz.rs` `XzReader` | a `ZipFile` (decoders inline, 40 KB) and the XZ decoder tables (30 KB) lived in the frame of the walk while a member was scanned | opened in functions of their own, and boxed (`make stack-frames`) |
 | 19 KB image whose HFS+ catalog leaves are each other's next (`vdisk`, 7-hour run, timeout: 21 s under the sanitizer, 1 s in a release build) | `formats/hfsplus.rs` `Tree::scan` | the chain was bounded by the nodes the catalog fork declares (the virtual disk's size over the node size), and each is read as valid from a disk of zeros | a leaf met again is damage (Brent's cycle check) (`a_leaf_chain_that_loops_is_damage_not_a_walk_to_the_end_of_the_fork`) |
 | PPMd header declaring a 4 GiB model (`saturate`) | `formats/ppmd7/model.rs`, `ppmd8/model.rs` | the arena was filled with zeros as it was made, so the pages were touched | `vec![0; n]`, which asks for zeroed pages (`saturate`) |
+| web page with a picture of a size near the largest number (`docs_html`, nightly campaign, overflow panic) | `office/docs/html/mod.rs` picture size | the width over the page's was scaled as `cy * MAX_PICTURE / cx`, and a size given alone as `w * nh / nw`, in `i64` | the products in `i128`, saturated (`a_picture_of_any_size_is_scaled_to_the_page`) |
 
 Header numbers at the top of their range are what unchecked sums overflow on,
 and libFuzzer's stock mutations seldom put one in a chosen field. Two things
 cover that. The `unpack` and `analyze` targets share a custom mutator
-(`fuzz/extreme.rs`) that sets one 2-, 4- or 8-byte field to such a value a
+(`fuzz/support/src/extreme.rs`) that sets one 2-, 4- or 8-byte field to such a value a
 quarter of the time. And `crates/exav-unpack/tests/suites/extreme.rs` does it
 exhaustively and deterministically for the disk-image formats: every field of a
 valid container, one at a time, must not panic the decoder. `make test-wasm`

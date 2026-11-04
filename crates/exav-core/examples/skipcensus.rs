@@ -62,7 +62,7 @@ fn main() {
         );
     }
 
-    // Re-run line by line to show worked examples per cause — a count says how
+    // Re-run line by line to show worked examples per cause: a count says how
     // big the gap is, an example says what to implement.
     println!("\nexamples (up to 6 per cause):");
     let mut seen: std::collections::HashMap<&'static str, Vec<String>> = Default::default();

@@ -5,7 +5,7 @@ pub(crate) enum Primitive {
     Null,
     Boolean(bool),
     Integer(i64),
-    Real,
+    Real(f64),
     Name(String),
     String(Vec<u8>),
     /// An indirect reference `n g R`; carries the object number `n`. Consuming

@@ -6,6 +6,7 @@ use super::formula::{Ctx, read_chars};
 use super::record::Rec;
 use crate::bytes::Cur;
 use crate::formats::charset;
+use std::collections::HashMap;
 
 /// A BOUNDSHEET record.
 pub struct BoundSheet {
@@ -68,8 +69,8 @@ pub struct Book {
     pub sheet_names: Vec<String>,
     /// The names of `names`; set by [`Book::finish`].
     pub name_texts: Vec<String>,
-    /// External documents, numbered from 1 by their place here.
-    ext_docs: Vec<String>,
+    /// External documents, numbered from 1 in the order first named.
+    ext_docs: HashMap<String, usize>,
 }
 
 impl Book {
@@ -84,7 +85,7 @@ impl Book {
             ext5: vec![],
             sheet_names: vec![],
             name_texts: vec![],
-            ext_docs: vec![],
+            ext_docs: HashMap::new(),
         }
     }
 
@@ -212,13 +213,12 @@ impl Book {
 
     /// The number of an external document among those the workbook names.
     pub fn ext_doc(&mut self, doc: &str) -> usize {
-        match self.ext_docs.iter().position(|d| d == doc) {
-            Some(i) => i + 1,
-            None => {
-                self.ext_docs.push(doc.to_string());
-                self.ext_docs.len()
-            }
+        if let Some(&n) = self.ext_docs.get(doc) {
+            return n;
         }
+        let n = self.ext_docs.len().saturating_add(1);
+        self.ext_docs.insert(doc.to_string(), n);
+        n
     }
 
     /// A BIFF5 EXTERNSHEET record's entry.
@@ -341,5 +341,36 @@ mod tests {
         assert_eq!((b.sheets[0].kind, b.sheets[0].pos), (1, 0x100));
         assert_eq!(b.sheet_names, ["Macro1"]);
         assert_eq!(b.name_texts, ["_xlnm.Auto_Open"]);
+    }
+
+    #[test]
+    fn external_documents_are_numbered_in_one_pass() {
+        // SUPBOOK: no sheets, then the document's name.
+        let supbook = |url: &str| {
+            let mut d = vec![0, 0];
+            d.extend((url.len() as u16).to_le_bytes());
+            d.push(0);
+            d.extend(url.as_bytes());
+            rec(0x01AE, d)
+        };
+        // Numbered in one pass this takes tens of milliseconds; comparing each
+        // name with every earlier one, minutes. The time allowed is far above
+        // the first, and the loop stops at it.
+        const DOCS: usize = 1 << 18;
+        let mut b = Book::new(8);
+        let t = std::time::Instant::now();
+        for i in 0..DOCS {
+            if i % 1024 == 0 {
+                assert!(
+                    t.elapsed().as_secs() < 10,
+                    "{i} documents in {:?}",
+                    t.elapsed()
+                );
+            }
+            b.record(&supbook(&format!("u{i}")));
+        }
+        b.record(&supbook("u1"));
+        let n: Vec<usize> = b.supbooks.iter().map(|s| s.ext_index).collect();
+        assert_eq!((n[0], n[1], n[DOCS]), (1, 2, 2));
     }
 }

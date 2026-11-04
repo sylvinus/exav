@@ -1,14 +1,17 @@
-//! The WebAssembly half of `@exav/viewer`. Built nine times (see
+//! The WebAssembly half of `@exav/viewer`. Built ten times (see
 //! `Cargo.toml`): with `image`, exav-render's raster decoders; with `dwg`,
 //! its DWG and DXF engine; with `model`, its IFC, STL, OBJ, PLY and glTF meshes;
-//! with `text`, its Markdown reader; with `sheets`, its
+//! with `text`, its Markdown reader and JSON, XML and diff lines, and
+//! exav-unpack's rule for how a file is read as text; with `sheets`, its
 //! XLS, ODS and Numbers to XLSX converter; with `slides`,
 //! its PPT, ODP, Keynote, ODG and VSDX to PPTX converter; with `docs`,
 //! its DOC, ODT, RTF, Word 2003 XML and Pages to DOCX converter; with
+//! `sniff`, exav's detection of what a file is from its first bytes, and
+//! exav-unpack's reader of a ZIP's central directory; with
 //! `pdf-jpx` and `pdf-jbig2`, the image
 //! decoders pdf.js loads in place of its C and C++ ones. Each runs in a
-//! worker, and only finished pixels or vertex buffers cross back to the
-//! page.
+//! worker, and only finished pixels, vertex buffers or lists cross back to
+//! the page.
 
 #![forbid(unsafe_code)]
 
@@ -344,12 +347,15 @@ mod model {
             std::mem::take(&mut self.colors)
         }
 
-        /// `{origin, bounds, batches: [{class, color, storey, vertex, vertices,
+        /// `{origin, bounds, framing, batches: [{class, color, storey, vertex, vertices,
         /// index, indices, edge, edges, color0}], elements: [{id,
         /// globalId, class, name, node, storey, ranges: [[batch, first,
         /// count]]}], nodes: [{id, class, name, parent, elevation}],
         /// warnings}` (`storey` and `parent` index `nodes`; `elevation`
-        /// is a storey's, in metres, or null); offsets in
+        /// is a storey's, in metres, or null; `bounds` and `framing` are
+        /// min xyz, max xyz relative to `origin`, `framing` being the
+        /// IFC reader's box to frame the view by, null for the other
+        /// formats); offsets in
         /// elements of their arrays (`color0` in bytes, -1 for none).
         #[wasm_bindgen(js_name = metaJson)]
         pub fn meta_json(&self) -> String {
@@ -378,6 +384,22 @@ mod model {
         }
     }
 
+    /// A box as `[min x, y, z, max x, y, z]`, or null.
+    fn corners(out: &mut String, b: Option<[[f32; 3]; 2]>) {
+        let Some(b) = b else {
+            out.push_str("null");
+            return;
+        };
+        out.push('[');
+        for (k, v) in b.iter().flatten().enumerate() {
+            if k > 0 {
+                out.push(',');
+            }
+            number(out, f64::from(*v));
+        }
+        out.push(']');
+    }
+
     fn pack(scene: Scene) -> Model {
         let vertices: usize = scene.batches.iter().map(|b| b.positions.len()).sum();
         let mut m = Model {
@@ -397,19 +419,9 @@ mod model {
             number(o, *v);
         }
         o.push_str("],\"bounds\":");
-        match scene.bounds {
-            Some(b) => {
-                o.push('[');
-                for (k, v) in b.iter().flatten().enumerate() {
-                    if k > 0 {
-                        o.push(',');
-                    }
-                    number(o, f64::from(*v));
-                }
-                o.push(']');
-            }
-            None => o.push_str("null"),
-        }
+        corners(o, scene.bounds);
+        o.push_str(",\"framing\":");
+        corners(o, scene.framing);
         o.push_str(",\"batches\":[");
         for (i, b) in scene.batches.iter().enumerate() {
             if i > 0 {
@@ -621,9 +633,102 @@ mod slides;
 #[cfg(feature = "docs")]
 mod docs;
 
+#[cfg(feature = "table")]
+mod table;
+
+#[cfg(feature = "sniff")]
+mod sniff;
+
 #[cfg(feature = "text")]
 mod text {
     use wasm_bindgen::prelude::*;
+
+    /// How a file is read as text: `bytes[start, end)` in the encoding of the
+    /// WHATWG label, for a `TextDecoder` with `ignoreBOM`.
+    #[wasm_bindgen]
+    pub struct FileReading(exav_unpack::text::Reading);
+
+    #[wasm_bindgen]
+    impl FileReading {
+        /// The WHATWG label of the encoding.
+        #[wasm_bindgen(getter)]
+        pub fn encoding(&self) -> String {
+            self.0.encoding.label().to_owned()
+        }
+
+        /// After the byte-order mark.
+        #[wasm_bindgen(getter)]
+        pub fn start(&self) -> usize {
+            self.0.start
+        }
+
+        /// Before the character a partial read cut.
+        #[wasm_bindgen(getter)]
+        pub fn end(&self) -> usize {
+            self.0.end
+        }
+    }
+
+    /// How `bytes` are read as text by exav-unpack's rule, or `undefined` when
+    /// they are not text. `partial`: `bytes` are the start of a longer file.
+    #[wasm_bindgen(js_name = fileReading)]
+    pub fn file_reading(bytes: &[u8], partial: bool) -> Option<FileReading> {
+        exav_unpack::text::file_reading(bytes, partial).map(FileReading)
+    }
+
+    /// How a page is read, as `FileReading` says of a file.
+    #[wasm_bindgen]
+    pub struct PageReading(exav_unpack::html::Reading);
+
+    #[wasm_bindgen]
+    impl PageReading {
+        /// The WHATWG name of the encoding.
+        #[wasm_bindgen(getter)]
+        pub fn encoding(&self) -> String {
+            self.0.encoding.name().to_owned()
+        }
+
+        /// After the byte-order mark.
+        #[wasm_bindgen(getter)]
+        pub fn start(&self) -> usize {
+            self.0.start
+        }
+
+        #[wasm_bindgen(getter)]
+        pub fn end(&self) -> usize {
+            self.0.end
+        }
+    }
+
+    /// How `bytes`, a page shown as its source, are read: in the encoding the
+    /// scanner reads a page in (`exav_unpack::html::reading`: a byte-order
+    /// mark, its `<meta charset>`, else UTF-8 when valid, else windows-1252),
+    /// or `undefined` when `fileReading` says they are not text.
+    #[wasm_bindgen(js_name = pageReading)]
+    pub fn page_reading(bytes: &[u8], partial: bool) -> Option<PageReading> {
+        exav_unpack::text::file_reading(bytes, partial)?;
+        Some(PageReading(exav_unpack::html::reading(bytes)))
+    }
+
+    /// JSON indented (exav-render's `text_view`) as the JSON of its
+    /// `Formatted`, or `undefined` when `text` is not JSON.
+    #[wasm_bindgen(js_name = formatJson)]
+    pub fn format_json(text: &str, max_lines: usize) -> Option<String> {
+        exav_render::text_view::format_json(text, max_lines).map(|f| f.to_json())
+    }
+
+    /// XML indented, as the JSON of its `Formatted`, or `undefined` when
+    /// `text` does not start with markup.
+    #[wasm_bindgen(js_name = formatXml)]
+    pub fn format_xml(text: &str, max_lines: usize) -> Option<String> {
+        exav_render::text_view::format_xml(text, max_lines).map(|f| f.to_json())
+    }
+
+    /// A diff's lines marked, as the JSON of its `Formatted`.
+    #[wasm_bindgen(js_name = formatDiff)]
+    pub fn format_diff(text: &str, max_lines: usize) -> String {
+        exav_render::text_view::format_diff(text, max_lines).to_json()
+    }
 
     /// Reads Markdown into the JSON of `exav_render::markdown::Document`.
     #[wasm_bindgen(js_name = parseMarkdown)]

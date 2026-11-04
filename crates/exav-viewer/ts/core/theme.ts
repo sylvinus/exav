@@ -20,6 +20,10 @@ const TOKEN_DEFS = {
   "--exav-viewer-error": ["#b91c1c", "color"],
   "--exav-viewer-warning": ["#b45309", "color"],
   "--exav-viewer-media-bg": ["#0f172a", "color"],
+  /** Fill of a highlight's boxes, multiplied with the page under it. */
+  "--exav-viewer-highlight": ["rgb(250 204 21 / 0.45)", "color"],
+  /** Outline of the highlight last gone to. */
+  "--exav-viewer-highlight-current": ["#ca8a04", "color"],
   // A colour too, in a theme: a gradient is not sent to the frame.
   "--exav-viewer-model-bg": ["radial-gradient(circle at 50% 30%, #ffffff 0%, #e2e8f0 55%, #cbd5e1 100%)", "color"],
   "--exav-viewer-radius": ["0.375rem", "length"],

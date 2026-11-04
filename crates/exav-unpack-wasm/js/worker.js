@@ -6,7 +6,7 @@
 // only inside a Worker. Running here is what lets a `File` be read through the
 // same archive code as everything else, a member at a time, without loading it
 // whole. The alternative was a second set of archive readers written against
-// async I/O — and a second reader is a second set of answers about the same
+// async I/O, and a second reader is a second set of answers about the same
 // bytes.
 //
 // This file is an RPC shim and nothing else. Every decision about archives is
@@ -44,8 +44,8 @@ function dispatch(op, args) {
     case "extractAll":
       return archive.extractAll(args.passwords);
     case "close":
-      // `free` is wasm-bindgen's destructor. Without it the archive — and the
-      // buffered reader inside it — stays live in the Worker's memory for as
+      // `free` is wasm-bindgen's destructor. Without it the archive (and the
+      // buffered reader inside it) stays live in the Worker's memory for as
       // long as the Worker does.
       archive.free();
       open.delete(args.handle);

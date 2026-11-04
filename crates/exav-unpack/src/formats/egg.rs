@@ -1,4 +1,4 @@
-//! EGG — ESTsoft's successor to ALZ, ordinary in Korea and rare elsewhere.
+//! EGG: ESTsoft's successor to ALZ, ordinary in Korea and rare elsewhere.
 //!
 //! Implemented from ESTsoft's published *EGG Format Specification v1.0*. No
 //! vendor code was consulted: the spec documents the layout completely, which is
@@ -13,12 +13,12 @@
 //!
 //! The archive is a chain of self-describing records. Each extension field is
 //! `magic(4) | flags(1) | size(2 or 4) | data`, and a run of them ends at a stop
-//! marker — so an unknown field is skipped by length rather than guessed at, and
+//! marker, so an unknown field is skipped by length rather than guessed at, and
 //! a future EGG version stays readable. AZO is ESTsoft's own undocumented
 //! algorithm, decoded by a port of the one permissively licensed implementation
 //! (`formats::azo`).
 
-use crate::{Budget, Entry, Format, LimitHit, Sink};
+use crate::{Budget, Entry, Format, Sink};
 
 /// Ends any run of extension fields, and the archive itself.
 const END: u32 = 0x08E2_8222;
@@ -52,7 +52,7 @@ struct Field {
 }
 
 /// Read the extension field at `at`, or `None` if it is the stop marker or the
-/// buffer is too short. Unknown magics parse identically — that is the point of
+/// buffer is too short. Unknown magics parse identically: that is the point of
 /// the length prefix.
 fn field(d: &[u8], at: usize) -> Option<Field> {
     let magic = le_u32(d, at)?;
@@ -102,11 +102,7 @@ fn extension_run(d: &[u8], mut at: usize) -> (usize, Option<String>, bool) {
     (at.saturating_add(4), name, encrypted)
 }
 
-pub(crate) fn extract_egg<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_egg(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     if !super::sniff::is(data, Format::Egg) {
         return Ok(None);
     }
@@ -161,8 +157,19 @@ pub(crate) fn extract_egg<R>(
                     .unwrap_or_else(|| format!("egg-member-{index}"));
                 budget.count_entry()?;
                 let cap = budget.reserve()?;
+                let over = "EGG block exceeds the per-member decompression budget";
+                // Larger than its room: a stored block by the bytes it stores,
+                // a compressed one by the size it says when all of it is in
+                // the file.
+                let said_over = match algo {
+                    STORE => raw.len() as u64 > cap,
+                    _ => !rest_absent && uncomp > cap,
+                };
                 let entry = if encrypted {
                     Entry::unsupported(member, uncomp, true, "encrypted EGG member")
+                } else if said_over {
+                    // Not decoded, nothing charged.
+                    Entry::over_limit(member, uncomp, over)
                 } else {
                     match decode_block(algo, raw, uncomp, cap) {
                         Some(s) if !s.over_cap && (s.undecoded || s.cut_short) => {
@@ -170,7 +177,6 @@ pub(crate) fn extract_egg<R>(
                             // covers bytes that did not decode, so it cannot
                             // be checked; damage, or a stream that ended
                             // with bytes of the block after it, is reported.
-                            crate::ratio_guard(raw.len() as u64, s.data.len() as u64, budget)?;
                             budget.commit(s.data.len() as u64);
                             let why = s.part_way(rest_absent).then_some(
                                 "EGG block failed to decode part way; the bytes before the \
@@ -189,7 +195,6 @@ pub(crate) fn extract_egg<R>(
                             if !s.over_cap
                                 && (!budget.should_verify_checksums() || crc32(&s.data) == crc) =>
                         {
-                            crate::ratio_guard(raw.len() as u64, s.data.len() as u64, budget)?;
                             budget.commit(s.data.len() as u64);
                             Entry::new(member, s.data)
                         }
@@ -199,18 +204,17 @@ pub(crate) fn extract_egg<R>(
                             false,
                             "EGG block did not match its recorded CRC-32 after decoding",
                         ),
-                        Some(_) => Entry::unsupported(
-                            member,
-                            uncomp,
-                            false,
-                            "EGG block exceeds the per-member decompression budget",
-                        ),
+                        Some(s) => {
+                            budget.commit(s.data.len() as u64);
+                            Entry::over_limit(member, uncomp, over)
+                        }
                         None => Entry::unsupported(
                             member,
                             uncomp,
                             false,
                             "EGG block uses a compression method exav cannot decode",
-                        ),
+                        )
+                        .of_kind(crate::tree::ReasonKind::Unsupported),
                     }
                 };
                 if let Some(r) = visit(entry, budget) {
@@ -257,7 +261,7 @@ fn decode_block(algo: u8, raw: &[u8], uncomp: u64, cap: u64) -> Option<crate::Sa
         )),
         LZMA => {
             // An LZMA block is not a bare stream. It opens with a 4-byte codec
-            // record — algorithm, flags, then a u16 property length — followed by
+            // record (algorithm, flags, then a u16 property length) followed by
             // that many LZMA1 property bytes and the stream itself.
             //
             // The spec's block section does not describe this, so it was read off
@@ -329,7 +333,7 @@ mod tests {
         let mut seen = Vec::new();
         let _ = extract_egg(blob, &mut b, &mut |e: Entry, _: &mut Budget| {
             seen.push(e);
-            None::<()>
+            None
         });
         seen
     }
@@ -357,6 +361,34 @@ mod tests {
         assert!(seen[0].unsupported.is_none());
     }
 
+    /// [`build_egg`] of a block that says it is 1 GiB uncompressed, over the
+    /// default room, and `extra` bytes longer compressed than `body`.
+    fn said_over(algo: u8, body: &[u8], extra: u32) -> Vec<Entry> {
+        let mut blob = build_egg("hello.txt", algo, body, 0);
+        let block = BLOCK_HEADER.to_le_bytes();
+        let at = blob.windows(4).position(|w| w == block).unwrap() + 6;
+        blob[at..at + 4].copy_from_slice(&(1u32 << 30).to_le_bytes());
+        blob[at + 4..at + 8].copy_from_slice(&(body.len() as u32 + extra).to_le_bytes());
+        members(&blob)
+    }
+
+    /// A block said to be over the room is read when what it says is not all
+    /// in the file: a stored one is the bytes it stores, and a compressed one
+    /// the file ends inside is what of it is here.
+    #[test]
+    fn a_block_said_over_the_room_is_read_when_that_is_not_in_the_file() {
+        use std::io::Write;
+        let payload = b"the quick brown fox\n";
+        let seen = said_over(STORE, payload, 0);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].data, payload, "stored: {seen:?}");
+        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        e.write_all(payload).unwrap();
+        let seen = said_over(DEFLATE, &e.finish().unwrap(), 100);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].data, payload, "cut: {seen:?}");
+    }
+
     /// Every byte of the block was read, so the mismatch hides nothing.
     #[test]
     fn a_block_whose_crc_disagrees_after_a_full_decode_is_delivered() {
@@ -378,7 +410,7 @@ mod tests {
         let mut seen = Vec::new();
         let _ = extract_egg(&blob, &mut b, &mut |e: Entry, _: &mut Budget| {
             seen.push(e);
-            None::<()>
+            None
         });
         assert_eq!(seen.len(), 1);
         assert!(seen[0].unsupported.is_some(), "{seen:?}");

@@ -1,9 +1,11 @@
 //! The files a DWG drawing carries, for the scanner: the preview images
 //! (spec 14.2), the objects its OLE2FRAME entities embed (20.4.88), the VBA
 //! project (spec 15 and the VBA_PROJECT object, 20.3), and a text member
-//! with the hyperlinks, external-reference paths and the names of the
-//! applications its proxy and custom objects demand, for signatures and
-//! heuristics to match.
+//! with the external-reference paths and the names of the applications its
+//! proxy and custom objects demand, for signatures and heuristics to match.
+//! What cannot be read, or is encrypted, is a member marked unsupported.
+//! The hyperlinks are not in the text member: [`Dwg::hyperlinks`] gives
+//! them, to the text view of exav-render.
 
 use super::{BitError, BitResult, Dwg, Error, PreviewKind, Version, file};
 use crate::*;
@@ -67,29 +69,20 @@ pub fn bmp_file(dib: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn emit<R>(
-    name: String,
-    bytes: Vec<u8>,
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+fn emit(name: String, bytes: Vec<u8>, budget: &mut Budget, visit: Sink) -> crate::Extracted {
     budget.count_entry()?;
     let cap = budget.reserve()?;
     if bytes.len() as u64 > cap {
-        return Err(LimitHit::new(format!(
-            "dwg: {name} ({} bytes) exceeds the per-member budget",
-            bytes.len()
-        )));
+        let spent = bytes.len() as u64;
+        let name = crate::tree::quoted(&name);
+        budget.over_cap(cap, spent, format_args!("dwg: {name} ({spent} bytes)"))?;
+        return Ok(None);
     }
     budget.commit(bytes.len() as u64);
     Ok(visit(Entry::new(name, bytes), budget))
 }
 
-pub(crate) fn extract_dwg<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_dwg(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     // A release before R13 is a drawing whose contents were not examined.
     if let Some(v) = super::pre_r13_version(data) {
         budget.count_entry()?;
@@ -164,19 +157,30 @@ fn frame_data(dwg: &Dwg<'_>, offset: usize) -> BitResult<Vec<u8>> {
 /// (`ole2frame-<HANDLE>.ole` from the compound file's signature, AutoCAD's
 /// header before it dropped as for DXF, `.bin` when there is none), the VBA
 /// project (`vbaproject.ole` from the R2004+ section, `vbaproject-<H>.ole`
-/// from a VBA_PROJECT object), and the metadata text member. A drawing
-/// whose objects cannot be read is reported, since they were not examined.
-fn from_objects<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+/// from a VBA_PROJECT object), and the metadata text member. What was not
+/// examined is reported as an unsupported member: a drawing whose objects
+/// cannot be read (`dwg-objects`), a part of one that could not
+/// (`dwg-damaged`: a page, the object map, the classes, an object), and an
+/// encrypted VBA project (`vbaproject.ole`, marked encrypted).
+fn from_objects(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     // What the sections decompress to is held while they are searched.
     let cap = budget.reserve()?;
     let dwg = match Dwg::open_with(data, cap) {
         Ok(d) => d,
         Err(Error::NotDwg | Error::UnsupportedVersion(_)) => return Ok(None),
         Err(Error::LimitExceeded(why)) => return Err(LimitHit::new(format!("dwg: {why}"))),
+        Err(Error::Encrypted) => {
+            budget.count_entry()?;
+            return Ok(visit(
+                Entry::unsupported(
+                    "dwg-objects".into(),
+                    data.len() as u64,
+                    true,
+                    "the drawing is password-protected",
+                ),
+                budget,
+            ));
+        }
         Err(Error::Damaged(_)) => {
             budget.count_entry()?;
             return Ok(visit(
@@ -191,8 +195,11 @@ fn from_objects<R>(
         }
     };
     let mut meta = Metadata::default();
+    // Objects the map lists whose type cannot be read: not examined.
+    let mut unreadable = 0usize;
     for &(handle, offset) in dwg.object_map() {
         let Ok(t) = dwg.type_at(offset) else {
+            unreadable += 1;
             continue;
         };
         meta.note_class(&dwg, t);
@@ -230,12 +237,15 @@ fn from_objects<R>(
             // R13 to R2000, and any file whose VBA is an object: the
             // project is the compound file in the object's bytes (spec
             // 20.3 lists no prescription; it is DXF's group 310 data).
-            if let Some((name, bytes)) = dwg
-                .object_bytes(offset)
-                .and_then(|b| vba_member(format!("vbaproject-{handle:X}.ole"), b))
-                && let Some(r) = emit(name, bytes, budget, visit)?
-            {
-                return Ok(Some(r));
+            match dwg.object_bytes(offset) {
+                None => unreadable += 1,
+                Some(b) => {
+                    if let Some((name, bytes)) = vba_member(format!("vbaproject-{handle:X}.ole"), b)
+                        && let Some(r) = emit(name, bytes, budget, visit)?
+                    {
+                        return Ok(Some(r));
+                    }
+                }
             }
         }
         meta.note_xref(&dwg, t, offset);
@@ -254,16 +264,53 @@ fn from_objects<R>(
     {
         return Ok(Some(r));
     }
+    // What the file locates and could not be read, or is encrypted, was not
+    // examined.
+    if dwg.vba_encrypted()
+        && let Some(r) = unsupported(
+            "vbaproject.ole",
+            true,
+            "the drawing's VBA project is encrypted",
+            budget,
+            visit,
+        )?
+    {
+        return Ok(Some(r));
+    }
+    if !dwg.left_out().is_empty() || unreadable > 0 {
+        return unsupported(
+            "dwg-damaged",
+            false,
+            "part of the drawing could not be read, and what it holds was not examined",
+            budget,
+            visit,
+        );
+    }
     Ok(None)
+}
+
+/// A part of the drawing that was not examined, as a member without data.
+fn unsupported(
+    name: &str,
+    encrypted: bool,
+    why: &'static str,
+    budget: &mut Budget,
+    visit: Sink,
+) -> crate::Extracted {
+    budget.count_entry()?;
+    Ok(visit(
+        Entry::unsupported(name.to_string(), 0, encrypted, why),
+        budget,
+    ))
 }
 
 /// The text member a drawing's objects fill for signatures and heuristics:
 /// the names of the applications its proxy and custom objects demand (the
 /// classes' application names, spec 10), and the external-reference paths
 /// of its block records (spec 20.4.52). One string a line, `kind: value`,
-/// as [`crate::formats::pdf`] emits its URIs; hyperlinks are on entities'
-/// extended data, which the scanner reaches through the drawing model's
-/// reader, so they are not duplicated here.
+/// as [`crate::formats::pdf`] emits its URIs. Hyperlinks, which are on
+/// objects' extended data, are not here: exav-render's text view takes them
+/// from [`Dwg::hyperlinks`].
 #[derive(Default)]
 struct Metadata {
     lines: Vec<String>,

@@ -53,11 +53,7 @@ pub(crate) fn is_nsis(p: &crate::Probe) -> bool {
     p.head.starts_with(b"MZ") && p.find(&NSIS_SIG).and_then(|at| at.checked_sub(4)).is_some()
 }
 
-pub(crate) fn extract_nsis<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_nsis(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     let Some(fh) = find_firstheader(data) else {
         return Ok(None);
     };
@@ -143,7 +139,8 @@ pub(crate) fn extract_nsis<R>(
                     clamped as u64,
                     false,
                     "NSIS block codec",
-                ),
+                )
+                .of_kind(crate::tree::ReasonKind::Unsupported),
                 budget,
             ),
         };
@@ -391,6 +388,23 @@ mod tests {
             entries
                 .iter()
                 .all(|e| e.unsupported.is_some() || !e.data.is_empty())
+        );
+    }
+
+    /// A block neither codec reads anything out of is reported as a codec not
+    /// decoded, not as damage. Too short for LZMA, and a reserved DEFLATE
+    /// block type, so no byte comes out of either.
+    #[test]
+    fn a_block_no_codec_reads_is_reported_as_unsupported() {
+        let blob = synthetic_nsis(&[0x07, 0, 0, 0]);
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Nsis, &blob, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(entries[0].data.is_empty(), "{entries:?}");
+        assert_eq!(entries[0].unsupported, Some("NSIS block codec"));
+        assert_eq!(
+            entries[0].reason_kind,
+            Some(crate::tree::ReasonKind::Unsupported)
         );
     }
 

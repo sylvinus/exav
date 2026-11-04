@@ -1,6 +1,6 @@
 ---
 title: Roadmap
-description: What's next for exav, from signature-matching performance and one read pass for large files to broader bytecode coverage, streaming RAR, multi-volume archives, the viewer's Office converters, document text search and less dependency unsafe.
+description: What's next for exav, from signature-matching performance and one read pass for large files to broader bytecode coverage, streaming the containers still read whole, volume sets inside archives, the viewer's Office converters, document text search and less dependency unsafe.
 ---
 
 exav is beta and `0.0.x`: any release may change behaviour or APIs. What has
@@ -35,30 +35,23 @@ A file larger than `--max-object-bytes` gets the full engine, read through a
 block cache (see [Streaming & memory](/scanner/concepts/streaming-memory/)). Two things
 remain:
 
-- **One forward pass.** Format detection, carving and the digests already share
-  one read, but the signature sweep, YARA and the checks that verify a match
-  still read the file again. Feeding them all from one pass would make a large
-  scan faster, and cheaper over HTTP.
-- **PE structure past the limit.** A PE's layout, imports, icons and
-  Authenticode signature are parsed from the whole file, so a PE over the limit
-  is `LIMITS-EXCEEDED` unless something is found. Reading only the headers and
-  sections would cover the common case of a small executable with a large
-  overlay. YARA's `pe`, `elf` and `dotnet` modules have the same limit.
-- **A spill file for `exav-grep`.** A container inside a member longer than
-  `--max-object-bytes` is reported unreadable, because opening it takes
-  somewhere to write it.
-- **HTTP sources.** A scan over HTTP has no timeout of its own, follows
-  redirects without filtering where they lead, and does not check that the
-  object stays the same between range requests (see
-  [HTTP sources](/scanner/concepts/streaming-memory/#http-sources)).
+- **One forward pass.** Format detection, carving, the digests, the signature
+  sweep and YARA are fed from one read. Left: the walk that looks for what
+  follows an unbounded gap, a YARA regexp whose first atom comes late re-reading
+  what lies before it, and a PE's image read twice.
+- **Packed PEs past the limit.** A PE's structure is read from its image, so a
+  small executable with a large overlay gets the full PE checks. A PE whose
+  image is over the limit, ELF and Mach-O executables, and the readers that
+  hold a packed PE whole (NSIS, AutoIt, UPX, PE packers) are still
+  `LIMITS-EXCEEDED`.
 
 ## Streaming the containers read whole
 
-Most containers, disk images and filesystems included, are walked member by
-member off the source, so peak memory is one member rather than the whole
-decoded object (see [how extraction works](/unpack/how-it-works/)), the files
-of a disk image or an archive past `--max-object-bytes` through a spill file.
-RAR, OLE, CHM, ARJ, email and a few others are still read whole (see
+Most containers, disk images, filesystems, RAR, OLE and email included, are
+walked member by member off the source, so peak memory is one member rather
+than the whole decoded object (see [how extraction works](/unpack/how-it-works/)):
+a stored member past `--max-object-bytes` is read where it lies, a compressed
+one through a spill file. ARJ and a few others are still read whole (see
 [Supported formats](/scanner/reference/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole)):
 past `--max-object-bytes` their own bytes get the full scan but their members are
 not extracted, and the file is `LIMITS-EXCEEDED` unless something is found.
@@ -114,14 +107,14 @@ formats in the browser. What is not done:
   Publisher and the other page layout formats are read only by an
   [external converter](/viewer/integration/#the-external-converter).
 - **Searching documents.** `exav-grep --text` and the scanner's text view read
-  Markdown, HTML, the XML parts of Office and OpenDocument files, DXF and DWG,
-  and, behind opt-in features, PDF and the legacy and flat office formats.
-  Still to do: IFC names and property values, an email's headers, the
-  hyperlinks of OOXML files (apart from their labels), PDF link annotations,
-  the speaker notes of presentations, and matches located by page and by
-  drawing entity. PDF text and the office readers are not defaults because of
-  hayro's `unsafe` and the size of the readers. OCR for images and scanned
-  pages, and QR codes for the scanner, are proposed.
+  Markdown, HTML, the XML parts of Office and OpenDocument files with their
+  hyperlinks, an email's headers, IFC names and property values, DXF and DWG
+  (a DWG's hyperlinks too), and, behind opt-in features, PDF and the legacy and flat office formats; QR
+  codes in images are read behind an opt-in feature. Still to do: the labels
+  of PDF links, the speaker notes of PPT and FODP files, and matches located
+  by page and by drawing entity. PDF text and the office readers are not
+  defaults because of hayro's `unsafe` and the size of the readers. OCR for
+  images and scanned pages is proposed.
 - **Drawings and models.** DWG before R13 is reported unsupported. Large
   drawings have no level of detail, annotative objects and linked images are
   not resolved (external references are, from the files around the drawing),

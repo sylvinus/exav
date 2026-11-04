@@ -9,8 +9,8 @@ tools that are not Rust libraries.
 A fixture whose whole job is to be *detected* is a fixture that gets this
 repository quarantined on `git clone`, deleted by an AV-scanned CI runner, and
 flagged by whatever watches a contributor's laptop. Several of these carry the
-EICAR test string, and one — `upx_nrv_gamma_overflow.upx`, a fuzzer-built UPX'd
-i386 ELF — matches ClamAV's generic Mirai signature.
+EICAR test string, and one (`upx_nrv_gamma_overflow.upx`, a fuzzer-built UPX'd
+i386 ELF) matches ClamAV's generic Mirai signature.
 
 So the ones a scanner reacts to are committed XORed with `0x5A` under a `.xor`
 suffix. That removes the archive magic and the payload in one step, leaving
@@ -25,7 +25,7 @@ Nothing needs to know which is which:
   time and cannot fall back.
 
 To mask a new fixture, XOR it with `0x5A`, add the `.xor` suffix, and delete the
-original — no code change if it is loaded through `read_fixture`.
+original; no code change if it is loaded through `read_fixture`.
 
 XOR rather than the password-protected ZIP that is standard for *distributing*
 samples: these fixtures are the corpus for an archive extractor, so wrapping them

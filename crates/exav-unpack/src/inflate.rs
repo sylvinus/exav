@@ -15,8 +15,8 @@ use flate2::{Crc, Decompress, FlushDecompress, Status};
 use crate::checksum_mismatch;
 
 /// Raw deflate over a buffered source.
-pub(crate) struct Inflate<R> {
-    src: R,
+pub(crate) struct Inflate<'a> {
+    src: Box<dyn BufRead + 'a>,
     state: Decompress,
     /// Decoded bytes not yet handed over, and how many of them were.
     out: Vec<u8>,
@@ -31,10 +31,10 @@ pub(crate) struct Inflate<R> {
 /// holds; every later call fails at once, so the rest would be lost.
 const OUT: usize = 64 * 1024;
 
-impl<R: BufRead> Inflate<R> {
-    pub(crate) fn new(src: R) -> Self {
+impl<'a> Inflate<'a> {
+    pub(crate) fn new(src: impl BufRead + 'a) -> Self {
         Self {
-            src,
+            src: Box::new(src),
             state: Decompress::new(false),
             out: Vec::new(),
             given: 0,
@@ -44,8 +44,8 @@ impl<R: BufRead> Inflate<R> {
     }
 
     /// The source, positioned right after the deflate data once it has ended.
-    fn source(&mut self) -> &mut R {
-        &mut self.src
+    fn source(&mut self) -> &mut (dyn BufRead + 'a) {
+        &mut *self.src
     }
 
     /// Start over on a new deflate stream from the current source position.
@@ -57,7 +57,7 @@ impl<R: BufRead> Inflate<R> {
     }
 }
 
-impl<R: BufRead> Inflate<R> {
+impl Inflate<'_> {
     /// Decode the next run of output into `self.out`. `Ok(false)` once the
     /// stream has ended.
     fn fill(&mut self) -> io::Result<bool> {
@@ -109,7 +109,7 @@ impl<R: BufRead> Inflate<R> {
     }
 }
 
-impl<R: BufRead> Read for Inflate<R> {
+impl Read for Inflate<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -127,13 +127,13 @@ impl<R: BufRead> Read for Inflate<R> {
 /// The deflate data of a zlib stream (RFC 1950), or `None` when its header is
 /// not one. The trailing Adler-32 is not checked: a mismatch after a full
 /// decode hides nothing.
-pub(crate) fn zlib_body(data: &[u8]) -> Option<Inflate<&[u8]>> {
+pub(crate) fn zlib_body(data: &[u8]) -> Option<Inflate<'_>> {
     zlib_reader(data).ok().flatten()
 }
 
 /// [`zlib_body`] over a reader: the error is the reader's, `UnexpectedEof`
 /// when the input ends inside the 2-byte header.
-pub(crate) fn zlib_reader<R: BufRead>(mut src: R) -> io::Result<Option<Inflate<R>>> {
+pub(crate) fn zlib_reader<'a>(mut src: impl BufRead + 'a) -> io::Result<Option<Inflate<'a>>> {
     let mut h = [0u8; 2];
     src.read_exact(&mut h)?;
     let [cmf, flg] = h;
@@ -149,8 +149,8 @@ pub(crate) fn zlib_reader<R: BufRead>(mut src: R) -> io::Result<Option<Inflate<R
 /// has been decoded, so one bad trailer does not cost the members after it.
 /// Bytes after the last member that do not start another one are ignored, as
 /// `gzip -d` does.
-pub(crate) struct Gunzip<R> {
-    body: Inflate<R>,
+pub(crate) struct Gunzip<'a> {
+    body: Inflate<'a>,
     crc: Crc,
     state: GzState,
     members: u32,
@@ -164,8 +164,8 @@ enum GzState {
     Done,
 }
 
-impl<R: BufRead> Gunzip<R> {
-    pub(crate) fn new(src: R) -> Self {
+impl<'a> Gunzip<'a> {
+    pub(crate) fn new(src: impl BufRead + 'a) -> Self {
         Self {
             body: Inflate::new(src),
             crc: Crc::new(),
@@ -230,7 +230,7 @@ impl<R: BufRead> Gunzip<R> {
     }
 }
 
-impl<R: BufRead> Read for Gunzip<R> {
+impl Read for Gunzip<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -268,17 +268,17 @@ impl<R: BufRead> Read for Gunzip<R> {
 
 /// Wraps a member's decoded bytes, which must have CRC-32 `expected`; a
 /// mismatch at the end is a checksum mismatch.
-pub(crate) struct CrcCheck<R> {
-    inner: R,
+pub(crate) struct CrcCheck<'a> {
+    inner: Box<dyn Read + 'a>,
     crc: Crc,
     expected: u32,
     reported: bool,
 }
 
-impl<R: Read> CrcCheck<R> {
-    pub(crate) fn new(inner: R, expected: u32) -> Self {
+impl<'a> CrcCheck<'a> {
+    pub(crate) fn new(inner: impl Read + 'a, expected: u32) -> Self {
         Self {
-            inner,
+            inner: Box::new(inner),
             crc: Crc::new(),
             expected,
             reported: false,
@@ -286,7 +286,7 @@ impl<R: Read> CrcCheck<R> {
     }
 }
 
-impl<R: Read> Read for CrcCheck<R> {
+impl Read for CrcCheck<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         if n == 0 && !buf.is_empty() && !self.reported && self.crc.sum() != self.expected {
@@ -298,7 +298,7 @@ impl<R: Read> Read for CrcCheck<R> {
     }
 }
 
-fn skip<R: BufRead>(src: &mut R, n: u64) -> io::Result<()> {
+fn skip(src: &mut dyn BufRead, n: u64) -> io::Result<()> {
     if io::copy(&mut src.take(n), &mut io::sink())? < n {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
@@ -306,7 +306,7 @@ fn skip<R: BufRead>(src: &mut R, n: u64) -> io::Result<()> {
 }
 
 /// Skip a NUL-terminated header field without holding it.
-fn skip_string<R: BufRead>(src: &mut R) -> io::Result<()> {
+fn skip_string(src: &mut dyn BufRead) -> io::Result<()> {
     loop {
         let buf = src.fill_buf()?;
         if buf.is_empty() {
@@ -330,11 +330,15 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// `prefix` deflated and flushed (a sync flush, through the compressor
+    /// itself: the writer's `flush` leaves part of it behind under zlib-rs),
+    /// then a block of a reserved type and bytes after it.
     fn deflate_broken_after(prefix: &[u8]) -> Vec<u8> {
-        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        e.write_all(prefix).unwrap();
-        e.flush().unwrap();
-        let mut raw = e.get_ref().clone();
+        let mut c = flate2::Compress::new(flate2::Compression::default(), false);
+        let mut raw = Vec::with_capacity(prefix.len() + 1024);
+        c.compress_vec(prefix, &mut raw, flate2::FlushCompress::Sync)
+            .unwrap();
+        assert_eq!(c.total_in(), prefix.len() as u64);
         raw.push(0x06);
         raw.extend_from_slice(&[0x5a; 64]);
         raw

@@ -3,23 +3,49 @@
  * converter only what it does not recognise, or everything when the options
  * say so.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { RenderContext } from "../core/types.js";
+import { compoundFile } from "../test/compound.js";
+import { officeKindsNow, start } from "../test/sniff.js";
+import { storedZip } from "../test/stored-zip.js";
 import type { ConversionOptions } from "./index.js";
-import { SheetConversionError, sniffSheet } from "./sheets.js";
+import { SheetConversionError, sniffSheet as sniff } from "./sheets.js";
+
+// The containers are read by exav's readers, which the tests run in this process.
+vi.mock("./zip-engine.js", () => import("../test/sniff.js"));
+beforeAll(start);
+const sniffSheet = (b: Uint8Array) => sniff(b, officeKindsNow(b));
 
 const bytes = (...parts: (string | number[])[]) =>
   new Uint8Array(parts.flatMap((p) => (typeof p === "string" ? [...p].map((c) => c.charCodeAt(0)) : p)));
 
-/** A ZIP's first local header (30 bytes), then `rest`. */
-const zip = (rest: string) => bytes([0x50, 0x4b, 0x03, 0x04, ...new Array(26).fill(0)], rest);
+/** A stored ZIP whose members are the words of `rest`; a first word `mimetype...` is the member of that name holding the rest of the word. */
+const zip = (rest: string): Uint8Array =>
+  storedZip(
+    rest
+      .split(/\s+/)
+      .filter((w) => w && w !== "...")
+      .map((w, i) => (i === 0 && w.startsWith("mimetype") ? ["mimetype", bytes(w.slice(8))] : [w, new Uint8Array()]) as [string, Uint8Array]),
+  );
 
 describe("what the bytes are", () => {
-  it("reads compound files and BIFF2 to BIFF4 worksheets as XLS", () => {
-    expect(sniffSheet(bytes([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]))).toBe("xls");
+  it("reads compound files with a workbook stream and BIFF2 to BIFF4 worksheets as XLS", () => {
+    expect(sniffSheet(compoundFile(["Workbook"]))).toBe("xls");
+    expect(sniffSheet(compoundFile(["SummaryInformation", "Book"]))).toBe("xls");
     expect(sniffSheet(bytes([0x09, 0x00, 0x04, 0x00, 0x02, 0x00, 0x10, 0x00]))).toBe("xls");
     expect(sniffSheet(bytes([0x09, 0x04, 0x06, 0x00, 0x00, 0x00, 0x10, 0x00]))).toBe("xls");
+  });
+
+  it("does not read the other compound files as XLS", () => {
+    // A Word document, a presentation, and a compound file that is neither.
+    expect(sniffSheet(compoundFile(["WordDocument"]))).toBeNull();
+    expect(sniffSheet(compoundFile(["PowerPoint Document"]))).toBeNull();
+    expect(sniffSheet(compoundFile(["Contents"]))).toBeNull();
+    // The workbook of a file that holds a Word document too.
+    expect(sniffSheet(compoundFile(["WordDocument", "Workbook"]))).toBe("xls");
+    // One the reader could not look into (`officeKinds` says `null`) is taken as its name says.
+    expect(sniff(compoundFile(["WordDocument"]), null)).toBe("xls");
   });
 
   it("tells the packages apart by their members", () => {
@@ -36,6 +62,12 @@ describe("what the bytes are", () => {
     expect(sniffSheet(zip("QuickLook/Thumbnail.jpg index.xml"))).toBe("numbers");
     expect(sniffSheet(zip("Doc.numbers/index.xml.gz"))).toBe("numbers");
     expect(sniffSheet(zip("word/document.xml"))).toBeNull();
+  });
+
+  it("tells a package by the members of its directory, not by bytes inside a member", () => {
+    // A ZIP that holds a workbook, stored: the workbook's own directory is in the last bytes.
+    const inner = zip("[Content_Types].xml xl/workbook.xml");
+    expect(sniffSheet(storedZip([["backup.zip", inner]]))).toBeNull();
   });
 
   it("reads flat OpenDocument and the text formats Excel opens, nothing else as text", () => {
@@ -89,7 +121,7 @@ function context(data: Uint8Array, options: ConversionOptions, external: boolean
   return { ctx, nested, statuses };
 }
 
-const XLS = bytes([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+const XLS = compoundFile(["Workbook"]);
 
 describe("a spreadsheet opened", () => {
   it("is converted by exav-render's sheets and shown as XLSX", async () => {
@@ -175,6 +207,16 @@ describe("a spreadsheet opened", () => {
     expect(error.error.cause).toMatchObject({ kind: "needs-converter", format: "xls" });
     expect(convertSheet).not.toHaveBeenCalled();
     expect(nested).not.toHaveBeenCalled();
+  });
+
+  it("sends a Word document named .xls to the external converter, not to sheets", async () => {
+    const { rendererFor } = await import("./convert.js");
+    convertExternal.mockResolvedValue({ format: "xlsx", bytes: new Uint8Array([9]) });
+    const word = compoundFile(["WordDocument"]);
+    const { ctx } = context(word, {}, true);
+    await rendererFor("xls").mount(document.createElement("div"), ctx);
+    expect(convertSheet).not.toHaveBeenCalled();
+    expect(convertExternal).toHaveBeenCalledWith(word, expect.objectContaining({ hint: "xls" }));
   });
 
   it("is shown as it is when it is an XLSX under another name", async () => {

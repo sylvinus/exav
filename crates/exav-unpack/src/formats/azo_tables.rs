@@ -1,8 +1,8 @@
 //! AZO's match code tables, transcribed from `EggDotNet` (MIT, see NOTICE).
 //!
 //! A match is coded as an index into one of these plus a number of extra bits
-//! given by the parallel `*_EXTRABIT` table — the usual deflate-style bucketing,
-//! with ESTsoft's own bucket boundaries. Kept in their own module because they
+//! given by the parallel `*_EXTRABIT` table (the usual deflate-style bucketing,
+//! with ESTsoft's own bucket boundaries). Kept in their own module because they
 //! are data, and because a transcription error here decodes to plausible bytes
 //! rather than an error.
 

@@ -63,7 +63,7 @@ for (const file of files) {
 }
 
 // The frame app: its page, its policy, its code, its workers and its licences.
-for (const file of ["index.html", "app.js", "styles.css", "frame.css", "cad.worker.js", "decode.worker.js", "markdown.worker.js", "model.worker.js", "pdfjs.worker.js", "sheets.worker.js", "slides.worker.js", "docs.worker.js", "worker.js", "exav-viewer/manifest.json", "licenses/README.txt"]) {
+for (const file of ["index.html", "app.js", "styles.css", "frame.css", "cad.worker.js", "decode.worker.js", "text.worker.js", "model.worker.js", "pdfjs.worker.js", "sheets.worker.js", "slides.worker.js", "docs.worker.js", "zip.worker.js", "table.worker.js", "sniff.worker.js", "worker.js", "exav-viewer/manifest.json", "licenses/README.txt"]) {
   need(`dist/frame/app/${file}`, "the frame app");
 }
 // Whose each of those files is, for a frame published for some formats only.

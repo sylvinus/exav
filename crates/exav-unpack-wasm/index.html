@@ -46,7 +46,7 @@
 </head>
 <body>
   <h1>exav-unpack-wasm</h1>
-  <p class="subtitle">In-browser archive extraction — no server, no native dependencies. Supports zip, rar, 7z, tar, gz, bz2, xz, cab, arj, lha, iso, cpio, ar, xar, ole, pdf, email, UPX. Handles encrypted archives.</p>
+  <p class="subtitle">In-browser archive extraction: no server, no native dependencies. Supports zip, rar, 7z, tar, gz, bz2, xz, cab, arj, lha, iso, cpio, ar, xar, ole, pdf, email, UPX. Handles encrypted archives.</p>
 
   <div id="drop-zone">
     <p><strong>Drop an archive here</strong> or click to browse</p>
@@ -163,7 +163,7 @@
         );
 
         if (hasEncryptedUnsupported) {
-          status.textContent = `Listed in ${elapsed}s — archive contains encrypted members`;
+          status.textContent = `Listed in ${elapsed}s; the archive contains encrypted members`;
           status.className = "";
           renderMembers(members);
           showPasswordPrompt();
@@ -186,7 +186,7 @@
       pwInput.value = "";
       pwInput.focus();
       if (currentPasswords.length > 0) {
-        pwError.textContent = "Wrong password — try again.";
+        pwError.textContent = "Wrong password, try again.";
         pwError.style.display = "block";
       }
     }
@@ -261,7 +261,7 @@
               } else if (isText(combined)) {
                 pre.textContent = new TextDecoder().decode(combined);
               } else {
-                pre.textContent = `[Binary data — ${formatSize(combined.length)}]`;
+                pre.textContent = `[Binary data, ${formatSize(combined.length)}]`;
               }
               row.style.display = "";
 

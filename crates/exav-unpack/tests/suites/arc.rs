@@ -1,4 +1,4 @@
-//! ARC — the pre-ZIP SEA format, plus the PKARC/PAK variants.
+//! ARC: the pre-ZIP SEA format, plus the PKARC/PAK variants.
 //!
 //! Worth having because The Unarchiver, 7-Zip and Microsoft's RecursiveExtractor
 //! all still open one: exav's rule is the union of what a victim's tools open.
@@ -72,7 +72,7 @@ fn contents(name: &str) -> Vec<(String, String)> {
 #[test]
 fn stored_and_crunched_members_decode_to_their_originals() {
     // `dle.bin` is the one that matters: it holds literal 0x90 bytes, which is
-    // the run-length escape, plus long runs — so it exercises both sides of the
+    // the run-length escape, plus long runs, so it exercises both sides of the
     // `DLE n` / `DLE 00` rule that the crunched methods apply after LZW.
     let mut want = vec![
         ("dle.bin".to_string(), DLE.to_string()),
@@ -93,7 +93,7 @@ fn a_stored_only_archive_decodes() {
 
 #[test]
 fn a_third_party_archive_decodes() {
-    // From Microsoft's RecursiveExtractor corpus — a different writer, and one
+    // From Microsoft's RecursiveExtractor corpus: a different writer, and one
     // that happens to NUL-pad the name field where `arc` leaves garbage there.
     let e = members(&fixture("microsoft_testdata.arc"));
     assert!(

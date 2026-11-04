@@ -4,11 +4,11 @@ use crate::stream::{Visit, emit_stream, single_meta};
 use crate::{Budget, LimitHit};
 use std::io::Read;
 
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     budget.count_entry()?;
     let mut dec = content_reader(src, budget.limits().max_buffer_bytes);
     emit_stream(
@@ -96,12 +96,10 @@ impl<R: Read> Read for AsFarAsItGoes<R> {
 struct Recovering<'a> {
     data: &'a dyn ByteSource,
     range: (usize, usize),
-    first: super::bzip2_rs::DecoderReader<Reader<'a>>,
+    first: super::bzip2_rs::DecoderReader<'a>,
     /// Bytes `first` produced, to skip in the second pass.
     produced: u64,
-    second: Option<
-        super::bzip2_rs::DecoderReader<std::io::Chain<Reader<'a>, std::io::Take<std::io::Repeat>>>,
-    >,
+    second: Option<super::bzip2_rs::DecoderReader<'a>>,
     skip: u64,
     cut: Option<(std::io::ErrorKind, String)>,
 }

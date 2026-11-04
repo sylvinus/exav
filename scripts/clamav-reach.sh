@@ -4,7 +4,7 @@
 #
 # WHY: comparing feature lists answers the wrong question. ClamAV's EGG submodule
 # is on by default and it still returns `OK` on an EGG whose members are LZMA or
-# solid — format-level support is not member-level reach. And a signature-database
+# solid: format-level support is not member-level reach. And a signature-database
 # comparison cannot separate "did not detect" from "never looked".
 #
 # METHOD: extract each container's members with exav, hash every member into an
@@ -80,7 +80,7 @@ for f in "$@"; do
   found=$(clamscan -d "$db" $ALERTS "$f" 2>&1 | grep -cE "FOUND")
   total=$(wc -l < "$db/m.hdb" | tr -d ' ')
   if [ "$found" -eq 0 ]; then
-    verdict="SILENT MISS — clamav reached none"
+    verdict="SILENT MISS: clamav reached none"
     misses=$((misses+1))
   elif [ "$found" -lt "$total" ]; then
     verdict="partial"

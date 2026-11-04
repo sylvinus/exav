@@ -3,7 +3,7 @@
 //! Machine-learning models ship as serialized blobs, and two of the most common
 //! carriers are attacker-controllable:
 //!
-//! * **Python pickle** — the real threat. A pickle is a little stack-machine
+//! * **Python pickle**: the real threat. A pickle is a little stack-machine
 //!   program; the `GLOBAL`/`STACK_GLOBAL` + `REDUCE` opcodes let a crafted
 //!   pickle import an arbitrary callable (e.g. `os.system`, `subprocess.Popen`,
 //!   `builtins.eval`) and call it with attacker-chosen arguments *at load time*.
@@ -13,7 +13,7 @@
 //!   dangerous imports (`os\nsystem`, `posix\nsystem`, `subprocess\nPopen`, …)
 //!   and on embedded command strings / base64 payloads.
 //!
-//! * **safetensors** — designed to be safe (tensors are opaque data), but the
+//! * **safetensors**: designed to be safe (tensors are opaque data), but the
 //!   leading JSON header can carry a `__metadata__` map with attacker strings.
 //!   We surface just that header as `safetensors-header`.
 //!
@@ -28,7 +28,7 @@
 //! truncated or malformed pickle stops being interpreted at that point. That is
 //! safe rather than a silent skip, because the caller pattern-scans the raw
 //! buffer before it ever asks for extraction (`member_content_scan` in
-//! `exav-core`), so no byte goes unexamined — what is lost is the *surfaced*
+//! `exav-core`), so no byte goes unexamined: what is lost is the *surfaced*
 //! opcode text, which only affects signatures written against the disassembled
 //! form. Recorded here so the next reader can tell this apart from a member
 //! being dropped, which would be a defect.
@@ -89,11 +89,7 @@ fn is_safetensors_in(data: &[u8], len: usize) -> bool {
     header.contains(&b'"')
 }
 
-pub(crate) fn extract_aimodel<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_aimodel(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     if is_pickle(data) || looks_like_pickle_opcodes(data) {
         return extract_pickle(data, budget, visit);
     }
@@ -110,11 +106,7 @@ fn looks_like_pickle_opcodes(data: &[u8]) -> bool {
 }
 
 /// Emit the leading JSON header of a safetensors file as `safetensors-header`.
-fn extract_safetensors<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+fn extract_safetensors(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     // Re-validate defensively (caller may route loosely).
     if data.len() < 9 {
         return Ok(None);
@@ -136,14 +128,13 @@ fn extract_safetensors<R>(
     // The header is the model's JSON metadata, and what a rule looks for in it
     // can sit anywhere. Clamping to the budget and emitting the prefix as though
     // it were the header hides whatever falls past the cut, so an over-cap header
-    // is reported — and the part that fits is still handed over, since a prefix
+    // is reported, and the part that fits is still handed over, since a prefix
     // is content even when it is not all of it.
     if header.len() as u64 > cap
         && let Some(r) = visit(
-            Entry::unsupported(
+            Entry::over_limit(
                 "safetensors-header".into(),
                 header.len() as u64,
-                false,
                 "safetensors header exceeds the per-member size budget; \
                  the part that fits was scanned",
             ),
@@ -165,11 +156,7 @@ fn extract_safetensors<R>(
 /// globals + string/bytes literals into a single `pickle-imports` member.
 /// Never executes anything; on any unknown opcode or short read the walk stops
 /// and whatever was collected so far is emitted.
-fn extract_pickle<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+fn extract_pickle(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     // Hard cap on how much we buffer, so a hostile pickle full of giant string
     // literals can't blow memory before we hit the emit-time budget check.
     let cap = budget.reserve()?;
@@ -386,7 +373,7 @@ fn disassemble(data: &[u8], cap: u64) -> Vec<u8> {
                 i = s.saturating_add(len as usize);
             }
 
-            // Ints / binints — skip operands only.
+            // Ints / binints: skip operands only.
             0x4b => i += 2, // BININT1: +1
             0x4d => i += 3, // BININT2: +2
             0x4a => i += 5, // BININT: +4
@@ -411,7 +398,7 @@ fn disassemble(data: &[u8], cap: u64) -> Vec<u8> {
                 }
             }
 
-            // Memo / put / get — skip operands.
+            // Memo / put / get: skip operands.
             0x71 => i += 2, // BINPUT: +1
             0x72 => i += 5, // LONG_BINPUT: +4
             0x94 => i += 1, // MEMOIZE: +0

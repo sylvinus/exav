@@ -1,4 +1,4 @@
-# delharc 0.6.1 — panic "attempt to add with overflow" in LHA header parser
+# delharc 0.6.1: panic "attempt to add with overflow" in LHA header parser
 
 Found by fuzzing exav (which builds with `overflow-checks = true`). `delharc`'s
 LHA header parser performs an unchecked `u32` addition that overflows on a
@@ -6,7 +6,7 @@ crafted header, panicking (with overflow-checks on) or silently wrapping (in a
 stock release build).
 
 - **Crate:** `delharc` 0.6.1
-- **Location:** `src/header/parser.rs:265` — `else if long_header_len < parser.len as u32 + first_header_len`
+- **Location:** `src/header/parser.rs:265`, `else if long_header_len < parser.len as u32 + first_header_len`
 - **Panic:** `attempt to add with overflow`
 - **Trigger:** `parser.len as u32 + first_header_len` overflows `u32`.
 
@@ -39,13 +39,13 @@ overflow, rather than relying on wrapping.
 
 ## Notes
 exav contains this via a `catch_unwind` boundary around all archive decoders,
-so it is not a crash for exav users — it is reported as an unscannable member.
+so it is not a crash for exav users: it is reported as an unscannable member.
 The raw bytes live at `fixtures/lha_delharc_overflow_min.lha`. Filed upstream at
 the `delharc` repository.
 
 ---
 
-# delharc 0.6.1 — issue 2: unbounded allocation from a header length field (memory DoS)
+# delharc 0.6.1, issue 2: unbounded allocation from a header length field (memory DoS)
 
 Found by fuzzing exav (2026-07-02). A crafted LHA header drives
 `Parser::read_limit_no_checksums` (`header/parser.rs:140`) to
@@ -53,7 +53,7 @@ Found by fuzzing exav (2026-07-02). A crafted LHA header drives
 header field (`extra_header_len` / `extended_len` / `filename_len`). A 143-byte
 input reserves ~3.2 GB. `try_reserve` degrades gracefully on a memory-constrained
 host (returns `HeaderParse("memory allocation failed")`), but on a host with
-enough RAM it succeeds and allocates the full attacker-declared size — a
+enough RAM it succeeds and allocates the full attacker-declared size: a
 memory-amplification denial of service.
 
 - **Crate:** `delharc` 0.6.1
@@ -64,13 +64,13 @@ memory-amplification denial of service.
 - **Repro bytes:** `fixtures/lha_delharc_oom.lha` (143 bytes).
 
 ## Suggested fix
-Bound `limit` before reserving — reject a declared extended-header/filename
+Bound `limit` before reserving: reject a declared extended-header/filename
 length that exceeds the bytes actually remaining in the reader (or a sane
 absolute cap), rather than reserving the full declared size up front.
 
 ## exav mitigation
-`Budget` cannot see this allocation — delharc makes it internally, before
-yielding any output — and `catch_unwind` does not catch an allocation, which
+`Budget` cannot see this allocation (delharc makes it internally, before
+yielding any output), and `catch_unwind` does not catch an allocation, which
 aborts rather than unwinding. So the bound has to be applied before the reader
 is handed the bytes.
 
@@ -80,7 +80,7 @@ past the end of the archive *and* declares a size no archiver writes
 alone is not grounds for refusal: this extractor is handed carved and embedded
 regions, where a genuine archive's header can legitimately describe more than
 the slice holds, and turning one of those into an `Unscannable` would hide a
-member from the scan — worth more to an attacker than the allocation it avoids.
+member from the scan, worth more to an attacker than the allocation it avoids.
 Requiring the size to be implausible as well keeps the check inside the region
 where delharc cannot succeed either: it would allocate, read short, and fail.
 

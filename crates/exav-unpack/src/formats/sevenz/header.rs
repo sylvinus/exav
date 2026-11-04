@@ -226,7 +226,7 @@ fn parse_streams_info(r: &mut SevenZReader) -> Result<StreamsInfo, LimitHit> {
                 // An encoded header chain, whose length is only knowable by
                 // decoding it. There is no way to step over it, so continuing
                 // would leave the reader misaligned and every field after this
-                // point would be read from the wrong offset — which does not
+                // point would be read from the wrong offset, which does not
                 // announce itself, and can end as a short member list rather
                 // than an error.
                 //
@@ -463,7 +463,7 @@ fn parse_sub_streams_info(
         // `num_streams` is an attacker-controlled var-int. Without a bound the
         // running `total_sub_streams` accumulation overflows `usize` (a panic
         // under overflow-checks) and the `resize` calls below try to allocate an
-        // astronomical number of elements (capacity-overflow / OOM abort — not
+        // astronomical number of elements (capacity-overflow / OOM abort, not
         // caught by the panic boundary). Every declared sub-stream ultimately
         // consumes header bytes (a size and/or CRC), so cap the total at the
         // bytes left to parse; the per-block value is clamped to whatever budget
@@ -838,7 +838,7 @@ fn decompress_encoded_header(
     // The 7z parser threads no `Budget`, so the encoded header/TOC is bounded by
     // the *default* global peak-buffer limit. A header is metadata (not the
     // operator's tuning surface), and it must be buffered whole for random-access
-    // parsing — so a fixed default ceiling is the right bound here.
+    // parsing, so a fixed default ceiling is the right bound here.
     let max_buffer = crate::Limits::default().max_buffer_bytes;
     // Its decoder may hold what it is given, so what it is given is bounded
     // too, not by the archive's size.
@@ -924,7 +924,7 @@ fn parse_header(data: &[u8]) -> Result<Archive, LimitHit> {
 /// The folder's final decompressed size: the size of the one output stream not
 /// consumed by a bind pair. For a single-coder folder this equals that coder's
 /// output size; for a multi-coder chain (e.g. AES→Copy, or a BCJ filter over
-/// LZMA) it is the *last* stage's output — NOT the sum of every coder's output,
+/// LZMA) it is the *last* stage's output, NOT the sum of every coder's output,
 /// which would double-count the intermediate streams.
 pub(super) fn folder_out_size(block: &Block) -> u64 {
     let total_out: u64 = block.coders.iter().map(|c| c.num_out_streams).sum();

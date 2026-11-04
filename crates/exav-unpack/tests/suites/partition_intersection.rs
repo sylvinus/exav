@@ -1,4 +1,4 @@
-//! Overlapping partition entries — ClamAV's three
+//! Overlapping partition entries: ClamAV's three
 //! `Heuristics.*PartitionIntersect*` alerts.
 //!
 //! Two partitions claiming the same sectors is not something an installer
@@ -7,12 +7,19 @@
 //!
 //! The alert names are ClamAV's exactly, **including the doubled `n` in
 //! `MBRPartitionnIntersect`**. That is an upstream typo, and reproducing it is
-//! deliberate — the name is the API, and a gateway filtering on it would not
+//! deliberate: the name is the API, and a gateway filtering on it would not
 //! match a corrected spelling.
 
-use exav_unpack::partition_intersection_alert;
+use exav_unpack::Limits;
+use exav_unpack::partition_intersection_alert as alert_within;
+use exav_unpack::source::ByteSource;
 
 const SECTOR: usize = 512;
+
+/// The alert under the default limits.
+fn partition_intersection_alert(data: &dyn ByteSource) -> Option<&'static str> {
+    alert_within(data, &Limits::default())
+}
 
 /// An MBR with `parts` entries, each `(first_lba, sectors)`.
 fn mbr(parts: &[(u32, u32)], total_sectors: usize) -> Vec<u8> {

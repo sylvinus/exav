@@ -1,4 +1,4 @@
-//! ALZ — the ESTsoft archive format, ordinary in Korea and rare elsewhere.
+//! ALZ: the ESTsoft archive format, ordinary in Korea and rare elsewhere.
 //!
 //! exav had no code for it, which is the worst shape a gap can take: an
 //! unrecognised container gets a raw pattern scan, matches nothing because its
@@ -9,11 +9,11 @@
 //! against `unalz` and `unar` as external oracles rather than against itself: on
 //! a real archive the first member's declared sizes (1,171,458 compressed /
 //! 1,195,080 uncompressed) and name matched both tools exactly. That is what
-//! pins the layout — a decoder checked only against its own output emits
+//! pins the layout: a decoder checked only against its own output emits
 //! plausible bytes rather than errors, which is the failure mode this project
 //! refuses to ship.
 
-use crate::{Budget, Entry, Format, LimitHit, Sink};
+use crate::{Budget, Entry, Format, Sink};
 
 fn is_alz(d: &[u8]) -> bool {
     super::sniff::is(d, Format::Alz)
@@ -25,15 +25,11 @@ fn is_alz(d: &[u8]) -> bool {
 /// length, attributes, DOS timestamp, a descriptor byte whose **high nibble is
 /// the byte width of the two size fields**, then method, CRC-32, the two sizes,
 /// and the name. Methods are 0 stored, 1 bzip2, 2 deflate.
-pub(crate) fn extract_alz<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_alz(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     if !is_alz(data) {
         return Ok(None);
     }
-    /// `BLZ\x01` — introduces one member.
+    /// `BLZ\x01`: introduces one member.
     const LOCAL: &[u8] = b"BLZ\x01";
     /// Low nibble of the descriptor: the member is encrypted and carries a
     /// 12-byte verification block before its data.
@@ -93,21 +89,28 @@ pub(crate) fn extract_alz<R>(
 
         budget.count_entry()?;
         let cap = budget.reserve()?;
+        let over = "ALZ member exceeds the per-member decompression budget";
+        // Larger than its room: a stored member by the bytes it stores, a
+        // compressed one by the size it says when all of it is in the file.
+        let said_over = match method {
+            0 => body.len() as u64 > cap,
+            _ => !rest_absent && uncomp > cap,
+        };
         let entry = if encrypted {
             Entry::unsupported(name, uncomp, true, "encrypted ALZ member")
+        } else if said_over {
+            // Not decoded, nothing charged.
+            Entry::over_limit(name, uncomp, over)
         } else {
             match decode_alz_member(method, body, cap) {
                 // Truncated at the per-member cap: the bytes we have are real,
                 // but the member was not seen in full, so it must not read as
-                // fully scanned.
-                Some(s) if s.over_cap => Entry::unsupported(
-                    name,
-                    uncomp,
-                    false,
-                    "ALZ member exceeds the per-member decompression budget",
-                ),
+                // fully scanned. What was decoded is charged.
+                Some(s) if s.over_cap => {
+                    budget.commit(s.data.len() as u64);
+                    Entry::over_limit(name, uncomp, over)
+                }
                 Some(s) => {
-                    crate::ratio_guard(body.len() as u64, s.data.len() as u64, budget)?;
                     budget.commit(s.data.len() as u64);
                     let why = s.part_way(rest_absent).then_some(
                         "ALZ member failed to decode part way; the bytes before the failure \
@@ -123,7 +126,8 @@ pub(crate) fn extract_alz<R>(
                     uncomp,
                     false,
                     "ALZ member uses a compression method exav cannot decode",
-                ),
+                )
+                .of_kind(crate::tree::ReasonKind::Unsupported),
             }
         };
         if let Some(r) = visit(entry, budget) {
@@ -194,7 +198,7 @@ mod tests {
             &mut b,
             &mut |e: Entry, _: &mut Budget| {
                 seen.push(e);
-                None::<()>
+                None
             },
         );
         assert_eq!(seen.len(), 1, "exactly one report");
@@ -203,5 +207,68 @@ mod tests {
             "must surface as unscannable, not pass as clean"
         );
         assert!(seen[0].data.is_empty(), "nothing is invented");
+    }
+
+    /// The members of an archive of one, of `method`, that says it is `comp`
+    /// bytes compressed and 1 GiB uncompressed, over the default room.
+    fn said_over(method: u8, comp: u32, body: &[u8]) -> Vec<Entry> {
+        one_member(method, comp, 1 << 30, body)
+    }
+
+    /// The members of an archive of one, of `method`, that says it is `comp`
+    /// bytes compressed and `uncomp` uncompressed.
+    fn one_member(method: u8, comp: u32, uncomp: u32, body: &[u8]) -> Vec<Entry> {
+        let mut alz = b"ALZ\x01\x0a\x00\x00\x00BLZ\x01".to_vec();
+        alz.extend_from_slice(&5u16.to_le_bytes());
+        // Attributes, time, sizes 4 bytes wide, then the method, CRC-32.
+        alz.extend_from_slice(&[0x20, 0, 0, 0, 0, 0x40, 0, method, 0, 0, 0, 0, 0]);
+        alz.extend_from_slice(&comp.to_le_bytes());
+        alz.extend_from_slice(&uncomp.to_le_bytes());
+        alz.extend_from_slice(b"a.txt");
+        alz.extend_from_slice(body);
+        let mut b = Budget::new(Limits::default());
+        let mut seen = Vec::new();
+        extract_alz(&alz, &mut b, &mut |e: Entry, _: &mut Budget| {
+            seen.push(e);
+            None
+        })
+        .unwrap();
+        seen
+    }
+
+    /// A member said to be over the room is read when what it says is not all
+    /// in the file: a stored one is the bytes it stores, and a compressed one
+    /// the file ends inside is what of it is here.
+    #[test]
+    fn a_member_said_over_the_room_is_read_when_that_is_not_in_the_file() {
+        use std::io::Write;
+        let body = b"some bytes";
+        let got = said_over(0, body.len() as u32, body);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].data, body, "stored: {got:?}");
+        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        e.write_all(body).unwrap();
+        let deflated = e.finish().unwrap();
+        let got = said_over(2, deflated.len() as u32 + 100, &deflated);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].data, body, "cut: {got:?}");
+    }
+
+    /// A method other than stored, bzip2 and deflate is reported as a method
+    /// not decoded, not as damage.
+    #[test]
+    fn an_unknown_method_is_reported_as_unsupported() {
+        let body = b"some bytes";
+        let got = one_member(3, body.len() as u32, body.len() as u32, body);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].data.is_empty(), "{got:?}");
+        assert_eq!(
+            got[0].unsupported,
+            Some("ALZ member uses a compression method exav cannot decode")
+        );
+        assert_eq!(
+            got[0].reason_kind,
+            Some(crate::tree::ReasonKind::Unsupported)
+        );
     }
 }

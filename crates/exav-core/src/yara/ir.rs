@@ -395,9 +395,10 @@ pub(crate) struct EvalCtx<'a> {
 /// language caps that, and the scan has no other clock: without a step budget a
 /// single such rule stalls every scan for as long as it takes.
 ///
-/// The ceiling is far above what real rulesets reach — large community feeds
-/// evaluate in the low millions of steps for a whole scan — so it costs
-/// legitimate rules nothing and bounds a runaway one to a fraction of a second.
+/// The ceiling is far above what real rulesets reach (large community feeds
+/// evaluate in the low millions of steps for a whole scan), so it costs
+/// legitimate rules nothing. It counts nodes: one that reads a range of the
+/// object (a `math` or `hash` call, a string operator) costs by its range.
 pub(crate) const EVAL_STEP_BUDGET: u64 = 20_000_000;
 
 impl EvalCtx<'_> {
@@ -460,43 +461,9 @@ impl Cond {
             Cond::Str(s) => Some(Value::Str(s.clone())),
             Cond::Filesize => Some(Value::Int(ctx.data.len() as i64)),
 
-            Cond::Pattern(id, anchor) => {
-                let ms = &ctx.matches[*id];
-                let ok = match anchor {
-                    None => !ms.is_empty(),
-                    Some(Anchor::At(e)) => {
-                        let n = eval_int(e, ctx)?;
-                        n >= 0 && ms.iter().any(|m| m.offset as i64 == n)
-                    }
-                    Some(Anchor::In(lo, hi)) => {
-                        let lo = eval_int(lo, ctx)?;
-                        let hi = eval_int(hi, ctx)?;
-                        ms.iter().any(|m| {
-                            let o = m.offset as i64;
-                            o >= lo && o <= hi
-                        })
-                    }
-                };
-                Some(Value::Bool(ok))
-            }
+            Cond::Pattern(id, anchor) => Some(Value::Bool(pattern_present(*id, anchor, ctx)?)),
 
-            Cond::Count(id, range) => {
-                let ms = &ctx.matches[*id];
-                let c = match range {
-                    None => ms.len() as i64,
-                    Some((lo, hi)) => {
-                        let lo = eval_int(lo, ctx)?;
-                        let hi = eval_int(hi, ctx)?;
-                        ms.iter()
-                            .filter(|m| {
-                                let o = m.offset as i64;
-                                o >= lo && o <= hi
-                            })
-                            .count() as i64
-                    }
-                };
-                Some(Value::Int(c))
-            }
+            Cond::Count(id, range) => count_in_range(*id, range, ctx).map(Value::Int),
 
             Cond::Offset(id, idx) => {
                 let i = index_value(idx, ctx)?;
@@ -618,7 +585,14 @@ impl Cond {
     }
 }
 
-/// Counts a pattern's matches, optionally restricted to an offset range.
+/// How many of `ms`, sorted by offset, start before `bound`.
+fn starting_before(ms: &[Match], bound: i64) -> usize {
+    ms.partition_point(|m| (m.offset as i64) < bound)
+}
+
+/// Counts a pattern's matches, optionally restricted to an offset range. The
+/// matches are sorted by offset, so a range costs a search, not a pass over
+/// them: a loop over a pattern's matches asks for it once per iteration.
 fn count_in_range(id: usize, range: &Option<(Box<Cond>, Box<Cond>)>, ctx: &EvalCtx) -> Option<i64> {
     let ms = &ctx.matches[id];
     Some(match range {
@@ -626,12 +600,12 @@ fn count_in_range(id: usize, range: &Option<(Box<Cond>, Box<Cond>)>, ctx: &EvalC
         Some((lo, hi)) => {
             let lo = eval_int(lo, ctx)?;
             let hi = eval_int(hi, ctx)?;
-            ms.iter()
-                .filter(|m| {
-                    let o = m.offset as i64;
-                    o >= lo && o <= hi
-                })
-                .count() as i64
+            if hi < lo {
+                0
+            } else {
+                let upto = ms.partition_point(|m| (m.offset as i64) <= hi);
+                upto.saturating_sub(starting_before(ms, lo)) as i64
+            }
         }
     })
 }
@@ -902,17 +876,19 @@ fn pattern_present(id: usize, anchor: &Option<Anchor>, ctx: &EvalCtx) -> Option<
     let ms = &ctx.matches[id];
     Some(match anchor {
         None => !ms.is_empty(),
+        // The matches are sorted by offset: see `count_in_range`.
         Some(Anchor::At(e)) => {
             let n = eval_int(e, ctx)?;
-            n >= 0 && ms.iter().any(|m| m.offset as i64 == n)
+            n >= 0
+                && ms
+                    .get(starting_before(ms, n))
+                    .is_some_and(|m| m.offset as i64 == n)
         }
         Some(Anchor::In(lo, hi)) => {
             let lo = eval_int(lo, ctx)?;
             let hi = eval_int(hi, ctx)?;
-            ms.iter().any(|m| {
-                let o = m.offset as i64;
-                o >= lo && o <= hi
-            })
+            ms.get(starting_before(ms, lo))
+                .is_some_and(|m| m.offset as i64 <= hi)
         }
     })
 }

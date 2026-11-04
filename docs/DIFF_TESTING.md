@@ -307,8 +307,8 @@ extractors deliberately disabled.
 ### The EXAV_ONLY hits: zero false positives
 
 Every one was checked, and the method matters because the naive reading is
-wrong. Handing clamd **exav's own extracted members** (see
-`exav-unpack/examples/dump_members.rs`) makes clamd flag them under the *same
+wrong. Handing clamd **exav's own extracted members** (written by
+`exav-unpack -r FILE -d OUTDIR`) makes clamd flag them under the *same
 signature name* while still calling the container clean. That is the oracle
 settling it: exav was not matching wrongly, it was reaching content clamd never
 unpacked: `word/*.rtf` inside a docx, `/cab1.cab/MainExecutable` inside an MSI,

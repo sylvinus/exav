@@ -5,10 +5,11 @@ description: "The files of the @exav/viewer demo: what each is, who made it, whe
 
 <!-- Written by crates/exav-viewer/demo/examples/generate/make-attributions.mjs from examples.json. Do not edit. -->
 
-The [demo](/viewer/demo/) lists 235 example files, one or more for each format the viewer reads. Each is public domain, CC0,
+The [demo](/viewer/demo/) lists 233 example files, one or more for each format the viewer reads. Each is public domain, CC0,
 CC-BY, or an MIT, BSD or Apache test file, and its licence was read at the source page named below.
 Most are made for the demo by scripts of the repository and given to the public domain (CC0-1.0); the others
-are credited here and in the demo's licence notice. A file is downloaded only when it is opened.
+are credited here and in the demo's licence notice. A file from a Zenodo or figshare record takes the licence that
+the record states for all of its files. A file is downloaded only when it is opened.
 
 The facts are in [`examples.json`](https://github.com/sylvinus/exav/blob/main/crates/exav-viewer/demo/examples/examples.json)
 and [`NOTICE.md`](https://github.com/sylvinus/exav/blob/main/crates/exav-viewer/demo/examples/NOTICE.md): the page
@@ -218,8 +219,6 @@ that states each licence, the words read there, the SHA-256 of the file, and how
 | `building-survey-plans-r2000.dwg` | dwg | 2.0 MB | Giovanni De Gasperis, Sante Dino Facchini, Asif Saeed | [zenodo.org](https://zenodo.org/records/15076037) | [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) |
 | `golden-tile-palace-r2004.dwg` | dwg | 746 KB | Jing Zhang, Yunying Ren, Xiaofan An | [figshare.com](https://figshare.com/articles/dataset/Figure_of_surveying_and_mapping_of_Golden_Tile_Palace_/21374221) | [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) |
 | `residential-site-plan-r2007.dwg` | dwg | 926 KB | Yijun Fan | [figshare.com](https://figshare.com/articles/dataset/Drainage_System_Layout_of_Old_Urban_Residential_Communities_In_Beijing/28188725) | [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) |
-| `hospital-floor-plan-r2013.dwg` | dwg | 1.2 MB | Toka Ehab | [zenodo.org](https://zenodo.org/records/10520508) | [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) |
-| `commercial-building-hvac-plans-r2018.dwg` | dwg | 495 KB | Kevin Anthony do Bem | [zenodo.org](https://zenodo.org/records/10407941) | [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) |
 | `ezdxf-dim-linear-tutorial-r2013.dwg` | dwg | 36 KB | Manfred Moitzi (ezdxf) | [github.com](https://github.com/mozman/ezdxf/blob/748e211c9a0b977b9e15845a6bcad8e1b9743e26/docs/graphics/dim_linear_tutorial.dwg) | [MIT](https://spdx.org/licenses/MIT.html) |
 | `hospital-ward-wing-plan-section.dxf` | dxf | 300 KB | Innerscene (original model) | [innerscene.com](https://www.innerscene.com/tools/library/drawings/hospital-ward-wing-1200-square-metres-plan-and-section-73a3f4dd) | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | `grocery-store-plan-section.dxf` | dxf | 128 KB | Innerscene (original model) | [innerscene.com](https://www.innerscene.com/tools/library/drawings/grocery-store-600-square-metres-plan-and-section-2a67d041) | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
@@ -314,8 +313,6 @@ The lines the licences ask to keep:
 - `building-survey-plans-r2000.dwg`: De Gasperis, G., Facchini, S. D., Saeed, A., Building Ledger Dossier: Seismic Prevention and Building Documentation Tracking through a Digital Twin Approach (4_Architectural_Building_Survey.dwg), Zenodo, doi:10.5281/zenodo.15076037, CC BY 4.0. No changes.
 - `golden-tile-palace-r2004.dwg`: Jing Zhang, Yunying Ren, Xiaofan An, Figure of surveying and mapping of Golden Tile Palace, supplementary file S1 of PLOS ONE doi:10.1371/journal.pone.0262155, figshare, CC BY 4.0. No changes.
 - `residential-site-plan-r2007.dwg`: Yijun Fan, Drainage System Layout of Old Urban Residential Communities In Beijing (Site Plan.dwg), figshare, doi:10.6084/m9.figshare.28188725.v1, CC BY 4.0. No changes.
-- `hospital-floor-plan-r2013.dwg`: Toka Ehab, Nanotechnology Applications in Interior Design of hospitals to enhance thermal comfort and decrease the infection spread for the occupants (Elite hospital plan.dwg), Zenodo, doi:10.5281/zenodo.10520508, CC BY 4.0. No changes.
-- `commercial-building-hvac-plans-r2018.dwg`: Kevin Anthony do Bem, Projeto de Climatização de um Edifício de Comércio e Serviços (F04 Plantas- Rede aerolica.dwg), Zenodo, doi:10.5281/zenodo.10407941, CC BY 4.0. No changes.
 - `ezdxf-dim-linear-tutorial-r2013.dwg`: Copyright (c) 2020 Manfred Moitzi, ezdxf, MIT License. No changes.
 - `ezdxf-uncommon-entities.dxf`: Copyright (c) 2020 Manfred Moitzi, ezdxf, MIT License. No changes.
 - `ezdxf-hatches-1.dxf`: Copyright (c) 2020 Manfred Moitzi, ezdxf, MIT License. No changes.

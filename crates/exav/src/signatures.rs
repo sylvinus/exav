@@ -25,13 +25,13 @@ use std::time::Duration;
 use crate::Cli;
 
 /// The shortest interval honoured, however short a one is asked for. A
-/// zero-second sleep is not a fast poll — it is a loop with no delay at all,
+/// zero-second sleep is not a fast poll: it is a loop with no delay at all,
 /// aimed at someone else's servers. A minute between checks is already far more
 /// often than any signature feed changes.
 const MIN_UPDATE_INTERVAL_SECS: u64 = 60;
 
 /// Seconds between update checks unless `--update-interval-secs` says otherwise
-/// — once a day, which is how often the signature feeds actually move.
+/// (once a day, which is how often the signature feeds actually move).
 const DEFAULT_UPDATE_INTERVAL_SECS: u64 = 24 * 3600;
 
 /// Seconds `--auto-update` waits for a sidecar to populate an empty signature
@@ -53,7 +53,7 @@ const DEFAULT_DB_URL_POLL_SECS: u64 = 300;
 /// Expand one `--sig-sources` value into the source URLs it names.
 ///
 /// Three shapes, told apart by the value itself rather than by which flag it
-/// arrived on. No privileged "official" source — every URL is fetched the same
+/// arrived on. No privileged "official" source: every URL is fetched the same
 /// way:
 ///
 ///   `https://host/main.cvd`  an exact source, fetched verbatim
@@ -62,7 +62,7 @@ const DEFAULT_DB_URL_POLL_SECS: u64 = 300;
 ///
 /// The trailing slash is what separates a mirror from a file, and it is the
 /// convention every other tool uses for "a directory, not a document". A value
-/// that is not an `http(s)` URL is a path — the same rule `--listen` uses to
+/// that is not an `http(s)` URL is a path, the same rule `--listen` uses to
 /// tell a socket path from a `host:port`.
 fn expand_source(value: &str, out: &mut Vec<String>) {
     let v = value.trim();
@@ -86,7 +86,7 @@ fn is_url(s: &str) -> bool {
 }
 
 /// Expand a mirror base (a bare host or a full URL) into the three ClamAV CVD
-/// source URLs. A bare host gets an `https://` scheme, matching freshclam — a
+/// source URLs. A bare host gets an `https://` scheme, matching freshclam: a
 /// `freshclam.conf` `DatabaseMirror` line is written that way.
 fn push_mirror_cvds(base: &str, out: &mut Vec<String>) {
     let base = base.trim().trim_end_matches('/');
@@ -110,9 +110,9 @@ fn push_mirror_cvds(base: &str, out: &mut Vec<String>) {
 ///   `DatabaseMirror <host|url>` / `PrivateMirror <host|url>`  -> `<base>/{main,daily,bytecode}.cvd`
 ///   `DatabaseCustomURL <url>`                                 -> one source, verbatim (http/https)
 /// A bare `http(s)` line (no directive) is a source. Every OTHER line is **warned
-/// about and ignored** — including `DatabaseDirectory` (set the dir with
+/// about and ignored**, including `DatabaseDirectory` (set the dir with
 /// `--sig-dir`/`EXAV_SIG_DIR`, it is not a source) and non-source directives like
-/// `Foreground` — so pointing at a real `freshclam.conf` reports exactly what was
+/// `Foreground`, so pointing at a real `freshclam.conf` reports exactly what was
 /// and wasn't used.
 fn parse_sources_file(path: &Path) -> std::io::Result<Vec<String>> {
     let text = std::fs::read_to_string(path)?;
@@ -161,7 +161,7 @@ fn parse_sources_file(path: &Path) -> std::io::Result<Vec<String>> {
 }
 
 /// Every configured signature source, merged and de-duplicated: each
-/// `--sig-sources` value expanded by its shape — an exact URL, a mirror base, or
+/// `--sig-sources` value expanded by its shape: an exact URL, a mirror base, or
 /// a file of either. A read failure on a file is reported and the rest still run.
 fn sources(cli: &Cli) -> Vec<String> {
     let mut urls = Vec::new();
@@ -252,7 +252,7 @@ fn update_signatures(
 /// credential in `--db-url` never lands in the daemon's output.
 ///
 /// Two places carry one. `user:pass@` is the obvious one. The query string is
-/// the one that gets missed, and it is where the common forms live — a
+/// the one that gets missed, and it is where the common forms live: a
 /// presigned S3 or Azure SAS URL is a bearer token in `?…`, and anyone holding
 /// the logged line holds the database. So the query and fragment are dropped
 /// rather than masked in place: what is left still names the source, which is
@@ -295,30 +295,48 @@ impl Reload {
     }
 }
 
-/// The `--auto-update` lifecycle for this run: the sources it fetches, the
-/// signature path it maintains, and the schedule it keeps.
+/// The `--auto-update` lifecycle for this run: what it fetches, where, and the
+/// schedule it keeps.
 ///
 /// Built by [`start`], which does the up-front half (create the directory, fetch
-/// or wait) before the database is loaded. The periodic half starts with
-/// [`AutoUpdate::poll_in_background`], after the load, so the first tick is a
-/// cheap conditional re-check rather than a re-download.
+/// or wait) before the database is loaded. The periodic half is
+/// [`AutoUpdate::poll`], on a thread of its own ([`AutoUpdate::poll_in_background`])
+/// or in a child of the pool's supervisor, and starts with a cheap conditional
+/// re-check rather than a re-download.
 ///
 /// A build with no updater in it never constructs one: it has nothing to fetch
 /// with, so `start` does the directory and waiting half and stops there.
 #[cfg_attr(not(feature = "http-update"), allow(dead_code))]
+#[derive(Clone)]
 pub(crate) struct AutoUpdate {
-    /// Signature sources to fetch, already merged and de-duplicated.
-    sources: Vec<String>,
-    /// The directory the sources are fetched into. `None` in prebuilt-database
-    /// mode, where [`start`] already owns the polling.
-    dir: Option<PathBuf>,
-    /// Time between source re-checks; `None` when they are off.
+    /// What is fetched, and what the fetches so far learned of it.
+    #[cfg(feature = "http-update")]
+    fetch: Fetch,
+    /// Time between re-checks; `None` when they are off.
     interval: Option<Duration>,
     /// How an installed update reaches the running server.
     reload: Reload,
-    /// Per-source HTTP validators learned by the initial fetch.
-    #[cfg(feature = "http-update")]
-    validators: std::collections::HashMap<String, Option<String>>,
+}
+
+/// What an [`AutoUpdate`] re-checks.
+#[cfg(feature = "http-update")]
+#[derive(Clone)]
+enum Fetch {
+    /// Signature sources, already merged and de-duplicated, fetched into
+    /// `dir`, with the HTTP validator each last gave.
+    Sources {
+        sources: Vec<String>,
+        dir: PathBuf,
+        validators: std::collections::HashMap<String, Option<String>>,
+    },
+    /// A prebuilt database (`--db-url`), fetched to `dest`, with the validator
+    /// it last gave. `shown` is the address as a log line may show it.
+    Database {
+        url: String,
+        shown: String,
+        dest: PathBuf,
+        validator: Option<String>,
+    },
 }
 
 /// How often the sources are re-checked, from `--update-interval-secs`;
@@ -373,9 +391,8 @@ fn signature_path(cli: &Cli) -> PathBuf {
 
 /// Get signatures in place before the database is loaded.
 ///
-/// Returns the lifecycle to hand to [`AutoUpdate::poll_in_background`] once the
-/// load has succeeded, or `None` when there is nothing periodic left to do (the
-/// prebuilt-database poller starts here and owns itself).
+/// Returns the lifecycle whose [`AutoUpdate::poll`] keeps them current, or
+/// `None` when nothing is fetched.
 ///
 /// `cli.database` is set when a prebuilt database is pulled, so that the load,
 /// the reload and the mtime watch all read one source of truth.
@@ -385,7 +402,7 @@ pub(crate) fn start(cli: &mut Cli, reload: Reload) -> Result<Option<AutoUpdate>,
     // Prebuilt-database-over-HTTP (build once, serve many): one `.exavdb`
     // replaces the signature files entirely, so it is resolved first.
     if let Some(url) = cli.db_url.clone() {
-        return start_prebuilt_db(cli, &url, &sources, reload).map(|()| None);
+        return start_prebuilt_db(cli, &url, &sources, reload).map(Some);
     }
 
     let dir = signature_path(cli);
@@ -411,9 +428,9 @@ pub(crate) fn start(cli: &mut Cli, reload: Reload) -> Result<Option<AutoUpdate>,
     );
 
     // A source is saved under the filename its URL ends in, and the loader routes
-    // a database file by extension alone. A URL ending in anything else — a CGI
+    // a database file by extension alone. A URL ending in anything else (a CGI
     // endpoint like `feed.php?db=daily`, a redirect landing on `download`, a
-    // `.txt` mirror — is fetched successfully and then skipped in silence, which
+    // `.txt` mirror) is fetched successfully and then skipped in silence, which
     // costs an operator a working command line and a database that is never
     // there. Nothing later in the run says so: "updated signature X" is printed
     // by the fetch, and the loader does not report what it passed over.
@@ -446,21 +463,24 @@ pub(crate) fn start(cli: &mut Cli, reload: Reload) -> Result<Option<AutoUpdate>,
         eprintln!("exav: fetching {} signature source(s) ...", sources.len());
         update_signatures(&sources, &dir, &mut validators);
         Ok(Some(AutoUpdate {
-            sources,
-            dir: Some(dir),
+            fetch: Fetch::Sources {
+                sources,
+                dir,
+                validators,
+            },
             interval,
             reload,
-            validators,
         }))
     }
 }
 
-/// Pull a prebuilt `.exavdb` from `--db-url` and keep it current.
+/// Pull a prebuilt `.exavdb` from `--db-url`, and the lifecycle that keeps it
+/// current.
 ///
 /// The destination is `-d` when given, else `<--sig-dir>/remote.exavdb`;
 /// whichever it is becomes the database this run loads. The initial fetch is
-/// synchronous so the first load sees a file, and a background poll re-checks it
-/// every `--update-interval-secs` — cheap when nothing changed, since a `HEAD`
+/// synchronous so the first load sees a file, and the poll re-checks it every
+/// `--update-interval-secs`, cheap when nothing changed, since a `HEAD`
 /// compares the `ETag` / `Last-Modified` and skips the download. That cheapness
 /// is why its default cadence is minutes where a full source fetch's is a day.
 #[cfg(feature = "http-update")]
@@ -469,7 +489,7 @@ fn start_prebuilt_db(
     url: &str,
     sources: &[String],
     reload: Reload,
-) -> Result<(), String> {
+) -> Result<AutoUpdate, String> {
     if !sources.is_empty() {
         eprintln!(
             "exav: --db-url is set, ignoring --sig-sources \
@@ -499,7 +519,7 @@ fn start_prebuilt_db(
 
     // Synchronous initial fetch so the first load sees a file.
     eprintln!("exav: fetching database from {shown} -> {}", dest.display());
-    let mut validator = match exav_update::fetch_db_if_changed(url, &dest, None) {
+    let validator = match exav_update::fetch_db_if_changed(url, &dest, None) {
         Ok(f) => {
             if f.is_updated() {
                 eprintln!("exav: database installed from {shown}");
@@ -513,30 +533,17 @@ fn start_prebuilt_db(
     };
 
     eprintln!("exav: database from {shown} fetched {}", describe(poll));
-    let Some(poll) = poll else {
-        cli.database = Some(dest);
-        return Ok(());
-    };
-    let url = url.to_string();
-    let watched = dest.clone();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(poll);
-            match exav_update::fetch_db_if_changed(&url, &watched, validator.as_deref()) {
-                Ok(f) => {
-                    validator = f.validator().map(String::from);
-                    if f.is_updated() {
-                        eprintln!("exav: database updated from {shown}, reloading");
-                        reload.request();
-                    }
-                }
-                Err(e) => eprintln!("exav: database poll failed: {e}"),
-            }
-        }
-    });
-
-    cli.database = Some(dest);
-    Ok(())
+    cli.database = Some(dest.clone());
+    Ok(AutoUpdate {
+        fetch: Fetch::Database {
+            url: url.to_string(),
+            shown,
+            dest,
+            validator,
+        },
+        interval: poll,
+        reload,
+    })
 }
 
 #[cfg(not(feature = "http-update"))]
@@ -545,71 +552,104 @@ fn start_prebuilt_db(
     _url: &str,
     _sources: &[String],
     _reload: Reload,
-) -> Result<(), String> {
+) -> Result<AutoUpdate, String> {
     Err("--db-url needs the updater: build with `--features http-update`".to_string())
 }
 
 impl AutoUpdate {
-    /// Re-fetch the sources on the schedule and reload whenever any changed.
-    /// Consumes the validators the initial fetch learned, so the first tick is a
-    /// conditional check rather than a second download.
-    pub(crate) fn poll_in_background(self) {
+    /// Whether there is a periodic re-check at all (`--update-interval-secs`
+    /// is not `off`).
+    pub(crate) fn polls(&self) -> bool {
+        self.interval.is_some()
+    }
+
+    /// Re-check on the schedule, forever, and call `updated` after each check
+    /// that installed something. The validators the fetches learned go with
+    /// it, so a check is a conditional request rather than a download. Returns
+    /// at once when the checks are off.
+    pub(crate) fn poll(self, updated: &dyn Fn()) {
         #[cfg(feature = "http-update")]
         {
             let AutoUpdate {
-                sources,
-                dir,
+                mut fetch,
                 interval,
-                reload,
-                mut validators,
+                reload: _,
             } = self;
-            let (Some(dir), Some(interval)) = (dir, interval) else {
+            let Some(interval) = interval else {
                 return;
             };
-            std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(interval);
-                    if update_signatures(&sources, &dir, &mut validators) {
-                        reload.request();
-                    }
+            loop {
+                std::thread::sleep(interval);
+                if fetch.check() {
+                    updated();
                 }
-            });
+            }
         }
         #[cfg(not(feature = "http-update"))]
         {
-            let _ = self;
+            let _ = (self, updated);
         }
+    }
+
+    /// [`AutoUpdate::poll`] on a thread of its own, asking for a reload as
+    /// `reload` says.
+    pub(crate) fn poll_in_background(self) {
+        if !self.polls() {
+            return;
+        }
+        let reload = self.reload;
+        std::thread::spawn(move || self.poll(&|| reload.request()));
     }
 
     /// Refresh forever and never serve: the updater half of a two-container
     /// deployment, where another process serves the directory this one writes.
     pub(crate) fn refresh_forever(self) -> ! {
+        let interval = self
+            .interval
+            .expect("`updater_only_error` refuses an updater that never polls");
         #[cfg(feature = "http-update")]
-        {
-            let AutoUpdate {
-                sources,
-                dir,
-                interval,
-                reload: _,
-                mut validators,
-            } = self;
-            let dir = dir.expect("a prebuilt database poller is never an updater-only run");
-            let interval =
-                interval.expect("`updater_only_error` refuses an updater that never polls");
+        if let Fetch::Sources { dir, .. } = &self.fetch {
             eprintln!(
                 "exav: updater-only: refreshing {} every {}s",
                 dir.display(),
                 interval.as_secs()
             );
-            loop {
-                std::thread::sleep(interval);
-                update_signatures(&sources, &dir, &mut validators);
-            }
         }
         #[cfg(not(feature = "http-update"))]
-        {
-            let _ = self;
-            unreachable!("without the updater there is nothing to refresh")
+        let _ = interval;
+        self.poll(&|| ());
+        unreachable!("a poll with an interval does not return")
+    }
+}
+
+#[cfg(feature = "http-update")]
+impl Fetch {
+    /// One re-check: whether it installed anything.
+    fn check(&mut self) -> bool {
+        match self {
+            Fetch::Sources {
+                sources,
+                dir,
+                validators,
+            } => update_signatures(sources, dir, validators),
+            Fetch::Database {
+                url,
+                shown,
+                dest,
+                validator,
+            } => match exav_update::fetch_db_if_changed(url, dest, validator.as_deref()) {
+                Ok(f) => {
+                    *validator = f.validator().map(String::from);
+                    if f.is_updated() {
+                        eprintln!("exav: database updated from {shown}, reloading");
+                    }
+                    f.is_updated()
+                }
+                Err(e) => {
+                    eprintln!("exav: database poll failed: {e}");
+                    false
+                }
+            },
         }
     }
 }
@@ -667,7 +707,7 @@ mod tests {
 
     /// The sources file collects bare URLs + freshclam *source* directives, and
     /// **ignores** (with a warning) `DatabaseDirectory` and non-source lines like
-    /// `Foreground` — so it doubles as a plain URL list AND a freshclam.conf.
+    /// `Foreground`, so it doubles as a plain URL list AND a freshclam.conf.
     #[test]
     fn parses_sources_file_urls_and_directives_warning_on_rest() {
         let dir = std::env::temp_dir().join(format!("exav-srcfile-{}", std::process::id()));
@@ -703,7 +743,7 @@ mod tests {
     /// One flag takes all three shapes of source, told apart by the value.
     ///
     /// The alternative was a flag (or a variable) per shape, which asks an
-    /// operator to classify their own URL before they can pass it — and gets
+    /// operator to classify their own URL before they can pass it, and gets
     /// them a silently-inert setting when they pick the wrong one.
     #[test]
     fn a_source_is_read_by_its_shape() {
@@ -712,7 +752,7 @@ mod tests {
         expand_source("https://host/main.cvd", &mut out);
         assert_eq!(out, ["https://host/main.cvd"]);
 
-        // A trailing slash makes it a mirror base — the convention every other
+        // A trailing slash makes it a mirror base: the convention every other
         // tool uses for "a directory, not a document".
         out.clear();
         expand_source("https://host/db/", &mut out);
@@ -737,7 +777,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
 
         // And they merge, because a deployment can have a mirror and a feed.
-        let _env = crate::env_guard();
         let cli = Cli::parse_from([
             "exav",
             "--sig-sources",
@@ -757,10 +796,9 @@ mod tests {
     }
 
     /// The interval comes from the outside, and a short enough one is a loop
-    /// with no delay pointed at whoever hosts the mirror — so it is floored.
+    /// with no delay pointed at whoever hosts the mirror, so it is floored.
     #[test]
     fn the_update_interval_is_floored_however_short_a_one_is_asked_for() {
-        let _env = crate::env_guard();
         let cli =
             |args: &[&str]| Cli::parse_from(std::iter::once("exav").chain(args.iter().copied()));
 
@@ -786,7 +824,6 @@ mod tests {
     #[cfg(feature = "http-update")]
     #[test]
     fn the_database_poll_interval_is_floored_too() {
-        let _env = crate::env_guard();
         let cli =
             |args: &[&str]| Cli::parse_from(std::iter::once("exav").chain(args.iter().copied()));
 
@@ -811,7 +848,6 @@ mod tests {
     /// scan or daemon never stalls on an empty directory.
     #[test]
     fn only_an_asked_for_wait_happens() {
-        let _env = crate::env_guard();
         let cli =
             |args: &[&str]| Cli::parse_from(std::iter::once("exav").chain(args.iter().copied()));
 

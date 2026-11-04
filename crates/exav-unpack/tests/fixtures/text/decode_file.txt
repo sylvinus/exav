@@ -1,0 +1,24 @@
+# Files read as text, by `exav_unpack::text::decode_file` (encoding_rs) and, in the
+# viewer, by a browser's TextDecoder from `file_reading`. One case per line:
+# name;partial;encoding label;input (hex);text (UTF-8, hex)
+utf8;0;utf-8;6e61c3af766520636166c3a920e29c93;6e61c3af766520636166c3a920e29c93
+utf8-bom;0;utf-8;efbbbf68656c6c6f;68656c6c6f
+utf8-two-boms;0;utf-8;efbbbfefbbbf61;efbbbf61
+utf8-cut;1;utf-8;6162c3;6162
+utf8-empty;0;utf-8;;
+utf16le;0;utf-16le;fffe5a0061007c01f3004201070120003dd800de20006f006b00;5a61c5bcc3b3c582c48720f09f9880206f6b
+utf16le-lone-surrogate;0;utf-16le;fffe610000d86200;61efbfbd62
+utf16le-odd-byte;0;utf-16le;fffe610041;61efbfbd
+utf16le-cut-pair;1;utf-16le;fffe61003dd8;61
+utf16le-cut-pair-whole;0;utf-16le;fffe61003dd8;61efbfbd
+utf16le-second-bom;0;utf-16le;fffefffe6100;efbbbf61
+utf16be;0;utf-16be;feff005a0061017c00f3014201070020d83dde000020006f006b;5a61c5bcc3b3c582c48720f09f9880206f6b
+utf16be-lone-surrogate;0;utf-16be;feff0061d8000062;61efbfbd62
+utf16be-odd-byte;0;utf-16be;feff006141;61efbfbd
+utf16be-cut-pair;1;utf-16be;feff0061d83d;61
+utf16be-cut-pair-whole;0;utf-16be;feff0061d83d;61efbfbd
+utf16be-second-bom;0;utf-16be;fefffeff0061;efbbbf61
+windows-1252-upper-half;0;windows-1252;78808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff;78e282acc281e2809ac692e2809ee280a6e280a0e280a1cb86e280b0c5a0e280b9c592c28dc5bdc28fc290e28098e28099e2809ce2809de280a2e28093e28094cb9ce284a2c5a1e280bac593c29dc5bec5b8c2a0c2a1c2a2c2a3c2a4c2a5c2a6c2a7c2a8c2a9c2aac2abc2acc2adc2aec2afc2b0c2b1c2b2c2b3c2b4c2b5c2b6c2b7c2b8c2b9c2bac2bbc2bcc2bdc2bec2bfc380c381c382c383c384c385c386c387c388c389c38ac38bc38cc38dc38ec38fc390c391c392c393c394c395c396c397c398c399c39ac39bc39cc39dc39ec39fc3a0c3a1c3a2c3a3c3a4c3a5c3a6c3a7c3a8c3a9c3aac3abc3acc3adc3aec3afc3b0c3b1c3b2c3b3c3b4c3b5c3b6c3b7c3b8c3b9c3bac3bbc3bcc3bdc3bec3bf
+windows-1252-after-bom;0;windows-1252;efbbbf636166e9;636166c3a9
+windows-1252-not-cut;0;windows-1252;61c3;61c383
+windows-1252-invalid-before-the-end;1;windows-1252;61e962;61c3a962

@@ -194,7 +194,7 @@ fn an_executable_too_large_to_hold_is_judged_the_same() {
         opts.alert_broken = true;
         opts.clamav_compat = true;
         let held = analyze(&db, &blob, &opts).verdict;
-        opts.deep_analysis_max = 4096;
+        opts.limits.max_buffer_bytes = 4096;
         let len = blob.len() as u64;
         let streamed = exav_core::scan_seekable(&db, std::io::Cursor::new(&blob), len, &opts)
             .unwrap()

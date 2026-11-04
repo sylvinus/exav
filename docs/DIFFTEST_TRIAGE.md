@@ -39,11 +39,11 @@ scanned once per copy (all fixed, see "Code changes").
 
 ## How a difference was settled
 
-* **Oracle (the main tool).** `cargo run -p exav-unpack --example dump_members
-  --all-features -- FILE OUTDIR` writes every member exav extracts. Scanning that
-  directory with `clamscan -r --allmatch` shows whether ClamAV flags the same
-  bytes under the same name. If it does, exav reached content ClamAV never
-  unpacked.
+* **Oracle (the main tool).** `exav-unpack -r FILE -d OUTDIR` writes every
+  member exav extracts, those of the archives inside archives in directories
+  named for them. Scanning that directory with `clamscan -r --allmatch` shows
+  whether ClamAV flags the same bytes under the same name. If it does, exav
+  reached content ClamAV never unpacked.
 * **Mutation bisect.** Zero out a slice of the file and rescan with exav. The
   slice whose removal kills the detection is where the match comes from. Halve
   it until it is a few bytes.

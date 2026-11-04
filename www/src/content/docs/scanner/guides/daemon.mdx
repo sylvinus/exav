@@ -182,7 +182,23 @@ answered `LIMITS-EXCEEDED`. See
 When the daemon has its answer before the stream ends, it reads and discards up
 to 64 MiB of the rest before replying, so the reply is not lost to a reset
 connection; the [ICAP guide](/scanner/guides/icap/#draining-an-over-limit-body) explains
-why. ICAP bodies are buffered the same way.
+why. Past that it replies and closes the connection, an `IDSESSION` too. ICAP
+bodies are buffered the same way.
+
+These bounds keep a slow client from holding the daemon, in the thread model and
+in the pool. They go on the listener's address; the first two are always on,
+the last two off until the address names them.
+
+| On the address | Default | Bounds |
+|---|---|---|
+| `?idle-secs=` | 120 s clamd, 600 s ICAP | one read from a client (a clamd command, the next command of a session, the next `INSTREAM` chunk; an ICAP connection between requests or inside one) and one write of a reply to a client that is not reading it. The client is disconnected; a client that stopped reading is logged |
+| `?request-secs=` | 600 s | wall clock of one command's arrival, from its first byte to the end of its `INSTREAM` data (or an ICAP request's body); answered `COMMAND READ TIMED OUT` (`408` on ICAP) |
+| `?session-secs=` | off | how long a connection stays open, counted from accept. Once it has passed, no new clamd command (a single command, or the next one of an `IDSESSION`) and no new ICAP request is read, and the connection is closed without a reply or a log line. A command or request whose first byte arrived before is read, run and answered normally |
+| `?reply-secs=` | off | the time the writes of one reply spend waiting for the client, added up: everything written for one clamd command (every line of a `CONTSCAN`), or for one ICAP request. Past it the connection is closed and logged, as for a write past `?idle-secs=`. The daemon's own time between two writes does not count |
+
+`request-secs` takes `off` for no bound; `idle-secs` does not, as a client that
+sends nothing would keep its connection for good. `session-secs` and
+`reply-secs` take neither `off` nor `0`: leave the key out for no limit.
 
 ## Worker pool and per-job limits
 

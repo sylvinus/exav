@@ -20,11 +20,7 @@ pub(crate) fn is_szdd(data: &[u8]) -> bool {
     data.starts_with(SZDD_MAGIC) || data.starts_with(KWAJ_MAGIC)
 }
 
-pub(crate) fn extract_szdd<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_szdd(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     if data.starts_with(KWAJ_MAGIC) {
         extract_kwaj(data, budget, visit)
     } else if data.starts_with(SZDD_MAGIC) {
@@ -36,11 +32,11 @@ pub(crate) fn extract_szdd<R>(
 
 /// Walk an MS-Compress file. SZDD is decoded as it is read; KWAJ is decoded
 /// whole.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     use crate::stream::{MemberMeta, emit_stream, whole};
     let hdr = src.window(0, 14);
     if !hdr.starts_with(SZDD_MAGIC) {
@@ -174,11 +170,7 @@ impl Read for SzddReader<'_> {
     }
 }
 
-fn extract_szdd_inner<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+fn extract_szdd_inner(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     // 14-byte header: magic[8], compression 'A' [8], last-char [9], size u32 LE.
     if data.len() < 14 {
         return Err(LimitHit::corrupt("szdd: truncated header".to_string()));
@@ -188,16 +180,18 @@ fn extract_szdd_inner<R>(
 
     budget.count_entry()?;
     let cap = budget.reserve()?;
-    let mut out = Vec::new();
-    // Reading a slice cannot fail.
-    let _ = SzddReader::new(&mut body, declared)
-        .take(cap.saturating_add(1))
-        .read_to_end(&mut out);
-    if out.len() as u64 > cap {
-        return Err(LimitHit::new("szdd member exceeds budget".to_string()));
-    }
-    budget.commit(out.len() as u64);
-    if let Some(r) = visit(Entry::new(szdd_name(data), out), budget) {
+    // The reader stops at the declared size: one over the room is not decoded.
+    let e = if declared > cap {
+        Entry::over_limit(szdd_name(data), declared, "SZDD member exceeds size budget")
+    } else {
+        let mut out = Vec::new();
+        // Reading a slice cannot fail.
+        let _ =
+            crate::source::read_capped(&mut SzddReader::new(&mut body, declared), &mut out, cap);
+        budget.commit(out.len() as u64);
+        Entry::new(szdd_name(data), out)
+    };
+    if let Some(r) = visit(e, budget) {
         return Ok(Some(r));
     }
     Ok(None)
@@ -214,11 +208,7 @@ fn szdd_name(_data: &[u8]) -> String {
 const KWAJ_NONE: u16 = 0;
 const KWAJ_XOR: u16 = 1;
 
-fn extract_kwaj<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+fn extract_kwaj(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     // Fixed 14-byte header: magic[8], comp u16, data_offset u16, flags u16.
     if data.len() < 14 {
         return Err(LimitHit::corrupt("kwaj: truncated header".to_string()));
@@ -272,10 +262,13 @@ fn extract_kwaj<R>(
     budget.count_entry()?;
     let cap = budget.reserve()?;
     match method {
-        KWAJ_NONE => {
-            if body.len() as u64 > cap {
-                return Err(LimitHit::new("kwaj member exceeds budget".to_string()));
+        KWAJ_NONE | KWAJ_XOR if body.len() as u64 > cap => {
+            let e = Entry::over_limit(name, body.len() as u64, "KWAJ member exceeds size budget");
+            if let Some(r) = visit(e, budget) {
+                return Ok(Some(r));
             }
+        }
+        KWAJ_NONE => {
             let out = body.to_vec();
             budget.commit(out.len() as u64);
             if let Some(r) = visit(Entry::new(name, out), budget) {
@@ -283,9 +276,6 @@ fn extract_kwaj<R>(
             }
         }
         KWAJ_XOR => {
-            if body.len() as u64 > cap {
-                return Err(LimitHit::new("kwaj member exceeds budget".to_string()));
-            }
             let out: Vec<u8> = body.iter().map(|b| b ^ 0xFF).collect();
             budget.commit(out.len() as u64);
             if let Some(r) = visit(Entry::new(name, out), budget) {
@@ -300,7 +290,8 @@ fn extract_kwaj<R>(
                 body.len() as u64,
                 false,
                 "KWAJ: unsupported compression method",
-            );
+            )
+            .of_kind(crate::tree::ReasonKind::Unsupported);
             if let Some(r) = visit(e, budget) {
                 return Ok(Some(r));
             }
@@ -322,7 +313,7 @@ fn read_cstr(data: &[u8], p: &mut usize, present: bool) -> String {
         .map(|n| start + n)
         .unwrap_or(data.len());
     *p = (end + 1).min(data.len());
-    // Basename only — never let a stored name carry a path separator.
+    // Basename only: never let a stored name carry a path separator.
     String::from_utf8_lossy(&data[start..end])
         .rsplit(['/', '\\'])
         .next()

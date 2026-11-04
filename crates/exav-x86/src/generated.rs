@@ -1,11 +1,11 @@
 //! The opcode maps, generated from the `iced-x86` decoder (MIT; see
-//! `NOTICE`). Do not edit by hand — regenerate with
+//! `NOTICE`). Do not edit by hand: regenerate with
 //! `scripts/gen-x86-tables.sh`.
 //!
 //! Each cell records the facts a decoder cannot infer: which instruction
 //! an encoding names, how many immediate bytes follow the
 //! ModRM/SIB/displacement, and for VEX whether the encoding rejects a
-//! `vvvv` field other than `1111`. The displacement itself is *not* here —
+//! `vvvv` field other than `1111`. The displacement itself is *not* here:
 //! that is computed by `modrm()`, so a change to addressing rules cannot be
 //! contradicted by a stale table.
 
@@ -3152,7 +3152,7 @@ pub(crate) static OF_HAS_MODRM: [bool; 1536] = [
 ];
 
 /// `[prefix][opcode]` operand shapes for the `0F` map. `0` means the
-/// encoding's operands are not modelled — the decoder reports its
+/// encoding's operands are not modelled: the decoder reports its
 /// identity and length and nothing else, which is what an emulator
 /// needs in order to decline it rather than misread it.
 ///

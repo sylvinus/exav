@@ -4,6 +4,22 @@ use std::io::{self, Read};
 
 use lzma_rust2::{Action, Lzma2Stream, LzmaStream, Status, StreamResult};
 
+/// The raw LZMA stream of a member (ZIP method 14, a 7z LZMA coder) decoded as
+/// it is read, `size` its declared output (`u64::MAX`: to its end marker).
+/// Errors are deferred: a read hands over what it decoded before one, and for
+/// a stream the file ends inside, the symbols of its last bytes too, which the
+/// sans-I/O decoder keeps back (the rest is absent: `UnexpectedEof`).
+pub(crate) fn member_reader<'a>(
+    raw: impl Read + 'a,
+    size: u64,
+    props: u8,
+    dict: u32,
+) -> Option<Box<dyn Read + 'a>> {
+    let mut r = lzma_rust2::LzmaReader::new_with_props(raw, size, props, dict, None).ok()?;
+    r.set_defer_errors(true);
+    Some(Box::new(r))
+}
+
 /// A sans-I/O decoder of `lzma_rust2`: they share one shape.
 pub(crate) trait Process {
     fn process(
@@ -16,6 +32,10 @@ pub(crate) trait Process {
     /// Bytes handed to the caller so far, those of a call that failed
     /// included.
     fn total_out(&self) -> u64;
+
+    /// Bytes of input the stream used, not counting what it took in ahead of
+    /// its end. Only an LZMA stream says; the other counts what it took in.
+    fn used_input(&self) -> u64;
 }
 
 impl Process for LzmaStream {
@@ -30,6 +50,10 @@ impl Process for LzmaStream {
 
     fn total_out(&self) -> u64 {
         LzmaStream::total_out(self)
+    }
+
+    fn used_input(&self) -> u64 {
+        self.total_in() - self.unused_input().len() as u64
     }
 }
 
@@ -46,6 +70,10 @@ impl Process for Lzma2Stream {
     fn total_out(&self) -> u64 {
         Lzma2Stream::total_out(self)
     }
+
+    fn used_input(&self) -> u64 {
+        self.total_in()
+    }
 }
 
 /// Input bytes per decoder call. A call that meets damage loses what it
@@ -61,9 +89,9 @@ const STEP: usize = 1024;
 /// that is not there, are lost. [`SansIo::cut_is_damage`] makes that loss an
 /// `InvalidData` error. Damage is an error once the bytes decoded before it are
 /// handed over, but for those of the last [`STEP`] bytes of input.
-pub(crate) struct SansIo<R, S> {
-    inner: R,
-    stream: S,
+pub(crate) struct SansIo<'a> {
+    inner: Box<dyn Read + 'a>,
+    stream: Box<dyn Process + 'a>,
     input: Box<[u8]>,
     start: usize,
     end: usize,
@@ -78,11 +106,11 @@ pub(crate) struct SansIo<R, S> {
     cut_is_damage: bool,
 }
 
-impl<R: Read, S: Process> SansIo<R, S> {
-    pub(crate) fn new(inner: R, stream: S) -> Self {
+impl<'a> SansIo<'a> {
+    pub(crate) fn new(inner: impl Read + 'a, stream: impl Process + 'a) -> Self {
         SansIo {
-            inner,
-            stream,
+            inner: Box::new(inner),
+            stream: Box::new(stream),
             input: vec![0; 4096].into_boxed_slice(),
             start: 0,
             end: 0,
@@ -105,8 +133,8 @@ impl<R: Read, S: Process> SansIo<R, S> {
 
     /// The decoder, for what it says once its stream has ended.
     #[cfg_attr(not(feature = "lzip"), allow(dead_code))]
-    pub(crate) fn stream(&self) -> &S {
-        &self.stream
+    pub(crate) fn stream(&self) -> &dyn Process {
+        &*self.stream
     }
 }
 
@@ -127,7 +155,7 @@ fn withheld(e: io::Error) -> io::Error {
     }
 }
 
-impl<R: Read, S: Process> Read for SansIo<R, S> {
+impl Read for SansIo<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if let Some(e) = self.failed.take() {
             return Err(e);

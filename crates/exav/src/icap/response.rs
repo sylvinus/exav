@@ -5,9 +5,10 @@ use std::io::{self, Write};
 use exav_core::{ScanReport, Scanner, VerdictCategory};
 
 use super::chunked;
-use super::config::{IcapConfig, InfectionHeader};
+use super::config::IcapConfig;
 use super::wire::Entity;
 use crate::daemon::StreamPayload;
+use crate::endpoint::InfectionHeader;
 
 /// What the ICAP server decided to do with an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +31,7 @@ impl Decision {
     ///
     /// Keyed on [`VerdictCategory`] rather than on the individual verdicts, so
     /// a verdict added to the engine lands in the right column here without
-    /// this file being touched — and lands on the blocking side, which is the
+    /// this file being touched, and lands on the blocking side, which is the
     /// side that fails safe.
     pub(super) fn from_report(report: &ScanReport) -> Self {
         let v = &report.verdict;
@@ -62,9 +63,9 @@ impl Decision {
     /// The ICAP headers this decision adds to a `200` response.
     ///
     /// A detection always carries `X-Infection-Found` under its signature name.
-    /// A partial verdict carries the `X-Exav-*` trio — `Status`, `Category`,
-    /// `Reason` — which is the same three-word vocabulary the CLI prints and the
-    /// JSON emits, and — under [`InfectionHeader::Blocks`] —
+    /// A partial verdict carries the `X-Exav-*` trio (`Status`, `Category`,
+    /// `Reason`), which is the same three-word vocabulary the CLI prints and the
+    /// JSON emits, and, under [`InfectionHeader::Blocks`],
     /// `X-Infection-Found` as well, so that a client reading only the c-icap
     /// vocabulary still learns the object was blocked. The two are never
     /// confusable: a partial block is reported under `Heuristics.Exav.*`, a
@@ -98,7 +99,7 @@ impl Decision {
     ///
     /// The `X-Exav-*` pair and never `X-Infection-Found`, whichever
     /// [`InfectionHeader`] policy is in force. The object is being delivered, so
-    /// reporting an infection would be false on its face — and it would make
+    /// reporting an infection would be false on its face, and it would make
     /// exactly the header-only client the policy exists for treat the pass as a
     /// block, which is the opposite of what the operator asked for.
     fn pass_headers(&self) -> Vec<(&'static str, String)> {
@@ -121,14 +122,14 @@ impl Decision {
 
 /// The `X-Exav-*` trio describing a partial verdict.
 ///
-/// The same three words the CLI line and the JSON use — status, category,
-/// reason — so a client reading headers, a script reading stdout and a consumer
+/// The same three words the CLI line and the JSON use (status, category,
+/// reason), so a client reading headers, a script reading stdout and a consumer
 /// reading JSON all learn the object's fate in one vocabulary.
 ///
 /// `Status` is `PARTIAL` even under `--partial-as error`: ICAP has no exit code,
 /// which is the only thing those two statuses differ in, and reporting `ERROR`
 /// here would tell a proxy the *scanner* failed. Squid answers that by counting
-/// service failures and eventually bypassing the service — so relabelling an
+/// service failures and eventually bypassing the service, so relabelling an
 /// encrypted archive could take the scanner out of rotation and start failing
 /// open, which is the one outcome exav must never cause.
 fn partial_headers(tag: &str, reason: &str) -> Vec<(&'static str, String)> {
@@ -155,7 +156,7 @@ fn infection_found(threat: &str) -> (&'static str, String) {
 /// `Heuristics.Exav.LimitsExceeded`.
 ///
 /// Derived rather than tabulated, so a verdict added to the engine gets a name
-/// here without this file being touched — the same reason
+/// here without this file being touched: the same reason
 /// [`Decision::from_report`] keys on the category rather than the verdict.
 ///
 /// `Heuristics.` is the prefix ClamAV puts on exactly this class of finding (an
@@ -180,7 +181,7 @@ fn heuristic_name(tag: &str) -> String {
 /// Signature names come from the database, but the *reason* on a partial
 /// verdict can quote a container member's name, and that name came out of the
 /// file being scanned. A newline in it would end the header and let the rest be
-/// read as headers of its own — the attacker choosing what a proxy sees. So
+/// read as headers of its own, the attacker choosing what a proxy sees. So
 /// control characters and non-ASCII bytes are replaced rather than escaped, and
 /// the result is truncated.
 fn header_safe(s: &str) -> String {
@@ -221,7 +222,7 @@ fn html_escape(s: &str) -> String {
 ///
 /// ICAP clients cache adaptation results against the `ISTag`, so a tag that
 /// stayed put across a signature reload would keep serving verdicts from the
-/// old database — a newly-published signature would not reach cached objects.
+/// old database: a newly-published signature would not reach cached objects.
 /// The tag folds the database version, its build time and the signature count
 /// into one short opaque value; RFC 3507 caps the whole quoted string at 32
 /// bytes, which rules out spelling those fields out.
@@ -263,7 +264,7 @@ pub(super) struct Response {
     ///
     /// Echoing a message the client wants returned means writing back an object
     /// that may have spilled to disk, and collecting it into `payload` first
-    /// would put the whole thing in memory — undoing on the way out the bound
+    /// would put the whole thing in memory, undoing on the way out the bound
     /// the spill buys on the way in.
     stream: Option<StreamPayload>,
     /// Whether the connection must close after this response.
@@ -338,7 +339,7 @@ pub(super) fn write_continue<W: Write>(w: &mut W) -> io::Result<()> {
     w.flush()
 }
 
-/// `204 No Content` — the object is unchanged, pass it on.
+/// `204 No Content`: the object is unchanged, pass it on.
 pub(super) fn no_content() -> Response {
     Response::new(204, "No Content")
 }
@@ -363,8 +364,8 @@ pub(super) fn options(cfg: &IcapConfig) -> Response {
     if let Some(ttl) = cfg.options_ttl {
         r = r.header("Options-TTL", ttl.to_string());
     }
-    if !cfg.transfer_preview.is_empty() {
-        r = r.header("Transfer-Preview", cfg.transfer_preview.clone());
+    if cfg.transfer_preview {
+        r = r.header("Transfer-Preview", "*");
     }
     r
 }
@@ -372,7 +373,7 @@ pub(super) fn options(cfg: &IcapConfig) -> Response {
 /// A `200` that hands the original message back unmodified.
 ///
 /// This is what a clean object gets from a client that did not offer
-/// `Allow: 204`. The encapsulated headers go back byte for byte — rewriting
+/// `Allow: 204`. The encapsulated headers go back byte for byte: rewriting
 /// them would change a message exav has no opinion about.
 pub(super) fn echo(hdr_entity: Entity, hdr: &[u8], body: Option<StreamPayload>) -> Response {
     let mut r = Response::new(200, "OK");
@@ -394,8 +395,8 @@ pub(super) fn echo(hdr_entity: Entity, hdr: &[u8], body: Option<StreamPayload>) 
 
 /// A `200` that replaces the message with a block page.
 ///
-/// Blocking a REQMOD is done the same way as blocking a RESPMOD — by returning
-/// an HTTP *response* — which is RFC 3507's "request satisfaction": the client
+/// Blocking a REQMOD is done the same way as blocking a RESPMOD (by returning
+/// an HTTP *response*), which is RFC 3507's "request satisfaction": the client
 /// serves this instead of forwarding the request upstream.
 pub(super) fn block(decision: &Decision, policy: InfectionHeader) -> Response {
     let page = block_page(decision);
@@ -528,8 +529,8 @@ mod tests {
     #[test]
     fn a_not_scanned_verdict_is_legible_to_a_header_only_client() {
         // The default. A client that decides clean-or-not from
-        // `X-Infection-Found` alone — a scan wrapper shelling out to an ICAP
-        // client, a mail gateway — would otherwise read the block as a pass.
+        // `X-Infection-Found` alone (a scan wrapper shelling out to an ICAP
+        // client, a mail gateway) would otherwise read the block as a pass.
         for (reason, tag) in NOT_SCANNED {
             let d = Decision::from_report(&not_scanned(reason, tag));
             assert!(d.blocks());
@@ -544,7 +545,7 @@ mod tests {
                 ],
                 "{tag}"
             );
-            // `PARTIAL` whatever the category, because ICAP has no exit code —
+            // `PARTIAL` whatever the category, because ICAP has no exit code,
             // the one thing `--partial-as error` changes.
             assert_eq!(headers[1].1, "PARTIAL");
             assert_eq!(headers[2].1, tag);
@@ -640,7 +641,7 @@ mod tests {
             "member\r\nX-Injected: yes\r\n\r\nevil".to_string(),
         );
         let headers = d.headers(InfectionHeader::Detections);
-        // Status, Category, Reason — the reason is the one carrying attacker
+        // Status, Category, Reason: the reason is the one carrying attacker
         // bytes, since it can quote a container member's name.
         assert_eq!(headers[2].1, "member__X-Injected: yes____evil");
         assert!(!headers[2].1.contains('\r') && !headers[2].1.contains('\n'));

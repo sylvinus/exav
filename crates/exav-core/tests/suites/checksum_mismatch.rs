@@ -8,7 +8,11 @@
 //! checksum is changed here: exav-unpack's `tests/fixtures/checksum/`
 //! (`make.py` there: bzip2, lzip, wimlib, arc) and the RAR and ZOO fixtures
 //! written by RAR and zoo. EICAR is compressed in every one, so it is found
-//! only in the decoded member, never in the archive's own bytes.
+//! only in the decoded member, never in the archive's own bytes. The 7z
+//! fixtures are 7-Zip 25.01's, `7z a -m0=LZMA2:d=64k -mhc=off -mhe=off -mtc=off
+//! -mta=off -mtm=off` of one file: the EICAR string and a line of text
+//! (`lzma2_eicar.7z`), or a line of text (`lzma2_text.7z`). The header is not
+//! compressed.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
@@ -185,10 +189,30 @@ fn rar5(rel: &str, name: &[u8]) -> Vec<u8> {
     panic!("{rel}: no member {}", String::from_utf8_lossy(name));
 }
 
+/// 7z: the CRC of the one member, in a header that is not compressed, with
+/// the checksums of the header and of the start header brought in line.
+fn sevenz(rel: &str) -> Vec<u8> {
+    let mut d = fixture(rel);
+    let (at, size) = (32 + u64_le(&d, 12), u64_le(&d, 20));
+    // The digests of the substreams: property 0x0A, all defined, the CRC.
+    let digests = d[at..at + size]
+        .windows(2)
+        .rposition(|w| w == [0x0A, 0x01])
+        .unwrap_or_else(|| panic!("{rel}: no digests"));
+    d[at + digests + 2] ^= 1;
+    let header = crc32(&d[at..at + size]);
+    d[28..32].copy_from_slice(&header.to_le_bytes());
+    let start = crc32(&d[12..32]);
+    d[8..12].copy_from_slice(&start.to_le_bytes());
+    d
+}
+
 /// Every case: the archive with a wrong checksum, and what a default scan
 /// gives.
 fn cases() -> Vec<(&'static str, Vec<u8>, Want)> {
     vec![
+        ("7z EICAR", sevenz("7z/lzma2_eicar.7z"), Found),
+        ("7z clean", sevenz("7z/lzma2_text.7z"), Clean),
         ("bzip2 EICAR", bzip2("checksum/two_blocks.bz2"), Found),
         ("bzip2 clean", bzip2("checksum/clean.bz2"), Clean),
         (
@@ -265,6 +289,8 @@ fn a_member_failing_its_checksum_is_scanned() {
 #[test]
 fn the_fixtures_scan_as_named_with_their_checksums_intact() {
     let intact = [
+        ("7z EICAR", "7z/lzma2_eicar.7z", Found),
+        ("7z clean", "7z/lzma2_text.7z", Clean),
         ("bzip2 EICAR", "checksum/two_blocks.bz2", Found),
         ("bzip2 clean", "checksum/clean.bz2", Clean),
         ("lzip EICAR", "checksum/two_members.lz", Found),

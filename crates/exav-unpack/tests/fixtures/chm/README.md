@@ -2,7 +2,7 @@
 
 ## Committed (benign)
 
-`benign-lzx.chm` — a genuine **LZX-compressed** CHM built from original help-page
+`benign-lzx.chm`: a genuine **LZX-compressed** CHM built from original help-page
 HTML written for this repo and compiled with `chmcmd` (Free Pascal's CHM
 compiler). It carries **no payload**; its only purpose is to exercise the LZX
 decode path (it contains the marker `EXAV-LZX-OK` inside the compressed content
@@ -16,7 +16,7 @@ stream spans three 32 KiB frames and resets every two, so a page past the
 first frame of an interval decodes only with the state that frame left. Public
 domain (CC0).
 
-## Gitignored (real malware — never committed)
+## Gitignored (real malware, never committed)
 
 Real in-the-wild malware `.chm` samples (single-frame LZX). They are
 **gitignored** (`tests/fixtures/**/real-malware-*`) and kept locally as

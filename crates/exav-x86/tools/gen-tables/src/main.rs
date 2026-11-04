@@ -4,15 +4,15 @@
 //!
 //! Run it through `scripts/gen-x86-tables.sh`, which writes the result into
 //! place and formats it. It is its own workspace so that it stays runnable
-//! while `exav-x86` does not compile — the state any change to the cell layout
+//! while `exav-x86` does not compile, the state any change to the cell layout
 //! leaves the crate in until this has run.
 //!
 //! Only a few facts per cell are needed, and each one is a fact a decoder
 //! cannot infer from the bytes:
 //!
 //! * which instruction an encoding names;
-//! * how many immediate bytes follow the ModRM/SIB/displacement — the
-//!   displacement itself is computed by the decoder's own ModRM logic, so it
+//! * how many immediate bytes follow the ModRM/SIB/displacement (the
+//!   displacement itself is computed by the decoder's own ModRM logic), so it
 //!   must not be baked in here;
 //! * for VEX, whether the encoding rejects a `vvvv` field other than `1111`.
 //!
@@ -36,8 +36,8 @@ const GPR32: [Register; 8] = [
 ];
 
 /// The mandatory-prefix combinations a `0F` encoding can carry. `66` together
-/// with `F3` or `F2` is not the same column as either alone — several
-/// encodings that are valid under one are rejected under both — so the pair
+/// with `F3` or `F2` is not the same column as either alone (several
+/// encodings that are valid under one are rejected under both), so the pair
 /// gets its own column rather than being folded into the winner.
 const PFX: [&[u8]; 6] = [&[], &[0x66], &[0xf3], &[0xf2], &[0x66, 0xf3], &[0x66, 0xf2]];
 
@@ -78,9 +78,9 @@ fn probe(head: &[u8]) -> Cell {
 
 /// The same, where the bytes the opcode actually consumes are fewer than the
 /// bytes placed. An opcode that reads no ModRM byte still has to be probed with
-/// one present — otherwise the tail's first byte lands where the ModRM would
+/// one present: otherwise the tail's first byte lands where the ModRM would
 /// be, and `0F 20`, which ignores `mod` but not `reg`, is probed at the wrong
-/// register — but that byte must not be counted as consumed.
+/// register, but that byte must not be counted as consumed.
 fn probe_counting(head: &[u8], consumed: usize) -> Cell {
     let mut b = head.to_vec();
     b.extend_from_slice(&TAIL);
@@ -127,8 +127,8 @@ fn has_modrm(pfx: &[u8], op: u8) -> bool {
 //
 // The two share a shape: a three-byte prefix carrying an opcode-map selector,
 // `W`, an inverted `vvvv`, `L` and a mandatory-prefix field, then the opcode
-// and a ModRM byte. Only the prefix byte and the map numbering differ — `C4`
-// selects maps 1-3 (`0F`, `0F 38`, `0F 3A`), `8F` selects 8-10 — so the probing
+// and a ModRM byte. Only the prefix byte and the map numbering differ (`C4`
+// selects maps 1-3 (`0F`, `0F 38`, `0F 3A`), `8F` selects 8-10), so the probing
 // is written once and run twice.
 
 /// `C4`: the VEX prefix, and the maps it selects.
@@ -188,7 +188,7 @@ struct VexCell {
 ///
 /// Probed with `mod=00 rm=100`, which forces a SIB byte, with `index=001` and
 /// `base=000`. The destination is register 2 and the mask register `vvvv`
-/// reads as 0, so no two of the three registers a gather names collide — a
+/// reads as 0, so no two of the three registers a gather names collide: a
 /// collision is itself invalid, and would hide the VSIB.
 fn vex_vsib(pfx: u8, map: u8, w: u8, l: u8, pp: u8, op: u8) -> bool {
     let mut b = vex_head(pfx, map, w, 0b1111, l, pp, op, 0x14);
@@ -235,12 +235,12 @@ fn probe_vex(
     vsib: bool,
 ) -> Option<VexCell> {
     // A gather or scatter indexes memory with a vector register, which is only
-    // expressible through a SIB byte — `mod=00 rm=001` is not an encoding of
+    // expressible through a SIB byte: `mod=00 rm=001` is not an encoding of
     // one at all, so probing these with the usual memory ModRM decodes nothing
     // and the whole family would be missing from the map.
     //
-    // The three vector registers such an encoding names — destination, index
-    // and mask — must all differ, or it is invalid for a reason that has
+    // The three vector registers such an encoding names (destination, index
+    // and mask) must all differ, or it is invalid for a reason that has
     // nothing to do with the opcode. Fixing the mask at `vvvv = 0` would
     // decline the destination-`xmm0` form for every gather, so the registers
     // are chosen per digit instead.
@@ -268,7 +268,7 @@ fn probe_vex(
     // `1110` is `vvvv = 1`: a legal register for the encodings that take one,
     // and a rejected field for the encodings that do not. For a VSIB encoding
     // `vvvv` is the mask, so the alternative is a second non-colliding register
-    // rather than a fixed one — a collision would decode as invalid and be read
+    // rather than a fixed one: a collision would decode as invalid and be read
     // as "this opcode rejects the field", which would then reject every legal
     // mask a caller might pass.
     let mut b = vex_head(pfx, map, w, vvvv_b, l, pp, op, modrm);
@@ -293,7 +293,7 @@ fn probe_vex(
 // register file each operand names, which way round the two are, and how wide
 // a memory operand is.
 //
-// Nearly every SSE and MMX encoding fits one shape — a `reg`-field operand and
+// Nearly every SSE and MMX encoding fits one shape: a `reg`-field operand and
 // an `rm`-field operand, in one order or the other, optionally followed by an
 // `imm8`. That shape is what is recorded here. An encoding that does not fit
 // is marked as having no modelled operands, which is exactly what the decoder
@@ -379,7 +379,7 @@ struct Shape {
     /// The `reg`-field operand comes first.
     reg_first: bool,
     /// There is no `reg`-field operand: those bits are a group digit. This is
-    /// the shift groups — `psrlw mm, imm8` and its relatives.
+    /// the shift groups, `psrlw mm, imm8` and its relatives.
     rm_only: bool,
     reg_class: Class,
     rm_class: Class,
@@ -393,7 +393,7 @@ struct Shape {
 /// shows which register file each side names and which way round they are, and
 /// one addressing memory, which shows how wide the memory operand is.
 ///
-/// `reg = 1` and `rm = 2` are chosen so the two register numbers differ — that
+/// `reg = 1` and `rm = 2` are chosen so the two register numbers differ: that
 /// difference is the only thing that says which operand came from which field.
 fn probe_shape(pfx: &[u8], op: u8) -> Option<Shape> {
     probe_shape_in(pfx, &[], op)
@@ -405,14 +405,14 @@ fn probe_shape_in(pfx: &[u8], escape: &[u8], op: u8) -> Option<Shape> {
     // Each `/digit` is its own encoding, so a probe pinned to one digit sees
     // nothing when that digit is not defined. The shift groups (`0F 71/72/73`)
     // define no `/1`, which is exactly the family the `rm_only` shape exists
-    // for — so pinning digit 1 dropped every shape the branch was written to
+    // for, so pinning digit 1 dropped every shape the branch was written to
     // describe, and the branch never ran.
     //
     // Before taking a shape from any digit, rule out the opcode entirely if ANY
     // digit shows a memory form with fewer operands than its register form.
-    // That is what a GROUP opcode looks like — `0F 18`'s `/0../3` are prefetch
+    // That is what a GROUP opcode looks like: `0F 18`'s `/0../3` are prefetch
     // hints taking one memory operand, while its register forms render as
-    // two-operand aliases — and the digits where the memory form is undefined
+    // two-operand aliases, and the digits where the memory form is undefined
     // would otherwise slip a second operand into the table for an instruction
     // that has one.
     if (0..8).any(|digit| group_digit_evidence(pfx, escape, op, digit)) {
@@ -471,11 +471,11 @@ fn probe_shape_at(pfx: &[u8], escape: &[u8], op: u8, digit: u8) -> Option<Shape>
     let reg_at = |n: u32| i.op_kind(n) == iced_x86::OpKind::Register;
 
     // The memory form, for the width. `mod=00 rm=001` is `[ecx]`. An encoding
-    // with no memory form — the shift groups have none — reports zero, which is
+    // with no memory form (the shift groups have none) reports zero, which is
     // never read because the operand can only be a register.
     // The memory form, both for its width and as a cross-check. An encoding
     // whose memory form reports FEWER operands than its register form does not
-    // name the `reg` field at all — it is a group digit selecting the variant,
+    // name the `reg` field at all: it is a group digit selecting the variant,
     // as in `0F 0D` prefetch and `0F 18` hint-nop, whose register forms iced
     // renders as two-operand aliases. Recording a shape from the register probe
     // alone made the decoder report an operand the instruction does not have.
@@ -499,7 +499,7 @@ fn probe_shape_at(pfx: &[u8], escape: &[u8], op: u8, digit: u8) -> Option<Shape>
     // an operand. `psrlw mm, imm8` and the rest of the shift groups.
     if reg_at(0) && imm8_at(1) {
         let c = class_of(i.op_register(0))?;
-        // `rm = 2` above, so the operand must read as register 2 — otherwise
+        // `rm = 2` above, so the operand must read as register 2; otherwise
         // the probe is looking at something whose operand is not the `rm` field.
         if reg_num(i.op_register(0))? != 2 {
             return None;
@@ -515,7 +515,7 @@ fn probe_shape_at(pfx: &[u8], escape: &[u8], op: u8, digit: u8) -> Option<Shape>
     }
 
     // The same shape without an immediate: ONE operand, and it is the `r/m`
-    // field. `0F 1F` — the multi-byte NOP — is the family here, and without this
+    // field. `0F 1F`, the multi-byte NOP, is the family here, and without this
     // the decoder falls back to emitting `reg` and `rm` both, reporting a second
     // operand the instruction does not have.
     if i.op_count() == 1 && reg_at(0) {
@@ -533,8 +533,8 @@ fn probe_shape_at(pfx: &[u8], escape: &[u8], op: u8, digit: u8) -> Option<Shape>
         });
     }
 
-    // Two register operands, optionally an `imm8`. Anything else — an implicit
-    // operand, a third register, a wider immediate — is not this shape.
+    // Two register operands, optionally an `imm8`. Anything else (an implicit
+    // operand, a third register, a wider immediate) is not this shape.
     let has_imm8 = imm8_at(2);
     if (i.op_count() != 2 && !has_imm8) || !reg_at(0) || !reg_at(1) {
         return None;
@@ -545,7 +545,7 @@ fn probe_shape_at(pfx: &[u8], escape: &[u8], op: u8, digit: u8) -> Option<Shape>
     // register 2 (the `rm` field); if both read the same, the probe cannot tell
     // them apart. Comparing against `digit` rather than a fixed 1 is what keeps
     // a GROUP opcode out: where `reg` is a digit selecting the variant rather
-    // than naming a register — `0F 0D` prefetch, `0F 18` hint-nop — the operand
+    // than naming a register (`0F 0D` prefetch, `0F 18` hint-nop), the operand
     // iced reports does not track the digit, so no shape is recorded and the
     // decoder does not invent a second operand the instruction does not have.
     if digit == 2 {
@@ -558,7 +558,7 @@ fn probe_shape_at(pfx: &[u8], escape: &[u8], op: u8, digit: u8) -> Option<Shape>
     };
     let (reg_class, rm_class) = if reg_first { (c0, c1) } else { (c1, c0) };
     // `mem_bytes == 0` means "no memory form", which the comment above already
-    // promises is a legitimate answer — the register-only encodings say exactly
+    // promises is a legitimate answer: the register-only encodings say exactly
     // that. Discarding the shape here threw away `movmskps`, `pmovmskb`,
     // `pextrw` and `movbe` among others, so they decoded with no operands at
     // all; `pmovmskb` appears in real unpacker loops. `sized_mem` passes a
@@ -583,7 +583,7 @@ fn reg_num(r: Register) -> Option<u8> {
     None
 }
 
-/// Pack a shape, or — when the register shape is not modelled — just the memory
+/// Pack a shape, or (when the register shape is not modelled) just the memory
 /// ACCESS WIDTH, with bit 0 left clear.
 ///
 /// The width is a separate fact from which register file each side names, and it
@@ -629,7 +629,7 @@ fn shape_word(s: &Option<Shape>) -> u16 {
 /// `RXB` and `R'` extend register numbers that do not exist in 32-bit mode, so
 /// they are set to all-ones: the processor ignores them, but the byte still has
 /// to look like `mod == 3` or `62` is `bound`. `V'` and `P1` bit 2 are not
-/// ignored — 32-bit mode requires both set — and `P0` bits 3-2 are reserved.
+/// ignored (32-bit mode requires both set), and `P0` bits 3-2 are reserved.
 #[allow(clippy::too_many_arguments)]
 fn evex_head(
     mm: u8,
@@ -663,8 +663,8 @@ fn evex_key(mm: u8, pp: u8, w: u8, ll: u8, b: u8, op: u8) -> u32 {
 const EVEX_KEYS: u32 = 8 * 4 * 2 * 4 * 2 * 256;
 
 /// An EVEX cell. Beyond a VEX cell it carries `N`, the factor an EVEX `disp8`
-/// is multiplied by — which is why a compressed displacement cannot be computed
-/// from the ModRM byte alone — and which mask-field values the encoding rejects.
+/// is multiplied by (which is why a compressed displacement cannot be computed
+/// from the ModRM byte alone), and which mask-field values the encoding rejects.
 struct EvexCell {
     name: String,
     imm: u8,
@@ -673,7 +673,7 @@ struct EvexCell {
     strict_vvvv: bool,
     /// The encoding requires a non-zero mask register.
     needs_mask: bool,
-    /// The encoding forbids one — it writes a mask rather than reading one.
+    /// The encoding forbids one: it writes a mask rather than reading one.
     forbids_mask: bool,
     /// The encoding forbids zeroing-merge.
     forbids_z: bool,
@@ -682,13 +682,13 @@ struct EvexCell {
 }
 
 /// Does this EVEX encoding index memory with a vector register? The gathers do,
-/// and the scatters — which EVEX encodes and nothing else does — are the reason
+/// and the scatters (which EVEX encodes and nothing else does) are the reason
 /// this cannot be skipped: leave it out and `vscatterdps` is not in the map at
 /// all, so the decoder declines a real instruction rather than reporting it.
 ///
 /// Probed with `mod=00 rm=100`, which forces a SIB byte, with `index=001` and
 /// `base=000`. The destination is register 2, so it does not collide with the
-/// index — a gather rejects that, for a reason that has nothing to do with the
+/// index: a gather rejects that, for a reason that has nothing to do with the
 /// opcode. The mask is `aaa = 1`, which the gathers require.
 #[allow(clippy::too_many_arguments)]
 fn evex_vsib(mm: u8, w: u8, pp: u8, ll: u8, b: u8, op: u8) -> bool {
@@ -707,7 +707,7 @@ fn evex_vsib(mm: u8, w: u8, pp: u8, ll: u8, b: u8, op: u8) -> bool {
 /// A memory ModRM and its SIB byte for one `/digit`, VSIB or not.
 ///
 /// For a VSIB encoding `mod=00 rm=001` is not a smaller form of the
-/// instruction — it is not an encoding, so probing with it finds nothing and
+/// instruction: it is not an encoding, so probing with it finds nothing and
 /// the family goes missing from the map. `rm=100` names a SIB byte, whose index
 /// must be a different register from the destination.
 fn vsib_mem(digit: u8, vsib: bool) -> (u8, Option<u8>) {
@@ -724,7 +724,7 @@ fn vsib_mem(digit: u8, vsib: bool) -> (u8, Option<u8>) {
 ///
 /// The probe carries the caller's `digit`, because the scale belongs to the
 /// encoding and each `/digit` in a sub-block is a different one. Probing a fixed
-/// digit gives every cell in the block digit 0's answer — and where digit 0 is
+/// digit gives every cell in the block digit 0's answer, and where digit 0 is
 /// not an encoding at all the probe fails and yields 0, which reads as "do not
 /// scale". An unscaled displacement addresses the wrong memory by up to 64x.
 #[allow(clippy::too_many_arguments)]
@@ -886,7 +886,7 @@ fn main() {
     }
 
     // A few opcodes name a different instruction for every ModRM byte in the
-    // register range rather than for every `/digit` — `0F 01` holds `vmcall`,
+    // register range rather than for every `/digit`: `0F 01` holds `vmcall`,
     // `monitor`, `swapgs` and friends there. Those get an exact list.
     let mut special: Vec<(usize, u8, u8, String, u8)> = Vec::new();
     for (pi, pfx) in PFX.iter().enumerate() {
@@ -965,8 +965,8 @@ fn main() {
     // ---- VEX and XOP ------------------------------------------------------
     // One cell per (map, pp, L, W, opcode). Most opcodes name the same
     // instruction for every ModRM byte, so those collapse to a single cell and
-    // only the ones that do not — the shift groups, and the handful whose
-    // register form is a different instruction — spill into a 16-entry block.
+    // only the ones that do not (the shift groups, and the handful whose
+    // register form is a different instruction) spill into a 16-entry block.
     let mut families: Vec<(&str, VexTables)> = Vec::new();
     for (label, (pfx, base)) in [("VEX", VEX), ("XOP", XOP)] {
         let mut t = VexTables::default();
@@ -1103,13 +1103,13 @@ fn main() {
     let mut out = String::new();
     out.push_str(
         "//! The opcode maps, generated from the `iced-x86` decoder (MIT; see\n\
-         //! `NOTICE`). Do not edit by hand — regenerate with\n\
+         //! `NOTICE`). Do not edit by hand: regenerate with\n\
          //! `scripts/gen-x86-tables.sh`.\n\
          //!\n\
          //! Each cell records the facts a decoder cannot infer: which instruction\n\
          //! an encoding names, how many immediate bytes follow the\n\
          //! ModRM/SIB/displacement, and for VEX whether the encoding rejects a\n\
-         //! `vvvv` field other than `1111`. The displacement itself is *not* here —\n\
+         //! `vvvv` field other than `1111`. The displacement itself is *not* here:\n\
          //! that is computed by `modrm()`, so a change to addressing rules cannot be\n\
          //! contradicted by a stale table.\n",
     );
@@ -1173,7 +1173,7 @@ fn main() {
     emit_table(
         &mut out,
         "/// `[prefix][opcode]` operand shapes for the `0F` map. `0` means the\n\
-         /// encoding's operands are not modelled — the decoder reports its\n\
+         /// encoding's operands are not modelled: the decoder reports its\n\
          /// identity and length and nothing else, which is what an emulator\n\
          /// needs in order to decline it rather than misread it.\n\
          ///\n\

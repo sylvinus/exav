@@ -99,7 +99,7 @@ impl<'a> Lexer<'a> {
                         self.pos += 2;
                         return Token::DictEnd;
                     }
-                    // stray > — skip and retry
+                    // stray >: skip and retry
                     self.pos += 1;
                     continue;
                 }

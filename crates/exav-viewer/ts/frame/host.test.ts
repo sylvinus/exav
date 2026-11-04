@@ -3,12 +3,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import "../test/blob.js";
-import type { ByteRanges, Controllers, FileSource, FileTree, Session } from "../core/types.js";
+import type { BuiltinFormat, ByteRanges, Controllers, FileSource, FileTree, Session, ViewerFile } from "../core/types.js";
 import { builtinTranslate } from "../react/messages.js";
 import type { FrameTheme } from "../core/theme.js";
-import { createSandboxedViewer, KEY_RATE, type SandboxConfig, type SandboxedViewer } from "./index.js";
+import { createSniffer } from "../core/sniff-engine.js";
+import { sniffInWorker } from "../test/sniff.js";
+import { sniffed } from "./app/sniff.js";
+import { createSandboxedViewer, KEY_RATE, LINK_QUIET_MS, type SandboxConfig, type SandboxedViewer } from "./index.js";
 import { frameCsp, readPolicy, type FramePolicy } from "./policy.js";
-import { HELLO, MAX_DRAWS, PROTOCOL, READS, TREE } from "./protocol.js";
+import { HELLO, MAX_DRAWS, PROTOCOL, READS, TREE, type SniffMessage } from "./protocol.js";
+
+// The detection runs in this process (the page has it in a worker; jsdom has none).
+vi.mock("../core/sniff-engine.js", async () => {
+  const real = await import("../test/sniff.js");
+  return { createSniffer: vi.fn(() => real.sniffInWorker), createInspector: vi.fn(() => real.inspectInWorker), createOfficer: vi.fn(() => real.officeInWorker) };
+});
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
@@ -23,8 +32,12 @@ interface Frame {
   controllers(): Controllers;
 }
 
+/** What the played frame answers a `sniff`: what the frame app would, a format of the test's, or nothing. */
+let sniffAnswer: "auto" | "silent" | BuiltinFormat | null = "auto";
+
 let hosts: HTMLElement[] = [];
 afterEach(() => {
+  sniffAnswer = "auto";
   for (const h of hosts) h.remove();
   hosts = [];
   vi.restoreAllMocks();
@@ -52,11 +65,12 @@ async function mountWith(
   source: FileSource = { bytes: new Uint8Array([1, 2, 3]) },
   policy: FramePolicy | null = null,
   tree?: FileTree,
+  extra: Partial<ViewerFile> = {},
 ): Promise<Frame> {
   const host = document.createElement("div");
   document.body.append(host);
   hosts.push(host);
-  const session = viewer.mount(host, { id: "f1", name, source, ...(tree && { tree }) });
+  const session = viewer.mount(host, { id: "f1", name, source, ...(tree && { tree }), ...extra });
   const iframe = host.querySelector("iframe")!;
   const hello: { message: any; target: string; transfer: MessagePort[] }[] = [];
   iframe.contentWindow!.postMessage = ((message: unknown, target: string, transfer: MessagePort[]) => hello.push({ message, target, transfer })) as never;
@@ -75,7 +89,17 @@ async function mountWith(
   expect(hello).toHaveLength(1);
   const port = hello[0]!.transfer[0]!;
   const received: any[] = [];
-  port.onmessage = (e: MessageEvent) => received.push(e.data);
+  /** The `sniffed` answers being made. */
+  const answering: Promise<unknown>[] = [];
+  port.onmessage = (e: MessageEvent) => {
+    received.push(e.data);
+    // As the frame app answers, unless the test says what. Not checked
+    // (protocol.test does it): this port's buffers are of another realm.
+    if (e.data?.type !== "sniff") return;
+    const asked = e.data as SniffMessage;
+    const answer = sniffAnswer === "auto" ? sniffed(asked, sniffInWorker, null) : Promise.resolve(sniffAnswer);
+    answering.push(answer.then((format) => format !== "silent" && port.postMessage({ type: "sniffed", call: asked.call, format })));
+  };
   const frame: Frame = {
     session,
     iframe,
@@ -92,6 +116,11 @@ async function mountWith(
   };
   if (ready) await frame.send({ type: "ready", protocol: PROTOCOL, policy, formats: null });
   await tick(5);
+  // The host asks what the file is once the frame is ready, then opens it.
+  while (answering.length) {
+    await Promise.all(answering.splice(0));
+    await tick(5);
+  }
   return frame;
 }
 
@@ -127,14 +156,20 @@ describe("the frame element", () => {
     expect(open).toMatchObject({ type: "open", formats: ["pdf", "dwg"], file: { name: "plan.dwg", type: "", path: "plan.dwg", format: "dwg" } });
   });
 
-  it("is not made for a file of a format it was not given", async () => {
-    const viewer = createSandboxedViewer({ url: "https://frame.test/", formats: ["pdf"] });
+  it("is not made for a file of a format it was not given, when its bytes are not read", async () => {
+    const viewer = createSandboxedViewer({ url: "https://frame.test/", formats: ["pdf"], sniffBytes: 0 });
     const host = document.createElement("div");
     hosts.push(host);
     const s = viewer.mount(host, { id: "x", name: "plan.dwg", source: { bytes: new Uint8Array(1) } });
     expect(host.querySelector("iframe")).toBeNull();
-    // As in the page: no plugin claims it.
     expect(s.status.get()).toEqual({ phase: "error", error: { code: "file" } });
+  });
+
+  it("is made to ask what the bytes of a file of a format it was not given are, and dropped when they say none it opens", async () => {
+    const f = await mount({ formats: ["pdf"] }, "plan.dwg");
+    expect(f.received.find((m) => m.type === "sniff")).toMatchObject({ formats: ["pdf"], file: { name: "plan.dwg" } });
+    expect(f.iframe.isConnected).toBe(false);
+    expect(f.session.status.get()).toEqual({ phase: "error", error: { code: "file" } });
   });
 
   it("is dropped when it loads a second time: it navigated away", async () => {
@@ -698,6 +733,65 @@ describe("links", () => {
     await tick(5);
     expect(open).toHaveBeenCalledTimes(1);
   });
+
+  it("are dropped for a moment after each answer, so that a frame cannot ask again at once", async () => {
+    let now = 1000;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const confirmLink = vi.fn(async (_url: string) => false);
+    const f = await mount({ confirmLink });
+    await f.send({ type: "link", url: "https://example.com/a" });
+    await tick(5);
+    expect(confirmLink).toHaveBeenCalledTimes(1);
+    await f.send({ type: "link", url: "https://example.com/b" });
+    await tick(5);
+    now += LINK_QUIET_MS - 1;
+    await f.send({ type: "link", url: "https://example.com/c" });
+    await tick(5);
+    expect(confirmLink).toHaveBeenCalledTimes(1);
+    now += 1;
+    await f.send({ type: "link", url: "https://example.com/d" });
+    await tick(5);
+    expect(confirmLink).toHaveBeenCalledTimes(2);
+    expect(confirmLink.mock.calls[1]![0]).toBe("https://example.com/d");
+  });
+
+  it("with linkQuietMs 0 are asked about again as soon as the question is answered", async () => {
+    vi.spyOn(performance, "now").mockImplementation(() => 1000);
+    const confirmLink = vi.fn(async (_url: string) => false);
+    const f = await mount({ confirmLink, linkQuietMs: 0 });
+    await f.send({ type: "link", url: "https://example.com/a" });
+    await tick(5);
+    await f.send({ type: "link", url: "https://example.com/b" });
+    await tick(5);
+    expect(confirmLink).toHaveBeenCalledTimes(2);
+  });
+
+  it("are dropped with no question unless the user just clicked or pressed a key", async () => {
+    const activation = { isActive: false };
+    Object.defineProperty(navigator, "userActivation", { value: activation, configurable: true });
+    try {
+      const confirmLink = vi.fn(async (_url: string) => false);
+      const f = await mount({ confirmLink, linkQuietMs: 0 });
+      await f.send({ type: "link", url: "https://example.com/a" });
+      await tick(5);
+      expect(confirmLink).not.toHaveBeenCalled();
+      activation.isActive = true;
+      await f.send({ type: "link", url: "https://example.com/b" });
+      await tick(5);
+      expect(confirmLink).toHaveBeenCalledTimes(1);
+      expect(confirmLink.mock.calls[0]![0]).toBe("https://example.com/b");
+    } finally {
+      Reflect.deleteProperty(navigator, "userActivation");
+    }
+  });
+
+  it("with credentials in them are not asked about", async () => {
+    const confirmLink = vi.fn(async (_url: string) => false);
+    const f = await mount({ confirmLink });
+    await f.send({ type: "link", url: "https://bank.example@evil.example/" });
+    await tick(5);
+    expect(confirmLink).not.toHaveBeenCalled();
+  });
 });
 
 /** Byte `i` of these files is `i & 0xff`. */
@@ -765,6 +859,30 @@ describe("the files around the one shown", () => {
     expect(answer(f, 5)).toEqual({ type: "bytes", id: 5, error: "refused" });
   });
 
+  it("are judged by the size they state before they are read, all fetches together", async () => {
+    const read = vi.fn((_offset: number, _length: number) => new Promise<Uint8Array>(() => undefined));
+    const half = Math.floor(TREE.maxFileBytes / 2) + 1;
+    const sized: FileTree = {
+      path: "a.dwg",
+      paths: ["a.dwg", "huge.bin", "b.bin", "c.bin"],
+      open: async (path) => ({ ranges: { size: path === "huge.bin" ? TREE.maxFileBytes + 1 : half, read } }),
+    };
+    const f = await mountWith(createSandboxedViewer({ url: "https://frame.test/index.html" }), "a.dwg", true, { bytes: new Uint8Array([1]) }, null, sized);
+    // Past the limit: refused without a byte read.
+    await f.send({ type: "fetch", id: 1, path: "huge.bin" });
+    await tick(5);
+    expect(answer(f, 1)).toEqual({ type: "bytes", id: 1, error: "refused" });
+    expect(read).not.toHaveBeenCalled();
+    // Within it, read; another that would take the fetches together past it, refused while the first is read.
+    await f.send({ type: "fetch", id: 2, path: "b.bin" });
+    await tick(5);
+    expect(read).toHaveBeenCalledTimes(1);
+    await f.send({ type: "fetch", id: 3, path: "c.bin" });
+    await tick(5);
+    expect(answer(f, 3)).toEqual({ type: "bytes", id: 3, error: "refused" });
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
   it("are refused to a file that has none", async () => {
     const f = await mount();
     await f.send({ type: "fetch", id: 1, path: "site/title.dwg" });
@@ -788,6 +906,19 @@ describe("the files around the one shown", () => {
 });
 
 describe("a file read by ranges", () => {
+  it("answers a read with a copy, so a buffer the host keeps is not taken from it", async () => {
+    const kept = pattern(0, 200_000);
+    // The host's own buffer for a read of all of it.
+    const ranges: ByteRanges = {
+      size: kept.length,
+      read: async (offset, length) => (offset === 0 && length === kept.length ? kept : kept.slice(offset, offset + length)),
+    };
+    const f = await mount({}, "big.pdf", true, { ranges });
+    await f.send({ type: "read", id: 1, generation: 0, offset: 0, length: kept.length });
+    await vi.waitFor(() => expect(answer(f, 1)).toBeTruthy());
+    expect(kept.byteLength).toBe(200_000);
+  });
+
   it("gives the frame its size and first bytes, then what it asks within the file and the limits", async () => {
     const size = 100 * 1024 * 1024;
     const held = heldRanges(size);
@@ -869,6 +1000,47 @@ describe("a file read by ranges", () => {
   });
 });
 
+describe("highlights in the frame", () => {
+  const box = { x: 0.1, y: 0.2, width: 0.3, height: 0.05 };
+  const open = (extra: Partial<ViewerFile>) =>
+    mountWith(createSandboxedViewer({ url: "https://frame.test/index.html" }), "offre.pdf", true, { bytes: new Uint8Array([1]) }, null, undefined, extra);
+
+  it("go to the frame with the file, each with its id", async () => {
+    const f = await open({ highlights: [{ text: "prix", label: "Prix" }, { id: "b", page: 2, rects: [box] }], focusHighlight: "b" });
+    const message = f.received.find((m) => m.type === "open");
+    expect(message.highlights).toEqual([
+      { id: "0", text: "prix", label: "Prix" },
+      { id: "b", page: 2, rects: [box] },
+    ]);
+    expect(message.focusHighlight).toBe("b");
+  });
+
+  it("are placed where the frame says, with the host's own labels, colours and quotes, never the frame's", async () => {
+    const f = await open({ highlights: [{ id: "a", text: "prix", label: "Prix", color: "#ff0000" }] });
+    const item = { id: "a", state: "shown", page: 3, rects: [box], label: "<img src=x>", color: "url(https://x.test/leak)", text: "not this" };
+    await f.send({ type: "controllers", session: 0, values: { highlights: { items: [item], current: "a" } }, statics: {} });
+    expect(f.controllers().highlights?.get()).toEqual({ items: [{ id: "a", state: "shown", page: 3, rects: [box], label: "Prix", color: "#ff0000", text: "prix" }], current: "a" });
+    // A box off the page fails the message.
+    await f.send({ type: "state", session: 0, key: "highlights", value: { items: [{ ...item, rects: [{ ...box, x: 2 }] }], current: null } });
+    expect(f.controllers().highlights?.get().items[0]!.page).toBe(3);
+  });
+
+  it("send set and goTo to the frame, and take the labels of the list set", async () => {
+    const f = await open({});
+    await f.send({ type: "controllers", session: 0, values: { highlights: { items: [], current: null } }, statics: {} });
+    f.controllers().highlights!.set([{ text: "délai", label: "Délai" }]);
+    f.controllers().highlights!.goTo("0");
+    await tick(5);
+    const commands = f.received.filter((m) => m.type === "command");
+    expect(commands.map(({ target, action, args }) => [target, action, args])).toEqual([
+      ["highlights", "set", [[{ id: "0", text: "délai", label: "Délai" }]]],
+      ["highlights", "goTo", ["0"]],
+    ]);
+    await f.send({ type: "state", session: 0, key: "highlights", value: { items: [{ id: "0", state: "missing", page: null, rects: [] }], current: null } });
+    expect(f.controllers().highlights?.get().items[0]).toEqual({ id: "0", state: "missing", page: null, rects: [], label: "Délai", text: "délai" });
+  });
+});
+
 describe("replacing the document in the frame", () => {
   const replacements = (f: Frame) => f.received.filter((m) => m.type === "replace");
   const next = (name = "plan.dwg", bytes = [4, 5, 6]) => ({ id: "f1", name, source: { bytes: new Uint8Array(bytes) } });
@@ -932,6 +1104,8 @@ describe("replacing the document in the frame", () => {
 
   it("is not sent a delivery the frame was not made for: an image first given by URL stays a URL", async () => {
     const origins = { media: ["https://media.test"] };
+    // The address is asked for its first bytes.
+    vi.stubGlobal("fetch", async () => new Response(new Uint8Array(4)));
     const viewer = createSandboxedViewer({ url: "https://frame.test/index.html", delivery: { images: "url" }, origins });
     const f = await mountWith(viewer, "a.png", true, { url: "https://media.test/a.png" }, readPolicy(frameCsp(undefined, origins)));
     expect(f.received.find((m) => m.type === "open").source.kind).toBe("url");
@@ -960,8 +1134,8 @@ describe("delivery by URL", () => {
   let fetched: string[] = [];
   beforeEach(() => {
     fetched = [];
-    vi.stubGlobal("fetch", async (url: string) => {
-      fetched.push(String(url));
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      fetched.push(`${String(url)} ${new Headers(init?.headers).get("range") ?? ""}`.trim());
       return new Response(new Uint8Array([1, 2, 3]));
     });
   });
@@ -971,7 +1145,9 @@ describe("delivery by URL", () => {
     const origins = { media: [MEDIA] };
     let f = await mount({ origins }, "clip.mp4", true, { url: `${MEDIA}/v/clip.mp4` }, policy(origins));
     expect(f.received.find((m) => m.type === "open").source).toEqual({ kind: "url", url: `${MEDIA}/v/clip.mp4` });
+    // The page asked for nothing: a video given by its address is told by its name and type.
     expect(fetched).toEqual([]);
+    expect(f.received.some((m) => m.type === "sniff")).toBe(false);
     // Another origin, a URL with `init`, an image only the frame's decoders draw: read whole by the host.
     for (const [name, source] of [
       ["clip.mp4", { url: "https://other.test/clip.mp4" }],
@@ -1069,5 +1245,70 @@ describe("a file to be read by ranges", () => {
     expect(f.received.find((m) => m.type === "open").source.kind).toBe("ranges");
     await f.send({ type: "controllers", session: 0, values: {}, statics: {} });
     expect(f.controllers().warnings).toBeUndefined();
+  });
+});
+
+describe("a file whose bytes say one format and whose name says another", () => {
+  const pdf = new Uint8Array([...'%PDF-1.7\n%'].map((c) => c.charCodeAt(0)).concat([0xe2, 0xe3, 0xcf, 0xd3, 10]));
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1]);
+
+  it("is given to the frame as what its bytes are: a PDF named .png is a PDF", async () => {
+    const f = await mount({}, "plan.png", true, { bytes: pdf });
+    const open = f.received.find((m) => m.type === "open");
+    expect(open).toMatchObject({ file: { name: "plan.png", format: "pdf" }, source: { kind: "ranges" } });
+    expect(f.session.format).toBe("pdf");
+  });
+
+  it("starts its frame to ask what the bytes are when the name says no format the frame opens", async () => {
+    const f = await mount({}, "plan.bin", true, { bytes: pdf });
+    expect(f.received.find((m) => m.type === "sniff")).toMatchObject({ file: { name: "plan.bin" }, source: { kind: "head", size: pdf.length } });
+    expect(f.received.find((m) => m.type === "open")).toMatchObject({ file: { name: "plan.bin", format: "pdf" } });
+    expect(f.session.format).toBe("pdf");
+  });
+
+  it("takes from the frame only a format it was published for: for another, the name and the type decide", async () => {
+    sniffAnswer = "pdf";
+    const f = await mount({}, "plan.dwg", false);
+    await f.send({ type: "ready", protocol: PROTOCOL, policy: null, formats: ["dwg"] });
+    await tick(20);
+    expect(f.received.find((m) => m.type === "open")).toMatchObject({ file: { name: "plan.dwg", format: "dwg" } });
+    expect(f.session.format).toBe("dwg");
+  });
+
+  it("is judged by its bytes when it replaces the document", async () => {
+    const f = await mount({}, "a.pdf", true, { bytes: pdf });
+    const replacements = () => f.received.filter((m) => m.type === "replace");
+    const same = f.session.replace({ id: "f1", name: "b.png", source: { bytes: pdf } });
+    // The detection runs in a worker: wait for its answer, not a set time.
+    await vi.waitFor(() => expect(replacements()[0]).toMatchObject({ file: { name: "b.png", format: "pdf" } }));
+    await f.send({ type: "replaced", call: replacements()[0].call, ok: true });
+    expect(await same).toBe(true);
+    // A picture named .pdf is another format than the document on show.
+    expect(await f.session.replace({ id: "f1", name: "c.pdf", source: { bytes: png } })).toBe(false);
+    expect(replacements()).toHaveLength(1);
+  });
+
+  it("sends the frame plain options and the detection's timeout and size, to use in its own", async () => {
+    const evil = JSON.parse('{"__proto__":{"x":1},"constructor":{"x":1},"pdf":{"maxZoom":3,"prototype":{"x":1}}}');
+    evil.image = { maxScale: () => 1 };
+    const f = await mount({ options: evil, sniffTimeoutMs: 0, sniffBytes: 4096 }, "a.pdf", true, { bytes: pdf });
+    const options = f.received.find((m) => m.type === "open").options;
+    expect(options).toEqual({
+      pdf: { maxZoom: 3 },
+      image: {},
+      sniff: { timeoutMs: 0, bytes: 4096 },
+      limits: { maxExtractedBytes: 512 * 1024 * 1024, maxMembers: 20_000, maxCompressionRatio: 1000 },
+    });
+    expect(Object.hasOwn(options, "__proto__") || Object.hasOwn(options, "constructor")).toBe(false);
+  });
+
+  it("asks the frame within sniffTimeoutMs, the name and the type deciding past it, and runs no detection of its own", async () => {
+    sniffAnswer = "silent";
+    const f = await mount({ sniffTimeoutMs: 50 }, "plan.png", true, { bytes: pdf });
+    expect(f.received.find((m) => m.type === "sniff").sniff).toEqual({ timeoutMs: 50, bytes: 65536 });
+    expect(f.received.some((m) => m.type === "open")).toBe(false);
+    await tick(80);
+    expect(f.received.find((m) => m.type === "open")).toMatchObject({ file: { name: "plan.png", format: "image" } });
+    expect(createSniffer).not.toHaveBeenCalled();
   });
 });

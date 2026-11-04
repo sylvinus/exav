@@ -15,6 +15,7 @@ are useful without ever running a virus scan.
 | [exav-grep](/subprojects/exav-grep/) | grep for the inside of archives: search recursively through zip/rar/7z/tar/iso/OLE/PDF/email members, and with `--text` through the words of documents |
 | [exav-imagehash](/subprojects/exav-imagehash/) | Perceptual image hashes with every step a parameter, reproducing ClamAV's `fuzzy_img` hash and Python imagehash's `phash` bit for bit, as a library and a CLI |
 | [exav-pe-emu](/subprojects/exav-pe-emu/) | A sandboxed x86-32 emulator that unpacks packed Windows executables by running their stub, as a library and a CLI |
+| [exav-qr](/subprojects/exav-qr/) | The payloads of the QR codes in images and in what holds them (archives, documents, PDFs), as a command, and the QR reader behind `--qr` |
 
 ## Libraries
 

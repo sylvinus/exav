@@ -1,7 +1,7 @@
 //! Every integration suite, compiled into ONE test binary.
 //!
 //! Cargo builds each top-level `tests/*.rs` as its own crate, statically linked
-//! against the whole dependency graph — here that was 38 binaries at ~170 MB
+//! against the whole dependency graph: here that was 38 binaries at ~170 MB
 //! each, so a full run spent most of its time linking near-identical images.
 //! Collapsing them into modules under `tests/suites/` keeps every test and every
 //! name filter working (`cargo test --test suites alz::` still selects one
@@ -14,6 +14,8 @@
 mod allowed_formats;
 #[cfg(feature = "alz")]
 mod alz;
+#[cfg(feature = "applesingle")]
+mod applesingle;
 #[cfg(all(feature = "ar", feature = "cpio"))]
 mod ar_cpio_irregular;
 #[cfg(feature = "arc")]
@@ -37,8 +39,18 @@ mod cpio_never_silent;
 mod cramfs;
 #[cfg(all(feature = "bzip2", feature = "xz"))]
 mod cut_streams;
+#[cfg(all(
+    feature = "ar",
+    feature = "cpio",
+    feature = "email",
+    feature = "lha",
+    feature = "ole",
+    feature = "xar"
+))]
+mod damage_not_limit;
 #[cfg(all(not(feature = "decrypt"), feature = "zip"))]
 mod decrypt_disabled;
+mod detect_order;
 mod disabled_formats;
 #[cfg(feature = "diskimage")]
 mod diskimage;
@@ -53,6 +65,8 @@ mod egg;
 mod email;
 #[cfg(feature = "email")]
 mod email_readers_agree;
+#[cfg(feature = "email")]
+mod email_stream;
 #[cfg(feature = "decrypt")]
 mod encrypted_zip;
 #[cfg(feature = "tar")]
@@ -63,6 +77,8 @@ mod erofs;
 mod exfat;
 #[cfg(feature = "ext")]
 mod ext;
+#[cfg(feature = "zip")]
+mod extraction_total;
 mod extreme;
 #[cfg(feature = "fat")]
 mod fat;
@@ -82,6 +98,8 @@ mod lz4;
 mod lzfse;
 #[cfg(feature = "lzw")]
 mod lzw;
+#[cfg(all(feature = "partition", feature = "fat"))]
+mod mbr_logical;
 mod nesting;
 #[cfg(feature = "nsis")]
 mod nsis;
@@ -89,6 +107,8 @@ mod nsis;
 mod ntfs;
 #[cfg(feature = "ole")]
 mod ole_lenient;
+#[cfg(feature = "ole")]
+mod ole_source;
 #[cfg(feature = "onenote")]
 mod onenote;
 #[cfg(feature = "all-formats")]
@@ -123,13 +143,19 @@ mod rar_solid;
 mod romfs;
 #[cfg(feature = "rpm")]
 mod rpm;
+#[cfg(all(feature = "sevenz", feature = "decrypt"))]
+mod sevenz_aes;
 #[cfg(feature = "sevenz")]
 mod sevenz_bcj2;
+#[cfg(feature = "sevenz")]
+mod sevenz_crc;
 #[cfg(feature = "sevenz")]
 mod sevenz_entries;
 #[cfg(feature = "sevenz")]
 mod sevenz_ppmd;
 mod silent_skips;
+#[cfg(feature = "ext")]
+mod sparse;
 #[cfg(feature = "squashfs")]
 mod squashfs;
 #[cfg(feature = "all-formats")]
@@ -222,8 +248,11 @@ pub(crate) fn extract_each<R>(
             comp_size: meta.comp_size,
             encrypted: meta.encrypted,
             unsupported: meta.unsupported,
+            reason_kind: meta.reason_kind,
             mtime: meta.mtime,
             mode: meta.mode,
+            raster: meta.raster.clone(),
+            object_stream: meta.object_stream,
         };
         visit(entry, budget)
     })

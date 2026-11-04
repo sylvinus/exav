@@ -3,11 +3,11 @@ use crate::*;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 
 /// Walk a cabinet off its source.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     stream_cab(&mut crate::source::Reader::new(src), budget, visit)
 }
 
@@ -16,16 +16,16 @@ pub(crate) fn walk<T>(
 /// `take(uncompressed_size)` window; the decompressed folder is never buffered.
 /// Files are emitted folder-by-folder in offset order, and a file that starts
 /// before the reader restarts the folder.
-pub(crate) fn stream_cab<R: Read + Seek, T>(
+pub(crate) fn stream_cab<R: Read + Seek>(
     source: &mut R,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     use crate::formats::cab_parse::cabinet::Cabinet;
     use crate::formats::cab_parse::folder::FolderReader;
     use crate::stream::{MemberMeta, emit_stream};
     let (folder_metas, files) =
-        Cabinet::layout(source).map_err(|e| LimitHit::new(format!("cab: {e}")))?;
+        Cabinet::layout(source).map_err(|e| LimitHit::corrupt(format!("cab: {e}")))?;
     for (folder_idx, meta) in folder_metas.iter().enumerate() {
         let mut folder_files: Vec<&crate::formats::cab_parse::file::FileEntry> = files
             .iter()
@@ -41,7 +41,7 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
             meta.num_data_blocks,
             meta.compression_type,
         )
-        .map_err(|e| LimitHit::new(format!("cab folder: {e}")))?;
+        .map_err(|e| LimitHit::corrupt(format!("cab folder: {e}")))?;
         let mut pos = 0u64;
         // Set once the folder stream fails: past that, offsets no longer
         // match what the reader would return.
@@ -76,7 +76,7 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
                     meta.num_data_blocks,
                     meta.compression_type,
                 )
-                .map_err(|e| LimitHit::new(format!("cab folder: {e}")))?;
+                .map_err(|e| LimitHit::corrupt(format!("cab folder: {e}")))?;
                 pos = 0;
             }
             // A member the cabinet's own directory names exists; when this
@@ -165,4 +165,57 @@ fn skip_forward<R: Read>(r: &mut R, n: u64) -> (u64, bool) {
         }
     }
     (skipped, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, SeekFrom, Write};
+
+    /// A source that cannot seek to one place: the start of the folder's data.
+    struct NoSeekTo {
+        inner: Cursor<Vec<u8>>,
+        at: u64,
+    }
+
+    impl Read for NoSeekTo {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for NoSeekTo {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            if to == SeekFrom::Start(self.at) {
+                return Err(std::io::Error::other("cannot seek there"));
+            }
+            self.inner.seek(to)
+        }
+    }
+
+    /// A folder that cannot be opened is an unreadable cabinet: damage, like
+    /// the directory, not a limit.
+    #[test]
+    fn a_folder_that_cannot_be_opened_is_damage_not_a_limit() {
+        let mut builder = ::cab::CabinetBuilder::new();
+        builder
+            .add_folder(::cab::CompressionType::None)
+            .add_file("a.txt");
+        let mut w = builder.build(Cursor::new(Vec::new())).unwrap();
+        while let Some(mut f) = w.next_file().unwrap() {
+            f.write_all(b"MALWARETEST").unwrap();
+        }
+        let cab = w.finish().unwrap().into_inner();
+        // The first CFDATA record of the one folder, from its CFFOLDER entry.
+        let at = u64::from(u32::from_le_bytes(cab[36..40].try_into().unwrap()));
+        let mut source = NoSeekTo {
+            inner: Cursor::new(cab),
+            at,
+        };
+        let mut budget = Budget::new(crate::Limits::default());
+        let e = stream_cab(&mut source, &mut budget, &mut |_, _, _| None::<()>)
+            .expect_err("the folder cannot be opened");
+        assert!(e.is_corrupt(), "{}", e.reason);
+        assert!(e.reason.starts_with("cab folder"), "{}", e.reason);
+    }
 }

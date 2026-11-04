@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! WebAssembly bindings for `exav-unpack` — memory-safe, in-browser archive
+//! WebAssembly bindings for `exav-unpack`: memory-safe, in-browser archive
 //! extraction with no native/C dependencies.
 //!
 //! This module is SYNCHRONOUS throughout, and that is the design rather than an
@@ -27,13 +27,16 @@
 
 mod source;
 
-use exav_unpack::source::BlockCache;
+use exav_unpack::source::{BLOCK_SIZE, BlockCache};
 use exav_unpack::{
-    Budget, ByteSource, Entry as UnpackEntry, Format, LimitHit, Limits, Member, MemberMeta, walk,
+    Budget, ByteSource, Entry as UnpackEntry, Format, Limits, Member, MemberMeta, read_entry, walk,
 };
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use source::Src;
 use wasm_bindgen::prelude::*;
+
+/// Memory of the block cache of an archive read from a `Blob` or a callback.
+const BROWSER_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Carry any error's message out to JS.
 fn err<E: std::fmt::Display>(e: E) -> JsValue {
@@ -50,8 +53,8 @@ fn format_name(fmt: Format) -> String {
 
 /// Refuse a format the caller excluded.
 ///
-/// `allowedFormats` is a per-call control — "open only these; anything else is
-/// reported" — and it has to be checked on the way IN. `Limits::allows` is also
+/// `allowedFormats` is a per-call control ("open only these; anything else is
+/// reported"), and it has to be checked on the way IN. `Limits::allows` is also
 /// consulted during extraction, but an archive that was never allowed should
 /// not open at all.
 fn check_allowed(fmt: Format, limits: &Limits) -> Result<(), JsValue> {
@@ -93,7 +96,7 @@ fn unpack_entry_to_js(e: &UnpackEntry) -> Result<JsValue, JsValue> {
 
 /// Fail the way a decoder can, for a member named to ask for it.
 ///
-/// Every one of these is beyond Rust's reach on this target — `panic = "abort"`
+/// Every one of these is beyond Rust's reach on this target: `panic = "abort"`
 /// means no unwind to catch, a failed allocation aborts rather than returning,
 /// and an exhausted stack traps. That is precisely why they are worth firing on
 /// purpose: the containment for them lives in JS, and containment that has never
@@ -143,7 +146,7 @@ fn limit_marker_to_js(why: &str) -> Result<JsValue, JsValue> {
 }
 
 /// One member's metadata, as JS receives it. `size` is its decoded size where
-/// that is known without decoding it, else -1.
+/// that is known without decoding it, else -1. `synthetic` is `stream_member`.
 fn member_to_js(m: &MemberMeta, index: usize, size: Option<u64>) -> Result<JsValue, JsValue> {
     let obj = Object::new();
     Reflect::set(&obj, &"name".into(), &JsValue::from_str(&m.name))?;
@@ -159,29 +162,12 @@ fn member_to_js(m: &MemberMeta, index: usize, size: Option<u64>) -> Result<JsVal
         &JsValue::from_f64(size.map_or(-1.0, |n| n as f64)),
     )?;
     Reflect::set(&obj, &"encrypted".into(), &JsValue::from_bool(m.encrypted))?;
+    Reflect::set(
+        &obj,
+        &"synthetic".into(),
+        &JsValue::from_bool(m.stream_member),
+    )?;
     Ok(obj.into())
-}
-
-/// A member a walk handed over, as an entry: a streamed one is read whole
-/// under the budget, and a limit is an error that stops the walk.
-fn read_entry(
-    meta: &MemberMeta,
-    content: Option<Member<'_>>,
-    budget: &mut Budget,
-) -> Result<UnpackEntry, LimitHit> {
-    let mut entry = UnpackEntry::new(meta.name.clone(), Vec::new());
-    entry.comp_size = meta.comp_size;
-    entry.encrypted = meta.encrypted;
-    entry.unsupported = meta.unsupported;
-    if let Some(content) = content {
-        let (data, partial) = content.into_bytes(meta, budget)?;
-        entry.data = data;
-        if partial && entry.unsupported.is_none() {
-            entry.unsupported =
-                Some("member failed to decode part way; the bytes before the failure are kept");
-        }
-    }
-    Ok(entry)
 }
 
 fn parse_passwords(passwords: &JsValue) -> Vec<String> {
@@ -197,14 +183,14 @@ fn parse_passwords(passwords: &JsValue) -> Vec<String> {
 /// of extraction, 256 MiB for one member. wasm32 caps the whole address space
 /// at 4 GiB and a browser commonly allows far less, so those defaults let a
 /// page ask for more than the tab can give. Running out is not an error the
-/// caller sees — the module aborts and takes its instance with it, so the JS
+/// caller sees: the module aborts and takes its instance with it, so the JS
 /// side gets no verdict at all.
 ///
 /// The two byte budgets are therefore cut to an eighth, 128 MiB and 32 MiB. The
-/// rest of `Limits` is kept as it stands: member count, recursion depth and
-/// compression ratio bound counts and shapes rather than bytes, so the address
-/// space is not what constrains them. Raise any of them through the `limits`
-/// argument if the page can afford it.
+/// rest of `Limits` is kept as it stands: member count and recursion depth
+/// bound counts and shapes rather than bytes, so the address space is not what
+/// constrains them. Raise any of them through the `limits` argument if the page
+/// can afford it.
 fn browser_limits() -> Limits {
     let mut l = Limits::default();
     l.max_extracted_bytes = 128 * 1024 * 1024;
@@ -213,8 +199,9 @@ fn browser_limits() -> Limits {
 }
 
 /// Read a `{ maxExtractedBytes, maxBufferBytes, maxScannedBytes, maxMembers,
-/// maxRecursion, maxCompressionRatio }` object from JS. Absent keys keep the
-/// browser default; a caller sets only what it cares about.
+/// maxRecursion }` object from JS. Absent keys keep the browser default; a
+/// caller sets only what it cares about. The compression ratio is not one: it
+/// acts only on a member past `maxBufferBytes`, which is not held.
 fn limits_from_js(v: &JsValue) -> Limits {
     let mut l = browser_limits();
     if v.is_undefined() || v.is_null() {
@@ -241,10 +228,7 @@ fn limits_from_js(v: &JsValue) -> Limits {
     if let Some(n) = num("maxRecursion") {
         l.max_recursion = n as u32;
     }
-    if let Some(n) = num("maxCompressionRatio") {
-        l.max_compression_ratio = n as u64;
-    }
-    // `allowedFormats: ["Zip", "Tar"]` — names as `detectFormat` reports them.
+    // `allowedFormats: ["Zip", "Tar"]`, names as `detectFormat` reports them.
     // An unknown name is ignored rather than rejected: a page pinned to an
     // older module should not fail outright because it listed a format that
     // build does not have, and anything not listed is excluded anyway.
@@ -328,14 +312,20 @@ impl Archive {
     ///
     /// `limits` is optional and bounds every extraction from this archive:
     /// `{ maxExtractedBytes, maxBufferBytes, maxScannedBytes, maxMembers,
-    /// maxRecursion, maxCompressionRatio, allowedFormats }`. Absent keys keep the browser
-    /// default, which is an order of magnitude below the library's own — a tab
+    /// maxRecursion, allowedFormats }`. Absent keys keep the browser
+    /// default, which is an order of magnitude below the library's own: a tab
     /// has far less room than a server, and running out of it aborts the module
     /// rather than returning an error.
     #[wasm_bindgen(js_name = "open")]
     pub fn open(source: JsValue, limits: Option<JsValue>) -> Result<Archive, JsValue> {
         let limits = limits_from_js(&limits.unwrap_or(JsValue::UNDEFINED));
-        let reader = |src: Src| BlockCache::new(src).map(Bytes::Reader).map_err(err);
+        // A tab has far less memory than the 32 MiB library default of the
+        // cache, so the browser keeps 8 MiB.
+        let reader = |src: Src| {
+            BlockCache::with_sizes(src, BLOCK_SIZE, BROWSER_CACHE_BYTES)
+                .map(Bytes::Reader)
+                .map_err(err)
+        };
         let bytes = if let Some(bytes) = source.dyn_ref::<Uint8Array>() {
             Bytes::Memory(bytes.to_vec())
         } else if let Some(blob) = source.dyn_ref::<web_sys::Blob>() {
@@ -377,7 +367,7 @@ impl Archive {
         let out = Array::new();
         let mut index = 0;
         let mut failed = None;
-        let walked = walk(
+        let walked = walk::<()>(
             self.fmt,
             self.bytes.source(),
             &mut budget,
@@ -416,7 +406,8 @@ impl Archive {
     ) -> Result<JsValue, JsValue> {
         let mut budget = self.budget(passwords);
         let mut at = 0;
-        let found = walk(
+        let mut read = None;
+        let walked = walk::<()>(
             self.fmt,
             self.bytes.source(),
             &mut budget,
@@ -425,23 +416,24 @@ impl Archive {
                     at += 1;
                     return None;
                 }
-                Some(read_entry(meta, content, b))
+                read = Some(read_entry(meta, content, b));
+                Some(())
             },
         );
-        match found {
-            Ok(Some(Ok(entry))) => {
+        match (walked, read) {
+            (Err(hit), _) | (_, Some(Err(hit))) => Err(err(hit)),
+            (Ok(_), Some(Ok(entry))) => {
                 self.extracted += entry.data.len() as u64;
                 unpack_entry_to_js(&entry)
             }
-            Ok(Some(Err(hit))) | Err(hit) => Err(err(hit)),
-            Ok(None) => Err(JsValue::from_str(&format!("index {index} out of bounds"))),
+            (Ok(_), None) => Err(JsValue::from_str(&format!("index {index} out of bounds"))),
         }
     }
 
     /// Extract every member.
     ///
-    /// One budget across the walk, so `maxMembers`, `maxExtractedBytes` and the
-    /// compression-ratio guard bound the ARCHIVE rather than each member of it.
+    /// One budget across the walk, so `maxMembers` and `maxExtractedBytes`
+    /// bound the ARCHIVE rather than each member of it.
     /// A limit reached part-way is reported as a final member saying so,
     /// because a list that simply ends reads as an archive that simply ended.
     #[wasm_bindgen(js_name = "extractAll")]
@@ -450,14 +442,18 @@ impl Archive {
         let out = Array::new();
         let mut taken = 0;
         let mut failed = None;
-        let walked = walk(
+        let mut limit = None;
+        let walked = walk::<()>(
             self.fmt,
             self.bytes.source(),
             &mut budget,
             &mut |meta, content, b| {
                 let entry = match read_entry(meta, content, b) {
                     Ok(entry) => entry,
-                    Err(hit) => return Some(Err(hit)),
+                    Err(hit) => {
+                        limit = Some(hit);
+                        return Some(());
+                    }
                 };
                 taken += entry.data.len() as u64;
                 match unpack_entry_to_js(&entry) {
@@ -467,7 +463,7 @@ impl Archive {
                     }
                     Err(e) => {
                         failed = Some(e);
-                        Some(Ok(()))
+                        Some(())
                     }
                 }
             },
@@ -476,7 +472,7 @@ impl Archive {
         if let Some(e) = failed {
             return Err(e);
         }
-        if let Ok(Some(Err(hit))) | Err(hit) = walked {
+        if let Some(hit) = limit.or(walked.err()) {
             out.push(&limit_marker_to_js(&hit.to_string())?);
         }
         Ok(out)
@@ -493,6 +489,31 @@ pub fn detect_format(data: &[u8]) -> Option<String> {
     exav_unpack::detect(&data).map(format_name)
 }
 
+/// A ZIP's central directory from the last bytes of a `size`-byte file, for
+/// a reader that fetches by ranges: `{ headers }`, where its members' local
+/// headers are; `{ needs }`, the offset from which more bytes are needed; or
+/// `undefined` for what the ZIP reader does not open.
+#[cfg(feature = "zip")]
+#[wasm_bindgen(js_name = "zipTail")]
+pub fn zip_tail(tail: &[u8], size: f64) -> Result<JsValue, JsValue> {
+    use exav_unpack::TailDirectory;
+    let obj = Object::new();
+    match exav_unpack::directory_in_tail(tail, size as u64) {
+        TailDirectory::Found(d) => {
+            let headers = Array::new();
+            for m in &d.members {
+                headers.push(&JsValue::from_f64(m.header as f64));
+            }
+            Reflect::set(&obj, &"headers".into(), &headers)?;
+        }
+        TailDirectory::Needs(at) => {
+            Reflect::set(&obj, &"needs".into(), &JsValue::from_f64(at as f64))?;
+        }
+        TailDirectory::NotZip => return Ok(JsValue::UNDEFINED),
+    }
+    Ok(obj.into())
+}
+
 /// Extract every member from bytes already in memory.
 ///
 /// `limits` takes the same object as [`Archive::open`].
@@ -507,7 +528,7 @@ pub fn unpack(
 }
 
 /// Rejoin the **multi-volume archives** among a group of files handed over
-/// together — a multi-file drop, a directory picker, a set of uploads.
+/// together: a multi-file drop, a directory picker, a set of uploads.
 ///
 /// A set like `big.7z.001`, `.002`, `.003` is one archive cut into pieces at
 /// arbitrary byte offsets. Opened one file at a time, none of them is a
@@ -517,19 +538,19 @@ pub fn unpack(
 /// Input: an array of `{ name: string, data: Uint8Array }`.
 ///
 /// Output: an array of `{ name, data: Uint8Array, parts: string[], incomplete }`
-/// — one entry per set. `incomplete` is `null` for a set that rejoined, and
+/// with one entry per set. `incomplete` is `null` for a set that rejoined, and
 /// otherwise a string saying why it could not, with `data` holding the pieces
 /// that were present. Those pieces are returned rather than dropped on purpose:
 /// their bytes belong to an archive nothing can now read, and letting them
 /// vanish is precisely the failure this crate exists to prevent.
 ///
-/// Files that are not part of a set are simply absent from the result — the
+/// Files that are not part of a set are simply absent from the result: the
 /// caller already has them. Names are labels: nothing here resolves a path.
 ///
 /// Format-aware volumes (RAR `.partN`, ZIP `.zNN`) are not rejoined here. Each
 /// carries its own headers and a member's data resumes *past* the next volume's
 /// header, so concatenating them yields garbage that still looks like an
-/// archive — that join belongs to the format's decoder.
+/// archive; that join belongs to the format's decoder.
 #[wasm_bindgen(js_name = "joinVolumes")]
 pub fn join_volumes(files: &Array) -> Result<Array, JsValue> {
     // No cap of its own: the caller already holds every one of these buffers, so
@@ -564,8 +585,8 @@ pub fn join_volumes(files: &Array) -> Result<Array, JsValue> {
         out.push(&obj);
     }
     for u in held.unjoined {
-        // A lone numbered file is not a set — plenty of ordinary files end in
-        // `.001` — and the caller already has it.
+        // A lone numbered file is not a set (plenty of ordinary files end in
+        // `.001`), and the caller already has it.
         let Some(reason) = u.incomplete_set else {
             continue;
         };

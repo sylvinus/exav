@@ -4,7 +4,10 @@ The demo of `@exav/viewer` lists the files of this directory's `examples.json`. 
 that was read at the page named under "Evidence", or is made by a script of this repository and
 given to the public domain (CC0-1.0). This file is written by `generate/make-attributions.mjs`; do not edit it.
 
-235 files: 145 are committed under `files/` (5.6 MB); 90 are downloaded by `npm run demo:examples` (83.0 MB).
+A file from a Zenodo or figshare record takes the licence that the record states for all of its files: those
+records name no licence per file.
+
+233 files: 145 are committed under `files/` (5.6 MB); 88 are downloaded by `npm run demo:examples` (81.4 MB).
 
 To rebuild: run the scripts of `generate/` (each lists what it needs; `python3 -I generate/make-images.py`, `make-cad.py`,
 `make-models.py`, `make-ifc.py`, `make-text.py`, `make-archives.py`, `make-media.py`, `make-pdf.py`, `make-office.py`), then
@@ -2103,32 +2106,6 @@ embed none; documents that embed fonts embed the Liberation fonts (SIL OFL 1.1, 
 - Origin: downloaded from https://ndownloader.figshare.com/files/51611078
 - SHA-256: 37b03757172e5360a03cc26da473cde84e85dbd61914b67741c94a40f7f0db2f
 
-### hospital-floor-plan-r2013.dwg
-
-- What: Furnished hospital floor plan (DWG 2013) (dwg, 1.2 MB)
-- Shows: section and level marks, 109 dimensions, 429 block definitions of furniture and plants, 19 layers
-- Author: Toka Ehab
-- Source: https://zenodo.org/records/10520508
-- Licence: CC-BY-4.0
-- Evidence: https://zenodo.org/records/10520508
-- Words read there: "Creative Commons Attribution 4.0 International"
-- Attribution: Toka Ehab, Nanotechnology Applications in Interior Design of hospitals to enhance thermal comfort and decrease the infection spread for the occupants (Elite hospital plan.dwg), Zenodo, doi:10.5281/zenodo.10520508, CC BY 4.0. No changes.
-- Origin: downloaded from https://zenodo.org/records/10520508/files/Elite%20hospital%20plan.dwg?download=1
-- SHA-256: b618207b01a1759142e038e1edf762ab8efbe11804bb2e84fc6f472e7e040fb9
-
-### commercial-building-hvac-plans-r2018.dwg
-
-- What: Air-conditioning plans of a commercial building (DWG 2018) (dwg, 495 KB)
-- Shows: 48 layers, 320 blocks, 316 dimensions, 125 hatches, 112 wipeouts
-- Author: Kevin Anthony do Bem
-- Source: https://zenodo.org/records/10407941
-- Licence: CC-BY-4.0
-- Evidence: https://zenodo.org/records/10407941
-- Words read there: "Creative Commons Attribution 4.0 International"
-- Attribution: Kevin Anthony do Bem, Projeto de Climatização de um Edifício de Comércio e Serviços (F04 Plantas- Rede aerolica.dwg), Zenodo, doi:10.5281/zenodo.10407941, CC BY 4.0. No changes.
-- Origin: downloaded from https://zenodo.org/records/10407941/files/F04%20Plantas-%20Rede%20aerolica.dwg?download=1
-- SHA-256: bcf3b92e0afdf29bb75e7632e8193f881918ddabb4de67a1331b5eda34ee9be2
-
 ### ezdxf-dim-linear-tutorial-r2013.dwg
 
 - What: ezdxf documentation: linear dimension tutorial (DWG 2013) (dwg, 36 KB)
@@ -2152,7 +2129,7 @@ embed none; documents that embed fonts embed the Liberation fonts (SIL OFL 1.1, 
 - Evidence: https://www.innerscene.com/tools/library/drawings/hospital-ward-wing-1200-square-metres-plan-and-section-73a3f4dd
 - Words read there: "Original Innerscene model, released CC0."
 - Origin: downloaded from https://www.innerscene.com/api/library/hospital-ward-wing-1200-square-metres-plan-and-section-73a3f4dd/download
-- SHA-256: 4fabf62d6d7bbc7c8bdc5f3c9d292d4980c3ec504281b0bd77f487d3c6bb9ba3
+- SHA-256: 3042880c63b7d093f287528bc723298879ffe7c9cf7b47cd8de0d81045867b69
 
 ### grocery-store-plan-section.dxf
 
@@ -2164,7 +2141,7 @@ embed none; documents that embed fonts embed the Liberation fonts (SIL OFL 1.1, 
 - Evidence: https://www.innerscene.com/tools/library/drawings/grocery-store-600-square-metres-plan-and-section-2a67d041
 - Words read there: "Original Innerscene model, released CC0."
 - Origin: downloaded from https://www.innerscene.com/api/library/grocery-store-600-square-metres-plan-and-section-2a67d041/download
-- SHA-256: 0b875304e1769e0f7c9377abf270f1fb4d103547cc27a3795a57c34fb4619d30
+- SHA-256: b3d430fa6b47801e99cda102cd2a56c342fdc55f776d57e1e4b28fc59c2ec1bb
 
 ### ezdxf-uncommon-entities.dxf
 

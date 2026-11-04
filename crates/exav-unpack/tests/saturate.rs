@@ -22,6 +22,7 @@
 //! the whole reproduction.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -35,8 +36,13 @@ static PEAK: AtomicUsize = AtomicUsize::new(0);
 /// The largest single request this run has made.
 static BIGGEST: AtomicUsize = AtomicUsize::new(0);
 
+// SAFETY: each method calls `System`'s with its own arguments, so every block
+// it gives out or takes back is `System`'s, and around that only counts, in
+// atomics, and traces with `note`, which cannot panic: `GlobalAlloc` also
+// requires that an allocator not unwind.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's contract for `alloc` is `System.alloc`'s.
         let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
             note(layout.size());
@@ -45,6 +51,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's contract is `System.alloc_zeroed`'s.
         let p = unsafe { System.alloc_zeroed(layout) };
         if !p.is_null() {
             note(layout.size());
@@ -53,11 +60,14 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+        // SAFETY: the caller passes a block of this allocator, that is of
+        // `System`, with its layout: `System.dealloc`'s contract.
         unsafe { System.dealloc(p, layout) };
         NOW.fetch_sub(layout.size(), Ordering::Relaxed);
     }
 
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, new: usize) -> *mut u8 {
+        // SAFETY: as in `dealloc`, and the caller's `new` is `System.realloc`'s.
         let q = unsafe { System.realloc(p, layout, new) };
         if !q.is_null() {
             if new >= layout.size() {
@@ -83,7 +93,10 @@ fn note(size: usize) {
         && TRACING.load(Ordering::Relaxed)
         && !IN_TRACE.swap(true, Ordering::Relaxed)
     {
-        eprintln!(
+        // Not `eprintln!`, which panics if stderr fails: an allocator must
+        // not unwind.
+        let _ = writeln!(
+            std::io::stderr(),
             "{} bytes asked for at:\n{}",
             size,
             std::backtrace::Backtrace::force_capture()

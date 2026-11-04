@@ -751,11 +751,18 @@ pub fn table(
             }
         }
     }
-    // Merged cells: the first cell spans, the others are covered.
+    // Merged cells: the first cell spans, the others are covered. Merges
+    // that do not overlap cover no more cells than the table has.
+    let mut left = u64::from(d.rows) * u64::from(d.cols);
     for (r1, c1, r2, c2) in merges(model).into_iter().take(1 << 14) {
         if r1 > r2 || c1 > c2 || r2 >= d.rows || c2 >= d.cols {
             continue;
         }
+        let area = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
+        if area > left {
+            continue;
+        }
+        left -= area;
         for rw in r1..=r2 {
             for col in c1..=c2 {
                 let cell = &mut table.rows[rw as usize].cells[col as usize];

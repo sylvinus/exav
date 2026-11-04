@@ -23,8 +23,55 @@ import { dwg } from "@exav/viewer/cad";
 const viewer = createViewer({
   plugins: [pdf(), dwg()],
   assetBase: "/exav-viewer/", // the default
+  sniffTimeoutMs: 30_000, // the default
+  sniffBytes: 65_536, // the default
+  maxExtractedBytes: 512 * 1024 * 1024, // the default
+  maxMembers: 20_000, // the default
+  maxCompressionRatio: 1000, // the default
 });
 ```
+
+`sniffTimeoutMs` bounds how long exav's detection of a file's first bytes may
+take: past it the detection's worker is stopped, a warning is logged, and the
+file's name and type decide. A number of milliseconds, `0` for no timeout; it
+does not apply to the engines. `createSandboxedViewer` takes the same option.
+
+`sniffBytes` is how many bytes from the start of a file are read to tell what
+it is (a PDF named `.png` is a PDF). A file given as a Blob, bytes or ranges is
+read in place. A file given by an address is asked for them with a range
+request (`Range: bytes=0-65535`, with the source's `init`), once, before the
+engine is chosen. A server that ignores the range answers `200` with the whole
+file: the first `sniffBytes` of the answer are taken and the rest of it is
+cancelled, so the file is not downloaded for this; the engine then fetches it
+as it always did. A request that fails (a status other than 200, 206 and 416,
+a network or CORS error) is logged, and the file's name and type decide. A
+cross-origin server must expose `Content-Range` for the file's size to be
+known; without it the detection is told the head only. `0` turns it off: files
+are told by their name and type, and no request is made for it. Not asked for:
+a file given a `format`.
+
+`detectBytes(name, head)` and the files inside archives use the same size.
+
+`maxExtractedBytes`, `maxMembers` and `maxCompressionRatio` bound a ZIP's
+directory before the file reaches its engine. They apply to the ZIP-based
+Office formats (DOCX, XLSX, PPTX, ODT, ODS, ODP, ODG, Visio, Keynote, Numbers)
+and to archives that are ZIPs. exav's ZIP reader reads the directory from the
+end of the file (a file given by an address is asked for its last bytes with a
+suffix range request, as for `inspect`), and nothing is inflated: the sizes are
+the ones the directory declares. A file past a limit is not opened and ends
+in the error `too_large` (the members add up to more than `maxExtractedBytes`),
+`too_many_entries` (more than `maxMembers`, directories included) or
+`too_compressed` (a member of more than 256 MiB that inflates to more than
+`maxCompressionRatio` times its compressed size). The limits and their reasons
+are those of exav-unpack's extraction (`max_extracted_bytes`, `max_members`,
+`max_compression_ratio`), and the error's `cause` carries its reason. `0` turns
+a limit off. A directory the reader cannot open is left to the engine, which
+fails on it as before. The plugins keep their own limits, which apply as the
+file is read: `archive()` has `maxExtractedBytes` and `maxMembers`, and the Office
+plugins `maxArchiveEntries`. Not asked for:
+an address when the host gave a `format`, or when `sniffBytes` is `0`; a file
+given as a Blob, bytes or ranges is always looked at. `createSandboxedViewer`
+takes the same three options and applies them in the frame.
 
 `@exav/viewer/cad` also exports the drawing renderer's helpers
 (`isCadSupported`, `layerColor`, `GROUNDS`). A bundle that only lists
@@ -35,9 +82,14 @@ which leaves the renderer out until a drawing is opened.
 |---|---|
 | `mount(host, file)` | Shows `file` in the element `host` and returns its `Session`. |
 | `detect(info)` | The format of a file from its `type`, `path` and `name`, or `null`: synchronous, for deciding between the viewer and a download before anything is fetched. |
-| `detectBytes(name, head)` | The same from a name and the first bytes (`HEAD_BYTES`, 512, are enough), for files with no trusted type. |
-| `sniff(head)` | The content type the first bytes prove, or `""`. |
-| `table()` | The whole detection table as JSON, for a server-side copy. |
+| `detectFile(info, head, size?, signal?, tail?)` | The format of a file from its metadata and its first bytes (`sniffBytes`, 65,536 by default, or all of it when shorter), which exav's own detection reads in a worker. The type the bytes give replaces the host's, unless the format the metadata names is one they can be (a `.docx` is a zip). Where the bytes say nothing the viewer opens, or the engine fails, `detect`'s answer stands. A zip that no name claims for another format (none, or an archive's) is the format of its members when `tail(length)` reads the end of the file (null: it cannot) and they make it one Office or OpenDocument package, and only one: a Word package named `.zip` opens as a document, not as an archive. `mount` does this itself. |
+| `detectBytes(name, head, size?, signal?)` | `detectFile` for a file known by its name alone: an archive member. |
+| `sniff(head, size?, signal?)` | The content type exav's detection gives the first bytes, or `""` (a text file, a format with no viewer, a page without workers). A promise. |
+| `inspect(kind, head, size, tail)` | What exav's readers find wrong with a file of format `kind` that failed to open: `"valid"`, `"not-inspected"`, `"signature-mismatch"`, `"invalid-package"` or `"missing-part"`. `tail(length)` reads the end of the file (null: it cannot). A file it cannot judge is `"not-inspected"`, never `"valid"`. |
+| `exceeds(kind, head, size, tail)` | The limit (`code`: `"too_large"`, `"too_compressed"` or `"too_many_entries"`, and `reason`) that the ZIP directory of a file of format `kind` goes past, or `null`. Arguments as `inspect`. |
+| `limits` | `maxExtractedBytes`, `maxMembers` and `maxCompressionRatio`, as resolved (0: none). |
+| `headBytes` | `sniffBytes`. |
+| `table()` | The whole detection table as JSON (the matchers, the unknown types and the container types), for a server-side copy. |
 | `prefetch(formats)` | Loads these formats' code and fetches the assets their plugins list, for offline use ([Integration](/viewer/integration/#offline)). |
 | `plugins`, `assetBase` | As given. |
 
@@ -65,12 +117,36 @@ frame. The differences:
 - `options` are the plugins' options that are plain data (`FrameOptions`):
   no `overlay`, `detail` or `onTap`, and so no `image` controller.
 - `plugins` is empty and `assetBase` is `""`: the engines are the frame's.
-  `prefetch` does nothing.
+  `prefetch` does nothing. `detectFile`, `detectBytes` and `sniff` go by the
+  name and type alone: the page holds no detection module (the frame tells
+  the files it is given).
 - `confirmLink(url, file)` decides on a link the user followed in a
   document: absolute `http:` and `https:` URLs only reach it, and it is
-  opened with `noopener,noreferrer` when it resolves `true`.
+  opened with `noopener,noreferrer` when it resolves `true`. A link the user
+  did not just click or press a key for is dropped without a question, as
+  is one that comes while a question is open.
+- `linkQuietMs` (default 2,000, `0` for none): after each answer, the frame's
+  links are dropped for this many milliseconds, so that a frame cannot ask
+  again at once.
 - `startTimeoutMs` (default 20,000): a frame that has not answered by then
   is reported as an error.
+- `sniffTimeoutMs` (default 30,000, `0` for none) and `sniffBytes` (default
+  65,536, `0` for none): as for `createViewer`. The frame tells what a file is
+  from its first bytes, so a PDF named `.png` is shown as a PDF there too
+  ([Security](/viewer/security/#serving-the-frame)); the page runs no
+  detection of its own. The page sends the bytes where it reads the file
+  anyway: one it holds, or one given by an address that it fetches for the
+  frame (`delivery` "blob" or "ranges"), with a range request. Given the
+  address (`delivery` "url"), the frame reads them itself where its policy
+  lets it fetch it (a PDF, an image on an origin that is also a connect
+  origin); video and audio, and an image on a media origin alone, are told by
+  their name and type. Past `sniffTimeoutMs` without an answer, the name and
+  type decide. The frame uses the same two values for the files inside an
+  archive.
+- `maxExtractedBytes`, `maxMembers` and `maxCompressionRatio`: as for
+  `createViewer`; the frame applies them to the ZIP directory of an Office
+  file or an archive before opening it, and reports `too_large`,
+  `too_many_entries` or `too_compressed`.
 - `delivery` (`Delivery`): how each kind of file reaches the frame,
   `{ media?: "url" | "blob", images?: "url" | "blob", pdf?: "ranges" | "blob" | "url", archive?: "ranges" | "blob" }`.
   Defaults: PDF and archives `"ranges"`, video, audio and images `"url"`
@@ -123,6 +199,8 @@ interface ViewerFile<Meta = unknown> {
   tree?: FileTree;       // the files around this one
   format?: FormatId;     // skips detection
   meta?: Meta;           // the host's own data, for options resolved per file
+  highlights?: readonly Highlight[];  // passages drawn marked (below)
+  focusHighlight?: string;            // the highlight gone to on open; default the first
 }
 
 type FileSource =
@@ -143,6 +221,81 @@ A `ranges` source is read as pdf.js and the ZIP reader ask for it (a PDF's
 pages on screen, an archive's directory and the members opened), and whole,
 4 MiB at a time, by the other engines. The sandboxed frame reads files this
 way, over its port.
+
+A `resolve` source that gives an address is resolved again, once per request,
+when the server answers 401 or 403 (a signature that expired). That holds for
+every request the viewer makes to it: the first and last bytes, the ranges
+and the whole file.
+
+### Highlights
+
+Passages of the document drawn marked: boxes the host places on a page, or
+a quote the viewer finds in the document's text. On open the view goes to
+`focusHighlight`, or to the first highlight, as soon as it is found.
+
+```ts
+type Highlight =
+  | { id?: string; page: number; rects: Region[]; color?: string; label?: string }
+  | { id?: string; page?: number; text: string; color?: string; label?: string };
+
+interface Region { x: number; y: number; width: number; height: number }  // fractions of the page, top left origin
+```
+
+- `page` is 1-based. With `rects`, the page the boxes are on, in fractions
+  of the page as shown (its rotation applied). With `text`, the page
+  searched first, then the pages next to it, then the others.
+- `text` is matched without case, accents, spaces or punctuation, ligatures
+  split ("ﬁ", "œ"), so that a word cut by a hyphen at the end of a line, or
+  a quote whose spaces or punctuation differ, is found. `...` or `…` stands
+  for text left out: the parts are found in order. A quote is found on one
+  page; one that runs over two is not.
+- `id` names it for `focusHighlight` and `controllers.highlights.goTo`;
+  default its index in the list, as a string (`"0"`).
+- `label` is its accessible name and the boxes' tooltip; without one, a
+  quote's own text is its name. `color` is any CSS colour; the default is
+  `--exav-viewer-highlight` ([Styles](/viewer/react/#styles)).
+
+Boxes on one line that touch or nearly touch are drawn as one. The boxes are
+laid out in fractions of their page, so they follow the zoom and the scroll,
+and let the pointer through to the text, which stays selectable. A PDF draws
+them over the page, multiplied with it; a text or Markdown file wraps the
+quote in `<mark>` elements (boxes, which need pages, are not drawn there).
+
+| Format | Boxes (`rects`) | Quotes (`text`) |
+|---|---|---|
+| PDF, and a file an external converter turns into a PDF | yes | yes, in pdf.js's text layer: a scanned page with no text has none |
+| Text, Markdown, JSON, XML, source code | no | yes |
+| Word, PowerPoint, Excel, images, drawings, models | no | no: the list is ignored |
+
+The `highlights` controller (below) holds each one as found:
+`{ id, state, page, rects, color?, label?, text? }`, `state` being
+`"pending"` while a quote is looked for, `"shown"`, or `"missing"` (not
+found, a page the document does not have, boxes in a text). `set(list)`
+replaces them without moving the view, and `goTo(id)` brings one into view
+(once found, for a quote still pending; its page, for a quote not found that
+names one). `current` is the last one gone to, outlined.
+
+```ts
+const session = viewer.mount(element, {
+  id: "dce-42",
+  name: "rc.pdf",
+  source: { url: "/files/rc.pdf" },
+  highlights: [
+    { id: "deadline", page: 4, text: "Date limite de réception des offres : 12 mars 2027", label: "Deadline" },
+    { id: "price", page: 7, rects: [{ x: 0.12, y: 0.41, width: 0.5, height: 0.018 }] },
+  ],
+  focusHighlight: "deadline",
+});
+// later, from the host's own list of evidence
+session.controllers.get().highlights?.goTo("price");
+session.controllers.get().pages?.goTo?.(2);
+```
+
+In the sandboxed frame the highlights are sent with the file, each checked
+(a colour that is one, at most `MAX_HIGHLIGHTS` of them and
+`MAX_HIGHLIGHT_RECTS` boxes each); the frame reports where they are, and the
+labels, colours and quotes the host's store holds are the host's own. A
+member of an archive is opened with none.
 
 ### The files around a file
 
@@ -229,7 +382,9 @@ started yet, a file delivered another way than the first, say an image given
 by URL after one given as bytes) and changed nothing: mount a new session, as
 for a new file. In a frame, one replacement is with the frame at a time:
 call it again before it resolves and the earlier call resolves `true` without
-having been shown.
+having been shown. A frame keeps its realm across a replacement; a host that
+needs each file isolated from the others mounts a new session for it
+([Security](/viewer/security/#what-makes-it-hold)).
 
 The React UI does it for you: give `ViewerBody` the same `file.id` with a
 different `source` and the document is replaced in place, or the session
@@ -246,7 +401,7 @@ type Status =
   | { phase: "converting"; progress?: number; label?: string; step?: LoadStep }   // a step after the fetch that reports its progress
   | { phase: "ready"; partial?: boolean }        // partial: something drew, then the engine failed
   | { phase: "empty" }                           // parsed, nothing to draw
-  | { phase: "error"; error: { code: "pdf" | "image" | "image_no_preview" | "drawing" | "drawing_version" | "office" | "needs_converter" | "media" | "model" | "archive" | "text" | "text_binary" | "file" | (string & {}); message?: string; cause?: unknown } };
+  | { phase: "error"; error: { code: "pdf" | "image" | "image_no_preview" | "drawing" | "drawing_version" | "office" | "needs_converter" | "media" | "model" | "archive" | "text" | "text_binary" | "damaged" | "wrong_type" | "too_large" | "too_compressed" | "too_many_entries" | "file" | (string & {}); message?: string; cause?: unknown } };
 ```
 
 `step` says what a load is doing, for a progress display, and `progress`
@@ -290,6 +445,21 @@ the package's converters, or an `ExternalConversionError` (`kind` `"failed"` or
 `needs_converter`: a format only an external converter reads, and none is set;
 the `cause` is a `NeedsConverterError` (`kind` `"needs-converter"`, `format` the
 viewer's name for the file).
+`damaged` and `wrong_type`: a file of a format whose package or signature
+exav's readers check (PDF, DOCX, XLSX, PPTX, ODT, ODS, ODP) that failed to open.
+`damaged`: its ZIP package has no readable directory (`invalid-package`) or
+lacks a part the format requires (`missing-part`: `[Content_Types].xml` and the
+main part for Office Open XML, `content.xml` for OpenDocument). `wrong_type`:
+its first bytes are not those of the format (`signature-mismatch`): a text file
+named `.docx`. They replace the format's code only, and only after the file
+failed; the `cause` is the failure. A file that is sound as far as they look,
+or that they do not check (`not-inspected`), keeps the format's code. The end
+of a file given by an address is asked for with a suffix range request; an
+address given with a `format` is not asked for anything.
+`too_large`, `too_compressed` and `too_many_entries`: a ZIP-based Office file or
+an archive refused before it was opened, because its directory goes past
+`maxExtractedBytes`, `maxCompressionRatio` or `maxMembers` (see above). The
+`cause` is an `Error` with exav-unpack's reason.
 
 `errorCode(format)` gives the code a format's errors carry.
 
@@ -307,6 +477,7 @@ Each is present when the format has it. All are stores.
 | `media` | video, audio | `{ kind, paused, ended, currentTime, duration, buffered, volume, muted, rate, waiting, blocked }`; `play()`, `pause()`, `seek(seconds)`, `setVolume(v)`, `setMuted(m)`, `setRate(r)`, for a host drawing its own player (`video({ controls: "none" })`). `blocked`: the browser refused to start without a click on the player itself |
 | `drag` | PDF | what a mouse drag does: `{ mode: "pan" \| "select", available }`; `choose(mode)`. `available` is true once the page is larger than the viewer, which is when the choice matters; below that a drag always selects text. Hand ("pan") is the default |
 | `outline` | PDF | the document's own outline, flattened: `{ title, page, depth, offset }`; `goTo(entry)` |
+| `highlights` | PDF, text | the file's [highlights](#highlights) as found: `{ items: { id, state, page, rects, color?, label?, text? }[], current }`; `set(list)`, `goTo(id)` |
 | `layers` | DWG, DXF (layers), IFC (categories) | `{ kind, items: { id, name, color, visible }[] }`; `setVisible(id, visible)`, `setAll(visible)` |
 | `storeys` | IFC (a model with two or more building storeys that hold something) | `{ items: { id, name, elevation, visible }[] }`, highest first (`elevation` in metres, or `null`); `setVisible(id, visible)`, `setAll(visible)`. A hidden storey's elements, outlines included, are not drawn, not picked, and not in pictures; the default UI lists them above the categories |
 | `layouts` | DWG, DXF | model space and each paper layout; `select(id)`, `""` being model space |
@@ -334,7 +505,7 @@ included.
 | `text()` | none: it reads at most 2 MiB and 50,000 lines of a file, and cuts a line at 10,000 characters |
 | `ifc()` | `ground`, `colors`, `highlight`, `timeoutMs` (default 120,000), `maxTriangles` (default 6,000,000, about 330 MB of buffers: past it the remaining elements are left out, with a warning) |
 | `stl()` | `surface` (a colour), `zUp` (default true), `timeoutMs` (default 120,000), `maxTriangles` (default 6,000,000) |
-| `archive()` | `maxExtractedBytes` (512 MiB), `maxMembers` (5000), `maxCompressionRatio` (200) |
+| `archive()` | `maxExtractedBytes` (512 MiB), `maxMembers` (5000) |
 
 ### Drawing over an image
 
@@ -547,8 +718,8 @@ same format in place of this one (see [Replacing the document](#replacing-the-do
 without it `session.replace` answers `false`. A `mount` that throws ends in an error
 status with the format's code; one aborted by `signal` ends quietly.
 
-`match` is data: `types`, `extensions`, `containerTypes`,
-`extensionOverrides`, magic-byte `signatures`, and `confirmSniff(head, name)`
-to reject a sniffed type the bytes do not back. Being data, the detection
-table can be exported (`viewer.table()`) and checked against a server's
-copy.
+`match` is data: `types`, `extensions`, `containerTypes` and
+`extensionOverrides`. Being data, the detection table can be exported
+(`viewer.table()`) and checked against a server's copy. What the first bytes
+say is exav's detection, which a plugin cannot extend: a format it does not
+know is claimed by its type or its name.

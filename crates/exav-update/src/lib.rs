@@ -36,7 +36,7 @@ const MAX_FETCH: u64 = 4 * 1024 * 1024 * 1024;
 /// Mirrored from `exav-core::database` so this crate needs no `exav-core` dependency.
 const EXAV_DB_MAGIC: &[u8; 8] = b"EXAVDB\x00\x01";
 /// The format version `exav-core` reads and writes (its `database::VERSION`).
-const EXAV_DB_VERSION: u32 = 4;
+const EXAV_DB_VERSION: u32 = 5;
 const EXAV_DB_HEADER_LEN: usize = 12; // 8-byte magic + 4-byte LE version
 const EXAV_DB_DIGEST_LEN: usize = 4; // trailing CRC-32 of the payload, LE
 

@@ -25,7 +25,7 @@ use crate::formats::office::slides::error::{Error, Result};
 use crate::formats::office::slides::limits::Budget;
 use crate::formats::office::slides::model::*;
 use crate::formats::office::slides::package::Zip;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Message types ([keynote-parser]'s registry).
 pub(crate) mod ty {
@@ -234,7 +234,9 @@ fn read_files<'a>(
     for &(name, d) in files {
         if name.ends_with(".iwa") {
             let left = budget.limits.max_part.min(budget.limits.max_memory) as usize;
-            let used = store.add(d, left);
+            let used = store
+                .add(d, left)
+                .map_err(|_| Error::TooLarge("an IWA stream"))?;
             budget.alloc(used as u64 * 2)?;
         } else if let Some(i) = name.find("Data/") {
             data.insert(name[i + 5..].to_string(), DataFile::Bytes(d));
@@ -266,6 +268,7 @@ fn read_files<'a>(
         media: HashMap::new(),
         p: Presentation::default(),
         masters: HashMap::new(),
+        groups: HashSet::new(),
     };
     r.convert(doc, budget)?;
     Ok(r.p)
@@ -350,6 +353,9 @@ pub(crate) struct Reader<'a> {
     pub p: Presentation,
     /// Template slides to their master's index.
     masters: HashMap<u64, usize>,
+    /// The groups converted: each is converted once, so references that
+    /// loop or repeat convert nothing more.
+    groups: HashSet<u64>,
 }
 
 impl<'a> Reader<'a> {
@@ -447,6 +453,9 @@ impl<'a> Reader<'a> {
             return;
         };
         for c in node.references(1) {
+            if out.len() > 100_000 {
+                return;
+            }
             out.push(c);
             self.walk_nodes(c, out, depth + 1);
         }
@@ -604,5 +613,101 @@ impl<'a> Reader<'a> {
             hidden: skipped,
             show_master_shapes: true,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formats::office::common::iwa::proto::write::W;
+    use crate::formats::office::slides::limits::Limits;
+
+    fn reader(store: &Store) -> Reader<'_> {
+        Reader {
+            store,
+            data: HashMap::new(),
+            zip: None,
+            failed: None,
+            media: HashMap::new(),
+            p: Presentation::default(),
+            masters: HashMap::new(),
+            groups: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn a_slide_tree_that_holds_itself_lists_no_more_than_its_cap() {
+        let mut node = W::default();
+        for _ in 0..2000 {
+            node = node.reference(1, 7);
+        }
+        let s = Store::of(&[(7, ty::SLIDE_NODE, node)]);
+        let mut out = vec![];
+        reader(&s).walk_nodes(7, &mut out, 0);
+        assert!(out.len() <= 100_001, "{}", out.len());
+    }
+
+    #[test]
+    fn groups_that_hold_themselves_are_converted_once() {
+        let mut group = W::default().msg(1, W::default());
+        for _ in 0..64 {
+            group = group.reference(2, 9);
+        }
+        let s = Store::of(&[(9, ty::GROUP, group)]);
+        let mut r = reader(&s);
+        let mut budget = Budget::new(Limits::default());
+        let t = std::time::Instant::now();
+        let shape = shapes::drawable(&mut r, 9, 1, &mut budget, 0).unwrap();
+        assert!(t.elapsed().as_secs() < 2, "took {:?}", t.elapsed());
+        assert!(shape.is_none());
+    }
+
+    #[test]
+    fn merges_cover_no_more_cells_than_the_table_has() {
+        // Every merge spans the whole table.
+        let span = |n: u64| W::default().uint(1, 0).uint(2, n - 1);
+        let node = W::default()
+            .uint(1, 67)
+            .msg(40, W::default().msg(4, span(256)).msg(3, span(256)));
+        let pair = W::default().msg(2, W::default().msg(1, W::default().msg(1, node)));
+        let mut pairs = W::default();
+        for _ in 0..1 << 14 {
+            pairs = pairs.msg(3, pair.clone());
+        }
+        let model = W::default()
+            .uint(6, 256)
+            .uint(7, 256)
+            .msg(47, W::default().msg(2, pairs));
+        let s = Store::of(&[(5, 6001, model)]);
+        let info = W::default().msg(1, W::default()).reference(2, 5);
+        let mut r = reader(&s);
+        let mut budget = Budget::new(Limits::default());
+        let t = std::time::Instant::now();
+        let shape = table::table(&mut r, Msg(&info.0), 1, &mut budget).unwrap();
+        assert!(t.elapsed().as_secs() < 2, "took {:?}", t.elapsed());
+        let ShapeKind::Table(t) = shape.unwrap().kind else {
+            panic!("not a table");
+        };
+        assert_eq!(t.rows[0].cells[0].grid_span, 256);
+        assert!(t.rows[255].cells[255].v_merge);
+    }
+
+    #[test]
+    fn styles_are_found_in_one_pass() {
+        // Many characters, each under a table of many entries.
+        let mut runs = W::default();
+        for _ in 0..1 << 17 {
+            runs = runs.msg(1, W::default().uint(1, 0).reference(2, 9));
+        }
+        let storage = W::default()
+            .bytes(3, "x".repeat(1 << 17).as_bytes())
+            .msg(8, runs);
+        let s = Store::of(&[(9, ty::CHARACTER_STYLE, W::default())]);
+        let mut r = reader(&s);
+        let mut budget = Budget::new(Limits::default());
+        let t = std::time::Instant::now();
+        let body = text::body(&mut r, Msg(&storage.0), None, 1, &mut budget).unwrap();
+        assert!(t.elapsed().as_secs() < 2, "took {:?}", t.elapsed());
+        assert_eq!(body.unwrap().paras[0].runs.len(), 1);
     }
 }

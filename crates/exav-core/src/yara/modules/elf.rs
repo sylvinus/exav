@@ -11,7 +11,7 @@
 
 use std::rc::Rc;
 
-use super::FieldName;
+use super::{Copies, FieldName};
 use crate::yara::error::{Error, Result};
 use crate::yara::ir::{Fields, Value};
 
@@ -22,14 +22,18 @@ use crate::yara::ir::{Fields, Value};
 /// Parses `data` and returns the `elf` root value. A non-ELF input yields an
 /// empty struct, so every field reads as undefined (YARA's behaviour) rather
 /// than as a wrong value.
-pub(crate) fn build(data: &[u8]) -> Value {
+///
+/// The names of sections and symbols are charged to `copies` as they are
+/// copied, and the tables are cut where it runs out: many entries can name
+/// one long string.
+pub(crate) fn build(data: &[u8], copies: &Copies) -> Value {
     match goblin::elf::Elf::parse(data) {
-        Ok(elf) => build_elf(data, &elf),
+        Ok(elf) => build_elf(data, &elf, copies),
         Err(_) => Value::Struct(Rc::new(Fields::new())),
     }
 }
 
-fn build_elf(data: &[u8], elf: &goblin::elf::Elf) -> Value {
+fn build_elf(data: &[u8], elf: &goblin::elf::Elf, copies: &Copies) -> Value {
     let mut f = Fields::new();
     let ins = |f: &mut Fields, k: &str, v: i64| {
         f.insert(k.into(), Value::Int(v));
@@ -57,13 +61,11 @@ fn build_elf(data: &[u8], elf: &goblin::elf::Elf) -> Value {
     let mut sections = Vec::with_capacity(elf.section_headers.len());
     for sh in elf.section_headers.iter() {
         let mut s = Fields::new();
-        let name = elf
-            .shdr_strtab
-            .get_at(sh.sh_name)
-            .unwrap_or_default()
-            .as_bytes()
-            .to_vec();
-        s.insert("name".into(), Value::Str(name));
+        let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or_default();
+        if !copies.take(name.len()) {
+            break;
+        }
+        s.insert("name".into(), Value::Str(name.as_bytes().to_vec()));
         s.insert("type".into(), Value::Int(sh.sh_type as i64));
         s.insert("flags".into(), Value::Int(sh.sh_flags as i64));
         s.insert("address".into(), Value::Int(sh.sh_addr as i64));
@@ -102,12 +104,12 @@ fn build_elf(data: &[u8], elf: &goblin::elf::Elf) -> Value {
         f.insert("dynamic".into(), Value::Array(Rc::new(dyns)));
     }
 
-    let symtab = build_symbols(&elf.syms, &elf.strtab);
+    let symtab = build_symbols(&elf.syms, &elf.strtab, copies);
     if !symtab.is_empty() {
         ins(&mut f, "symtab_entries", symtab.len() as i64);
         f.insert("symtab".into(), Value::Array(Rc::new(symtab)));
     }
-    let dynsym = build_symbols(&elf.dynsyms, &elf.dynstrtab);
+    let dynsym = build_symbols(&elf.dynsyms, &elf.dynstrtab, copies);
     if !dynsym.is_empty() {
         ins(&mut f, "dynsym_entries", dynsym.len() as i64);
         f.insert("dynsym".into(), Value::Array(Rc::new(dynsym)));
@@ -117,16 +119,19 @@ fn build_elf(data: &[u8], elf: &goblin::elf::Elf) -> Value {
     Value::Struct(Rc::new(f))
 }
 
-fn build_symbols(syms: &goblin::elf::Symtab, strtab: &goblin::strtab::Strtab) -> Vec<Value> {
+fn build_symbols(
+    syms: &goblin::elf::Symtab,
+    strtab: &goblin::strtab::Strtab,
+    copies: &Copies,
+) -> Vec<Value> {
     let mut out = Vec::with_capacity(syms.len());
     for sym in syms.iter() {
         let mut s = Fields::new();
-        let name = strtab
-            .get_at(sym.st_name)
-            .unwrap_or_default()
-            .as_bytes()
-            .to_vec();
-        s.insert("name".into(), Value::Str(name));
+        let name = strtab.get_at(sym.st_name).unwrap_or_default();
+        if !copies.take(name.len()) {
+            break;
+        }
+        s.insert("name".into(), Value::Str(name.as_bytes().to_vec()));
         s.insert("value".into(), Value::Int(sym.st_value as i64));
         s.insert("size".into(), Value::Int(sym.st_size as i64));
         // `st_info` packs bind in the high nibble and type in the low nibble.

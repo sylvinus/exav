@@ -8,7 +8,7 @@
 # a clean file, which is why the test also pins the behaviour one level short of
 # the payload: that must read as LIMITS-EXCEEDED, never as clean.
 #
-# The first run of this fixture found a real bug — a compressed QCOW2 cluster at
+# The first run of this fixture found a real bug: a compressed QCOW2 cluster at
 # an odd host offset was being silently zero-filled.
 #
 # Every layer is produced by that format's own reference tool. Nothing here is
@@ -20,7 +20,7 @@
 #                   wimtools sharutils util-linux python3
 #
 # plus 7-Zip (`7zz`, https://7-zip.org) and official RAR (`rar`,
-# https://rarlab.com) — neither is packaged in Debian main.
+# https://rarlab.com); neither is packaged in Debian main.
 #
 # Layer order is deliberate: the bulky disk images sit in the middle, so the
 # QCOW2 layer above them compresses their megabytes of zeroes back down and the
@@ -44,7 +44,7 @@ n=0
 step() { n=$((n + 1)); printf '%2d %-10s %10s bytes\n' "$n" "$1" "$(wc -c < "$2")"; }
 
 # Pad a file up to a 512-byte sector so it can be handed to qemu-img as a raw
-# disk whose first bytes are the artefact itself — the reconstructed disk then
+# disk whose first bytes are the artefact itself: the reconstructed disk then
 # types by magic at offset 0 rather than relying on carving.
 pad() { python3 -c "
 import sys

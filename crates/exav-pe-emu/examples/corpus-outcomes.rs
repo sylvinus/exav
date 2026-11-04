@@ -1,8 +1,8 @@
 //! Record what the emulator does to every packed sample, as one line each.
 //!
 //! WHY THIS EXISTS: the emulator's output is not a verdict but an image, and
-//! the ways it can go subtly wrong — an operand read from the wrong register,
-//! a memory access one width too narrow — do not announce themselves. They
+//! the ways it can go subtly wrong (an operand read from the wrong register,
+//! a memory access one width too narrow) do not announce themselves. They
 //! change which bytes come out, or turn a successful unpack into a stall,
 //! quietly. A per-sample record of what happened is what makes a change to the
 //! decoder or the semantics reviewable: run it before, run it after, diff.
@@ -28,7 +28,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// FNV-1a. Not a security hash — this only has to change when the bytes do,
+/// FNV-1a. Not a security hash: this only has to change when the bytes do,
 /// and it keeps the example free of a hashing dependency.
 fn digest(b: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;

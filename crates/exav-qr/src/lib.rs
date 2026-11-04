@@ -1,0 +1,689 @@
+// Vendored from rqrr 0.11.0 (https://github.com/WanzenBug/rqrr), src/lib.rs,
+// a port of quirc. License: (MIT OR Apache-2.0) AND ISC, see LICENSE-*.
+// Copyright 2019 Moritz Wanzenböck; quirc: copyright 2010-2012 Daniel Beer.
+// Changed: `forbid(unsafe_code)`, `mod gf`, `mod limits` (a search stops at a
+// deadline, a memory budget and caps), the examples of the crate docs; rustfmt.
+
+//! Find and read QR-Codes
+//!
+//! This crates exports functions and types that can be used to search for
+//! QR-Codes in images and decode them.
+//!
+//! # Usage
+//! The most basic usage is shown below:
+//!
+//! ```rust
+//! # fn main() -> Result<(), Box<dyn ::std::error::Error>> {
+//! // Prepare a blank grey image of 64 by 64 pixels for detection
+//! let mut img = exav_qr::PreparedImage::prepare_from_greyscale(64, 64, |_, _| 255);
+//! // Search for grids, without decoding
+//! let grids = img.detect_grids();
+//! // Decode each grid; a blank image has none
+//! for grid in &grids {
+//!     let (_meta, _content) = grid.decode()?;
+//! }
+//! assert!(grids.is_empty());
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The pixels come from a function, so any form of picture storage can be
+//! searched: see [`PreparedImage::prepare_from_greyscale`] and its siblings.
+#![forbid(unsafe_code)]
+pub use self::decode::{MAX_PAYLOAD_SIZE, MetaData, RawData, Version};
+pub(crate) use self::detect::{CapStone, capstones_from_image};
+pub use self::identify::Point;
+pub(crate) use self::identify::SkewedGridLocation;
+pub use self::limits::{CHECK_EVERY, SearchLimits, Stop};
+pub use self::prepare::{Detection, PreparedImage};
+use std::error::Error;
+use std::io::Write;
+
+mod decode;
+mod detect;
+pub(crate) mod geometry;
+mod gf;
+mod identify;
+mod limits;
+mod prepare;
+mod version_db;
+
+/// Wrapper around any grid that can be interpreted as a QR code
+#[derive(Debug, Clone)]
+pub struct Grid<G> {
+    /// The backing binary square
+    pub grid: G,
+    /// The bounds of the square, in underlying coordinates.
+    ///
+    /// The points are listed in the following order:
+    /// [top-left, top-right, bottom-right, bottom-left]
+    ///
+    /// If this grid references for example an underlying image, these values
+    /// will be set to coordinates in that image.
+    pub bounds: [Point; 4],
+}
+
+impl<G> Grid<G>
+where
+    G: BitGrid,
+{
+    /// Create a new grid from a BitGrid.
+    ///
+    /// This just initialises the bounds to 0.
+    pub fn new(grid: G) -> Self {
+        Grid {
+            grid,
+            bounds: [
+                Point { x: 0, y: 0 },
+                Point { x: 0, y: 0 },
+                Point { x: 0, y: 0 },
+                Point { x: 0, y: 0 },
+            ],
+        }
+    }
+
+    /// Try to decode the grid.
+    ///
+    /// If successful returns the decoded string as well as metadata about the
+    /// code.
+    pub fn decode(&self) -> DeQRResult<(MetaData, String)> {
+        let mut out = Vec::new();
+        let meta = self.decode_to(&mut out)?;
+        let out = String::from_utf8(out)?;
+        Ok((meta, out))
+    }
+
+    /// Try to read metadata, and return the raw, uncorrected bit stream.
+    ///
+    /// If successful, returns the metadata along with the raw bit pattern.
+    /// The raw data is still masked, so bits appear as in the source image.
+    pub fn get_raw_data(&self) -> DeQRResult<(MetaData, RawData)> {
+        decode::get_raw(&self.grid, false)
+    }
+
+    /// Try to decode the grid.
+    ///
+    /// Instead of returning a String, this method writes the decoded result to
+    /// the given writer
+    ///
+    /// **Warning**: This may lead to half decoded content to be written to the
+    /// writer.
+    pub fn decode_to<W>(&self, writer: W) -> DeQRResult<MetaData>
+    where
+        W: Write,
+    {
+        decode::decode(&self.grid, writer)
+    }
+}
+
+/// A grid that contains exactly one QR code square.
+///
+/// The common trait for everything that can be decoded as a QR code. Given a
+/// normal image, we first need to find the QR grids in it.
+///
+/// This trait can be implemented when some object is known to be exactly the
+/// bit-pattern of a QR code.
+pub trait BitGrid {
+    /// Return the size of the grid.
+    ///
+    /// Since QR codes are always squares, the grid is assumed to be size *
+    /// size.
+    fn size(&self) -> usize;
+
+    /// Return the value of the bit at the given location.
+    ///
+    /// `true` means 'black', `false` means 'white'
+    fn bit(&self, y: usize, x: usize) -> bool;
+}
+
+/// Mirrored grid, switching x and y coordinates
+///
+/// Some QR codes are read mirrored, even though the spec does not officially support it.
+/// Since there is no marker in the QR code spec, we simply have to try to read the grid both ways
+/// if the first does not succeed.
+pub struct MirroredGrid<'a>(&'a dyn BitGrid);
+
+impl BitGrid for MirroredGrid<'_> {
+    fn size(&self) -> usize {
+        self.0.size()
+    }
+
+    fn bit(&self, y: usize, x: usize) -> bool {
+        self.0.bit(x, y)
+    }
+}
+
+/// A basic GridImage that can be generated from a given function.
+///
+/// # Example
+///
+/// ```rust
+/// # fn main() -> Result<(), exav_qr::DeQRError> {
+/// let grid = [
+///     [
+///         1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1,
+///     ],
+///     [
+///         1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
+///     ],
+///     [
+///         1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1,
+///     ],
+///     [
+///         1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1,
+///     ],
+///     [
+///         1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1,
+///     ],
+///     [
+///         1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1,
+///     ],
+///     [
+///         1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1,
+///     ],
+///     [
+///         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+///     ],
+///     [
+///         1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0,
+///     ],
+///     [
+///         1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1,
+///     ],
+///     [
+///         0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1,
+///     ],
+///     [
+///         1, 1, 0, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1,
+///     ],
+///     [
+///         0, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1,
+///     ],
+///     [
+///         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1,
+///     ],
+///     [
+///         1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1,
+///     ],
+///     [
+///         1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
+///     ],
+///     [
+///         1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 1, 1,
+///     ],
+///     [
+///         1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+///     ],
+///     [
+///         1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1,
+///     ],
+///     [
+///         1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0,
+///     ],
+///     [
+///         1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 1, 1,
+///     ],
+/// ];
+///
+/// let simple = exav_qr::SimpleGrid::from_func(21, |x, y| grid[y][x] == 1);
+/// let grid = exav_qr::Grid::new(simple);
+/// let (_meta, content) = grid.decode()?;
+/// assert_eq!(content, "rqrr");
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct SimpleGrid {
+    cell_bitmap: Vec<u8>,
+    size: usize,
+}
+
+impl SimpleGrid {
+    pub fn from_func<F>(size: usize, fill_func: F) -> Self
+    where
+        F: Fn(usize, usize) -> bool,
+    {
+        let mut cell_bitmap = vec![0; (size * size).div_ceil(8)];
+        let mut c = 0;
+        for y in 0..size {
+            for x in 0..size {
+                if fill_func(x, y) {
+                    cell_bitmap[c >> 3] |= 1 << (c & 7) as u8;
+                }
+                c += 1;
+            }
+        }
+
+        SimpleGrid { cell_bitmap, size }
+    }
+}
+
+impl BitGrid for SimpleGrid {
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn bit(&self, y: usize, x: usize) -> bool {
+        let c = y * self.size + x;
+        self.cell_bitmap[c >> 3] & (1 << (c & 7) as u8) != 0
+    }
+}
+
+/// Possible errors that can happen during decoding
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum DeQRError {
+    /// Could not write the output to the output stream/string
+    IoError,
+    /// Expected more bits to decode
+    DataUnderflow,
+    /// Expected less bits to decode
+    DataOverflow,
+    /// Unknown data type in encoding
+    UnknownDataType,
+    /// Could not correct errors / code corrupt
+    DataEcc,
+    /// Could not read format information from both locations
+    FormatEcc,
+    /// Unsupported / non-existent version read
+    InvalidVersion,
+    /// Unsupported / non-existent grid size read
+    InvalidGridSize,
+    /// Output was not encoded in expected UTF8
+    EncodingError,
+}
+
+type DeQRResult<T> = Result<T, DeQRError>;
+
+impl Error for DeQRError {}
+
+impl From<::std::string::FromUtf8Error> for DeQRError {
+    fn from(_: ::std::string::FromUtf8Error) -> Self {
+        DeQRError::EncodingError
+    }
+}
+
+impl ::std::fmt::Display for DeQRError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            DeQRError::IoError => "IoError(Could not write to output)",
+            DeQRError::DataUnderflow => "DataUnderflow(Expected more bits to decode)",
+            DeQRError::DataOverflow => "DataOverflow(Expected less bits to decode)",
+            DeQRError::UnknownDataType => "UnknownDataType(DataType not known or not implemented)",
+            DeQRError::DataEcc => "Ecc(Too many errors to correct)",
+            DeQRError::FormatEcc => "Ecc(Version information corrupt)",
+            DeQRError::InvalidVersion => "InvalidVersion(Invalid version or corrupt)",
+            DeQRError::InvalidGridSize => "InvalidGridSize(Invalid version or corrupt)",
+            DeQRError::EncodingError => "Encoding(Not UTF8)",
+        };
+        write!(f, "{msg}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rqrr() {
+        let grid = [
+            [
+                1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1,
+            ],
+            [
+                1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1,
+            ],
+            [
+                1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1,
+            ],
+            [
+                1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1,
+            ],
+            [
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+            [
+                1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0,
+            ],
+            [
+                1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1,
+            ],
+            [
+                0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1,
+            ],
+            [
+                1, 1, 0, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1,
+            ],
+            [
+                0, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1,
+            ],
+            [
+                0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1,
+            ],
+            [
+                1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1,
+            ],
+            [
+                1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 1, 1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1,
+            ],
+            [
+                1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0,
+            ],
+            [
+                1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 1, 1,
+            ],
+        ];
+
+        let img = crate::SimpleGrid::from_func(21, |x, y| grid[y][x] == 1);
+
+        let mut buf = vec![0; img.size() * img.size() / 8 + 1];
+        for y in 0..img.size() {
+            for x in 0..img.size() {
+                let i = y * img.size() + x;
+                if img.bit(y, x) {
+                    buf[i >> 3] |= 1 << ((i & 7) as u8);
+                }
+            }
+        }
+
+        let mut vec = Vec::new();
+        crate::decode::decode(&img, &mut vec).unwrap();
+
+        assert_eq!(b"rqrr".as_ref(), &vec[..])
+    }
+
+    #[test]
+    fn test_github() {
+        let grid = [
+            [
+                1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1,
+                1,
+            ],
+            [
+                1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0,
+                1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0,
+                1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0,
+                1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0,
+                1,
+            ],
+            [
+                1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0,
+                1,
+            ],
+            [
+                1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1,
+                1,
+            ],
+            [
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                0,
+            ],
+            [
+                1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1,
+                0,
+            ],
+            [
+                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0,
+                1,
+            ],
+            [
+                1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1,
+                1,
+            ],
+            [
+                1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1,
+                0,
+            ],
+            [
+                0, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 1,
+                1,
+            ],
+            [
+                0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0,
+                1,
+            ],
+            [
+                1, 0, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 1,
+                1,
+            ],
+            [
+                1, 1, 0, 0, 1, 1, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 1,
+                0,
+            ],
+            [
+                1, 0, 0, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1,
+                1,
+            ],
+            [
+                0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0,
+                1,
+            ],
+            [
+                1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1,
+                1,
+            ],
+            [
+                0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1,
+                0,
+            ],
+            [
+                1, 0, 1, 1, 1, 1, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0,
+                0,
+            ],
+            [
+                0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1,
+                1,
+            ],
+            [
+                1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1,
+                1,
+            ],
+            [
+                1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0, 1, 1, 0, 0,
+                0,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0,
+                1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1,
+                1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 0,
+                1,
+            ],
+            [
+                1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1,
+                0,
+            ],
+            [
+                1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1,
+                1,
+            ],
+        ];
+
+        let img = crate::SimpleGrid::from_func(29, |x, y| grid[y][x] == 1);
+
+        let mut buf = vec![0; img.size() * img.size() / 8 + 1];
+        for y in 0..img.size() {
+            for x in 0..img.size() {
+                let i = y * img.size() + x;
+                if img.bit(y, x) {
+                    buf[i >> 3] |= 1 << ((i & 7) as u8);
+                }
+            }
+        }
+
+        let mut vec = Vec::new();
+        crate::decode::decode(&img, &mut vec).unwrap();
+
+        assert_eq!(b"https://github.com/WanzenBug/rqrr".as_ref(), &vec[..])
+    }
+
+    #[test]
+    fn test_number() {
+        let grid = [
+            [
+                1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1,
+                1,
+            ],
+            [
+                1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0,
+                1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0,
+                1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0,
+                1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0,
+                1,
+            ],
+            [
+                1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0,
+                1,
+            ],
+            [
+                1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1,
+                1,
+            ],
+            [
+                0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+                0,
+            ],
+            [
+                1, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1, 0,
+                0,
+            ],
+            [
+                1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0,
+                1,
+            ],
+            [
+                0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 1,
+                0,
+            ],
+            [
+                0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+                1,
+            ],
+            [
+                0, 0, 1, 0, 1, 0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1,
+                0,
+            ],
+            [
+                0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0,
+                1,
+            ],
+            [
+                0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1,
+                0,
+            ],
+            [
+                1, 0, 0, 1, 0, 1, 0, 1, 1, 1, 1, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1,
+                1,
+            ],
+            [
+                0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1,
+                0,
+            ],
+            [
+                1, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0,
+                1,
+            ],
+            [
+                1, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1,
+                0,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0,
+                0,
+            ],
+            [
+                1, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+                0,
+            ],
+            [
+                0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0,
+                1,
+            ],
+            [
+                1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1,
+                0,
+            ],
+            [
+                1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+                1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0,
+                1,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0,
+                0,
+            ],
+            [
+                1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1,
+                0,
+            ],
+            [
+                1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1,
+                0,
+            ],
+            [
+                1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0,
+                0,
+            ],
+        ];
+
+        let img = crate::SimpleGrid::from_func(29, |x, y| grid[y][x] == 1);
+
+        let mut buf = vec![0; img.size() * img.size() / 8 + 1];
+        for y in 0..img.size() {
+            for x in 0..img.size() {
+                let i = y * img.size() + x;
+                if img.bit(y, x) {
+                    buf[i >> 3] |= 1 << ((i & 7) as u8);
+                }
+            }
+        }
+
+        let mut vec = Vec::new();
+        crate::decode::decode(&img, &mut vec).unwrap();
+
+        assert_eq!(b"1234567891011121314151617181920".as_ref(), &vec[..])
+    }
+}

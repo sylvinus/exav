@@ -319,14 +319,35 @@ impl Builder {
                     self.engine.add_literal_prov(&name, &bytes, unofficial);
                 }
             }
-            "hdb" | "hsb" | "hdu" | "hsu" => self.hashes.extend_from_text_prov(text, unofficial),
-            "mdb" | "mdu" | "msb" | "msu" => self.sections.extend_from_text_prov(text, unofficial),
-            "fdb" => self.fuzzy.extend_from_text(text),
-            "imp" => self.fuzzy.extend_imp(text),
-            "cdb" => self.cdb.extend_from_text_prov(text, unofficial),
+            // A line of these that does not parse is counted as an unsupported
+            // signature, as a `.db` line is.
+            "hdb" | "hsb" | "hdu" | "hsu" => {
+                let n = self.hashes.extend_from_text_prov(text, unofficial);
+                self.engine.skip_unloadable("hash line does not parse", n);
+            }
+            "mdb" | "mdu" | "msb" | "msu" => {
+                let n = self.sections.extend_from_text_prov(text, unofficial);
+                self.engine
+                    .skip_unloadable("section hash line does not parse", n);
+            }
+            "fdb" => {
+                let n = self.fuzzy.extend_from_text(text);
+                self.engine.skip_unloadable("fdb line does not parse", n);
+            }
+            "imp" => {
+                let n = self.fuzzy.extend_imp(text);
+                self.engine.skip_unloadable("imp line does not parse", n);
+            }
+            "cdb" => {
+                let n = self.cdb.extend_from_text_prov(text, unofficial);
+                self.engine.skip_unloadable("cdb line does not parse", n);
+            }
             // File-type magic: applied as a fallback when content detection is
             // inconclusive (never overrides native typing).
-            "ftm" => self.ftm.extend_from_text(text),
+            "ftm" => {
+                let n = self.ftm.extend_from_text(text);
+                self.engine.skip_unloadable("ftm line does not parse", n);
+            }
             // Phishing databases: `.pdb`/`.gdb` domain-list (`H:host` monitored
             // brands) and `.wdb` allow-list (`M:`/`X:` legitimate real/display
             // pairs). Fed to the phishing heuristic (`--alert-phishing`) for
@@ -342,7 +363,9 @@ impl Builder {
             "crb" => self.crb.parse_into(text),
             "yar" | "yara" => self.yara.extend_from_text(text, unofficial),
             // Whole-file hash allowlist (clears a detection).
-            "fp" | "sfp" => self.allow.extend_from_text(text),
+            "fp" | "sfp" => {
+                self.allow.extend_from_text(text);
+            }
             // Signature-name ignore lists. `.ign` is `db:line:name`, `.ign2`
             // is just the name; the trailing `:`-field is the name in both.
             "ign" | "ign2" => {
@@ -361,7 +384,10 @@ impl Builder {
             }
             // PE-icon perceptual-hash signatures (`daily.idb`, `main.idb`):
             // referenced by `IconGroup1/2`-constrained logical sigs.
-            "idb" => self.icons.extend_from_text(text),
+            "idb" => {
+                let n = self.icons.extend_from_text(text);
+                self.engine.skip_unloadable("idb line does not parse", n);
+            }
             // ClamAV password database: each line is
             // `SignatureName;TargetDescriptionBlock;PWStorageType;Password`
             // (PWStorageType 0 = cleartext, 1 = hex-encoded). We use only the
@@ -700,6 +726,50 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         let report = crate::analyze(&db, b"xx malware-good xx", &crate::ScanOptions::default());
         assert!(
             matches!(&report.verdict, crate::Verdict::Infected { signature, .. } if signature == "Test.Good"),
+            "{:?}",
+            report.verdict
+        );
+    }
+
+    /// A line of a hash, section hash, fuzzy, import hash, container, icon
+    /// or file type database that does not parse is counted, one each, and the
+    /// good lines beside it still load.
+    #[test]
+    fn an_unloadable_hash_database_line_is_counted() {
+        let body = b"the object a hash signature names";
+        let md5 = crate::hashes::digests_of(body).md5_hex();
+        let mut b = Builder::new();
+        b.add_named_bytes(
+            "a.hdb",
+            format!("{md5}:*:Test.Hash\n{md5}\nzz:1:Bad.Hex\n").as_bytes(),
+            false,
+        );
+        b.add_named_bytes(
+            "b.mdb",
+            format!("1:{md5}:Test.Sect\nnot-a-size:{md5}:X\n").as_bytes(),
+            false,
+        );
+        b.add_named_bytes(
+            "c.fdb",
+            b"imphash:abcd:Fam.A\ntlsh:not-a-digest:Fam.B\nnothing:x\n",
+            false,
+        );
+        b.add_named_bytes("d.imp", b"abcd:*:Imp.A\nabcd:big:Imp.B\nabcd\n", false);
+        b.add_named_bytes("e.cdb", b"too:few:fields\n", false);
+        b.add_named_bytes("f.idb", b"one:field:short\n", false);
+        b.add_named_bytes(
+            "g.ftm",
+            b"0:x:4d5a:Name:CL_TYPE_ANY:CL_TYPE_MSEXE\n1:0:4d5a:Kept:CL_TYPE_ANY:CL_TYPE_MSEXE\n",
+            false,
+        );
+        b.add_named_bytes("h.ndb", b"Sig.A:0:*:6d616c77617265\n", false);
+        let db = b.build().unwrap();
+        // hdb 2, mdb 1, fdb 2, imp 2, cdb 1, idb 1, ftm 1 (the type 1 line is
+        // skipped on purpose and not counted).
+        assert_eq!(db.unsupported_count(), 10);
+        let report = crate::analyze(&db, body, &crate::ScanOptions::default());
+        assert!(
+            matches!(&report.verdict, crate::Verdict::Infected { signature, .. } if signature == "Test.Hash"),
             "{:?}",
             report.verdict
         );

@@ -7,9 +7,10 @@
 export * from "./types.js";
 export { writable, derived, type Store, type WritableStore } from "./store.js";
 export { createViewer, errorCode } from "./viewer.js";
-export { createDetector, sniff, HEAD_BYTES } from "./detect.js";
-export { MATCHERS, WASM_IMAGES, SIGNATURES, UNKNOWN_TYPES, BUILTIN_ORDER, CONVERTED_FORMATS } from "./formats.js";
-export { canOpenInTab, createSourceReader, sameSource, type OwnedSourceReader } from "./source.js";
+export { createDetector, HEAD_BYTES, type Finding, type Inspector, type OfficeFinding, type Officer, type Sniffer } from "./detect.js";
+export { FormatMismatch, mismatchOf } from "./mismatch.js";
+export { MATCHERS, WASM_IMAGES, CONTAINER_TYPES, UNKNOWN_TYPES, BUILTIN_ORDER, CONVERTED_FORMATS } from "./formats.js";
+export { canOpenInTab, createSourceReader, sameSource, type FilePart, type OwnedSourceReader } from "./source.js";
 export { resolveInTree } from "./tree.js";
 export {
   fitCamera,
@@ -26,6 +27,7 @@ export {
   type Tile,
 } from "./pictures.js";
 export { createPictures, drawTiled, encodeBitmap, picturesOver } from "./raster.js";
+export { createHighlights, findQuote, fold, highlightId, MAX_HIGHLIGHT_RECTS, MAX_HIGHLIGHT_TEXT, MAX_HIGHLIGHTS, type HighlightTarget, type Highlights } from "./highlights.js";
 export { TOKENS, themeOf, type FrameTheme, type Token } from "./theme.js";
 export { builtinTranslate, MESSAGES, type MessageKey, type Translate } from "./messages.js";
 export { printPictures, type PrintOptions } from "./print.js";

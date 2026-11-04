@@ -150,6 +150,44 @@ impl Daemon {
             .trim_end_matches('\0')
             .to_string()
     }
+
+    fn command(&self, line: &str) -> String {
+        let mut s = std::os::unix::net::UnixStream::connect(&self.sock).unwrap();
+        s.write_all(format!("z{line}\0").as_bytes()).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out)
+            .trim_end_matches('\0')
+            .to_string()
+    }
+}
+
+/// A file's name reaches YARA whichever way it is scanned by its path: the
+/// CLI with and without `--all-matches`, the daemon's `SCAN` and
+/// `ALLMATCHSCAN`.
+#[test]
+fn a_files_name_reaches_yara_in_every_mode() {
+    let sigs = TempDir::new().unwrap();
+    std::fs::write(
+        sigs.path().join("n.yar"),
+        "rule by_ext { condition: extension == \".bin\" }\n",
+    )
+    .unwrap();
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("input.bin");
+    std::fs::write(&file, b"nothing to see").unwrap();
+    for args in [&[][..], &["--all-matches"][..]] {
+        let mut c = exav(sigs.path());
+        c.args(args).arg(&file);
+        let (code, out) = run(c, None);
+        assert!(out.contains("YARA.by_ext"), "{args:?}: {out}");
+        assert_eq!(code, 1, "{args:?}: {out}");
+    }
+    let daemon = Daemon::start(sigs.path(), &[]);
+    for verb in ["SCAN", "ALLMATCHSCAN"] {
+        let out = daemon.command(&format!("{verb} {}", file.display()));
+        assert!(out.contains("YARA.by_ext FOUND"), "{verb}: {out}");
+    }
 }
 
 /// Over `--max-input-bytes` with the payload inside the limit: found, by the
@@ -227,18 +265,30 @@ fn stdin_is_counted_profiled_and_bounded_as_a_file_is() {
         assert_eq!(row(out), file, "{how}: {out}");
     }
 
-    // A PE larger than the quarter of 128M a scan may hold in one object.
+    // A PE whose image, the headers and the sections' data, is larger than
+    // the quarter of 128M a scan may hold in one object: its section is 40M.
     let mut pe = vec![0u8; 40 << 20];
     pe[..2].copy_from_slice(b"MZ");
     pe[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
     pe[0x40..0x44].copy_from_slice(b"PE\0\0");
     pe[0x44..0x46].copy_from_slice(&0x14cu16.to_le_bytes());
+    pe[0x46..0x48].copy_from_slice(&1u16.to_le_bytes());
+    // The section table follows the COFF header (no optional header).
+    pe[0x58..0x5d].copy_from_slice(b".text");
+    pe[0x58 + 16..0x58 + 20].copy_from_slice(&((40u32 << 20) - 0x400).to_le_bytes());
+    pe[0x58 + 20..0x58 + 24].copy_from_slice(&0x400u32.to_le_bytes());
     for (how, code, out) in cli_verdicts(sigs.path(), &pe, &["--max-process-bytes", "128M"]) {
-        assert!(out.contains("deep-analysis limit"), "{how}: {out}");
+        assert!(out.contains("object limit"), "{how}: {out}");
         assert_eq!(code, 3, "{how}: {out}");
     }
     // The cap is what made it a limit.
     for (how, code, out) in cli_verdicts(sigs.path(), &pe, &[]) {
+        assert_eq!(code, 0, "{how}: {out}");
+    }
+    // The same size with the section small and the rest an overlay: the
+    // structure is read from the image, and nothing is left unchecked.
+    pe[0x58 + 16..0x58 + 20].copy_from_slice(&0x200u32.to_le_bytes());
+    for (how, code, out) in cli_verdicts(sigs.path(), &pe, &["--max-process-bytes", "128M"]) {
         assert_eq!(code, 0, "{how}: {out}");
     }
 }

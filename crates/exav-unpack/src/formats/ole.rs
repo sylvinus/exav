@@ -12,34 +12,236 @@ use std::io::{BufReader, Cursor, Read, Seek, Write};
 /// instead of the file being reported as not fully scanned.
 pub(crate) fn extract_ole(data: &[u8], budget: &mut Budget) -> Result<Vec<Entry>, LimitHit> {
     let comp = Compound::open(data)
-        .ok_or_else(|| LimitHit::new("ole: not a compound file".to_string()))?;
+        .ok_or_else(|| LimitHit::corrupt("ole: not a compound file".to_string()))?;
     collect_ole_entries(&comp, data.len() as u64, budget)
+}
+
+/// A compound file in memory or within the buffer limit is read whole
+/// ([`extract_ole`]). A larger one is read from its place in the source a
+/// stream at a time, and a stream past the buffer limit (an MSI's cabinet)
+/// is handed over as it is read.
+pub(crate) fn walk(
+    src: &dyn crate::source::ByteSource,
+    budget: &mut Budget,
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    use crate::stream::{emit_entry, emit_stream};
+    let max = budget.limits.max_buffer_bytes;
+    if src.as_slice().is_some() || src.len() as u64 <= max {
+        return crate::stream::whole(Format::Ole, src, budget, visit);
+    }
+    let total_len = src.len() as u64;
+    // The directory is held up to `max` bytes. A limit too small for one of its
+    // 128-byte entries leaves none, whatever the file is.
+    let comp = Compound::open_source(src, max).ok_or_else(|| {
+        if max < 128 {
+            LimitHit::new(format!(
+                "ole: the {max}-byte buffer limit holds no entry of the directory"
+            ))
+        } else {
+            LimitHit::corrupt("ole: not a compound file".to_string())
+        }
+    })?;
+    let streams = named_streams(&comp);
+    let msi = is_msi_database(&streams);
+    if let Some(e) = encrypted_package(&comp, &streams, total_len, budget)? {
+        return emit_entry(e, budget, visit);
+    }
+    // What the passes after the walk read is held until they have run, and
+    // handed over with what they find; every other stream is handed over at
+    // once.
+    let mut kept = Vec::new();
+    for s in &streams {
+        budget.count_entry()?;
+        let name = member_name(s, msi);
+        let cap = budget.reserve()?;
+        if s.size <= cap {
+            let read = comp.read(s.index, cap);
+            let entry = stream_entry(s, name, read.data.into_owned(), total_len, budget);
+            if read_by_passes(&entry.name) {
+                kept.push(entry);
+            } else if let Some(t) = emit_entry(entry, budget, visit)? {
+                return Ok(Some(t));
+            }
+            continue;
+        }
+        let head = comp.read(s.index, LEGACY_HEAD).data;
+        if legacy_encrypted(s.path, &head) {
+            let e = Entry::unsupported(
+                s.path.to_string(),
+                total_len,
+                true,
+                "encrypted Office document",
+            );
+            if let Some(t) = emit_entry(e, budget, visit)? {
+                return Ok(Some(t));
+            }
+            continue;
+        }
+        if read_by_passes(&name) {
+            kept.push(Entry::over_limit(
+                format!("{name}-contents"),
+                s.size,
+                "stream past the buffer limit: the objects and macros it holds were not extracted",
+            ));
+        }
+        let meta = crate::stream::MemberMeta {
+            name,
+            comp_size: s.size,
+            size: Some(s.size),
+            ..Default::default()
+        };
+        if let Some(t) = emit_stream(&meta, &mut comp.reader(s.index), budget, visit)? {
+            return Ok(Some(t));
+        }
+    }
+    if comp.cut() {
+        kept.push(Entry::over_limit(
+            "<directory>".to_string(),
+            total_len,
+            "compound file directory or mini stream past the buffer limit: read up to it",
+        ));
+    }
+    append_ole10native_payloads(&mut kept, budget)?;
+    append_ppt_embedded_storages(&mut kept, budget)?;
+    append_macro_artifacts(&mut kept, budget);
+    for e in kept {
+        if let Some(t) = emit_entry(e, budget, visit)? {
+            return Ok(Some(t));
+        }
+    }
+    Ok(None)
+}
+
+/// A stream the passes after the walk read: an embedded object, a
+/// presentation's records, a workbook, a VBA project's, or one the
+/// directory tree does not reach (a module stream can be found by its bare
+/// name).
+fn read_by_passes(name: &str) -> bool {
+    let leaf = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let leaf = leaf.trim_start_matches('\u{1}');
+    ["Ole10Native", "PowerPoint Document", "Workbook", "Book"]
+        .iter()
+        .any(|n| leaf.eq_ignore_ascii_case(n))
+        || !name.starts_with('/')
+        || name
+            .split(['/', '\\'])
+            .any(|c| c.eq_ignore_ascii_case("vba"))
+}
+
+/// The streams of the directory that have a name.
+fn named_streams<'c>(comp: &'c Compound<'_>) -> Vec<cfb::StreamInfo<'c>> {
+    // A stream entry with no name (a malformed directory) has its sectors
+    // inside this same file, uncompressed, where the raw scan of the caller
+    // covers them: skipping it loses the name and size, not the content.
+    comp.streams().filter(|s| !s.name.is_empty()).collect()
+}
+
+/// A stream's member name: its path, an MSI's decompressed.
+fn member_name(s: &cfb::StreamInfo<'_>, msi: bool) -> String {
+    // MSI compresses OLE2 stream names to fit longer names into the
+    // 31-char OLE2 limit.
+    if msi {
+        decompress_msi_name(s.path)
+    } else {
+        s.path.to_string()
+    }
+}
+
+/// A stream read whole, after the legacy encryption check.
+fn stream_entry(
+    s: &cfb::StreamInfo<'_>,
+    name: String,
+    data: Vec<u8>,
+    total_len: u64,
+    budget: &mut Budget,
+) -> Entry {
+    let (buf, was_decrypted) = match legacy_encryption(s.path, data, budget) {
+        Legacy::Plain(b) => (b, false),
+        Legacy::Decrypted(b) => (b, true),
+        Legacy::Locked => {
+            return Entry::unsupported(
+                s.path.to_string(),
+                total_len,
+                true,
+                "encrypted Office document",
+            );
+        }
+    };
+    budget.commit(buf.len() as u64);
+    // A stream we DECRYPTED carries its plaintext and stays marked encrypted.
+    // Both facts are true: the content is available to scan, and the document
+    // was protected. Reporting only the content is what let a document exav
+    // opened with the `VelvetSweatshop` default password come back with no
+    // mention of encryption at all.
+    let mut entry = Entry::new(name, buf);
+    entry.encrypted = was_decrypted;
+    entry
 }
 
 /// Walk every stream of a compound file and emit it as an [`Entry`], handling MSI
 /// name decompression, `.doc`/`.xls`/OOXML encryption detection, and VBA-macro
-/// artifact synthesis. `total_len` is the container size (used only for the
-/// encrypted-member size field).
+/// artifact synthesis. `total_len` is the container size: the most a stream
+/// holds, and the size of an encrypted member.
 fn collect_ole_entries(
     comp: &Compound<'_>,
     total_len: u64,
     budget: &mut Budget,
 ) -> Result<Vec<Entry>, LimitHit> {
-    // A stream entry with no name (a malformed directory) has its sectors
-    // inside this same file, uncompressed, where the raw scan of the caller
-    // covers them: skipping it loses the name and size, not the content.
-    let streams: Vec<cfb::StreamInfo<'_>> = comp.streams().filter(|s| !s.name.is_empty()).collect();
+    let streams = named_streams(comp);
 
     // Detect MSI database: decompress each stream name and check for `_Tables`.
     let msi = is_msi_database(&streams);
 
+    if let Some(e) = encrypted_package(comp, &streams, total_len, budget)? {
+        return Ok(vec![e]);
+    }
+
+    let mut entries = Vec::new();
+    for s in &streams {
+        budget.count_entry()?;
+        let name = member_name(s, msi);
+        let shown = crate::tree::quoted(&name);
+        // No stream holds more than the file.
+        let said = s.size.min(total_len);
+        let Some(cap) = budget.reserve_for(said, format_args!("ole stream '{shown}'"))? else {
+            continue;
+        };
+        // Within the room, so not cut by it.
+        let read = comp.read(s.index, cap);
+        entries.push(stream_entry(
+            s,
+            name,
+            read.data.into_owned(),
+            total_len,
+            budget,
+        ));
+    }
+
+    append_ole10native_payloads(&mut entries, budget)?;
+    // Before the macro pass: an embedded storage can itself hold the VBA
+    // project, and the artifacts are synthesised from whatever is present.
+    append_ppt_embedded_storages(&mut entries, budget)?;
+    append_macro_artifacts(&mut entries, budget);
+    Ok(entries)
+}
+
+/// The decrypted package of a password-protected OOXML file, or the member
+/// that says it is one, when the compound file is that wrapper.
+#[cfg_attr(not(feature = "decrypt"), allow(unused_variables))]
+fn encrypted_package(
+    comp: &Compound<'_>,
+    streams: &[cfb::StreamInfo<'_>],
+    total_len: u64,
+    budget: &mut Budget,
+) -> Result<Option<Entry>, LimitHit> {
     // Encrypted Office document. A password-protected OOXML file
     // (`.docx`/`.xlsx`/`.pptx`) is wrapped in an OLE2/CFB container holding the
     // MS-OFFCRYPTO `EncryptionInfo` + `EncryptedPackage` streams (the real ZIP is
     // AES-encrypted inside `EncryptedPackage`). Try to DECRYPT (standard ECB and
     // agile AES-CBC) with the default `VelvetSweatshop`/empty password + the caller
     // pool so the real content is scanned; if that fails (wrong password) we still
-    // surface an encrypted member — never a silent clean.
+    // surface an encrypted member, never a silent clean.
     let stream_named = |want: &str| -> Option<&cfb::StreamInfo<'_>> {
         streams.iter().find(|s| s.name.eq_ignore_ascii_case(want))
     };
@@ -51,86 +253,51 @@ fn collect_ole_entries(
         stream_named("EncryptedPackage"),
     ) {
         #[cfg(feature = "decrypt")]
-        let decrypted = {
+        let (decrypted, too_big) = {
             let cap = budget.limits.max_buffer_bytes;
             let info = comp.read(info_s.index, cap);
             let pkg = comp.read(pkg_s.index, cap);
-            super::ole_crypto::try_decrypt_ooxml(&info.data, &pkg.data, &budget.passwords)
+            // A package past the buffer limit would decrypt to a part of the
+            // ZIP passed on as a whole one: it is reported instead.
+            match pkg.truncated {
+                true => (None, true),
+                false => (
+                    super::ole_crypto::try_decrypt_ooxml(&info.data, &pkg.data, &budget.passwords),
+                    false,
+                ),
+            }
         };
         #[cfg(not(feature = "decrypt"))]
-        let decrypted: Option<Vec<u8>> = None;
+        let (decrypted, too_big): (Option<Vec<u8>>, bool) = (None, false);
         budget.count_entry()?;
-        return match decrypted {
+        return Ok(Some(match decrypted {
             Some(zip) => {
                 budget.commit(zip.len() as u64);
                 // Emit the recovered OOXML .zip so the ZIP path scans its parts.
-                Ok(vec![Entry::new("EncryptedPackage.zip".to_string(), zip)])
+                Entry::new("EncryptedPackage.zip".to_string(), zip)
             }
-            None => Ok(vec![Entry::unsupported(
+            None if too_big => Entry::over_limit(
+                "EncryptedPackage".to_string(),
+                total_len,
+                "encrypted Office package past the buffer limit: not decrypted",
+            ),
+            None => Entry::unsupported(
                 "EncryptedPackage".to_string(),
                 total_len,
                 true,
                 "encrypted Office document",
-            )]),
-        };
+            ),
+        }));
     }
-
-    let mut entries = Vec::new();
-    for s in &streams {
-        budget.count_entry()?;
-        let cap = budget.reserve()?;
-        let read = comp.read(s.index, cap);
-        // A prefix handed over as a whole stream would be a payload past the
-        // cap that nothing scanned and nothing reported.
-        if read.truncated {
-            return Err(LimitHit::new("ole stream exceeds budget".to_string()));
-        }
-        let (buf, was_decrypted) = match legacy_encryption(s.path, read.data.into_owned(), budget) {
-            Legacy::Plain(b) => (b, false),
-            Legacy::Decrypted(b) => (b, true),
-            Legacy::Locked => {
-                entries.push(Entry::unsupported(
-                    s.path.to_string(),
-                    total_len,
-                    true,
-                    "encrypted Office document",
-                ));
-                continue;
-            }
-        };
-        budget.commit(buf.len() as u64);
-
-        // MSI compresses OLE2 stream names to fit longer names into the
-        // 31-char OLE2 limit. Decompress if this is an MSI database.
-        let name = if msi {
-            decompress_msi_name(s.path)
-        } else {
-            s.path.to_string()
-        };
-        // A stream we DECRYPTED carries its plaintext and stays marked encrypted.
-        // Both facts are true: the content is available to scan, and the document
-        // was protected. Reporting only the content is what let a document exav
-        // opened with the `VelvetSweatshop` default password come back with no
-        // mention of encryption at all — 552 files, 6.3% of a corpus.
-        let mut entry = Entry::new(name, buf);
-        entry.encrypted = was_decrypted;
-        entries.push(entry);
-    }
-
-    append_ole10native_payloads(&mut entries, budget)?;
-    // Before the macro pass: an embedded storage can itself hold the VBA
-    // project, and the artifacts are synthesised from whatever is present.
-    append_ppt_embedded_storages(&mut entries, budget)?;
-    append_macro_artifacts(&mut entries, budget);
-    Ok(entries)
+    Ok(None)
 }
 
 /// Carve the payload out of every `\x01Ole10Native` stream and append it.
 ///
-/// `Ole10Native` is how Office stores a "Package" embedded object — the thing you
+/// `Ole10Native` is how Office stores a "Package" embedded object, the thing you
 /// get by dropping a file onto a document. The stream is NOT the file: it opens
 /// with an embedded-object header (a 4-byte total size, a 2-byte flag, then three
-/// NUL-terminated strings — label, original path, temp path — and a 4-byte
+/// NUL-terminated strings (label, original path, temp path) and a 4-byte
 /// payload size) and only then the bytes themselves.
 ///
 /// Nothing looked past that header, and the format sniffer only ever inspects
@@ -162,10 +329,9 @@ fn append_ole10native_payloads(
         budget.count_entry()?;
         let cap = budget.reserve()?;
         if payload.len() as u64 > cap {
-            carved.push(Entry::unsupported(
+            carved.push(Entry::over_limit(
                 format!("{leaf}-payload"),
                 payload.len() as u64,
-                false,
                 "embedded object exceeds the per-member budget",
             ));
             continue;
@@ -184,7 +350,7 @@ type Storage = (Vec<u8>, Option<&'static str>);
 /// append it.
 ///
 /// A `.ppt` is a compound file, but its interesting content is not in the
-/// streams — it is in a *record tree* inside the single `PowerPoint Document`
+/// streams: it is in a *record tree* inside the single `PowerPoint Document`
 /// stream. An embedded object (a VBA project, or any OLE object dropped into a
 /// slide) lives there as an `RT_ExternalOleObjectStg` record holding a whole
 /// compound file, usually deflated. Emitting the streams alone stops at the
@@ -195,7 +361,7 @@ type Storage = (Vec<u8>, Option<&'static str>);
 /// directory has five streams and no VBA storage; the macro project is a
 /// 10,752-byte compound file deflated inside one of these records, and exav's
 /// own OLE reader decompresses the module source from it once it is handed over.
-/// The value is wider than macros — *any* embedded object was unreachable.
+/// The value is wider than macros: *any* embedded object was unreachable.
 fn append_ppt_embedded_storages(
     entries: &mut Vec<Entry>,
     budget: &mut Budget,
@@ -214,6 +380,9 @@ fn append_ppt_embedded_storages(
             budget.commit(blob.len() as u64);
             let mut entry = Entry::new(format!("ppt-embedded-{i}"), blob);
             entry.unsupported = why;
+            if why == Some(PPT_STORAGE_OVER) {
+                entry.reason_kind = Some(crate::tree::ReasonKind::OVER_SIZE);
+            }
             carved.push(entry);
         }
     }
@@ -226,7 +395,7 @@ fn append_ppt_embedded_storages(
 ///
 /// A record header is `[verInstance:u16][type:u16][length:u32]`. The low nibble
 /// of `verInstance` is the version, and `0xF` marks a *container* whose body is
-/// more records — so a container is descended into rather than skipped, which is
+/// more records, so a container is descended into rather than skipped, which is
 /// how a record nested three levels down is reached at all. The instance (the
 /// high twelve bits) selects the storage form: `0` is stored, `1` is
 /// `[uncompressedSize:u32]` followed by a zlib stream.
@@ -270,6 +439,9 @@ fn ppt_embedded_storages(stream: &[u8], budget: &mut Budget) -> Result<Vec<Stora
     Ok(out)
 }
 
+/// Why a storage record's bytes stop at the per-member limit.
+const PPT_STORAGE_OVER: &str = "embedded PowerPoint storage exceeds the per-member budget";
+
 /// One storage record's bytes: stored as-is, or inflated, bounded by the
 /// budget, and why they are not the whole storage when they are not.
 fn ppt_storage_payload(
@@ -277,7 +449,7 @@ fn ppt_storage_payload(
     body: &[u8],
     budget: &mut Budget,
 ) -> Result<Option<Storage>, LimitHit> {
-    const OVER: &str = "embedded PowerPoint storage exceeds the per-member budget";
+    const OVER: &str = PPT_STORAGE_OVER;
     const BROKEN: &str = "embedded PowerPoint storage could not be decompressed";
     const PART_WAY: &str = "embedded PowerPoint storage failed to decompress part way; \
                             the bytes before the failure were scanned";
@@ -291,7 +463,7 @@ fn ppt_storage_payload(
         }));
     }
     // Compressed: a declared size then a zlib stream. The declared size is a
-    // hint from the file, so it is not trusted for allocation — the read is
+    // hint from the file, so it is not trusted for allocation: the read is
     // bounded by the budget and salvages a truncated tail, which is how a
     // deliberately-truncated object still gets scanned rather than dropped.
     let Some(zlib) = body.get(4..).and_then(crate::inflate::zlib_body) else {
@@ -351,7 +523,7 @@ fn ole10native_payload(data: &[u8]) -> Option<&[u8]> {
 /// artifacts: the `REM`-headed dump (code-lowercased, for `Doc.*` macro sigs) and
 /// the raw original-case source (for `Target:2` OLE sigs like `Attribute VB_Name
 /// =`/`CreateObject`). Excel 4.0 (XLM) macros live in a BIFF macro sheet, not a
-/// VBA project, so they evade VBA-only detection — surface an `xlm_macro` artifact
+/// VBA project, so they evade VBA-only detection: surface an `xlm_macro` artifact
 /// when the workbook carries a macro sheet.
 fn append_macro_artifacts(entries: &mut Vec<Entry>, budget: &mut Budget) {
     // Compute both macro artifacts while `streams` (which borrows `entries`) is
@@ -391,30 +563,31 @@ fn push_artifact(entries: &mut Vec<Entry>, budget: &mut Budget, name: &str, art:
     }
     let size = art.len() as u64;
     if budget.count_entry().is_err() {
-        entries.push(Entry::unsupported(
-            name.to_string(),
-            size,
-            false,
-            "macro source not scanned: the archive-wide file count was exhausted",
-        ));
+        entries.push(
+            Entry::unsupported(
+                name.to_string(),
+                size,
+                false,
+                "macro source not scanned: the archive-wide file count was exhausted",
+            )
+            .of_kind(crate::tree::ReasonKind::Limit(crate::LimitKind::MaxFiles)),
+        );
         return;
     }
-    // `reserve` failing is a limit, not an absence — treating it as a cap of
+    // `reserve` failing is a limit, not an absence: treating it as a cap of
     // zero silently discarded every artifact.
     let Ok(cap) = budget.reserve() else {
-        entries.push(Entry::unsupported(
+        entries.push(Entry::over_limit(
             name.to_string(),
             size,
-            false,
             "macro source not scanned: the extraction budget was exhausted",
         ));
         return;
     };
     if size > cap {
-        entries.push(Entry::unsupported(
+        entries.push(Entry::over_limit(
             name.to_string(),
             size,
-            false,
             "macro source exceeds the per-member size budget",
         ));
         return;
@@ -441,25 +614,38 @@ enum Legacy {
 /// workbook's as well as the document's own. The encryption covers that
 /// stream alone: the VBA project and the other streams are in the clear.
 fn legacy_encryption(path: &str, data: Vec<u8>, budget: &Budget) -> Legacy {
-    let leaf = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    let is_word = leaf.eq_ignore_ascii_case("worddocument");
-    let is_excel = leaf.eq_ignore_ascii_case("workbook") || leaf.eq_ignore_ascii_case("book");
-    let encrypted = if is_word {
-        data.len() >= 12 && (u16::from_le_bytes([data[10], data[11]]) & 0x0100) != 0
-    } else {
-        is_excel && xls_has_filepass(&data)
-    };
-    if !encrypted {
+    if !legacy_encrypted(path, &data) {
         return Legacy::Plain(data);
     }
     #[cfg(feature = "decrypt")]
-    if is_excel && let Some(dec) = super::ole_crypto::try_decrypt_workbook(&data, &budget.passwords)
+    if is_excel(path)
+        && let Some(dec) = super::ole_crypto::try_decrypt_workbook(&data, &budget.passwords)
     {
         return Legacy::Decrypted(dec);
     }
     #[cfg(not(feature = "decrypt"))]
     let _ = budget;
     Legacy::Locked
+}
+
+/// The bytes of a stream's start [`legacy_encrypted`] reads: eight BIFF
+/// records of the longest length.
+const LEGACY_HEAD: u64 = 8 * (4 + 0xFFFF);
+
+fn is_excel(path: &str) -> bool {
+    let leaf = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    leaf.eq_ignore_ascii_case("workbook") || leaf.eq_ignore_ascii_case("book")
+}
+
+/// The stream at `path`, of which `head` is the start, is a Word document or
+/// an Excel workbook that says it is encrypted.
+fn legacy_encrypted(path: &str, head: &[u8]) -> bool {
+    let leaf = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if leaf.eq_ignore_ascii_case("worddocument") {
+        head.len() >= 12 && (u16::from_le_bytes([head[10], head[11]]) & 0x0100) != 0
+    } else {
+        is_excel(path) && xls_has_filepass(head)
+    }
 }
 
 /// True if an Excel BIFF8 `Workbook`/`Book` stream is encrypted: a `FilePass`
@@ -538,6 +724,26 @@ pub(crate) fn decompress_msi_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::decompress_msi_name;
+
+    /// A source over the buffer limit that is no compound file is damage; a
+    /// buffer limit that cannot hold one entry of the directory is a limit,
+    /// whatever the file is.
+    #[test]
+    fn a_source_that_is_no_compound_file_is_damage_and_a_tiny_limit_is_a_limit() {
+        use crate::{Budget, Limits};
+        use std::io::Cursor;
+        let junk = vec![0x5Au8; 4000];
+        let src = crate::source::BlockCache::with_sizes(Cursor::new(junk), 512, 4096).unwrap();
+        for (max, corrupt) in [(1024u64, true), (64, false)] {
+            let mut budget = Budget::new(Limits {
+                max_buffer_bytes: max,
+                ..Limits::default()
+            });
+            let e = super::walk(&src, &mut budget, &mut |_, _, _| None::<()>)
+                .expect_err("not a compound file");
+            assert_eq!(e.is_corrupt(), corrupt, "{max}: {}", e.reason);
+        }
+    }
 
     #[test]
     fn decompress_single_char_encoding() {
@@ -636,11 +842,14 @@ mod macro_artifact_tests {
 
         // Damaged after a long run of content: that run, and a reason.
         let content: Vec<u8> = (0..20_000u32).flat_map(|i| i.to_le_bytes()).collect();
-        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        e.write_all(&content).unwrap();
-        e.flush().unwrap();
+        // Flushed through the compressor: the writer's `flush` leaves part of
+        // the stream behind under zlib-rs.
+        let mut c = flate2::Compress::new(flate2::Compression::default(), false);
+        let mut deflated = Vec::with_capacity(content.len() + 1024);
+        c.compress_vec(&content, &mut deflated, flate2::FlushCompress::Sync)
+            .unwrap();
         let mut damaged = vec![0, 0, 0, 0, 0x78, 0x9c];
-        damaged.extend_from_slice(e.get_ref());
+        damaged.extend_from_slice(&deflated);
         damaged.extend_from_slice(&[0x06, 0x5a, 0x5a]);
         let (data, why) = ppt_storage_payload(1, &damaged, &mut b).unwrap().unwrap();
         assert_eq!(data, content);

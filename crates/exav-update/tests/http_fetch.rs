@@ -107,7 +107,7 @@ fn spawn(state: Arc<Mutex<State>>) -> String {
 }
 
 /// The `.exavdb` format version this build loads.
-const EXAVDB_VERSION: u32 = 4;
+const EXAVDB_VERSION: u32 = 5;
 
 /// A valid `.exavdb`: magic + version + payload + trailing CRC-32.
 fn exavdb_body() -> Vec<u8> {

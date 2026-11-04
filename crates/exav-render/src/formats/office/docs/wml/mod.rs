@@ -6,7 +6,7 @@ use crate::formats::office::common::base64;
 use crate::formats::office::common::image;
 use crate::formats::office::common::xml::{self, Node};
 use crate::formats::office::docs::error::{Error, Result};
-use crate::formats::office::docs::limits::Budget;
+use crate::formats::office::docs::limits::{Budget, LIST_BYTES};
 use crate::formats::office::docs::model::*;
 use props::*;
 use std::collections::HashMap;
@@ -63,7 +63,7 @@ pub(crate) fn read(input: &[u8], budget: &mut Budget) -> Result<Document> {
         w.styles(s);
     }
     if let Some(l) = root.child("w:lists") {
-        w.lists(l);
+        w.lists(l)?;
     }
     if let Some(d) = root.child("w:docPr")
         && let Some(t) = d.child("w:defaultTabStop")
@@ -164,9 +164,11 @@ impl Wml<'_> {
         }
     }
 
-    fn lists(&mut self, n: &Node) {
-        let mut defs: Vec<String> = vec![];
-        for d in n.all("w:listDef") {
+    fn lists(&mut self, n: &Node) -> Result<()> {
+        // The first definition of each id.
+        let mut defs: HashMap<String, u32> = HashMap::new();
+        for (i, d) in n.all("w:listDef").enumerate() {
+            self.b.alloc(LIST_BYTES)?;
             let id = d.attr("w:listDefId").unwrap_or("").to_string();
             let mut levels = vec![];
             for l in d.all("w:lvl") {
@@ -225,7 +227,7 @@ impl Wml<'_> {
                 multi_level: true,
                 levels,
             });
-            defs.push(id);
+            defs.entry(id).or_insert(i as u32);
         }
         for l in n.all("w:list") {
             let Some(ilfo) = l.attr("w:ilfo").and_then(|v| v.parse::<u32>().ok()) else {
@@ -234,8 +236,8 @@ impl Wml<'_> {
             let abs = l
                 .child("w:ilst")
                 .and_then(|i| i.attr("w:val"))
-                .and_then(|v| defs.iter().position(|d| d == v))
-                .unwrap_or(0) as u32;
+                .and_then(|v| defs.get(v).copied())
+                .unwrap_or(0);
             let mut overrides = vec![];
             for o in l.all("w:lvlOverride") {
                 let lvl = o.attr("w:ilvl").and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -251,6 +253,7 @@ impl Wml<'_> {
                 overrides,
             });
         }
+        Ok(())
     }
 
     // ---- body ----
@@ -697,5 +700,27 @@ impl Wml<'_> {
             t.grid = vec![9000 / n.max(1) as i32; n.max(1)];
         }
         Ok(t)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formats::office::docs::limits::Limits;
+
+    #[test]
+    fn list_definitions_are_counted_in_the_memory() {
+        // Definitions of a few bytes each, given nine levels.
+        let mut x = String::from(
+            r#"<w:wordDocument xmlns:w="http://schemas.microsoft.com/office/word/2003/wordml"><w:lists>"#,
+        );
+        for i in 0..10_000 {
+            x += &format!(r#"<w:listDef w:listDefId="{i}"/>"#);
+        }
+        x += r#"<w:list w:ilfo="1"><w:ilst w:val="7"/></w:list></w:lists><w:body/></w:wordDocument>"#;
+        let mut b = Budget::new(Limits::default());
+        let doc = read(x.as_bytes(), &mut b).unwrap();
+        assert!(b.used() >= 10_000 * LIST_BYTES, "{}", b.used());
+        assert_eq!(doc.numbering.nums[0].abstract_id, 7);
     }
 }

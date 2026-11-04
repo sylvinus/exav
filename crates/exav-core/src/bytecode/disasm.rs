@@ -2,8 +2,8 @@
 //!
 //! The bytecode `disasm_x86(DISASM_RESULT*, len)` API decodes one instruction at
 //! the file cursor into a fixed 64-byte `DISASM_RESULT`, which programs read to
-//! match (poly/metamorphic) code patterns. Decoding is `exav-x86` — pure Rust,
-//! decode-only, no dependencies — and this module translates its output into the
+//! match (poly/metamorphic) code patterns. Decoding is `exav-x86` (pure Rust,
+//! decode-only, no dependencies), and this module translates its output into the
 //! ABI layout: a 287-value `real_op`, a `(reg/size/value)` per operand, and the
 //! operand-access encoding the format specifies.
 //!
@@ -16,7 +16,7 @@
 //! instructions outside its scope, and it cannot tell them apart. The caller in
 //! `exec.rs` therefore treats `None` as an *unsupported operation*, which
 //! discards the whole program's result, rather than as the ABI's "could not
-//! disassemble" return — a program that silently took a different branch would
+//! disassemble" return: a program that silently took a different branch would
 //! be a false negative with nothing to show for it.
 
 use exav_x86::{Insn, Mn, Op, Seg, Size};
@@ -348,7 +348,7 @@ const X86OPS: &[&str] = &[
 /// `enum X86REGS` names in order; the index is the register value.
 ///
 /// The ABI transports a register as that index, so nothing here reads the
-/// names — but they are what makes the numbering in [`reg`] and [`seg_reg_num`]
+/// names, but they are what makes the numbering in [`reg`] and [`seg_reg_num`]
 /// checkable against the ABI rather than trusted, and the length assertion in
 /// the tests is what keeps the table and the numbering in step.
 #[allow(dead_code)]
@@ -380,8 +380,8 @@ fn real_op(mn: Mn) -> u16 {
 
 /// Map a general-purpose register number and width to the `X86REGS` value.
 ///
-/// The ABI orders its register file by width — eight 32-bit, then eight 16-bit,
-/// then the four high and four low byte registers — so the encoding's number
+/// The ABI orders its register file by width (eight 32-bit, then eight 16-bit,
+/// then the four high and four low byte registers), so the encoding's number
 /// indexes into the block its width selects.
 fn reg(num: u8, size: Size) -> u8 {
     if num > 7 {
@@ -442,7 +442,7 @@ fn prefix_flags(bytes: &[u8], len: usize) -> (u8, u8) {
         match b {
             0x66 => opsize = 1,
             0x67 => adsize = 1,
-            // lock / repne / rep / segment overrides — keep scanning.
+            // lock / repne / rep / segment overrides: keep scanning.
             0xf0 | 0xf2 | 0xf3 | 0x2e | 0x36 | 0x3e | 0x26 | 0x64 | 0x65 => {}
             _ => break, // first non-prefix byte: prefixes end here
         }
@@ -466,7 +466,7 @@ pub fn disasm_one(bytes: &[u8]) -> Option<([u8; RESULT_SIZE], usize)> {
     let mut r = [0u8; RESULT_SIZE];
     r[0..2].copy_from_slice(&real_op(insn.mn).to_le_bytes());
     // opsize/adsize are flags (0 = default 32-bit, 1 = 16-bit via a 0x66/0x67
-    // prefix), NOT a bit width — the ABI uses `s.opsize`/`s.adsize` verbatim.
+    // prefix), NOT a bit width: the ABI uses `s.opsize`/`s.adsize` verbatim.
     let (opsize, adsize) = prefix_flags(slice, insn.len);
     r[2] = opsize;
     r[3] = adsize;
@@ -493,7 +493,7 @@ fn fill_arg(arg: &mut [u8], insn: &Insn, i: usize) {
         // The x87 stack and the vector register files are not in the ABI's
         // register file, which holds general-purpose registers only. A slot or
         // a vector register therefore has no representation, and is reported as
-        // absent rather than as a general-purpose register of the same number —
+        // absent rather than as a general-purpose register of the same number,
         // which would name `eax` for `xmm0` and read as a real operand.
         Op::St(_) | Op::Xmm(_) | Op::Mmx(_) => arg[0] = ACCESS_NOARG,
         Op::Rel(target) => {

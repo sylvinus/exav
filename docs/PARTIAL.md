@@ -165,7 +165,8 @@ rotation and start failing open.
 
 `X-Infection-Found` on a *block* defaults on: a large class of ICAP client greps
 that header alone and reads a `200` without it as a pass.
-`--icap-infection-header detections` restricts it to database hits, at that cost.
+`?infection-header=detections` on the ICAP address restricts it to database
+hits, at that cost.
 On a *pass* it is always withheld: the object is being delivered, so claiming an
 infection would be false and would make those clients block it anyway.
 

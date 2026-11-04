@@ -152,7 +152,7 @@ const converted = (kind: ConvertedFormat, options: ConversionOptions): FormatPlu
 export const docx = (options: OfficeOptions = {}) => plugin("docx", options);
 export const xlsx = (options: OfficeOptions = {}) => plugin("xlsx", options);
 export const pptx = (options: OfficeOptions = {}) => plugin("pptx", options);
-/** The separator and the encoding are read off the bytes (`readingOf`). */
+/** CSV and TSV: the encoding and the separator are read off the bytes. */
 export const csv = (options: OfficeOptions = {}) => plugin("csv", options);
 
 // Converted, templates and flat XML included. Within each kind (text,
@@ -188,7 +188,6 @@ export const zonerdraw = (options: ConversionOptions = {}) => converted("zonerdr
 /** WordPerfect Graphics 1 and 2. */
 export const wpg = (options: ConversionOptions = {}) => converted("wpg", options);
 
-export { readingOf, type Reading } from "./delimited.js";
 export { SheetConversionError, type SheetErrorKind, type SheetFormat } from "./sheets.js";
 export { SlideConversionError, type SlideErrorKind, type SlideFormat } from "./slides.js";
 export { DocConversionError, type DocErrorKind, type DocFormat } from "./docs.js";

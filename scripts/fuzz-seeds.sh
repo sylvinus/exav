@@ -33,7 +33,7 @@ SKIP="crates/exav-unpack/tests/fixtures/rar/ppmd_lzss_conversion.rar"
 
 cd "$ROOT"
 rm -rf "$OUT"
-mkdir -p "$OUT"/{containers,pe,drawing,imagehash,raw_preview,cad_dxf,cad_dwg,ifc,mesh,markdown,visible_text,full_pipeline,seekable,volumes,vdisk,fsimage,lzo,yara,pcre,cvd,database,authenticode,sheets_xls,sheets_ods,sheets_numbers,sheets_text,slides_ppt,slides_odp,slides_odg,slides_vsdx,slides_keynote,docs_doc,docs_odt,docs_rtf,docs_wml,docs_html,docs_pages}
+mkdir -p "$OUT"/{containers,pe,drawing,imagehash,raw_preview,cad_dxf,cad_dwg,ifc,mesh,markdown,visible_text,full_pipeline,seekable,volumes,vdisk,fsimage,installers,rar_walk,lzo,yara,pcre,cvd,database,authenticode,sheets_xls,sheets_ods,sheets_numbers,sheets_text,slides_ppt,slides_odp,slides_odg,slides_vsdx,slides_keynote,docs_doc,docs_odt,docs_rtf,docs_wml,docs_html,docs_pages}
 
 # Tracked files, and new ones not yet committed (but not ignored ones).
 files() { git ls-files -co --exclude-standard -- "$@"; }
@@ -148,6 +148,15 @@ done
 # their target reads first).
 cp fuzz/seeds/fsimage/*.bin "$OUT/fsimage/"
 cp fuzz/seeds/lzo/*.bin "$OUT/lzo/"
+# installers: the AppleSingle files and InstallShield cabinets written for it
+# (fuzz/seeds/installers/make.py), behind the byte that picks the format.
+cp fuzz/seeds/installers/*.bin "$OUT/installers/"
+
+# rar_walk: the RAR fixtures, as they are (the encrypted ones derive keys,
+# which is slow under the sanitizer: run with a longer -timeout).
+for f in "$OUT"/containers/*; do
+  if cmp -s -n 4 "$f" <(printf 'Rar!'); then cp "$f" "$OUT/rar_walk/"; fi
+done
 
 # full_pipeline: a zero header (no option bits, no database files: the
 # signatures are fuzz/db/'s) in front of each fixture. seekable: no option

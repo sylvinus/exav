@@ -36,9 +36,11 @@ pub(crate) use rarity::FILTER_MIN_BODIES;
 #[cfg(feature = "yara")]
 pub(crate) use rarity::structural;
 pub(crate) use rarity::{GramStats, anchor_score};
-pub(crate) use sweep::sweep;
+#[cfg(feature = "yara")]
+pub(crate) use sweep::Sweeper;
 #[cfg(test)]
 pub(crate) use sweep::{MIN_SKIP_RUN, NO_RUN_COLLAPSE, SWEEP_WINDOW};
+pub(crate) use sweep::{sweep, sweep_fed};
 
 use crate::byte_source::ByteSource;
 
@@ -749,6 +751,7 @@ impl Grams {
 
 #[cfg(test)]
 mod tests {
+    use super::sweep::{Sweeper, sweep_fed};
     use super::*;
     use crate::byte_source::BlockCache;
 
@@ -913,6 +916,42 @@ mod tests {
         }
     }
 
+    /// Random anchors over a small alphabet, partitions and cases, and a
+    /// haystack full of runs and of copies of them.
+    #[allow(clippy::type_complexity)]
+    fn random_case(next: &mut impl FnMut(usize) -> usize) -> (Vec<(u32, bool, Vec<u8>)>, Vec<u8>) {
+        const ALPHA: &[u8] = b"aAb\x00\xff";
+        let anchors: Vec<(u32, bool, Vec<u8>)> = (0..1 + next(30))
+            .map(|_| {
+                let len = [1, 2, 3, 4, 5, 6, 7, 9, 14, 40][next(10)];
+                let nocase = next(3) == 0;
+                let a: Vec<u8> = (0..len).map(|_| ALPHA[next(ALPHA.len())]).collect();
+                (next(3) as u32, nocase, a)
+            })
+            .collect();
+        let mut hay = Vec::new();
+        while hay.len() < 3000 + next(3000) {
+            match next(5) {
+                0 => hay.extend(std::iter::repeat_n(
+                    ALPHA[next(ALPHA.len())],
+                    [3, 70, 900, 2500][next(4)],
+                )),
+                1 => {
+                    let a = &anchors[next(anchors.len())].2;
+                    hay.extend(a.iter().map(|&c| {
+                        if next(2) == 0 {
+                            c.to_ascii_uppercase()
+                        } else {
+                            c
+                        }
+                    }));
+                }
+                _ => hay.push(ALPHA[next(ALPHA.len())]),
+            }
+        }
+        (anchors, hay)
+    }
+
     /// Random anchors over a small alphabet, partitions and cases, swept over
     /// haystacks full of runs and copies of them: exactly what a search for
     /// each finds, in memory and through small cache blocks, across windows.
@@ -925,37 +964,9 @@ mod tests {
             state ^= state << 17;
             (state % n as u64) as usize
         };
-        const ALPHA: &[u8] = b"aAb\x00\xff";
         for round in 0..120 {
-            let anchors: Vec<(u32, bool, Vec<u8>)> = (0..1 + next(30))
-                .map(|_| {
-                    let len = [1, 2, 3, 4, 5, 6, 7, 9, 14, 40][next(10)];
-                    let nocase = next(3) == 0;
-                    let a: Vec<u8> = (0..len).map(|_| ALPHA[next(ALPHA.len())]).collect();
-                    (next(3) as u32, nocase, a)
-                })
-                .collect();
+            let (anchors, hay) = random_case(&mut next);
             let g = index(&anchors);
-            let mut hay = Vec::new();
-            while hay.len() < 3000 + next(3000) {
-                match next(5) {
-                    0 => hay.extend(std::iter::repeat_n(
-                        ALPHA[next(ALPHA.len())],
-                        [3, 70, 900, 2500][next(4)],
-                    )),
-                    1 => {
-                        let a = &anchors[next(anchors.len())].2;
-                        hay.extend(a.iter().map(|&c| {
-                            if next(2) == 0 {
-                                c.to_ascii_uppercase()
-                            } else {
-                                c
-                            }
-                        }));
-                    }
-                    _ => hay.push(ALPHA[next(ALPHA.len())]),
-                }
-            }
             let src =
                 BlockCache::with_sizes(std::io::Cursor::new(hay.clone()), 61, 4 * 61).unwrap();
             for active in [[true, true, true], [false, true, false]] {
@@ -970,6 +981,176 @@ mod tests {
                     want,
                     "round {round} {active:?}, through a cache"
                 );
+            }
+        }
+    }
+
+    fn rng(seed: u64) -> impl FnMut(usize) -> usize {
+        let mut state = seed;
+        move |n| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        }
+    }
+
+    /// An object in memory that is not given as a slice, so it is read like
+    /// one behind a cache, and counts the bytes it hands out.
+    struct Counting<'a>(&'a [u8], std::cell::Cell<usize>);
+
+    impl ByteSource for Counting<'_> {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        fn window(&self, off: usize, len: usize) -> std::borrow::Cow<'_, [u8]> {
+            let w = &self.0[off.min(self.0.len())..(off.saturating_add(len)).min(self.0.len())];
+            self.1.set(self.1.get() + w.len());
+            std::borrow::Cow::Borrowed(w)
+        }
+
+        fn identity(&self) -> (usize, usize) {
+            (self as *const Self as usize, self.0.len())
+        }
+    }
+
+    /// The tap of a sweep is given every byte of the object once, in order:
+    /// the bytes of a skipped run and of a run cut by a window included. A
+    /// sweep that stops has given a prefix and read no further.
+    #[test]
+    fn a_sweep_gives_its_tap_every_byte_it_reads() {
+        use crate::pass::{Fed, testing::Recorder};
+        let mut next = rng(0x51ed_270b_1f4c_9a3d);
+        let mut cut_short = 0;
+        for round in 0..60 {
+            let (anchors, hay) = random_case(&mut next);
+            let g = index(&anchors);
+            let held: &[u8] = &hay;
+            let cache =
+                BlockCache::with_sizes(std::io::Cursor::new(hay.clone()), 61, 4 * 61).unwrap();
+            for active in [[true, true, true], [false, true, false]] {
+                let want = searched(&anchors, &hay, &active);
+                for (src, what) in [(&held as &dyn ByteSource, "held"), (&cache, "cache")] {
+                    let mut rec = Recorder::default();
+                    let mut got = Vec::new();
+                    {
+                        let mut fed = Fed::new(&mut rec, src);
+                        assert!(sweep_fed(
+                            &g,
+                            &active,
+                            src,
+                            Some(&mut fed),
+                            &mut |p, v, s, l, n| {
+                                got.extend((s..s + n).map(|s| (p, v, s, l)));
+                                true
+                            }
+                        ));
+                    }
+                    got.sort_unstable();
+                    assert_eq!(got, want, "round {round} {active:?} {what}");
+                    assert!(
+                        rec.bytes == hay,
+                        "round {round} {active:?} {what}: not every byte"
+                    );
+                    // Stopped at the first hit: what the tap has is the start.
+                    let mut rec = Recorder::default();
+                    let reached_end = {
+                        let mut fed = Fed::new(&mut rec, src);
+                        sweep_fed(&g, &active, src, Some(&mut fed), &mut |_, _, _, _, _| false)
+                    };
+                    assert_eq!(
+                        reached_end,
+                        want.is_empty(),
+                        "round {round} {active:?} {what}"
+                    );
+                    assert!(
+                        hay.starts_with(&rec.bytes),
+                        "round {round} {active:?} {what}"
+                    );
+                    cut_short += (rec.bytes.len() < hay.len()) as usize;
+                }
+            }
+        }
+        assert!(
+            cut_short > 20,
+            "too few stopped sweeps stopped early ({cut_short})"
+        );
+    }
+
+    /// A run of one byte over many windows is read once, by the sweep, and
+    /// the tap is given it from that read.
+    #[test]
+    fn a_run_is_given_to_the_tap_from_the_sweeps_own_read() {
+        use crate::pass::{Fed, testing::Recorder};
+        let anchors: Vec<(u32, bool, Vec<u8>)> = vec![(0, false, b"MZ\x90".to_vec())];
+        let g = index(&anchors);
+        let mut hay = b"..MZ\x90..".to_vec();
+        hay.extend(std::iter::repeat_n(0u8, 40 * 1000 + 17));
+        hay.extend_from_slice(b"MZ\x90");
+        let src = Counting(&hay, std::cell::Cell::new(0));
+        let mut rec = Recorder::default();
+        let mut hits = 0;
+        {
+            let mut fed = Fed::new(&mut rec, &src);
+            assert!(sweep_fed(
+                &g,
+                &[true],
+                &src,
+                Some(&mut fed),
+                &mut |_, _, _, _, n| {
+                    hits += n;
+                    true
+                }
+            ));
+        }
+        assert_eq!(hits, 2);
+        assert!(rec.bytes == hay);
+        let read = src.1.get();
+        // Each window, the stretch of the run past it that is looked at to
+        // find its end, and a few bytes at the seams.
+        assert!(
+            read < hay.len() + hay.len() / 8,
+            "read {read} bytes of {}",
+            hay.len()
+        );
+    }
+
+    /// A sweeper handed its object in pieces of any size finds what a whole
+    /// sweep finds, whether the pieces touch or leave a gap, which it reads.
+    #[test]
+    fn a_sweeper_fed_in_pieces_finds_what_a_sweep_finds() {
+        let mut next = rng(0x2f6b_c7a1_9e03_d845);
+        for round in 0..60 {
+            let (anchors, hay) = random_case(&mut next);
+            let g = index(&anchors);
+            let held: &[u8] = &hay;
+            let cache =
+                BlockCache::with_sizes(std::io::Cursor::new(hay.clone()), 61, 4 * 61).unwrap();
+            for active in [[true, true, true], [false, true, false]] {
+                let want = searched(&anchors, &hay, &active);
+                for (src, what) in [(&held as &dyn ByteSource, "held"), (&cache, "cache")] {
+                    for gaps in [false, true] {
+                        let mut sw = Sweeper::new(&g, &active, src);
+                        let mut got = Vec::new();
+                        let mut at = 0;
+                        while at < hay.len() {
+                            let len = [1, 7, 8, 9, 100, 999, 1000, 1001, 2600][next(9)];
+                            let end = (at + len).min(hay.len());
+                            assert!(sw.feed(at, &hay[at..end], None, &mut |p, v, s, l, n| {
+                                got.extend((s..s + n).map(|s| (p, v, s, l)));
+                                true
+                            }));
+                            at = end;
+                            // The next piece starts a little further on.
+                            if gaps && next(3) == 0 && at + 40 < hay.len() {
+                                at += 1 + next(40);
+                            }
+                        }
+                        got.sort_unstable();
+                        assert_eq!(got, want, "round {round} {active:?} {what} gaps {gaps}");
+                    }
+                }
             }
         }
     }

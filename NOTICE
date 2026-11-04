@@ -21,7 +21,7 @@ confirms every dependency resolves to a permissive license on the allowlist in
 deny.toml.
 
 Versions below reflect Cargo.lock at the time of writing (last verified
-2026-09-09).
+2026-11-14).
 
 
 -------------------------------------------------------------------------------
@@ -31,7 +31,13 @@ Versions below reflect Cargo.lock at the time of writing (last verified
 exav's YARA engine is native, in `crates/exav-core/src/yara/`. Parts of it are
 derived from yara-x's source: the module implementations (`pe`, `elf`, `dotnet`,
 `math`, `hash`, `string`) and the compiler's base64 handling, including field
-semantics and the RVA-to-offset and import-hash routines. Each such file carries
+semantics and the RVA-to-offset and import-hash routines, the import loop
+(`parse_import_impl`) and the name checks (`dll_name_at_rva`,
+`parse_import_by_name`) of the `pe` module (`crates/exav-core/src/pe.rs`,
+`yara/modules/pe.rs`), and the ordinal tables of imports from ws2_32, wsock32
+and oleaut32 (`crates/exav-core/src/pe/ordinals.rs`, from
+`lib/src/modules/pe/parser.rs` of yara-x 1.21.0 and 1.22.1, which are the same;
+libyara 4.5.2 has the same entries). Each such file carries
 a per-file attribution header, and the license text is reproduced below and in
 `crates/exav-core/LICENSE-YARA-X`.
 
@@ -44,7 +50,7 @@ The differential test that compares exav's engine against yara-x
 `yr` binary from `PATH`) rather than linking it, and skips when that binary is
 absent.
 
-Components: yara-x-parser 1.19.
+Components: yara-x-parser 1.23.
 Upstream: https://github.com/VirusTotal/yara-x
 Copyright (c) 2024. The YARA-X Authors. All Rights Reserved.
 
@@ -88,7 +94,8 @@ without its SIMD.
 
 The RAR5 (unpack50) decompressor in
 crates/exav-unpack/src/formats/rar5_unpack.rs is a Rust port of the
-decompression core of libarchive's archive_read_support_format_rar5.c. As a
+decompression core of libarchive's archive_read_support_format_rar5.c (v3.8.8,
+the release current when the port entered the tree). As a
 source derivative, BSD-2-Clause requires retaining the upstream copyright and
 licence text reproduced below.
 
@@ -123,7 +130,8 @@ All rights reserved.
 
 The RAR3/RAR4 (unpack29) decompressor in
 crates/exav-unpack/src/formats/rar3_unpack.rs is a Rust port of the
-decompression core of the Go package nwaples/rardecode. As a source
+decompression core of the Go package nwaples/rardecode (v2.2.5, the release
+current when the port entered the tree). As a source
 derivative, BSD-2-Clause requires retaining the upstream copyright and licence
 text reproduced below.
 
@@ -221,9 +229,10 @@ ships no separate NOTICE file.
 -------------------------------------------------------------------------------
 
 The CAB (Microsoft Cabinet) reader in crates/exav-unpack/src/formats/cab_parse/
-is vendored and adapted from the `rust-cab` crate: write support, the datetime
-module, unused public types, and tests removed; bounds checks added for
-folder data-block and short-read cases. Licensed MIT; the MIT License requires
+is vendored and adapted from the `rust-cab` crate (version 0.6.0): write
+support, the datetime module, unused public types, tests and `byteorder`
+removed; bounds checks added for folder data-block and short-read cases.
+Licensed MIT; the MIT License requires
 retaining the copyright and permission notice (reproduced in the exav LICENSE
 file) in distributions.
 
@@ -236,7 +245,8 @@ Copyright (c) Matthew D. Steele <mdsteele@alum.mit.edu>.
 -------------------------------------------------------------------------------
 
 The ARJ reader in crates/exav-unpack/src/formats/arj_parse/ is vendored and
-adapted from the `unarc-rs` crate: multi-volume support, volume providers, and
+adapted from the `unarc-rs` crate (version 0.6.1): multi-volume support,
+volume providers, and
 external error types removed; wired to `delharc` for LH6 decompression.
 Dual-licensed MIT OR Apache-2.0; the MIT or Apache terms apply at the
 distributor's choice (both reproduced/referenced elsewhere in this file).
@@ -279,8 +289,7 @@ own examples, redistributed under the same terms. `undhr.z` is shipped alongside
 against the real file rather than against itself.
 
 This is a DIFFERENT format from the InstallShield `ISc(` InstallScript cabinet,
-whose only implementation is the LGPL `unshield` C project (never read), and the
-reason that format stays recognised-but-unopened.
+read after the MIT `unshield` C project (section 1h8).
 
 Upstream: https://github.com/agrif/unshield , https://github.com/agrif/explode
 Copyright (c) Aaron Griffith.
@@ -377,7 +386,8 @@ Copyright © 2010 by Jeffrey 'Alex' Clark and contributors
 crates/exav-unpack/src/formats/lzfse.rs, the LZFSE and LZVN decoder for DMG
 runs, is a Rust port of the decoder of Apple's reference implementation
 (lzfse_decode_base.c, lzfse_fse.c/.h, lzvn_decode_base.c and the tables of
-lzfse_internal.h), changed to decode a whole buffer into a capped one.
+lzfse_internal.h, as in lzfse-1.0), changed to decode a whole buffer into a
+capped one.
 
 Upstream: https://github.com/lzfse/lzfse
 Copyright (c) 2015-2016, Apple Inc. All rights reserved.
@@ -419,6 +429,108 @@ markers), over exav's own codecs and with its own bounds.
 
 Upstream: https://github.com/Dil4rd/dpp
 Copyright (c) 2026 Dil4rd
+
+
+-------------------------------------------------------------------------------
+1h8. unshield (C library), MIT (source derivative)
+-------------------------------------------------------------------------------
+
+crates/exav-unpack/src/formats/ishield_cab.rs reads InstallShield InstallScript
+cabinets (`ISc(`) as the `unshield` C library reads them: the common and volume
+headers, the cabinet descriptor and file table, the file records of each
+layout, the deflated chunks, the old compression (chunks with no length, cut at
+the flush marker `00 00 ff ff` and inflated each on its own) and the
+obfuscation of stored data. It is a port,
+altered to read a member as it is streamed, within exav's bounds, and to report
+what lies in another cabinet of a set.
+
+Upstream: https://github.com/twogood/unshield
+
+  Copyright (c) 2003 David Eriksson <twogood@users.sourceforge.net>
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+
+-------------------------------------------------------------------------------
+1h9. innoextract, zlib (source derivative)
+-------------------------------------------------------------------------------
+
+crates/exav-unpack/src/formats/inno.rs reads Inno Setup installers as
+innoextract reads them: the loader table, the version string and blocks of
+setup-0, the layout of the data entries by version, the chunks of setup-1 and
+their compression headers, and the x86 call and jump filters. It is altered
+from it: written in Rust, the setup header read only up to its compression
+method, members streamed within exav's bounds. Inno Setup's own source, under its own licence, was not read.
+
+Upstream: https://github.com/dscharrer/innoextract
+
+  Copyright (C) 2011-2020 Daniel Scharrer <daniel@constexpr.org>
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the author(s) be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+
+
+-------------------------------------------------------------------------------
+1h10. ISx, MIT (source derivative)
+-------------------------------------------------------------------------------
+
+crates/exav-unpack/src/formats/ishield_msi.rs reads the layout and the coding
+of the files in an InstallShield setup executable as ISx.c (v0.3.11, commit
+3c4177ddd0519244490ff8e78d380110c8dacdc8) does. It is altered from it: written
+in Rust, the files handed over as they are decoded, within exav's bounds.
+
+Upstream: https://github.com/lifenjoiner/ISx
+
+  MIT License
+
+  Copyright (c) 2017 lifenjoiner
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
 
 
 -------------------------------------------------------------------------------
@@ -598,15 +710,19 @@ crates/exav-render/src/formats/image/raw.rs and raw/ read the previews of
 camera RAW files. No code was taken from another implementation. They were
 written from these public specifications, which are not redistributed here:
 
-- TIFF Revision 6.0 (Adobe Systems Incorporated, 1992), published by Adobe for
-  anyone to implement.
-- Adobe Digital Negative (DNG) Specification 1.7.1.0 (Adobe), published with a
-  royalty-free licence to implement DNG.
-- Exif 2.32, CIPA DC-008-2019 (Camera & Imaging Products Association), freely
-  downloadable.
+- TIFF Revision 6.0 (Aldus Corporation, 1992; its copyright passed to Adobe
+  with Aldus).
+- Adobe Digital Negative (DNG) Specification 1.7.1.0 (Adobe, September 2023),
+  which Adobe publishes on its Digital Negative page with a worldwide,
+  royalty-free patent licence for reading and writing DNG files. That
+  licence asks for this notice: This product includes DNG technology under
+  license by Adobe.
+- Exif 2.32, CIPA DC-008-2019 (Camera & Imaging Products Association). CIPA
+  offers its standards for download at no charge, after a disclaimer
+  (https://www.cipa.jp/e/std/std-sec.html; the current edition is Exif 3.1).
 - ITU-T T.81 | ISO/IEC 10918-1, the JPEG standard.
-- ISO/IEC 14496-12, ISO base media file format, from ISO's publicly available
-  standards.
+- ISO/IEC 14496-12, ISO base media file format; its 2015 edition was among
+  ISO's Publicly Available Standards, free of charge.
 
 What the makers' own containers hold (the signatures of RAF, X3F, CRW, MRW,
 ORF, RW2 and IIQ, the compression numbers of their sensor data) was read off
@@ -715,6 +831,33 @@ untrusted (ISC); rustls is Apache-2.0 OR ISC OR MIT. They come only with the
 permission-notice terms; reproduce the copyright notice and the
 permission/disclaimer notice in distributions.
 
+exav-qr, the QR code reader of exav-render's `qr` feature (off by default), is
+rqrr 0.11.0 ((MIT OR Apache-2.0) AND ISC, copyright 2019 Moritz Wanzenböck)
+vendored without its dependencies (crates/exav-qr; each file's header says what
+was changed; the MIT and Apache-2.0 texts are in crates/exav-qr/LICENSE-MIT and
+LICENSE-APACHE). rqrr is a port of quirc, whose notice it carries:
+
+  quirc -- QR-code recognition library
+  Copyright (C) 2010-2012 Daniel Beer <dlbeer@gmail.com>
+
+  Permission to use, copy, modify, and/or distribute this software for
+  any purpose with or without fee is hereby granted, provided that the
+  above copyright notice and this permission notice appear in all
+  copies.
+
+  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+  WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+  WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+  AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+  DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+  PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+  TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+  PERFORMANCE OF THIS SOFTWARE.
+
+What it brings with it: g2p, g2gen and g2poly (MIT OR Apache-2.0), lru (MIT,
+2016 Jerome Froelich), hashbrown (MIT OR Apache-2.0) and foldhash (Zlib, 2024
+Orson Peters).
+
 
 -------------------------------------------------------------------------------
 3. MIT / Apache-2.0 dual-licensed components (the bulk of the graph)
@@ -758,15 +901,16 @@ the distributor's choice. Notable examples:
   wasm-bindgen, js-sys, web-sys,         WebAssembly/JS bindings; these reach
     wasm-bindgen-futures                   the published npm artifact
 
-sevenz-rust2, bzip2, ppmd-rust and lzfse_rust are dev-only: they build test
-fixtures. The shipped 7z reader is native (§1m), the bzip2 decoder is vendored
-(§1h3) and the LZFSE decoder is ported from Apple's (§1h6).
+sevenz-rust2, bzip2, ppmd-rust, lzfse_rust and tar are dev-only: they build
+test fixtures. The shipped 7z reader is native (§1m), the bzip2 decoder is
+vendored (§1h3), the LZFSE decoder is ported from Apple's (§1h6) and the tar
+reader is exav's own, written from the POSIX and GNU format descriptions.
 
 MIT-only components (the MIT copyright and permission notice must be retained;
 the MIT text is in the exav LICENSE file): ascii_tree, bcdec_rs (2023 SMG;
 a port of bcdec, MIT or public domain, 2022 Sergii Kudlai), cfb, color_quant,
 deflate64, fax, fax_derive, goblin, lznt1, quick-xml,
-rmp, rmp-serde, ruzstd, salzweg, scroll, scroll_derive, simd-adler32, slab,
+rmp, rmp-serde, ruzstd, scroll, scroll_derive, simd-adler32, slab,
 strsim, xz4rust, zip, zmij, and bytes (`http` features only). fancy-regex and
 tiff are vendored, and Pillow's resampler ported (§1h5); unshield and explode
 are ported (§1h1).
@@ -798,8 +942,8 @@ Recorded here because a decoder's provenance is part of what makes it auditable:
   AZO        ESTsoft's own compression algorithm, absent from the EGG spec.
              `crates/exav-unpack/src/formats/azo.rs` and `azo_tables.rs` are a
              Rust port of the AZO decoder in `EggDotNet`
-             (https://github.com/akolman/EggDotNet), MIT, Copyright (c) Andrew
-             Kolman. ESTsoft's own UnEgg library was NOT used: its licence
+             (https://github.com/akolman/EggDotNet, v0.1.0-beta), MIT,
+             Copyright (c) Andrew Kolman. ESTsoft's own UnEgg library was NOT used: its licence
              forbids commercial use without approval and forbids using it to
              develop a compression algorithm.
 

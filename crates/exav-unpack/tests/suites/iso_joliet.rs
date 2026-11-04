@@ -1,6 +1,6 @@
 //! Regression: an ISO-9660 image that lists its payload ONLY in the Joliet
-//! supplementary tree (leaving the primary tree empty) — a common malware-ISO
-//! evasion, e.g. an `Invoice.pdf.lnk` delivered inside an ISO — must still have
+//! supplementary tree (leaving the primary tree empty), a common malware-ISO
+//! evasion, e.g. an `Invoice.pdf.lnk` delivered inside an ISO, must still have
 //! that file extracted and scanned. Walking only the primary volume descriptor's
 //! directory tree would silently miss such files.
 
@@ -63,7 +63,7 @@ fn joliet_only_iso(name_utf16be: &[u8], payload: &[u8]) -> Vec<u8> {
     put(&mut img, 18, 0, &[255]);
     put(&mut img, 18, 1, b"CD001");
 
-    // Primary root dir (LBA 19): "." and ".." only — NO files.
+    // Primary root dir (LBA 19): "." and ".." only, NO files.
     let mut prim = dir_record(19, SECTOR as u32, true, &[0]);
     prim.extend(dir_record(19, SECTOR as u32, true, &[1]));
     put(&mut img, 19, 0, &prim);

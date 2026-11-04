@@ -15,7 +15,7 @@ assert_eq!(insn.len, 3);
 and nothing in `[dependencies]`.
 
 The SIMD and system regions of the opcode maps come from `src/generated.rs`,
-which is checked in and produced by `scripts/gen-x86-tables.sh` — it reads each
+which is checked in and produced by `scripts/gen-x86-tables.sh`: it reads each
 cell off `iced-x86` (MIT; attributed in `NOTICE`) rather than transcribing a
 manual, because a hand-copied table is wrong in ways review does not catch.
 
@@ -28,7 +28,7 @@ manual, because a hand-copied table is wrong in ways review does not catch.
 
 A caller must therefore report `None` as **unsupported**, never as an illegal
 instruction. Fabricating a CPU fault for code a real processor runs is how an
-emulator gets fooled — a program that branches on its own exception handler will
+emulator gets fooled: a program that branches on its own exception handler will
 take the wrong path, and the wrong path can look clean.
 
 ## Scope
@@ -56,7 +56,7 @@ have. Every encoding exav's packer emulator actually executes is covered.
 ## Testing
 
 A decoder cannot be checked against itself, so the tests are differential
-against `iced-x86` (a dev-dependency — it reaches no shipped binary). They
+against `iced-x86` (a dev-dependency; it reaches no shipped binary). They
 compare instruction length and mnemonic, plus memory base/index/scale/
 displacement, over:
 
@@ -64,13 +64,13 @@ displacement, over:
 * those sweeps repeated under each prefix and prefix pair that changes how an
   encoding is read (`66`, `67`, `F0`, `F2`, `F3`, segment overrides),
 * pseudo-random and prefix-biased random bytes, from fixed seeds,
-* truncation — no prefix of an instruction may decode,
-* self-consistency — an instruction re-decoded from exactly its own reported
+* truncation: no prefix of an instruction may decode,
+* self-consistency: an instruction re-decoded from exactly its own reported
   length must give the same answer.
 
 `fuzz/fuzz_targets/x86_decode.rs` asserts the same properties under
-coverage-guided mutation, which reaches body shapes — a SIB byte that changes
-whether a displacement is present, a prefix run that pushes past fifteen bytes —
+coverage-guided mutation, which reaches body shapes (a SIB byte that changes
+whether a displacement is present, a prefix run that pushes past fifteen bytes)
 that a fixed sweep does not.
 
 ```sh

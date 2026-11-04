@@ -1,9 +1,9 @@
-//! ext2/3/4 — reading the filesystem, not carving the blocks.
+//! ext2/3/4: reading the filesystem, not carving the blocks.
 //!
 //! Same argument as the FAT suite next door. A raw disk is a pile of blocks;
 //! carving finds a file whose magic sits at the start of a contiguous run and
-//! misses everything else. A **fragmented** file — one written into a hole left
-//! by a deleted file and continuing past it — comes back as disconnected pieces
+//! misses everything else. A **fragmented** file (one written into a hole left
+//! by a deleted file and continuing past it) comes back as disconnected pieces
 //! that will not decompress.
 //!
 //! The fixture is built to be exactly that case. Three 64 KB files written, the
@@ -15,7 +15,7 @@
 //! ```
 //!
 //! Two extents, non-adjacent. The payload is a ZIP whose EICAR member is
-//! deflated, so the signature bytes appear nowhere in the image — only walking
+//! deflated, so the signature bytes appear nowhere in the image: only walking
 //! the extent tree reassembles it.
 //!
 //! Regenerate with (`e2fsprogs`):
@@ -261,6 +261,37 @@ fn a_directory_that_names_its_ancestor_is_walked_once() {
     img[at..at + 4].copy_from_slice(&2u32.to_le_bytes());
     let e = walk_members(Format::Ext, &img);
     assert_tree(&e, &tree(true));
+}
+
+/// A file kept in its inode whose size is more than the inode holds comes with
+/// the bytes it holds, and says that is what it is.
+#[test]
+fn a_file_in_its_inode_that_is_longer_than_the_inode_says_so() {
+    let mut img = image("ext4_inline");
+    // The inode has the 10 bytes of `tiny.txt` in its block field, 40 bytes
+    // in, and their count in its size, 4 bytes in.
+    let tiny = walk_members(Format::Ext, &img)
+        .into_iter()
+        .find(|m| m.name == "tiny.txt")
+        .expect("tiny.txt")
+        .data;
+    let at = (40..img.len() - 10)
+        .find(|&p| img[p..p + 10] == tiny[..] && img[p - 36..p - 32] == 10u32.to_le_bytes())
+        .expect("the bytes are in the inode")
+        - 40;
+    img[at + 4..at + 8].copy_from_slice(&5000u32.to_le_bytes());
+    let (e, end) = walked(Format::Ext, &img, Limits::default());
+    end.unwrap();
+    let t = e.iter().find(|x| x.name == "tiny.txt").expect("tiny.txt");
+    assert_eq!(
+        t.unsupported,
+        Some("ext file whose inline data is shorter than its size")
+    );
+    assert!(
+        !t.data.is_empty() && t.data.len() < 5000,
+        "{}",
+        t.data.len()
+    );
 }
 
 /// A file whose extent tree is gone is reported, and the others come out.

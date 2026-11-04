@@ -10,10 +10,9 @@ import { MATCHERS } from "../core/formats.js";
 import type { FormatPlugin } from "../core/types.js";
 
 export interface ArchiveOptions {
-  /** Defaults: 512 MiB extracted, 5000 members, ratio 200. */
+  /** Defaults: 512 MiB extracted, 5000 members. */
   maxExtractedBytes?: number;
   maxMembers?: number;
-  maxCompressionRatio?: number;
 }
 
 export function archive(options: ArchiveOptions = {}): FormatPlugin<ArchiveOptions> {

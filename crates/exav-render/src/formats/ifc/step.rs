@@ -164,12 +164,7 @@ impl<'a> StepFile<'a> {
             return Err(Error::NoData);
         }
         let mut s = Scanner { data, pos: 0 };
-        // A UTF-8 byte order mark, then the magic.
-        if s.rest().starts_with(b"\xEF\xBB\xBF") {
-            s.pos = 3;
-        }
-        s.skip_space();
-        if !s.rest().starts_with(b"ISO-10303-21;") {
+        if !s.magic() {
             return Err(Error::NotStep);
         }
         let mut file = StepFile {
@@ -181,7 +176,6 @@ impl<'a> StepFile<'a> {
             damaged: false,
         };
         let mut type_ids: HashMap<&'a [u8], u32> = HashMap::new();
-        s.pos += 13;
         let mut in_data = false;
         loop {
             s.skip_space();
@@ -207,25 +201,11 @@ impl<'a> StepFile<'a> {
                 } else if rest.starts_with(b"END-ISO-10303-21") {
                     break;
                 } else if rest.starts_with(b"FILE_SCHEMA") {
-                    s.pos += 11;
-                    s.skip_space();
-                    let start = s.pos;
-                    if s.peek() != Some(b'(') || s.skip_balanced().is_none() {
-                        // A header that is not well formed (a stray `;`
-                        // in it, say) says nothing of the instances: the
-                        // schema is what it names before the `;`, and the
-                        // statement ends there.
-                        s.pos = start;
-                        let end = s.rest().iter().position(|&c| c == b';');
-                        if let Some(end) = end {
-                            file.schema = schema_of(&data[start..start + end]);
-                            s.pos = start + end + 1;
-                            continue;
-                        }
+                    let Some(params) = s.file_schema() else {
                         file.damaged = true;
                         break;
-                    }
-                    file.schema = schema_of(&data[start + 1..s.pos - 1]);
+                    };
+                    file.schema = schema_of(params);
                 } else if !s.skip_statement() {
                     file.damaged = true;
                     break;
@@ -362,6 +342,38 @@ impl<'a> StepFile<'a> {
     }
 }
 
+/// Whether `head`, the start of a file, is a STEP file of any schema: its
+/// magic, after a byte order mark and blank space, as [`StepFile::parse`]
+/// reads it.
+pub fn is_step(head: &[u8]) -> bool {
+    Scanner { data: head, pos: 0 }.magic()
+}
+
+/// Whether `head`, the start of a file, is a STEP file whose header names an
+/// IFC schema (`FILE_SCHEMA`). Cheap: the header is scanned up to `DATA`,
+/// not parsed, and a head that ends first says no.
+pub fn is_ifc(head: &[u8]) -> bool {
+    let mut s = Scanner { data: head, pos: 0 };
+    if !s.magic() {
+        return false;
+    }
+    loop {
+        s.skip_space();
+        let rest = s.rest();
+        if rest.is_empty() || rest.starts_with(b"DATA") {
+            return false;
+        }
+        if rest.starts_with(b"FILE_SCHEMA") {
+            return s
+                .file_schema()
+                .is_some_and(|params| params.to_ascii_uppercase().windows(3).any(|w| w == b"IFC"));
+        }
+        if !s.skip_statement() {
+            return false;
+        }
+    }
+}
+
 fn schema_of(params: &[u8]) -> Schema {
     let upper = params.to_ascii_uppercase();
     let has = |n: &[u8]| upper.windows(n.len()).any(|w| w == n);
@@ -388,6 +400,38 @@ impl<'a> Scanner<'a> {
 
     fn peek(&self) -> Option<u8> {
         self.data.get(self.pos).copied()
+    }
+
+    /// A UTF-8 byte order mark and whitespace, then the magic; false if it
+    /// is not there. The scanner is after the magic.
+    fn magic(&mut self) -> bool {
+        if self.rest().starts_with(b"\xEF\xBB\xBF") {
+            self.pos = 3;
+        }
+        self.skip_space();
+        if !self.rest().starts_with(b"ISO-10303-21;") {
+            return false;
+        }
+        self.pos += 13;
+        true
+    }
+
+    /// At `FILE_SCHEMA`: the parameters of the statement, which is read. None
+    /// when the data ends before it does.
+    fn file_schema(&mut self) -> Option<&'a [u8]> {
+        self.pos += 11;
+        self.skip_space();
+        let start = self.pos;
+        if self.peek() != Some(b'(') || self.skip_balanced().is_none() {
+            // A header that is not well formed (a stray `;` in it, say) says
+            // nothing of the instances: the schema is what it names before
+            // the `;`, and the statement ends there.
+            self.pos = start;
+            let end = self.rest().iter().position(|&c| c == b';')?;
+            self.pos = start + end + 1;
+            return Some(&self.data[start..start + end]);
+        }
+        Some(&self.data[start + 1..self.pos - 1])
     }
 
     /// Whitespace and `/* comments */`.

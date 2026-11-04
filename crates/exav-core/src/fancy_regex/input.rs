@@ -30,6 +30,7 @@ pub struct RegexInput<'h, S: Input + ?Sized> {
     start_text: Option<bool>,
     end_text: Option<bool>,
     continue_from_previous_match_end: Option<bool>,
+    work: Option<&'h core::cell::Cell<usize>>,
 }
 
 impl<'h, S: Input + ?Sized> Clone for RegexInput<'h, S> {
@@ -44,6 +45,7 @@ impl<'h, S: Input + ?Sized> Clone for RegexInput<'h, S> {
             start_text: self.start_text,
             end_text: self.end_text,
             continue_from_previous_match_end: self.continue_from_previous_match_end,
+            work: self.work,
         }
     }
 }
@@ -59,6 +61,7 @@ impl<'h, S: Input + ?Sized> RegexInput<'h, S> {
             start_text: None,
             end_text: None,
             continue_from_previous_match_end: None,
+            work: None,
         }
     }
 
@@ -138,6 +141,23 @@ impl<'h, S: Input + ?Sized> RegexInput<'h, S> {
     pub fn anchored(mut self, yes: bool) -> Self {
         self.anchored = yes;
         self
+    }
+
+    /// Return a copy of this input whose search draws from `work`, in place
+    /// of the backtrack limit the regex was built with.
+    ///
+    /// `work` holds the room left, counted as [`STEP_BYTES`](crate::fancy_regex::STEP_BYTES)
+    /// for a backtrack and one for each byte that a delegated search or a
+    /// back reference reads. A search leaves in it what it did not use, so
+    /// searches that share a cell share the room; one that runs out of it
+    /// fails with a backtrack-limit error and leaves it empty.
+    pub fn work(mut self, work: &'h core::cell::Cell<usize>) -> Self {
+        self.work = Some(work);
+        self
+    }
+
+    pub(crate) fn work_cell(&self) -> Option<&'h core::cell::Cell<usize>> {
+        self.work
     }
 
     pub(crate) fn effective_start(&self) -> usize {

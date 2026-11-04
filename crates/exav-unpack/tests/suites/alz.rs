@@ -49,6 +49,44 @@ fn extract_all(data: &[u8]) -> Vec<exav_unpack::Entry> {
     extract(Format::Alz, &data, &mut b).expect("ALZ extraction must not error")
 }
 
+/// A member past the object limit is left out with a limit for its reason,
+/// not damage, and the members after it are still extracted.
+#[test]
+fn a_member_over_the_object_limit_is_a_limit() {
+    use exav_unpack::tree::{ReasonClass, ReasonKind};
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 1 << 20;
+    let entries = extract(Format::Alz, &fixture(), &mut Budget::new(limits)).unwrap();
+    let tif = entries
+        .iter()
+        .find(|e| e.name == "lorem_ipsum_long.tif")
+        .unwrap();
+    assert!(tif.data.is_empty() && tif.unsupported.is_some(), "{tif:?}");
+    assert_eq!(
+        tif.reason_kind.map(ReasonKind::class),
+        Some(ReasonClass::Limits)
+    );
+    let short = entries.iter().find(|e| e.name == "lorem_ipsum_short.txt");
+    assert_eq!(short.map(|e| e.data.len()), Some(525));
+}
+
+/// A member said to be larger than what is left of the extraction total is
+/// left out before it is decoded, nothing charged: the members after it are
+/// still extracted.
+#[test]
+fn a_member_over_what_is_left_of_the_total_does_not_use_it_up() {
+    let mut limits = Limits::default();
+    limits.max_extracted_bytes = 1 << 20;
+    let entries = extract(Format::Alz, &fixture(), &mut Budget::new(limits)).unwrap();
+    let tif = entries.iter().find(|e| e.name == "lorem_ipsum_long.tif");
+    assert!(
+        tif.is_some_and(|e| e.data.is_empty() && e.unsupported.is_some()),
+        "{tif:?}"
+    );
+    let long = entries.iter().find(|e| e.name == "lorem_ipsum_long.txt");
+    assert_eq!(long.map(|e| e.data.len()), Some(15_238));
+}
+
 #[test]
 fn every_member_matches_the_oracle_byte_for_byte() {
     let entries = extract_all(&fixture());

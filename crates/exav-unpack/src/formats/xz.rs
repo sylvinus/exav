@@ -1,15 +1,15 @@
 use crate::*;
 
 /// The dictionary size exav is willing to allocate for an XZ stream. Matches the
-/// decoder's own allocation cap below — one number, not two that can drift.
+/// decoder's own allocation cap below: one number, not two that can drift.
 pub const XZ_MAX_DICT: u64 = 64 * 1024 * 1024;
 
 /// Walk an `.xz` file: one member, every stream decoded in turn as it is read.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     use crate::stream::{emit_stream, single_meta};
     budget.count_entry()?;
     let mut dec = content_reader(src);
@@ -30,7 +30,7 @@ pub(crate) fn walk<T>(
 /// (`Heuristics.XZ.DicSizeLimit`) with no flag to turn it off.
 ///
 /// Returns `None` when the stream is not XZ, is truncated, or uses a filter
-/// chain this does not model — never a guess.
+/// chain this does not model, never a guess.
 pub fn declared_dict_size(data: &[u8]) -> Option<u64> {
     /// `\xFD 7 z X Z \0` then 2 flag bytes and a CRC32.
     const STREAM_HEADER: usize = 12;
@@ -68,7 +68,7 @@ pub fn declared_dict_size(data: &[u8]) -> Option<u64> {
                 return None;
             }
             // `(2 | (b & 1)) << (b / 2 + 11)`, exactly as the format defines it.
-            // The largest legal property, 40, yields 4 GiB — which needs 64 bits,
+            // The largest legal property, 40, yields 4 GiB, which needs 64 bits,
             // so the arithmetic is done there rather than clamped to `u32::MAX`
             // (that was off by one byte and made the boundary untestable).
             return Some(u64::from(2 | (b & 1)) << (b / 2 + 11));
@@ -110,17 +110,26 @@ const OUT_STEP: usize = 1024;
 /// Concatenated streams need no special handling here: the decoder resets at
 /// each end-of-stream and carries on, so multi-stream files stream like any
 /// other.
-pub(crate) fn content_reader(
-    data: &dyn crate::source::ByteSource,
-) -> XzReader<crate::source::Reader<'_>> {
+pub(crate) fn content_reader(data: &dyn crate::source::ByteSource) -> XzReader<'_> {
     XzReader::new(crate::source::Reader::new(data))
 }
 
+/// The decoder, built in a function of its own: its tables are about 30 KB,
+/// which the frame of a caller would take for as long as a member is scanned,
+/// once per level of xz inside xz.
+#[inline(never)]
+fn new_decoder() -> Box<xz4rust::XzDecoder<'static>> {
+    Box::new(xz4rust::XzDecoder::with_alloc_dict_size(
+        8192,
+        XZ_MAX_DICT as usize,
+    ))
+}
+
 /// Every stream of an `.xz` input read from `input`, decoded as it is read.
-pub(crate) struct XzReader<R> {
+pub(crate) struct XzReader<'a> {
     /// The input, with a check the decoder does not read taken out
     /// ([`super::xz_nocheck`]).
-    input: super::xz_nocheck::NoCheck<R>,
+    input: super::xz_nocheck::NoCheck<'a>,
     inbuf: Vec<u8>,
     in_pos: usize,
     in_len: usize,
@@ -142,17 +151,14 @@ pub(crate) struct XzReader<R> {
     cut: bool,
 }
 
-impl<R: std::io::Read> XzReader<R> {
-    pub(crate) fn new(input: R) -> Self {
+impl<'a> XzReader<'a> {
+    pub(crate) fn new(input: impl std::io::Read + 'a) -> Self {
         XzReader {
             input: super::xz_nocheck::NoCheck::new(input),
             inbuf: vec![0; 8192],
             in_pos: 0,
             in_len: 0,
-            decoder: Box::new(xz4rust::XzDecoder::with_alloc_dict_size(
-                8192,
-                XZ_MAX_DICT as usize,
-            )),
+            decoder: new_decoder(),
             staged: Vec::new(),
             taken: 0,
             done: false,
@@ -201,7 +207,7 @@ impl<R: std::io::Read> XzReader<R> {
     }
 }
 
-impl<R: std::io::Read> std::io::Read for XzReader<R> {
+impl std::io::Read for XzReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         loop {
             if self.taken < self.staged.len() {

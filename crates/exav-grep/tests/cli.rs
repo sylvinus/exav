@@ -1,7 +1,7 @@
 //! End-to-end tests for the `exav-grep` binary.
 //!
 //! The library is unit-tested in `src/lib.rs`; what is only reachable through
-//! the binary is the part a user actually depends on — **exit codes**, which
+//! the binary is the part a user actually depends on: **exit codes**, which
 //! stream each kind of output goes to, and the flag wiring. In particular exit
 //! code 3 ("no matches, but something could not be read") is this tool's whole
 //! reason to differ from `grep`: a script that treats it as 1 concludes "not
@@ -45,25 +45,95 @@ impl Drop for Scratch {
     }
 }
 
-/// Minimal stored-member ZIP (local headers only — exav reads those).
+/// Minimal stored-member ZIP (local headers only; exav reads those).
 fn zip_of(members: &[(&str, &[u8])]) -> Vec<u8> {
     let mut v = Vec::new();
     for (name, body) in members {
-        v.extend_from_slice(b"PK\x03\x04");
-        v.extend_from_slice(&20u16.to_le_bytes());
-        v.extend_from_slice(&0u16.to_le_bytes());
-        v.extend_from_slice(&0u16.to_le_bytes()); // stored
-        v.extend_from_slice(&0u16.to_le_bytes());
-        v.extend_from_slice(&0u16.to_le_bytes());
-        v.extend_from_slice(&0u32.to_le_bytes());
-        v.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        v.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        v.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        v.extend_from_slice(&0u16.to_le_bytes());
-        v.extend_from_slice(name.as_bytes());
-        v.extend_from_slice(body);
+        v.extend(zip_member(0, name, body, body.len()));
     }
     v
+}
+
+/// A local header and the `body` of a ZIP member of `size` bytes once decoded,
+/// stored (method 0) or deflated (method 8).
+fn zip_member(method: u16, name: &str, body: &[u8], size: usize) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"PK\x03\x04");
+    v.extend_from_slice(&20u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&method.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&0u32.to_le_bytes());
+    v.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    v.extend_from_slice(&(size as u32).to_le_bytes());
+    v.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(name.as_bytes());
+    v.extend_from_slice(body);
+    v
+}
+
+/// A ZIP of `(method, name, body, size)` members, with its central directory,
+/// so that it is read member by member as it is decoded.
+fn zip_with_directory(members: &[(u16, &str, &[u8], usize)]) -> Vec<u8> {
+    let (mut out, mut directory) = (Vec::new(), Vec::new());
+    for (method, name, body, size) in members {
+        let offset = out.len() as u32;
+        out.extend(zip_member(*method, name, body, *size));
+        directory.extend_from_slice(b"PK\x01\x02");
+        directory.extend_from_slice(&20u16.to_le_bytes()); // made by
+        directory.extend_from_slice(&20u16.to_le_bytes()); // needed to extract
+        directory.extend_from_slice(&0u16.to_le_bytes()); // flags
+        directory.extend_from_slice(&method.to_le_bytes());
+        directory.extend_from_slice(&[0; 4]); // time and date
+        directory.extend_from_slice(&0u32.to_le_bytes()); // CRC-32
+        directory.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        directory.extend_from_slice(&(*size as u32).to_le_bytes());
+        directory.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        directory.extend_from_slice(&[0; 12]); // extra, comment, disk, attributes
+        directory.extend_from_slice(&offset.to_le_bytes());
+        directory.extend_from_slice(name.as_bytes());
+    }
+    let (start, count) = (out.len() as u32, members.len() as u16);
+    out.extend_from_slice(&directory);
+    out.extend_from_slice(b"PK\x05\x06\0\0\0\0");
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&(directory.len() as u32).to_le_bytes());
+    out.extend_from_slice(&start.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// A raw deflate stream of `1 + 258 * matches` zero bytes: one fixed-Huffman
+/// block with a zero, then a match of 258 bytes back one byte, `matches` times.
+/// About 158 bytes out for each one in.
+fn deflated_zeros(matches: usize) -> Vec<u8> {
+    let (mut out, mut acc, mut used) = (Vec::new(), 0u32, 0u32);
+    // A Huffman code goes in from its most significant bit.
+    let mut put = |code: u32, len: u32| {
+        for i in (0..len).rev() {
+            acc |= ((code >> i) & 1) << used;
+            used += 1;
+            if used == 8 {
+                out.push(acc as u8);
+                (acc, used) = (0, 0);
+            }
+        }
+    };
+    put(1, 1); // the last block
+    put(0b10, 2); // of the fixed kind
+    put(0x30, 8); // the literal 0
+    for _ in 0..matches {
+        put(0xC5, 8); // length 258
+        put(0, 5); // distance 1
+    }
+    put(0, 7); // the end of the block
+    if used > 0 {
+        out.push(acc as u8);
+    }
+    out
 }
 
 /// A ZIP holding one member with a compression method no engine implements: a
@@ -88,9 +158,30 @@ fn zip_with_undecodable_member() -> Vec<u8> {
     v
 }
 
+/// The variables the limits fall back to. A run does not see the ones set in
+/// the environment of whoever runs the tests.
+const LIMIT_VARS: [&str; 7] = [
+    "EXAV_MAX_OBJECT_BYTES",
+    "EXAV_MAX_EXTRACTED_BYTES",
+    "EXAV_MAX_MEMBERS",
+    "EXAV_MAX_COMPRESSION_RATIO",
+    "EXAV_MAX_UNPACK_DEPTH",
+    "EXAV_SPILL_DIR",
+    "EXAV_MAX_TOTAL_SPILL_BYTES",
+];
+
 fn run(args: &[&str]) -> Output {
-    Command::new(BIN)
-        .args(args)
+    run_env(&[], args)
+}
+
+/// Run with `vars` set in its environment.
+fn run_env(vars: &[(&str, &str)], args: &[&str]) -> Output {
+    let mut c = Command::new(BIN);
+    for var in LIMIT_VARS {
+        c.env_remove(var);
+    }
+    c.args(args)
+        .envs(vars.iter().copied())
         .output()
         .expect("spawn exav-grep")
 }
@@ -256,7 +347,7 @@ fn context_flags_print_surrounding_lines() {
     let o = run(&["-C", "1", "-F", "TARGET", f.to_str().unwrap()]);
     assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
     let out = stdout(&o);
-    // Context lines use `-` as the separator, matches use `:` — the same
+    // Context lines use `-` as the separator, matches use `:`, the same
     // convention grep uses, so downstream tooling can tell them apart.
     assert!(out.contains("-2-two"), "{out:?}");
     assert!(out.contains(":3:TARGET"), "{out:?}");
@@ -316,7 +407,7 @@ fn a_plain_file_is_searched_without_needing_a_container() {
 /// A directory the walk cannot enter is reported, and the run does not exit 1.
 ///
 /// Exit 1 means "searched it, found nothing". For a subtree nobody could open,
-/// that is a claim about content that was never read — and it is the answer a
+/// that is a claim about content that was never read, and it is the answer a
 /// script acts on. The crate already distinguishes this for members it cannot
 /// decode (exit 3); the filesystem walk one level up has to agree, or the
 /// distinction is defeated by a `chmod`.
@@ -376,4 +467,348 @@ fn a_binary_member_reports_that_it_matched_without_dumping_bytes() {
     let out = stdout(&o);
     assert!(out.contains("Binary file"), "{out:?}");
     assert!(out.contains("a.zip!blob.bin"), "{out:?}");
+}
+
+/// `zip_of` with a central directory, so that a member is read as it is
+/// produced and one over `--max-object-bytes` is streamed.
+fn zip_indexed(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut v = zip_of(members);
+    let mut directory = Vec::new();
+    let mut offset = 0u32;
+    for (name, body) in members {
+        directory.extend_from_slice(b"PK\x01\x02");
+        directory.extend_from_slice(&[20, 0, 20, 0]); // made by, needed
+        directory.extend_from_slice(&[0; 2 + 2 + 4 + 4]); // flags, stored, time, crc
+        directory.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        directory.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        directory.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        directory.extend_from_slice(&[0; 8 + 4]); // extra, comment, disk, attributes
+        directory.extend_from_slice(&offset.to_le_bytes());
+        directory.extend_from_slice(name.as_bytes());
+        offset += 30 + name.len() as u32 + body.len() as u32;
+    }
+    let at = v.len() as u32;
+    v.extend_from_slice(&directory);
+    v.extend_from_slice(b"PK\x05\x06");
+    v.extend_from_slice(&[0; 4]);
+    v.extend_from_slice(&(members.len() as u16).to_le_bytes());
+    v.extend_from_slice(&(members.len() as u16).to_le_bytes());
+    v.extend_from_slice(&(directory.len() as u32).to_le_bytes());
+    v.extend_from_slice(&at.to_le_bytes());
+    v.extend_from_slice(&[0; 2]);
+    v
+}
+
+/// A gzip of `data` in stored blocks: its one member is a stream decoded as it
+/// is read, with no place in its container.
+fn gzip_of(data: &[u8]) -> Vec<u8> {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+    let mut blocks = data.chunks(65_535).peekable();
+    while let Some(block) = blocks.next() {
+        gz.push(u8::from(blocks.peek().is_none()));
+        gz.extend_from_slice(&(block.len() as u16).to_le_bytes());
+        gz.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+        gz.extend_from_slice(block);
+    }
+    gz.extend_from_slice(&(!crc).to_le_bytes());
+    gz.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    gz
+}
+
+/// A ZIP in a gzip in a ZIP, the inner one about 400 KB, with the pattern at
+/// the end of its member. The inner ZIP is a stream decoded as it is read.
+fn nested_zip(s: &Scratch) -> PathBuf {
+    let mut log = Vec::new();
+    for i in 0..10_000 {
+        log.extend_from_slice(format!("line {i} of the log, nothing to see\n").as_bytes());
+    }
+    log.extend_from_slice(b"the needle is here\n");
+    let inner = zip_indexed(&[("deep.txt", &log)]);
+    s.write("o.zip", &zip_indexed(&[("inner.gz", &gzip_of(&inner))]))
+}
+
+/// A container in a member over `--max-object-bytes` is opened through a spill
+/// file, and the sizes of both flags take the suffixes their help gives.
+#[test]
+fn the_size_flags_take_suffixes_and_off() {
+    let s = Scratch::new("sizes");
+    let f = nested_zip(&s);
+    let f = f.to_str().unwrap();
+    for spill in ["2G", "1m", "1048576", "off", "0"] {
+        let o = run(&[
+            "-F",
+            "needle",
+            "--max-object-bytes",
+            "64K",
+            "--max-total-spill-bytes",
+            spill,
+            f,
+        ]);
+        assert_eq!(
+            code(&o),
+            0,
+            "--max-total-spill-bytes {spill}: {}",
+            stderr(&o)
+        );
+        assert!(stdout(&o).contains("o.zip!inner.gz!gzip-content!deep.txt:10001:"));
+    }
+    // A budget under the inner zip: reported, not opened, and the suffix is
+    // what sets its size.
+    let o = run(&[
+        "-F",
+        "needle",
+        "--max-object-bytes",
+        "64K",
+        "--max-total-spill-bytes",
+        "100K",
+        f,
+    ]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+    assert!(stderr(&o).contains("spill budget"), "{}", stderr(&o));
+    // The limit of what is held is read the same way: `off` holds it all.
+    let o = run(&["-F", "needle", "--max-object-bytes", "off", f]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("o.zip!inner.gz!gzip-content!deep.txt:10001:"));
+}
+
+/// Each limit has a variable, named as the scanner names it, that does what
+/// the flag does, and the flag wins over it.
+#[test]
+fn a_limit_is_read_from_its_variable_and_the_flag_wins() {
+    let s = Scratch::new("limitvars");
+    let nested = nested_zip(&s);
+    let two = s.write(
+        "two.zip",
+        &zip_of(&[("a.txt", b"nothing\n"), ("b.txt", b"the needle\n")]),
+    );
+    // A PDF whose one stream, 4 KB long, the extracted bytes count.
+    let mut stream = vec![b'x'; 4096];
+    stream.extend_from_slice(b"\nthe needle\n");
+    let mut pdf = format!(
+        "%PDF-1.4\n1 0 obj\n<< /Length {} >>\nstream\n",
+        stream.len()
+    )
+    .into_bytes();
+    pdf.extend_from_slice(&stream);
+    pdf.extend_from_slice(b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n");
+    let pdf = s.write("big.pdf", &pdf);
+    let spill = s.path().join("spill");
+    std::fs::create_dir_all(&spill).unwrap();
+    // A member of 1 MB of zeros that deflate makes 158 times smaller, then one
+    // with the needle.
+    let ratio = zip_with_directory(&[
+        (8, "zeros.bin", &deflated_zeros(4064), 1 + 258 * 4064),
+        (0, "after.txt", b"the needle\n", 11),
+    ]);
+    let ratio = s.write("ratio.zip", &ratio);
+    let (nested, two, spill, pdf, ratio) = (
+        nested.to_str().unwrap(),
+        two.to_str().unwrap(),
+        spill.to_str().unwrap(),
+        pdf.to_str().unwrap(),
+        ratio.to_str().unwrap(),
+    );
+    // The variable, its value, the flag that says the same, the arguments it
+    // is tried with, and a flag that undoes it.
+    type Case<'a> = (&'a str, &'a str, [&'a str; 2], Vec<&'a str>, [&'a str; 2]);
+    let cases: [Case; 7] = [
+        (
+            "EXAV_MAX_OBJECT_BYTES",
+            "64K",
+            ["--max-object-bytes", "64K"],
+            vec!["-F", "needle", "--spill-dir", "off", nested],
+            ["--max-object-bytes", "off"],
+        ),
+        (
+            "EXAV_MAX_EXTRACTED_BYTES",
+            "1K",
+            ["--max-extracted-bytes", "1K"],
+            vec!["-F", "needle", pdf],
+            ["--max-extracted-bytes", "off"],
+        ),
+        (
+            "EXAV_SPILL_DIR",
+            "off",
+            ["--spill-dir", "off"],
+            vec!["-F", "needle", "--max-object-bytes", "64K", nested],
+            ["--spill-dir", spill],
+        ),
+        (
+            "EXAV_MAX_TOTAL_SPILL_BYTES",
+            "100K",
+            ["--max-total-spill-bytes", "100K"],
+            vec!["-F", "needle", "--max-object-bytes", "64K", nested],
+            ["--max-total-spill-bytes", "off"],
+        ),
+        (
+            "EXAV_MAX_MEMBERS",
+            "1",
+            ["--max-members", "1"],
+            vec!["-F", "needle", two],
+            ["--max-members", "10"],
+        ),
+        (
+            "EXAV_MAX_UNPACK_DEPTH",
+            "1",
+            ["--max-unpack-depth", "1"],
+            vec!["-F", "needle", nested],
+            ["--max-unpack-depth", "8"],
+        ),
+        (
+            "EXAV_MAX_COMPRESSION_RATIO",
+            "10",
+            ["--max-compression-ratio", "10"],
+            vec!["-F", "needle", "--max-object-bytes", "64K", ratio],
+            ["--max-compression-ratio", "off"],
+        ),
+    ];
+    let same = |a: &Output, b: &Output, what: &str| {
+        assert_eq!(code(a), code(b), "{what}: {}{}", stdout(a), stderr(a));
+        assert_eq!(stdout(a), stdout(b), "{what}");
+        assert_eq!(stderr(a), stderr(b), "{what}");
+    };
+    for (var, value, flag, base, undo) in &cases {
+        let with = |extra: &[&str]| -> Output {
+            let mut args: Vec<&str> = base.to_vec();
+            args.extend(extra);
+            run(&args)
+        };
+        let by_flag = with(flag);
+        let mut args: Vec<&str> = base.to_vec();
+        let by_variable = run_env(&[(*var, *value)], &args);
+        same(&by_variable, &by_flag, var);
+        // The test means something: the flag changes the run.
+        let plain = run(&args);
+        assert!(
+            code(&plain) != code(&by_flag)
+                || stdout(&plain) != stdout(&by_flag)
+                || stderr(&plain) != stderr(&by_flag),
+            "{var}: the flag changes nothing here"
+        );
+        // The flag wins.
+        args.extend(undo);
+        same(
+            &run_env(&[(*var, *value)], &args),
+            &with(undo),
+            &format!("{var} against {undo:?}"),
+        );
+    }
+    // `off` is no limit for the count, and so is `0`; the depth has none.
+    let o = run_env(&[("EXAV_MAX_MEMBERS", "off")], &["-F", "needle", two]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    for off in ["off", "0"] {
+        for args in [[two, "--max-members"], [ratio, "--max-compression-ratio"]] {
+            let o = run(&["-F", "needle", args[0], args[1], off]);
+            assert_eq!(code(&o), 0, "{args:?} {off}: {}", stderr(&o));
+            assert!(stderr(&o).is_empty(), "{args:?} {off}: {}", stderr(&o));
+        }
+    }
+    let o = run_env(
+        &[("EXAV_MAX_COMPRESSION_RATIO", "off")],
+        &["-F", "needle", ratio],
+    );
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    for (var, bad) in [
+        ("EXAV_MAX_MEMBERS", "many"),
+        ("EXAV_MAX_COMPRESSION_RATIO", "many"),
+        ("EXAV_MAX_UNPACK_DEPTH", "off"),
+        ("EXAV_MAX_OBJECT_BYTES", "12x"),
+        ("EXAV_MAX_EXTRACTED_BYTES", "12x"),
+        ("EXAV_MAX_TOTAL_SPILL_BYTES", "lots"),
+    ] {
+        let o = run_env(&[(var, bad)], &["-F", "needle", two]);
+        assert_eq!(code(&o), 2, "{var}={bad}: {}", stderr(&o));
+    }
+    let o = run(&["-F", "needle", two, "--max-unpack-depth", "off"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+}
+
+/// A file past `--max-object-bytes` is read through a cache the two cache
+/// flags size, and the same answer comes out of any size of it, `off` and `0`
+/// (the least) included.
+#[test]
+fn the_cache_flags_size_the_cache_of_an_object_read_in_place() {
+    let s = Scratch::new("cache");
+    let mut log = Vec::new();
+    for i in 0..20_000 {
+        log.extend_from_slice(format!("line {i} of the log, nothing to see\n").as_bytes());
+    }
+    log.extend_from_slice(b"the needle is here\n");
+    let f = s.write("big.log", &log);
+    let f = f.to_str().unwrap();
+    for (bytes, block) in [("32M", "1M"), ("64K", "4K"), ("off", "off"), ("0", "1")] {
+        let o = run(&[
+            "-F",
+            "needle",
+            "--max-object-bytes",
+            "64K",
+            "--object-cache-bytes",
+            bytes,
+            "--object-cache-block-bytes",
+            block,
+            f,
+        ]);
+        assert_eq!(code(&o), 0, "{bytes} {block}: {}", stderr(&o));
+        assert!(
+            stdout(&o).ends_with(":20001:the needle is here\n"),
+            "{}",
+            stdout(&o)
+        );
+    }
+    // The environment says the same, and a flag overrides it.
+    let o = Command::new(env!("CARGO_BIN_EXE_exav-grep"))
+        .args(["-F", "needle", "--max-object-bytes", "64K", f])
+        .env("EXAV_OBJECT_CACHE_BYTES", "garbage")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("--object-cache-bytes"),
+        "{}",
+        stderr(&o)
+    );
+    let o = Command::new(env!("CARGO_BIN_EXE_exav-grep"))
+        .args([
+            "-F",
+            "needle",
+            "--max-object-bytes",
+            "64K",
+            "--object-cache-bytes",
+            "1M",
+            f,
+        ])
+        .env("EXAV_OBJECT_CACHE_BYTES", "garbage")
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
+/// A size that is not one is a usage error that names the flag.
+#[test]
+fn a_bad_size_is_a_usage_error_naming_the_flag() {
+    let s = Scratch::new("badsize");
+    let f = s.write("a.txt", b"hello\n");
+    for (flag, value) in [
+        ("--max-total-spill-bytes", "2GB"),
+        ("--max-total-spill-bytes", "lots"),
+        ("--max-object-bytes", "12x"),
+        ("--max-object-bytes", ""),
+        ("--object-cache-bytes", "32MB"),
+        ("--object-cache-block-bytes", "x"),
+    ] {
+        let o = run(&["-F", "hello", flag, value, f.to_str().unwrap()]);
+        assert_eq!(code(&o), 2, "{flag} {value}");
+        assert!(stderr(&o).contains(flag), "{}", stderr(&o));
+    }
 }

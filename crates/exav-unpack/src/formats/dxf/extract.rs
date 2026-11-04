@@ -34,29 +34,20 @@ fn whole_file_extension(data: &[u8]) -> Option<&'static str> {
         .map(|(_, ext)| *ext)
 }
 
-fn emit<R>(
-    name: String,
-    bytes: Vec<u8>,
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+fn emit(name: String, bytes: Vec<u8>, budget: &mut Budget, visit: Sink) -> crate::Extracted {
     budget.count_entry()?;
     let cap = budget.reserve()?;
     if bytes.len() as u64 > cap {
-        return Err(LimitHit::new(format!(
-            "dxf: {name} ({} bytes) exceeds the per-member budget",
-            bytes.len()
-        )));
+        let spent = bytes.len() as u64;
+        let name = crate::tree::quoted(&name);
+        budget.over_cap(cap, spent, format_args!("dxf: {name} ({spent} bytes)"))?;
+        return Ok(None);
     }
     budget.commit(bytes.len() as u64);
     Ok(visit(Entry::new(name, bytes), budget))
 }
 
-pub(crate) fn extract_dxf<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_dxf(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     let mut records = Records::new(data);
     let mut unnamed = 0usize;
     while let Some(rec) = records.next() {

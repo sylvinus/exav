@@ -12,7 +12,7 @@ categories = ["parser-implementations", "no-std"]
 readme = "README.md"
 
 # No dependencies at all. That is the point of the crate: the two places exav
-# decodes x86 — the packer emulator and the bytecode `disasm_x86` API — need a
+# decodes x86 (the packer emulator and the bytecode `disasm_x86` API) need a
 # few hundred encodings, and the general-purpose decoders that cover the whole
 # ISA carry hundreds of `unsafe` blocks to do it.
 [dependencies]

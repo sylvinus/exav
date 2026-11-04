@@ -6,23 +6,20 @@ use crate::*;
 use std::collections::HashMap;
 use std::io::Cursor;
 
+use super::pdf_objstm::{self, ObjStm};
 #[cfg(feature = "decrypt")]
 use super::pdf_parse::crypt::{CryptDict, Decoder};
 use super::pdf_parse::filters;
-use super::pdf_parse::lex::Lexer;
-use super::pdf_parse::parse::{parse_indirect_object_body, parse_object};
+use super::pdf_parse::lex::{Lexer, Token};
+use super::pdf_parse::parse::{
+    parse_indirect_object_body, parse_object, parse_stream_head, skip_stream_data,
+};
 use super::pdf_parse::types::Primitive;
+use super::pdf_raster::{self, Decrypt};
 
-/// PDF: emit each stream object's content. FlateDecode streams are decompressed
-/// through the bounded reader (so a Flate bomb trips the budget); other streams
-/// are passed through raw.
-///
-/// Uses a linear byte-scanning approach that finds `N G obj` patterns directly,
-/// so a broken xref — common in malicious PDFs — doesn't stop extraction. The
-/// parser is depth-bounded (`MAX_DEPTH`), avoiding nested-object stack overflow.
 /// ClamAV `Heuristics.PDF.ObfuscatedNameObject`: a PDF **name object** (`/Name`)
-/// that hex-escapes (`#XX`) a character that never requires escaping — an ASCII
-/// letter or digit — *and* whose de-escaped form is one of the sensitive
+/// that hex-escapes (`#XX`) a character that never requires escaping (an ASCII
+/// letter or digit) *and* whose de-escaped form is one of the sensitive
 /// action/feature keywords malware hides this way (`/J#61vaScript` → `JavaScript`,
 /// `/Ope#6eAction` → `OpenAction`). The PDF spec only needs `#`-escaping for
 /// whitespace, the delimiters `()<>[]{}/%#`, and bytes outside `0x21..=0x7E`, so
@@ -30,7 +27,7 @@ use super::pdf_parse::types::Primitive;
 ///
 /// Requiring the de-escaped name to be a *sensitive keyword* is deliberate: a lone
 /// incidental escape in an ordinary name (e.g. `/C#31` → `C1`) is common in benign
-/// PDFs and must not fire — stock ClamAV likewise flags the systematic
+/// PDFs and must not fire: stock ClamAV likewise flags the systematic
 /// keyword-hiding case, not any single gratuitous escape. This keeps the heuristic
 /// FP-safe enough to run by default.
 pub fn has_obfuscated_name_object(data: &[u8]) -> bool {
@@ -90,11 +87,18 @@ pub fn has_obfuscated_name_object(data: &[u8]) -> bool {
     false
 }
 
-pub(crate) fn extract_pdf<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+/// PDF: emit each stream object's content, decoded through its `/Filter` chain
+/// by the bounded readers (so a Flate bomb trips the budget), and the active
+/// content of every object as the members `pdf-javascript` and `pdf-uris`.
+///
+/// The objects are found by scanning for `N G obj`, so a broken xref, common in
+/// malicious PDFs, does not stop extraction. The objects inside object streams
+/// are read from the decoded streams. The parser is depth-bounded
+/// (`MAX_DEPTH`), avoiding nested-object stack overflow.
+///
+/// The active content is emitted after the scan, whatever ended it: a limit is
+/// reported once the content found before it has been seen.
+pub(crate) fn extract_pdf(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     // --- Phase 1: encryption ---
     // Without the `decrypt` feature there is no cipher stack; an encrypted PDF
     // is reported unsupported (never parsed as garbage, never silently clean).
@@ -152,57 +156,92 @@ pub(crate) fn extract_pdf<R>(
     };
 
     // --- Phase 2: linear scan for objects ---
-    // Accumulate active-content (JavaScript) and URI/launch targets across the
-    // whole document; emit them as synthetic members after the object scan so
-    // signatures keyed on `app.alert(`, `http://…`, launched commands, etc. match
-    // even when the value is a direct string (indirect streams are already
-    // surfaced by the stream path below). ClamAV surfaces the same content.
-    let mut js_acc: Vec<u8> = Vec::new();
-    let mut uri_acc: Vec<u8> = Vec::new();
+    // The strings of JavaScript actions and the URI/launch targets met on the
+    // way are emitted as synthetic members after the scan, so signatures keyed
+    // on `app.alert(`, `http://…`, launched commands, etc. match even when the
+    // value is a direct string (indirect streams are already surfaced by the
+    // stream path). ClamAV surfaces the same content.
+    let mut harvest = Harvest::default();
+    let walked = walk_objects(
+        data,
+        budget,
+        visit,
+        &mut harvest,
+        #[cfg(feature = "decrypt")]
+        decoder.as_ref(),
+    );
+    if matches!(walked, Ok(Some(_))) {
+        return walked;
+    }
+    // A limit that ended the scan does not take the content found before it
+    // away: the members are seen first and the limit is reported after them.
+    let mut end = walked;
+    for (name, acc) in [("pdf-javascript", harvest.js), ("pdf-uris", harvest.uri)] {
+        if acc.is_empty() {
+            continue;
+        }
+        if let Err(hit) = budget.count_entry() {
+            end = end.and(Err(hit));
+        }
+        if let Some(r) = visit(Entry::new(name.to_string(), acc), budget) {
+            return Ok(Some(r));
+        }
+    }
+    end
+}
+
+/// The scan of [`extract_pdf`]: hands each stream object, decoded, to `visit`
+/// and the strings of the actions of every object to `harvest`. It ends with
+/// the first limit of the whole scan; `harvest` keeps what it took until then.
+/// A stream past the object limit, or a string the harvest has no room for,
+/// is left out and the scan goes on ([`Budget::skip`]).
+fn walk_objects(
+    data: &[u8],
+    budget: &mut Budget,
+    visit: Sink,
+    harvest: &mut Harvest,
+    #[cfg(feature = "decrypt")] decoder: Option<&Decoder>,
+) -> crate::Extracted {
     let mut lex = Lexer::new(data);
-    // Where each object number is, found when a stream's `/Filter` or
-    // `/DecodeParms` is a reference to one.
-    let mut index: Option<HashMap<u32, usize>> = None;
-    // Bytes read again because an object ended before its parse did, or did not
-    // parse. Bounded, since every object of a crafted file can claim the rest of
-    // it, and the bound is said when it is reached.
-    let mut reread = 0u64;
-    let reread_cap = (data.len() as u64)
-        .saturating_mul(8)
-        .saturating_add(1 << 20);
-    let mut gave_up = false;
+    // Decrypts the strings and streams an image's color space names, and the
+    // object streams that hold objects it names.
+    #[cfg(feature = "decrypt")]
+    let decrypt = |id: u32, r#gen: u32, bytes: &mut Vec<u8>| {
+        if let Some(dec) = decoder {
+            dec.decrypt_stream(id, r#gen, bytes);
+        }
+    };
+    #[cfg(not(feature = "decrypt"))]
+    let decrypt = |_: u32, _: u32, _: &mut Vec<u8>| {};
+    // Found by number when a stream's `/Filter`, `/DecodeParms` or, for an
+    // image, `/ColorSpace` is a reference to one.
+    let mut objects = Objects::new(data, &decrypt, budget.limits().max_buffer_bytes);
     while let Some((obj_id, r#gen, obj_start)) = lex.find_next_obj() {
         lex.set_pos(obj_start);
         let Some((obj, end)) = parse_indirect_object_body(&mut lex) else {
             // An object that does not parse (an unterminated string in it runs
             // to the end of the file) is not the end of the document: the scan
             // goes on from its start, as a reader going by the cross-reference
-            // table reaches every object after it.
-            reread = reread.saturating_add(lex.pos().saturating_sub(obj_start) as u64);
-            if reread > reread_cap {
-                gave_up = true;
-            } else {
-                lex.set_pos(obj_start);
-            }
+            // table reaches every object after it. Every object of a crafted
+            // file can claim the rest of it, so the bytes parsed again are
+            // charged to the extraction budget.
+            budget.charge_reparsed(lex.pos().saturating_sub(obj_start) as u64)?;
+            lex.set_pos(obj_start);
             continue;
         };
         // An object that does not end where it says (a string left open takes
         // the rest of the file for itself, and the dictionary round it still
         // parses) must not take the objects after it. Parsing resumes after the
         // first `endobj`, as a reader that goes by the cross-reference table
-        // finds each of them.
+        // finds each of them. The bytes parsed again are charged as above.
         if let Some(p) = memchr::memmem::find(
             &data[obj_start.min(data.len())..end.min(data.len())],
             b"endobj",
         ) {
             let stop = obj_start + p + b"endobj".len();
             if end > stop {
-                reread = reread.saturating_add((end - stop) as u64);
-                if reread > reread_cap {
-                    gave_up = true;
-                } else {
-                    lex.set_pos(stop);
-                }
+                budget.charge_reparsed((end - stop) as u64)?;
+                lex.set_pos(stop);
             }
         }
         budget.count_entry()?;
@@ -210,16 +249,17 @@ pub(crate) fn extract_pdf<R>(
         // Harvest JS / URI / launch strings from this object's dictionary(s).
         // Strings are decrypted with the object key when the doc is encrypted,
         // so the recovered plaintext matches (same key schedule as streams).
-        #[cfg(feature = "decrypt")]
+        // The strings that references name are found with the room the budget
+        // has left.
+        objects.room = budget.left();
+        objects.entries = budget.limits().max_members.saturating_sub(budget.files);
         harvest_actions(
             &obj,
-            decoder.as_ref(),
-            (obj_id, r#gen),
-            &mut js_acc,
-            &mut uri_acc,
+            Source::Object(obj_id, r#gen),
+            &mut objects,
+            budget,
+            harvest,
         );
-        #[cfg(not(feature = "decrypt"))]
-        harvest_actions(&obj, &mut js_acc, &mut uri_acc);
 
         if let Primitive::Stream {
             info,
@@ -227,38 +267,65 @@ pub(crate) fn extract_pdf<R>(
         } = obj
         {
             #[cfg(feature = "decrypt")]
-            if let Some(ref dec) = decoder {
+            if let Some(dec) = decoder {
                 dec.decrypt_stream(obj_id, r#gen, &mut stream_data);
             }
             let raw_len = stream_data.len() as u64;
             let cap = budget.reserve()?;
-            let info = resolve_filter_references(info, data, &mut index);
+            objects.room = budget.left();
+            let info = resolve_filter_references(info, &mut objects);
             let outcome = apply_filters(&stream_data, &info, cap)?;
             if outcome.truncated {
-                return Err(LimitHit::new("pdf stream exceeds budget".to_string()));
+                // The stream decoded past the cap, up to which it is held. Past
+                // the object limit it is left out and the scan goes on with the
+                // next object, its ratio the reason when that is past the limit
+                // too.
+                let spent = outcome.buf.len() as u64;
+                match ratio_guard(raw_len, cap.saturating_add(1), budget) {
+                    Err(hit) if cap == budget.limits().max_buffer_bytes => {
+                        budget.commit(spent);
+                        budget.skip(format_args!("{}", hit.reason));
+                    }
+                    _ => budget.over_cap(cap, spent, format_args!("pdf stream {obj_id} {gen}"))?,
+                }
+                budget.charge_reparsed(objects.take_parsed())?;
+                continue;
             }
             let buf = outcome.buf;
-            ratio_guard(raw_len, buf.len() as u64, budget)?;
             budget.commit(buf.len() as u64);
+            // The objects inside an object stream are harvested as the ones
+            // of the file are. A limit reached doing so is reported after the
+            // member is seen, as for the objects its references named.
+            let header = (pdf_objstm::may_be_object_stream(&info)
+                && !outcome.decode_error
+                && !outcome.unknown_filter)
+                .then(|| object_stream_header(&buf, &info, &mut objects))
+                .flatten();
+            let contained = header.map(|(count, first)| {
+                harvest_object_stream(&buf, count, first, &mut objects, budget, harvest)
+            });
             // A stream whose bytes an implemented filter failed to decode is
             // content we failed to produce, not an empty object. Emitting it
             // as a zero-byte member says "scanned, nothing there" about bytes
-            // nobody read — the silent skip this scanner exists to avoid. Say
-            // so instead. But a stream that DECODED to empty (legal — an
+            // nobody read, the silent skip this scanner exists to avoid. Say
+            // so instead. But a stream that DECODED to empty (legal: an
             // empty page-content stream carries no bytes to hide) is a
             // scanned empty member, not an undecodable one.
             //
             // Image codecs (`apply_filters` stops at DCTDecode, JPXDecode,
             // CCITTFaxDecode) pass the raw bytes through, so those streams
-            // are scanned as their raw content — the signatures match the
+            // are scanned as their raw content: the signatures match the
             // bytes either way.
             //
             // An undecodable stream's raw bytes are scanned in its place, as
             // ClamAV scans them: a filter that names Flate over data that is
             // not (a ZIP, say) hides nothing from that scan.
             let entry = if buf.is_empty() && raw_len > 0 && outcome.decode_error {
-                if raw_len > budget.reserve()? {
-                    return Err(LimitHit::new("pdf stream exceeds budget".to_string()));
+                let cap = budget.reserve()?;
+                if raw_len > cap {
+                    budget.over_cap(cap, 0, format_args!("pdf stream {obj_id} {gen}"))?;
+                    budget.charge_reparsed(objects.take_parsed())?;
+                    continue;
                 }
                 budget.commit(raw_len);
                 let mut e = Entry::new(format!("pdf-obj-{obj_id}-{gen}"), stream_data);
@@ -266,6 +333,7 @@ pub(crate) fn extract_pdf<R>(
                 e
             } else {
                 let mut e = Entry::new(format!("pdf-obj-{obj_id}-{gen}"), buf);
+                e.object_stream = header.is_some();
                 if outcome.unknown_filter {
                     e.unsupported = Some(
                         "PDF stream uses a filter that is not decoded; its bytes were \
@@ -277,44 +345,43 @@ pub(crate) fn extract_pdf<R>(
                          failure were scanned",
                     );
                 }
+                // An image whose bytes are samples says how to read them, for
+                // a consumer that asked (`Budget::set_rasters`).
+                if budget.rasters && !outcome.unknown_filter {
+                    let room = budget.reserve().unwrap_or(0);
+                    objects.room = budget.left();
+                    e.raster =
+                        pdf_raster::raster_of(&info, &mut objects, (obj_id, r#gen), &decrypt, room);
+                }
                 e
             };
+            // The objects its references named were parsed again: charged
+            // after the member is seen, so that a limit reached here does not
+            // take its bytes out of the scan.
+            let reparsed = objects.take_parsed();
             if let Some(r) = visit(entry, budget) {
                 return Ok(Some(r));
             }
+            budget.charge_reparsed(reparsed)?;
+            if let Some(contained) = contained {
+                contained?;
+            }
+        } else {
+            // The objects the harvest followed were parsed again.
+            budget.charge_reparsed(objects.take_parsed())?;
         }
     }
-
-    if gave_up {
-        budget.count_entry()?;
-        if let Some(r) = visit(
-            Entry::unsupported(
-                "pdf-overlapping-objects".to_string(),
-                data.len() as u64,
-                false,
-                "PDF objects run into one another more than can be read again; the rest of the file was not scanned object by object",
-            ),
-            budget,
-        ) {
-            return Ok(Some(r));
-        }
+    // A string of the actions did not fit: the harvest stopped there, and the
+    // objects after it were still scanned.
+    if harvest.full {
+        budget.skip(format_args!("pdf actions exceed budget"));
     }
-
-    // Emit the harvested active-content members (bounded by the budget like any
-    // other member). Non-empty only.
-    for (name, acc) in [("pdf-javascript", js_acc), ("pdf-uris", uri_acc)] {
-        if acc.is_empty() {
-            continue;
-        }
-        budget.count_entry()?;
-        let cap = budget.reserve()?;
-        if acc.len() as u64 > cap {
-            return Err(LimitHit::new("pdf actions exceed budget".to_string()));
-        }
-        budget.commit(acc.len() as u64);
-        if let Some(r) = visit(Entry::new(name.to_string(), acc), budget) {
-            return Ok(Some(r));
-        }
+    // The references into the object streams that were not read found
+    // nothing: the rest of the scan went on without them.
+    if objects.unread {
+        return Err(LimitHit::new(
+            "pdf object streams exceed budget".to_string(),
+        ));
     }
     Ok(None)
 }
@@ -324,70 +391,468 @@ const JS_KEYS: &[&str] = &["JS", "JavaScript"];
 /// Keys whose values carry a URI / launch target / submitted URL.
 const URI_KEYS: &[&str] = &["URI", "URL", "Launch", "F", "Win", "SubmitForm"];
 
-/// Recursively walk a parsed object, collecting the string values of active-
-/// content keys (`/JS`, `/JavaScript`) into `js` and URI/launch targets into
-/// `uri`. Depth-bounded to match the parser and to bound crafted nesting.
-#[cfg(feature = "decrypt")]
+/// The strings of the active content of a document: the scripts, and the
+/// URI/launch targets. Each string is followed by a line end.
+#[derive(Default)]
+struct Harvest {
+    js: Vec<u8>,
+    uri: Vec<u8>,
+    /// A string did not fit in the room the budget has left, so nothing more
+    /// is taken and the scan reports a limit.
+    full: bool,
+}
+
+impl Harvest {
+    /// Adds `string` to the targets (`uri`) or to the scripts, and charges it
+    /// to the budget. A string that the budget has no room for, or that would
+    /// take a member past `max_buffer_bytes`, is not added: the harvest is
+    /// `full`.
+    fn add(&mut self, uri: bool, string: &[u8], budget: &mut Budget) {
+        let held = if uri { &mut self.uri } else { &mut self.js };
+        let n = string.len() as u64 + 1;
+        if n > budget.reserve().unwrap_or(0)
+            || held.len() as u64 + n > budget.limits().max_buffer_bytes
+        {
+            self.full = true;
+            return;
+        }
+        budget.commit(n);
+        held.extend_from_slice(string);
+        held.push(b'\n');
+    }
+}
+
+/// Recursively walk a parsed object, collecting the strings of the keys of
+/// active content (`/JS`, `/JavaScript`) and of URI/launch targets into `out`.
+/// `held` says how the strings of `obj` are encrypted. Depth-bounded to match
+/// the parser and to bound crafted nesting.
 fn harvest_actions(
     obj: &Primitive,
-    decoder: Option<&Decoder>,
-    obj_id: (u32, u32),
-    js: &mut Vec<u8>,
-    uri: &mut Vec<u8>,
+    held: Source,
+    objects: &mut Objects<'_>,
+    budget: &mut Budget,
+    out: &mut Harvest,
 ) {
-    harvest_inner(obj, decoder, obj_id, js, uri, 0);
-}
-#[cfg(not(feature = "decrypt"))]
-fn harvest_actions(obj: &Primitive, js: &mut Vec<u8>, uri: &mut Vec<u8>) {
-    harvest_inner(obj, js, uri, 0);
+    harvest_inner(obj, held, objects, budget, out, 0);
 }
 
 fn harvest_inner(
     obj: &Primitive,
-    #[cfg(feature = "decrypt")] decoder: Option<&Decoder>,
-    #[cfg(feature = "decrypt")] obj_id: (u32, u32),
-    js: &mut Vec<u8>,
-    uri: &mut Vec<u8>,
+    held: Source,
+    objects: &mut Objects<'_>,
+    budget: &mut Budget,
+    out: &mut Harvest,
     depth: u32,
 ) {
-    // Guard: bound recursion and total harvested size (crafted deep/huge dicts).
-    if depth > 32 || js.len() + uri.len() > (4 << 20) {
+    if depth > 32 || out.full {
         return;
     }
     match obj {
         Primitive::Dictionary(d) | Primitive::Stream { info: d, .. } => {
             for (key, val) in d {
-                let target = if JS_KEYS.contains(&key.as_str()) {
-                    Some(&mut *js)
+                if JS_KEYS.contains(&key.as_str()) {
+                    harvest_value(val, false, held, objects, budget, out);
                 } else if URI_KEYS.contains(&key.as_str()) {
-                    Some(&mut *uri)
-                } else {
-                    None
-                };
-                if let (Some(acc), Some(s)) = (target, val.as_str()) {
-                    let mut bytes = s.to_vec();
-                    #[cfg(feature = "decrypt")]
-                    if let Some(dec) = decoder {
-                        dec.decrypt_stream(obj_id.0, obj_id.1, &mut bytes);
-                    }
-                    acc.extend_from_slice(&bytes);
-                    acc.push(b'\n');
+                    harvest_value(val, true, held, objects, budget, out);
                 }
-                #[cfg(feature = "decrypt")]
-                harvest_inner(val, decoder, obj_id, js, uri, depth + 1);
-                #[cfg(not(feature = "decrypt"))]
-                harvest_inner(val, js, uri, depth + 1);
+                harvest_inner(val, held, objects, budget, out, depth + 1);
             }
         }
         Primitive::Array(items) => {
             for it in items {
-                #[cfg(feature = "decrypt")]
-                harvest_inner(it, decoder, obj_id, js, uri, depth + 1);
-                #[cfg(not(feature = "decrypt"))]
-                harvest_inner(it, js, uri, depth + 1);
+                harvest_inner(it, held, objects, budget, out, depth + 1);
             }
         }
         _ => {}
+    }
+}
+
+/// Adds the string that the value of a key of active content is, or names, to
+/// `out`. An object that a reference names is read only if it is a string: a
+/// stream is a member of its own (a script, or an embedded file under `/F`),
+/// and a dictionary is harvested as the object it is.
+fn harvest_value(
+    value: &Primitive,
+    uri: bool,
+    held: Source,
+    objects: &mut Objects<'_>,
+    budget: &mut Budget,
+    out: &mut Harvest,
+) {
+    let (mut string, source) = match value {
+        Primitive::Reference(_) => {
+            // Following a reference parses the object it names, and the bytes
+            // are charged once the object being harvested is done. Stop at
+            // the room one member has: an array of links to one large object
+            // would parse it for each.
+            if objects.parsed >= budget.reserve().unwrap_or(0) {
+                out.full = true;
+                return;
+            }
+            let Some(found) = objects.follow_string(value) else {
+                return;
+            };
+            found
+        }
+        _ => match value.as_str() {
+            Some(s) => (s.to_vec(), Source::Held),
+            None => return,
+        },
+    };
+    source.or(held).decrypt(objects.decrypt, &mut string);
+    out.add(uri, &string, budget);
+}
+
+/// The `/N` and `/First` of the stream with dictionary `info`, decoded to
+/// `decoded`, if it is an object stream.
+fn object_stream_header(
+    decoded: &[u8],
+    info: &HashMap<String, Primitive>,
+    objects: &mut Objects<'_>,
+) -> Option<(i64, i64)> {
+    let mut number = |key: &str| {
+        info.get(key)
+            .and_then(|p| objects.follow(p))
+            .and_then(|(value, _)| value.as_i64())
+    };
+    let (count, first) = (number("N")?, number("First")?);
+    pdf_objstm::is_object_stream(info, count, first, decoded).then_some((count, first))
+}
+
+/// Gives each object inside the object stream `decoded`, of `count` objects
+/// from `first`, to the harvest, as an object of the file is given. The stream
+/// was decrypted as a whole, so the strings inside are plain. Each object
+/// counts as an entry, and the bytes that more than one object parses are
+/// charged as the objects of the file are when they are parsed again.
+fn harvest_object_stream(
+    decoded: &[u8],
+    count: i64,
+    first: i64,
+    objects: &mut Objects<'_>,
+    budget: &mut Budget,
+    out: &mut Harvest,
+) -> Result<(), LimitHit> {
+    let left = budget.limits().max_members.saturating_sub(budget.files);
+    let mut table = pdf_objstm::table(decoded, count, first, left.saturating_add(1));
+    table.sort_by_key(|&(_, offset)| offset);
+    let mut parsed_to = 0;
+    for (_, offset) in table {
+        if out.full {
+            break;
+        }
+        budget.count_entry()?;
+        let (object, end) = pdf_objstm::object_at(decoded, offset);
+        budget.charge_reparsed(parsed_to.min(end).saturating_sub(offset) as u64)?;
+        parsed_to = parsed_to.max(end);
+        if let Some(object) = object {
+            harvest_actions(&object, Source::Compressed, objects, budget, out);
+        }
+    }
+    Ok(())
+}
+
+/// How the strings of an object that [`Objects::follow`] returned are
+/// encrypted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Source {
+    /// Not reached through a reference: part of the object that held it.
+    Held,
+    /// An object of the file, with this number and generation: its strings
+    /// are encrypted with the key of that object.
+    Object(u32, u32),
+    /// An object inside an object stream. The stream is decrypted as a whole,
+    /// so the strings inside it are plain.
+    Compressed,
+}
+
+impl Source {
+    /// `self`, or `held` when the object was not reached through a reference.
+    pub(crate) fn or(self, held: Source) -> Source {
+        match self {
+            Source::Held => held,
+            found => found,
+        }
+    }
+
+    /// Decrypts `bytes`, a string or a stream of the object, unless the object
+    /// is inside an object stream.
+    pub(crate) fn decrypt(self, decrypt: Decrypt<'_>, bytes: &mut Vec<u8>) {
+        if let Source::Object(number, generation) = self {
+            decrypt(number, generation, bytes);
+        }
+    }
+}
+
+/// The objects of a file: the last definition of each number, and its object
+/// streams in file order.
+struct Index {
+    /// Number to `(generation, offset)`. The last definition wins, as in an
+    /// incremental update.
+    objects: HashMap<u32, (u32, usize)>,
+    streams: Vec<ObjStm>,
+}
+
+impl Index {
+    fn build(data: &[u8]) -> Self {
+        let mut objects = HashMap::new();
+        let mut streams = Vec::new();
+        let mut lex = Lexer::new(data);
+        let mut next = lex.find_next_obj();
+        while let Some((number, generation, start)) = next {
+            objects.insert(number, (generation, start));
+            // An object's dictionary ends before the next definition starts,
+            // so that the bytes read for each are the ones it owns.
+            let following = lex.find_next_obj();
+            let end = following.map_or(data.len(), |(_, _, at)| at);
+            let mut head = Lexer::new(&data[..end]);
+            head.set_pos(start);
+            let Some(info) = parse_stream_head(&mut head) else {
+                next = following;
+                continue;
+            };
+            if pdf_objstm::may_be_object_stream(&info) {
+                streams.push(ObjStm {
+                    number,
+                    generation,
+                    start,
+                    decoded: Vec::new(),
+                });
+            }
+            // The data of a stream is not searched for definitions: text in
+            // it is not an object of the file.
+            lex.set_pos(head.pos());
+            skip_stream_data(&mut lex);
+            next = match following {
+                Some((_, _, at)) if at > lex.pos() => {
+                    lex.set_pos(at);
+                    following
+                }
+                _ => lex.find_next_obj(),
+            };
+        }
+        Index { objects, streams }
+    }
+}
+
+/// An object inside an object stream.
+#[derive(Clone, Copy)]
+struct Member {
+    /// Its object stream, as numbered in [`Index::streams`].
+    stream: usize,
+    /// Where it starts in what the stream decodes to.
+    offset: usize,
+    /// Where the object stream starts in the file, to compare with a
+    /// definition outside it: the last in the file wins.
+    at: usize,
+}
+
+/// The objects of a document, found by number when a stream names one.
+pub(crate) struct Objects<'a> {
+    data: &'a [u8],
+    decrypt: Decrypt<'a>,
+    /// The objects of the file, built on the first use.
+    index: Option<Index>,
+    /// The objects inside the object streams, by number, built on the first
+    /// use. Each object stream is decoded once for it.
+    members: Option<HashMap<u32, Member>>,
+    /// Set while the object streams are read: a reference met then is looked
+    /// up in the file only, so that no stream is read while another is.
+    reading: bool,
+    /// Bytes parsed or decoded to follow references since
+    /// [`Self::take_parsed`]. Every stream of a crafted file can name the same
+    /// large object, so the caller charges them to its budget.
+    parsed: u64,
+    /// The most the object streams may decode to, in all, until the caller sets
+    /// it again: what the budget has left of the total. A decode takes its
+    /// bytes out of it.
+    pub(super) room: u64,
+    /// The most one object stream may decode to.
+    each: u64,
+    /// The most entries the object streams may hold in all.
+    pub(super) entries: u64,
+    /// An object stream was not read, for lack of room: what it holds may be
+    /// named by references that found nothing.
+    unread: bool,
+    /// The JBIG2 globals streams read so far, by object number: `None` for
+    /// one that could not be read. Several images name the same stream.
+    pub(super) globals: HashMap<u32, Option<std::sync::Arc<[u8]>>>,
+}
+
+impl<'a> Objects<'a> {
+    fn new(data: &'a [u8], decrypt: Decrypt<'a>, each: u64) -> Self {
+        Objects {
+            data,
+            decrypt,
+            index: None,
+            members: None,
+            reading: false,
+            parsed: 0,
+            room: 0,
+            each,
+            entries: 0,
+            unread: false,
+            globals: HashMap::new(),
+        }
+    }
+
+    /// The bytes parsed to follow references since the last call, and the ones
+    /// [`Self::add_parsed`] counted.
+    pub(crate) fn take_parsed(&mut self) -> u64 {
+        std::mem::take(&mut self.parsed)
+    }
+
+    /// Counts `n` bytes made from an object that was followed, to be charged
+    /// with the ones parsed.
+    pub(crate) fn add_parsed(&mut self, n: u64) {
+        self.parsed = self.parsed.saturating_add(n);
+    }
+
+    /// The object `p` names, and where it was found when it was reached
+    /// through a reference; `p` itself when it is not one. A reference to a
+    /// reference is followed, a loop of them not forever. `None`: it names
+    /// nothing.
+    pub(crate) fn follow(&mut self, p: &Primitive) -> Option<(Primitive, Source)> {
+        self.follow_as(p, false)
+    }
+
+    /// [`Self::follow`] for a caller that wants a string: the string `p` names,
+    /// and where it was found. An object of the file that does not begin as a
+    /// string or a reference is not parsed, so naming a stream costs nothing.
+    pub(crate) fn follow_string(&mut self, p: &Primitive) -> Option<(Vec<u8>, Source)> {
+        match self.follow_as(p, true)? {
+            (Primitive::String(s), from) => Some((s, from)),
+            _ => None,
+        }
+    }
+
+    fn follow_as(&mut self, p: &Primitive, string: bool) -> Option<(Primitive, Source)> {
+        let mut at = p.clone();
+        let mut from = Source::Held;
+        for _ in 0..8 {
+            let Primitive::Reference(id) = at else {
+                return Some((at, from));
+            };
+            (at, from) = self.object(id, string)?;
+        }
+        None
+    }
+
+    /// The object numbered `id`: the last definition in the file, wherever it
+    /// is, in the body of the file or inside an object stream. `string`: the
+    /// caller wants a string, so an object of the file that does not begin as a
+    /// string or a reference (a number) is not parsed.
+    fn object(&mut self, id: u32, string: bool) -> Option<(Primitive, Source)> {
+        let data = self.data;
+        let index = self.index.get_or_insert_with(|| Index::build(data));
+        let top = index.objects.get(&id).copied();
+        let packed = self.member(id);
+        if let Some(m) = packed
+            && top.is_none_or(|(_, start)| start < m.at)
+        {
+            let decoded = &self.index.as_ref()?.streams[m.stream].decoded;
+            let (object, end) = pdf_objstm::object_at(decoded, m.offset);
+            self.parsed = self
+                .parsed
+                .saturating_add(end.saturating_sub(m.offset) as u64);
+            return Some((object?, Source::Compressed));
+        }
+        let (r#gen, start) = top?;
+        let mut lex = Lexer::new(data);
+        lex.set_pos(start);
+        if string && !matches!(lex.next_token(), Token::String(_) | Token::Integer(_)) {
+            return None;
+        }
+        lex.set_pos(start);
+        let parsed = parse_indirect_object_body(&mut lex);
+        // An object that does not parse can have run to the end of the file.
+        self.parsed = self
+            .parsed
+            .saturating_add(lex.pos().saturating_sub(start) as u64);
+        Some((parsed?.0, Source::Object(id, r#gen)))
+    }
+
+    /// Where the object `id` is inside an object stream, if it is in one. The
+    /// object streams are decoded the first time this is asked.
+    fn member(&mut self, id: u32) -> Option<Member> {
+        if self.reading || self.index.as_ref()?.streams.is_empty() {
+            return None;
+        }
+        if self.members.is_none() {
+            self.read_streams();
+        }
+        self.members.as_ref()?.get(&id).copied()
+    }
+
+    /// Decodes each object stream of the file once and lists the objects
+    /// inside. Of several definitions of a number, the last in the file wins.
+    fn read_streams(&mut self) {
+        self.reading = true;
+        let mut members: HashMap<u32, Member> = HashMap::new();
+        let streams = self.index.as_ref().map_or(0, |i| i.streams.len());
+        // Every object stream of a crafted file can run to the end of it, so
+        // the reading stops once it has parsed as much as it may decode. The
+        // caller charges what was parsed, and the scan reports the streams
+        // left unread.
+        let (before, allowed) = (self.parsed, self.room);
+        for stream in 0..streams {
+            if self.parsed.saturating_sub(before) >= allowed {
+                self.unread = true;
+                break;
+            }
+            let Some((at, table)) = self.read_stream(stream) else {
+                continue;
+            };
+            for (number, offset) in table {
+                if members.len() as u64 >= self.entries && !members.contains_key(&number) {
+                    break;
+                }
+                members.insert(number, Member { stream, offset, at });
+            }
+        }
+        self.reading = false;
+        self.members = Some(members);
+    }
+
+    /// Decodes the object stream `i`, keeps what it decodes to, and returns
+    /// where it starts in the file and where the objects inside it do. `None`:
+    /// it cannot be read or is not an object stream, so no object is found in
+    /// it.
+    fn read_stream(&mut self, i: usize) -> Option<(usize, Vec<(u32, usize)>)> {
+        let stream = self.index.as_ref()?.streams.get(i)?;
+        let (number, generation, start) = (stream.number, stream.generation, stream.start);
+        let mut lex = Lexer::new(self.data);
+        lex.set_pos(start);
+        let parsed = parse_indirect_object_body(&mut lex);
+        self.parsed = self
+            .parsed
+            .saturating_add(lex.pos().saturating_sub(start) as u64);
+        let (Primitive::Stream { info, mut data }, _) = parsed? else {
+            return None;
+        };
+        (self.decrypt)(number, generation, &mut data);
+        let info = resolve_filter_references(info, self);
+        let cap = self.room.min(self.each);
+        let outcome = apply_filters(&data, &info, cap).ok()?;
+        if outcome.truncated {
+            // What was decoded before the cut was work done: charged.
+            self.add_parsed(cap);
+            self.unread = true;
+            return None;
+        }
+        if outcome.decode_error || outcome.unknown_filter {
+            return None;
+        }
+        let decoded = outcome.buf;
+        self.room = self.room.saturating_sub(decoded.len() as u64);
+        self.add_parsed(decoded.len() as u64);
+        let count = self.follow(info.get("N")?)?.0.as_i64()?;
+        let first = self.follow(info.get("First")?)?.0.as_i64()?;
+        if !pdf_objstm::is_object_stream(&info, count, first, &decoded) {
+            return None;
+        }
+        let table = pdf_objstm::table(&decoded, count, first, self.entries);
+        self.index.as_mut()?.streams[i].decoded = decoded;
+        Some((start, table))
     }
 }
 
@@ -395,37 +860,15 @@ fn harvest_inner(
 /// objects they name, which a PDF may use for either. The scan is object by
 /// object, so a filter written as `7 0 R` was no filter at all, and the stream
 /// was scanned compressed.
-fn resolve_filter_references(
+pub(crate) fn resolve_filter_references(
     mut info: HashMap<String, Primitive>,
-    data: &[u8],
-    index: &mut Option<HashMap<u32, usize>>,
+    objects: &mut Objects<'_>,
 ) -> HashMap<String, Primitive> {
     let mut resolve = |p: &Primitive| -> Option<Primitive> {
-        let mut at = p.clone();
-        // A reference to a reference is followed, a loop of them not forever.
-        for _ in 0..8 {
-            let Primitive::Reference(id) = at else {
-                return Some(at);
-            };
-            let index = index.get_or_insert_with(|| {
-                let mut found = HashMap::new();
-                let mut lex = Lexer::new(data);
-                // The last definition of a number wins, as in an incremental
-                // update.
-                while let Some((n, _gen, start)) = lex.find_next_obj() {
-                    found.insert(n, start);
-                }
-                found
-            });
-            let start = *index.get(&id)?;
-            let mut lex = Lexer::new(data);
-            lex.set_pos(start);
-            at = match parse_indirect_object_body(&mut lex)?.0 {
-                Primitive::Stream { .. } => return None,
-                other => other,
-            };
+        match objects.follow(p)?.0 {
+            Primitive::Stream { .. } => None,
+            other => Some(other),
         }
-        None
     };
     for key in ["Filter", "DecodeParms", "DP"] {
         let Some(value) = info.get(key) else {
@@ -473,15 +916,15 @@ pub(crate) struct FilterOutcome {
     /// An implemented filter failed and nothing was recovered: the caller
     /// should report the stream undecodable rather than scan an empty buffer
     /// as though its bytes were examined. Distinct from "decoded to empty",
-    /// which is a successful decode of an empty stream (legal — e.g. an empty
+    /// which is a successful decode of an empty stream (legal, e.g. an empty
     /// page-content stream) and must NOT be reported undecodable.
-    decode_error: bool,
+    pub(crate) decode_error: bool,
     /// A filter decoded part of its input and failed on the rest: `buf` holds
     /// what came before the failure.
-    part_way: bool,
+    pub(crate) part_way: bool,
     /// The chain names a filter that is neither decoded here nor an image
     /// codec: what follows it was not decoded, and `buf` is not the content.
-    unknown_filter: bool,
+    pub(crate) unknown_filter: bool,
 }
 
 /// A zlib stream decoded up to any damage, without its Adler-32 check.
@@ -528,7 +971,7 @@ pub(crate) fn apply_filters(
     // Whether an implemented filter failed with nothing recovered. Sticky
     // across the chain: only a successful decode producing content clears the
     // question, and the caller reports `unsupported` solely on
-    // empty-output-with-error — a valid empty decode is a scanned empty member,
+    // empty-output-with-error: a valid empty decode is a scanned empty member,
     // not an undecodable stream.
     let mut decode_error = false;
     for (idx, name) in names.iter().enumerate() {
@@ -537,7 +980,7 @@ pub(crate) fn apply_filters(
             "FlateDecode" | "Fl" => {
                 // Strict first: a valid-but-empty stream must succeed (the
                 // caller emits it as a scanned empty member). Only on strict
-                // failure fall back to salvage — and only if salvage ALSO
+                // failure fall back to salvage, and only if salvage ALSO
                 // recovers nothing is the stream genuinely unreadable.
                 // Salvage still matters: malware content is often in the
                 // recoverable prefix, and PDF streams are commonly truncated
@@ -561,7 +1004,7 @@ pub(crate) fn apply_filters(
                 }
             }
             // The pure decoders report no error channel, so an empty output
-            // conservatively counts as a failure — today's behaviour,
+            // conservatively counts as a failure, today's behaviour,
             // unchanged. (A valid-but-empty LZW/ASCII85 stream is legal but
             // vanishingly rare in the wild, unlike empty Flate streams.)
             "LZWDecode" | "LZW" => {
@@ -585,7 +1028,7 @@ pub(crate) fn apply_filters(
                 (out, truncated, err)
             }
             // Unknown/unsupported filter: stop and emit what we have so far
-            // (an image codec over raw bytes reads as the raw bytes — same as
+            // (an image codec over raw bytes reads as the raw bytes, same as
             // ClamAV, which matches signatures against the stream content
             // without decoding image codecs either).
             // The identity crypt filter, which every reader passes over:
@@ -642,7 +1085,7 @@ pub(crate) fn filter_names(info: &HashMap<String, Primitive>) -> Vec<String> {
 /// Map `/DecodeParms` to one optional dict per filter. A single dict applies to
 /// the first filter; an array is aligned positionally with the filters (null /
 /// non-dict entries yield `None`).
-fn decode_parms_list(
+pub(crate) fn decode_parms_list(
     info: &HashMap<String, Primitive>,
     n: usize,
 ) -> Vec<Option<&HashMap<String, Primitive>>> {
@@ -705,7 +1148,7 @@ fn pdf_has_encrypt(data: &[u8]) -> bool {
 ///
 /// Two strategies:
 /// 1. Look for an object whose dictionary contains `/Encrypt` (some generators embed it in the catalog).
-/// 2. Look for a standalone encryption dictionary (has /V, /R, /O, /U keys) — pypdf puts it
+/// 2. Look for a standalone encryption dictionary (has /V, /R, /O, /U keys): pypdf puts it
 ///    as a separate object, referenced from the trailer via indirect ref.
 /// 3. Check the trailer dict directly for `/Encrypt` key.
 #[cfg(feature = "decrypt")]
@@ -842,7 +1285,7 @@ mod tests {
     }
 
     /// A valid-but-empty Flate stream (8 bytes of zlib wrapping zero content
-    /// bytes — common as empty page-content) decodes successfully to nothing.
+    /// bytes, common as empty page-content) decodes successfully to nothing.
     /// It must surface as a scanned empty member, never as undecodable: the
     /// old emptiness check reported whole benign PDFs `UNSCANNABLE` for this.
     #[test]
@@ -1043,7 +1486,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     }
 
     /// Deeply nested `/JS` arrays must not blow the harvest recursion (bounded at
-    /// depth 32) and a huge harvested value must stay budget-bounded — no panic.
+    /// depth 32) and a huge harvested value must stay budget-bounded, no panic.
     #[test]
     fn deeply_nested_and_large_harvest_no_panic() {
         let mut body = String::from("%PDF-1.5\n1 0 obj\n<< /JS ");
@@ -1057,6 +1500,89 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         body.push_str(" >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF");
         let mut budget = Budget::new(Limits::default());
         let _ = extract(Format::Pdf, &body.as_bytes(), &mut budget).unwrap();
+    }
+
+    /// An object stream is decrypted as a whole, so the strings of the objects
+    /// inside it are plain: the harvest and the color space reader must not
+    /// decrypt them again.
+    #[cfg(feature = "decrypt")]
+    #[test]
+    fn objects_in_an_object_stream_are_not_decrypted_twice() {
+        // RC4, 40 bits, the user password is "test".
+        let path = format!(
+            "{}/test_data/pdf/rc4_40bit_encrypted.pdf",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut pdf = crate::read_fixture(&path).unwrap();
+        let encrypt = detect_encryption(&pdf).unwrap();
+        let id = find_doc_id(&pdf).unwrap();
+        let dec = Decoder::from_password(&encrypt, &id, b"test").unwrap();
+
+        let action = "<< /S /JavaScript /JS (app.alert\\(1\\)) >>\n";
+        let space = "[/Indexed /DeviceRGB 0 <ff0000>]\n";
+        let header = format!("7 0 8 {} ", action.len());
+        let mut stream = zlib_compress(format!("{header}{action}{space}").as_bytes());
+        // RC4 is its own inverse.
+        dec.decrypt_stream(90, 0, &mut stream);
+        pdf.extend_from_slice(
+            format!(
+                "\n90 0 obj\n<< /Type /ObjStm /N 2 /First {} /Filter /FlateDecode \
+                 /Length {} >>\nstream\n",
+                header.len(),
+                stream.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&stream);
+        pdf.extend_from_slice(
+            b"\nendstream\nendobj\n91 0 obj\n<< /Subtype /Image /Width 1 /Height 1 \
+              /BitsPerComponent 8 /ColorSpace 8 0 R /Length 1 >>\nstream\n\0\nendstream\nendobj\n",
+        );
+
+        let mut budget = Budget::with_passwords(Limits::default(), vec!["test".to_string()]);
+        budget.set_rasters(true);
+        let entries = extract(Format::Pdf, &pdf, &mut budget).unwrap();
+        let js = entries.iter().find(|e| e.name == "pdf-javascript").unwrap();
+        assert_eq!(js.data, b"app.alert(1)\n");
+        let image = entries.iter().find(|e| e.name == "pdf-obj-91-0").unwrap();
+        assert_eq!(
+            image.raster.as_ref().map(|r| &r.space),
+            Some(&RasterSpace::Indexed {
+                base: Box::new(RasterSpace::Rgb),
+                hival: 0,
+                palette: vec![255, 0, 0],
+            })
+        );
+    }
+
+    /// A string object that a link names is decrypted with its own key, not with
+    /// the key of the dictionary that names it.
+    #[cfg(feature = "decrypt")]
+    #[test]
+    fn a_string_object_named_by_an_action_is_decrypted_with_its_own_key() {
+        // RC4, 40 bits, the user password is "test".
+        let path = format!(
+            "{}/test_data/pdf/rc4_40bit_encrypted.pdf",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut pdf = crate::read_fixture(&path).unwrap();
+        let encrypt = detect_encryption(&pdf).unwrap();
+        let id = find_doc_id(&pdf).unwrap();
+        let dec = Decoder::from_password(&encrypt, &id, b"test").unwrap();
+
+        let mut link = b"http://evil.example/x".to_vec();
+        // RC4 is its own inverse.
+        dec.decrypt_stream(92, 0, &mut link);
+        let hex: String = link.iter().map(|b| format!("{b:02x}")).collect();
+        pdf.extend_from_slice(
+            format!("\n92 0 obj\n<{hex}>\nendobj\n93 0 obj\n<< /S /URI /URI 92 0 R >>\nendobj\n")
+                .as_bytes(),
+        );
+
+        let mut budget = Budget::with_passwords(Limits::default(), vec!["test".to_string()]);
+        let entries = extract(Format::Pdf, &pdf, &mut budget).unwrap();
+        let uris = entries.iter().find(|e| e.name == "pdf-uris").unwrap();
+        assert_eq!(uris.data, b"http://evil.example/x\n");
     }
 
     /// A PDF with no active content emits no JS/URI members (no false members).

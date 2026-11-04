@@ -200,6 +200,23 @@ fn a_picture_in_a_data_address_is_embedded() {
     assert!(d.contains("<w:drawing>"), "{d}");
 }
 
+/// A picture's size as large as a number can say is drawn at the page's
+/// width, its height scaled without overflow (a fuzz finding).
+#[test]
+fn a_picture_of_any_size_is_scaled_to_the_page() {
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+    for size in [
+        r#"width=1e300 height=1e300"#,
+        r#"width=1e300"#,
+        r#"height=1e300"#,
+    ] {
+        let d = body(&run(&format!(
+            r#"<p>x<img src="data:image/png;base64,{png}" {size}></p>"#
+        )));
+        assert!(d.contains("<w:drawing>"), "{size}: {d}");
+    }
+}
+
 #[test]
 fn what_is_not_html_is_refused_and_hostile_pages_are_bounded() {
     let e = convert(b"just some text", Format::Html, &Limits::default()).unwrap_err();

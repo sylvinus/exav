@@ -3,7 +3,7 @@
 //! Rust's runtime ignores `SIGPIPE` before `main`, so a write to a closed pipe
 //! comes back as `EPIPE` and `println!` panics on it. Left alone, that prints a
 //! Rust backtrace at anyone who piped exav into `head`, `grep -q`, or a shell
-//! that stopped reading — all completely ordinary things to do, and one of them
+//! that stopped reading, all completely ordinary things to do, and one of them
 //! is on the front page of the README.
 //!
 //! The listeners need the opposite disposition, so [`daemon_client`] and the
@@ -42,7 +42,7 @@ fn scan_into_a_closed_pipe() -> String {
         .spawn()
         .expect("start exav");
 
-    // Read one line, then drop the pipe — which is what `head -1` does.
+    // Read one line, then drop the pipe, which is what `head -1` does.
     let mut out = child.stdout.take().expect("stdout");
     let mut byte = [0u8; 1];
     while out.read(&mut byte).unwrap_or(0) == 1 && byte[0] != b'\n' {}

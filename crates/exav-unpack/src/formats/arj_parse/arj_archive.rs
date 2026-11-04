@@ -10,7 +10,10 @@ const MAX_HEADER_SIZE: usize = 2600;
 const ARJ_MAGIC_1: u8 = 0x60;
 const ARJ_MAGIC_2: u8 = 0xEA;
 
-fn read_header(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+/// The next header from `pos`, which is searched for from there. A header whose
+/// CRC-32 does not hold is read as it stands unless `strict`: a stale checksum
+/// hides nothing, and ClamAV does not look at it.
+fn read_header(data: &[u8], pos: &mut usize, strict: bool) -> Option<Vec<u8>> {
     let mut u8_buf = [0u8; 1];
     loop {
         if *pos >= data.len() {
@@ -57,7 +60,7 @@ fn read_header(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
 
     let checksum = crc32fast::hash(&header_bytes);
     let expected = u32::from_le_bytes(crc);
-    if checksum != expected {
+    if strict && checksum != expected {
         return None;
     }
 
@@ -102,12 +105,16 @@ pub struct ArjArchive {
     /// the caller cannot tell a clean end from a walk that stopped early — and
     /// members after the break would vanish silently.
     stopped_early: bool,
+    /// A header whose CRC-32 does not hold is refused.
+    strict: bool,
 }
 
 impl ArjArchive {
-    pub fn new(data: Vec<u8>) -> Option<Self> {
+    /// The archive in `data`. With `strict`, a header whose CRC-32 does not hold
+    /// ends the reading of the archive, as damage.
+    pub fn new(data: Vec<u8>, strict: bool) -> Option<Self> {
         let mut pos = 0;
-        let header_bytes = read_header(&data, &mut pos)?;
+        let header_bytes = read_header(&data, &mut pos, strict)?;
         if header_bytes.is_empty() {
             return None;
         }
@@ -119,6 +126,7 @@ impl ArjArchive {
             pos,
             passwords: Vec::new(),
             stopped_early: false,
+            strict,
         })
     }
 
@@ -129,15 +137,16 @@ impl ArjArchive {
 
     pub fn get_encryption_type(&self) -> Option<ArjEncryption> {
         let mut pos = 0;
-        let header_bytes = read_header(&self.data, &mut pos)?;
+        let header_bytes = read_header(&self.data, &mut pos, self.strict)?;
         let header = MainHeader::load_from(&header_bytes)?;
         ArjEncryption::from_version(header.encryption_version, header.is_gabled())
     }
 
     pub fn get_next_entry(&mut self) -> Option<LocalFileHeader> {
-        let Some(header_bytes) = read_header(&self.data, &mut self.pos) else {
-            // A bad header CRC, an implausible header size or a truncated read.
-            // Any of these ends the walk with members still ahead of us.
+        let Some(header_bytes) = read_header(&self.data, &mut self.pos, self.strict) else {
+            // A bad header CRC when headers are checked, an implausible header
+            // size or a truncated read. Any of these ends the walk with members
+            // still ahead of us.
             self.stopped_early = true;
             return None;
         };
@@ -264,7 +273,7 @@ mod tests {
     #[test]
     fn a_member_past_the_top_of_the_address_space_is_not_in_the_file() {
         let path = format!("{}/tests/fixtures/sample.arj", env!("CARGO_MANIFEST_DIR"));
-        let mut arc = ArjArchive::new(std::fs::read(path).unwrap()).unwrap();
+        let mut arc = ArjArchive::new(std::fs::read(path).unwrap(), true).unwrap();
         let header = arc.get_next_entry().unwrap();
         assert!(header.compressed_size > 0);
         arc.pos = usize::MAX - 3;

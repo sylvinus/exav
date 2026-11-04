@@ -171,3 +171,17 @@ fn hostile_files() {
         let _ = read(s.as_bytes(), &mut Budget::new(Limits::default()));
     }
 }
+
+#[test]
+fn many_formats_are_styled_in_one_pass() {
+    // More formats than are remembered, each a font of its own.
+    let mut s = String::from("ID;P\r\n");
+    for i in 0..200_000 {
+        s += &format!("F;SM{i};X1;Y{}\r\n", i + 1);
+    }
+    s += "E\r\n";
+    let t = std::time::Instant::now();
+    let wb = read_bytes(s.as_bytes());
+    assert!(t.elapsed().as_secs() < 2, "took {:?}", t.elapsed());
+    assert_eq!(wb.sheets[0].cells.len(), 200_000);
+}

@@ -5,15 +5,27 @@ import "../test/blob.js";
 import { MAX_BYTES, MAX_LINE, MAX_LINES } from "./decode.js";
 import { kindOf, renderer } from "./renderer.js";
 
-// The page reads Markdown in a worker, which jsdom has not: the same module, in this process.
-const engine = vi.hoisted(() => ({ fail: false }));
-vi.mock("./markdown-engine.js", async () => {
-  const real = (await import("../test/markdown.js")).readMarkdown;
+// The page decodes and reads Markdown in a worker, which jsdom has not: the same module, in this process.
+const engine = vi.hoisted(() => ({ fail: false, failFormat: false, decoded: 0, closed: 0, formatted: [] as string[] }));
+vi.mock("./engine.js", async () => {
+  const real = await import("../test/text-wasm.js");
   return {
-    readMarkdown: async (source: string) => {
-      if (engine.fail) throw new Error("the engine stopped");
-      return real(source);
-    },
+    openTextEngine: () => ({
+      decode: (bytes: Uint8Array, partial: boolean, page: boolean) => {
+        engine.decoded++;
+        return real.decodeText(bytes, partial, page);
+      },
+      format: (kind: "json" | "xml" | "diff", text: string, maxLines: number) => {
+        engine.formatted.push(kind);
+        if (engine.failFormat) return Promise.reject(new Error("the engine stopped"));
+        return real.formatLines(kind, text, maxLines);
+      },
+      markdown: async (source: string) => {
+        if (engine.fail) throw new Error("the engine stopped");
+        return real.readMarkdown(source);
+      },
+      close: () => void engine.closed++,
+    }),
   };
 });
 
@@ -116,6 +128,36 @@ describe("the text renderer", () => {
     }
     // A text with a few NULs in it is not one either.
     expect((await open("a.txt", enc("hello\0world"))).statuses.at(-1)).toMatchObject({ phase: "error" });
+  });
+
+  it("takes one control byte in twenty for a text and more for a binary file, as the scanner does", async () => {
+    // ANSI colour codes: an escape every 15 bytes is 6.7 %.
+    const coloured = "a log line\u001b[0m\n".repeat(50);
+    expect((await open("app.log", enc(coloured))).statuses.at(-1)).toEqual({ phase: "error", error: { code: "text_binary" } });
+    // One in 30 is 3.3 %.
+    const light = "a longer log line\u001b[0m\n".repeat(50);
+    const o = await open("app.log", enc(light));
+    expect(o.statuses.at(-1)).toEqual({ phase: "ready" });
+    expect(shownText(o.host)).toContain(`line${ch(0x241b)}[0m`);
+  });
+
+  it("decodes in the engine's worker, which is stopped once the file is shown", async () => {
+    const before = { decoded: engine.decoded, closed: engine.closed };
+    await open("a.txt", enc("hello"));
+    await open("a.bin", Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0, 0]));
+    expect({ decoded: engine.decoded - before.decoded, closed: engine.closed - before.closed }).toEqual({ decoded: 2, closed: 2 });
+  });
+
+  it("has the engine's worker make the lines of JSON, XML and diffs, and of nothing else", async () => {
+    engine.formatted.length = 0;
+    await open("a.json", enc('{"a":1}'));
+    await open("a.xml", enc("<a/>"));
+    await open("a.patch", enc("+a"));
+    await open("a.txt", enc("hello"));
+    await open("a.md", enc("# hi"));
+    // A cut JSON file is not judged.
+    await open("big.json", enc(`[${"1,".repeat(MAX_BYTES)}1]`));
+    expect(engine.formatted).toEqual(["json", "xml", "diff"]);
   });
 
   it("cuts a file past the byte limit, says so, and draws no more than the limit holds", async () => {
@@ -235,6 +277,12 @@ describe("HTML", () => {
       expect(o.host.querySelector("script,img,a,html,body,iframe,link,style"), name).toBeNull();
     }
   });
+
+  it("is read in the charset its <meta> names, as the scanner reads a page", async () => {
+    const page = new Uint8Array([...enc('<meta charset="Shift_JIS"><p>'), 0x93, 0xfa, 0x96, 0x7b, ...enc("</p>")]);
+    const o = await open("page.html", page);
+    expect(shownText(o.host)).toBe('<meta charset="Shift_JIS"><p>日本</p>');
+  });
 });
 
 describe("Markdown", () => {
@@ -301,6 +349,24 @@ describe("Markdown", () => {
       expect(o.statuses.at(-1)).toEqual({ phase: "ready" });
     } finally {
       engine.fail = false;
+    }
+  });
+
+  it("shows JSON, XML and a diff as they are, and says so, when the formatter fails", async () => {
+    engine.failFormat = true;
+    try {
+      for (const [name, src] of [
+        ["data.json", '{"a":1,"b":[2]}'],
+        ["data.xml", "<a><b>1</b></a>"],
+        ["fix.diff", "--- a\n+++ b\n@@ -1 +1 @@\n-x\n+y"],
+      ] as const) {
+        const o = await open(name, enc(src));
+        expect(o.warnings, name).toEqual([{ key: "text_format_failed", count: 1 }]);
+        expect(shownText(o.host), name).toBe(src);
+        expect(o.statuses.at(-1), name).toEqual({ phase: "ready" });
+      }
+    } finally {
+      engine.failFormat = false;
     }
   });
 

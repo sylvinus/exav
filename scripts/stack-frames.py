@@ -32,10 +32,15 @@ WATCHED = [
     r"exav_unpack::formats::\w+::walk\b",
     r"exav_unpack::formats::\w+::walk_\w+",
     r"exav_unpack::stream::",
+    # The walker: one container's members, the objects found inside an object.
+    r"exav_unpack::tree::engine::",
     # The scan's own recursion into members.
     r"exav_core::walk_members",
-    r"exav_core::scan_found",
+    r"exav_core::scan_child",
     r"exav_core::scan_object",
+    r"exav_core::member_content_scan",
+    r"exav_core::visit_member",
+    r"exav_core::Members as ",
     # The converters' walks of shapes, blocks, groups and nested values.
     r"exav_render::formats::office::\w+::(?:\w+::)*(?:shape|group|drawable|drawables|block|list|body|inlines|walk|find_shape)\b",
     r"exav_render::formats::(?:gltf|ifc|cad)::.*::(?:value|item|curve|profile|unit|entity|document)\b",

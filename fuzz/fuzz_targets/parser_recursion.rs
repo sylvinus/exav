@@ -4,7 +4,7 @@
 //!
 //! WHY IT EXISTS SEPARATELY: `catch_unwind` at the extraction boundary contains
 //! a panic, and a panic is what a bounds check produces. It does not contain a
-//! stack overflow, which is what unbounded recursive descent produces — the
+//! stack overflow, which is what unbounded recursive descent produces: the
 //! process dies with no verdict, and in the daemon that costs a worker. The
 //! container-nesting budget (`max_recursion`) does not help: it counts
 //! archives-inside-archives, while this is one file whose *own grammar* nests
@@ -14,7 +14,7 @@
 //! level needs another well-formed pair of delimiters. Constructing the nesting
 //! from a couple of input bytes reaches thousands, which is where the cliff is.
 //!
-//! A finding here looks like a crash with no panic message — that is the shape
+//! A finding here looks like a crash with no panic message: that is the shape
 //! of a stack overflow, and it is worth checking `ulimit -s` before concluding
 //! the parser is at fault.
 
@@ -30,7 +30,7 @@ fn tight_limits() -> Limits {
     l.max_buffer_bytes = 64 * 1024;
     l.max_scanned_bytes = 256 * 1024;
     l.max_recursion = 2;
-    // Every format stays reachable — this target is about depth, and a format
+    // Every format stays reachable: this target is about depth, and a format
     // filter would decide in advance which nestings are even tried.
     l.allowed_formats = None;
     l

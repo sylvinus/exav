@@ -32,7 +32,7 @@ scan.
   (`Scanner::unsupported_count`, shown in the CLI's `-v` summary).
 - **Matching:** one index of literal anchors for body signatures plus size-keyed
   hash tables for whole-file and section hashes, over an object held in memory up
-  to the deep-analysis limit and read through a bounded block cache beyond it:
+  to the object limit and read through a bounded block cache beyond it:
   the same matching either way. Wildcard verification runs as a simulation
   over reachable position intervals, so it cannot backtrack or blow up on
   repetitive input. See [Streaming & memory](/scanner/concepts/streaming-memory/).
@@ -63,18 +63,18 @@ use exav_core::ScanOptions;
 
 let mut opts = ScanOptions::default();
 opts.limits.max_extracted_bytes = 256 * 1024 * 1024; // held at once, in total
-opts.deep_analysis_max = 64 * 1024 * 1024;           // one object held whole
+opts.limits.max_buffer_bytes = 64 * 1024 * 1024;     // one object held whole
 opts.limits.max_recursion = 8;
 opts.limits.max_pe_emulation_steps = 200_000_000;
 ```
 
-`deep_analysis_max` also caps `limits.max_buffer_bytes` for a scan. `Limits` and
-`ScanOptions` are `#[non_exhaustive]`, so set fields on a default value; a struct
+`limits.max_buffer_bytes` is the one setting for the largest object a scan holds
+whole. `Limits` and `ScanOptions` are `#[non_exhaustive]`, so set fields on a default value; a struct
 literal does not compile outside the crate, even with `..Default::default()`.
 Each field, with the CLI flag that sets it and its default, is in
 [Limits and tuning](/scanner/reference/limits/#the-in-core-budgets).
 
-An object over `deep_analysis_max` is scanned through a block cache. Its text
+An object over `limits.max_buffer_bytes` is scanned through a block cache. Its text
 views, and an archive member too large to hold, need somewhere to be written and
 read back: give the scan a [`Spill`](#somewhere-to-spill), or those are reported
 `LimitsExceeded` rather than scanned.
@@ -127,11 +127,11 @@ through a block cache rather than whole. The entry points:
 | `scan_path` | a file, with its path as YARA's `filepath`/`filename`/`extension` |
 | `scan_seekable` | any `Read + Seek` of known length (`scan_seekable_located` also returns the member path of a hit) |
 | `analyze` | bytes already in memory |
-| `analyze_all_with_outcome`, `analyze_all_seekable` | every match, not just the first, with whether the scan finished (`analyze_all` drops that, so avoid it) |
+| `analyze_all_with_outcome`, `analyze_all_seekable`, `analyze_all_path` | every match, not just the first, with whether the scan finished (`analyze_all` drops that, so avoid it) |
 | `warm_up` | nothing: builds the lazily-initialised structures, to call before forking workers |
 
-Only `scan_path` knows a file name. Set `opts.filename` when calling the others
-if your YARA rules test it. The YARA engine can also be used on its own, as
+Only `scan_path` and `analyze_all_path` know a file name. Set `opts.filename`
+when calling the others if your YARA rules test it. The YARA engine can also be used on its own, as
 `exav_core::yara` (see [YARA rules](/scanner/guides/yara/#using-the-engine-directly)).
 
 ### Somewhere to spill
@@ -211,6 +211,7 @@ spill flags are not engine fields (see
 | `--detect pua` | PUA databases loaded, `PUA.*` kept | off |
 | `--dlp-credit-cards` / `--dlp-ssns` | `structured_cc_count` / `structured_ssn_count` | off |
 | `--passwords` / `--passwords-from` | `passwords` | none |
+| `--qr` / `--max-qr-pixels` / `--max-qr-millis` / `--max-qr-codes` / `--max-qr-finders` / `--max-qr-grids` | `qr_codes` / `max_qr_pixels` / `max_qr_millis` / `max_qr_codes` / `max_qr_finders` / `max_qr_grids` (feature `qr`) | off / 50000000 / 5000 / 64 / 1000 / 256 |
 | `--partial-as …=found` | `alert_encrypted` / `alert_exceeds_max` | partial |
 | `--clamav-compat` | `restrict_extractors` + `unofficial_suffix` + `clamav_compat`, plus the limits and decoders listed under [ClamAV compatibility](/scanner/reference/cli/#clamav-compatibility) | off (full reach) |
 | none (always on) | `clamav_heuristics` (imphash + PDF obfuscation) | on |
@@ -231,6 +232,7 @@ names.
 | `visible-text` | [The text a reader sees](/scanner/reference/formats/#the-text-a-reader-sees) of a document is matched as a text view |
 | `visible-text-pdf` | And PDF's, through hayro; not a default (see [feature flags](/scanner/reference/feature-flags/)) |
 | `visible-text-office` | And the legacy and flat office formats, through exav-render's office converters; not a default |
+| `qr` | The payloads of the [QR codes](/scanner/reference/formats/#qr-codes) in images, read by rqrr when `ScanOptions::qr_codes` asks; not a default |
 | `http` | The HTTP range-request reader (`dep:ureq`) |
 | `checksums` | Lets `ScanOptions::verify_checksums` make a container checksum mismatch an error |
 | `unstable-internals` | Makes the engine internals (`engine`, `bytecode`, `pe`, …) public, for tools; no stability promise |

@@ -10,20 +10,50 @@
 //!
 //! Any buffering of a streamed member (to run the checks that need it whole)
 //! is the caller's decision, made in `exav-core`.
+//!
+//! A reader takes `Visit<()>` and its input as `&dyn ByteSource` or
+//! `&mut dyn Disk`, with no type parameter for what the visitor stops with or
+//! for what it reads from, so that it is compiled once in a binary
+//! (`make compiled-once` checks the release builds).
 
 use crate::source::ByteSource;
 use crate::{Budget, Format, LimitHit};
 use std::io::{self, Read, Seek};
 
-/// Sentinel wrapped in an `io::Error` when a member's decoded bytes exceed its
-/// reserved budget. The extraction walk recognises it and converts it to a
-/// [`LimitHit`] (→ `LimitsExceeded`), so a bomb is never a silent truncation.
-const BUDGET_OVERFLOW: &str = "exav:member-budget-overflow";
+/// A `Read + Seek` source, whichever it is: the readers take this rather than
+/// being generic over it, so each is compiled once.
+pub(crate) trait Disk: Read + Seek {}
+impl<T: Read + Seek + ?Sized> Disk for T {}
+
+/// The error wrapped in an `io::Error` when a member's decoded bytes exceed its
+/// reserved budget. The extraction walk recognises it ([`is_budget_overflow`])
+/// and converts it to a [`LimitHit`] (`LimitsExceeded`), so a bomb is never a
+/// silent truncation. Its text is what a user reads where it is shown.
+#[derive(Debug)]
+struct BudgetOverflow;
+
+const BUDGET_OVERFLOW: &str = "member over its budget: not read to its end";
+
+impl std::fmt::Display for BudgetOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(BUDGET_OVERFLOW)
+    }
+}
+
+impl std::error::Error for BudgetOverflow {}
+
+/// The error a member's reader gives when a limit stops its decoder part way,
+/// as a [`BudgetReader`] gives at its cap: the walk leaves the member, and the
+/// reader that hands it over reports the limit.
+#[cfg_attr(not(feature = "rar"), allow(dead_code))]
+pub(crate) fn limit_stop() -> io::Error {
+    io::Error::other(BudgetOverflow)
+}
 
 /// A `Read` that yields at most `cap` bytes from `inner`, counting what it
 /// delivers and refusing to deliver a single byte past the cap. When `inner`
-/// still has data at the cap, the next `read` fails with `BUDGET_OVERFLOW`
-/// rather than returning EOF — so an over-budget (bomb) member is reported, not
+/// still has data at the cap, the next `read` fails with [`BudgetOverflow`]
+/// rather than returning EOF, so an over-budget (bomb) member is reported, not
 /// silently cut short and treated as fully scanned.
 pub(crate) struct BudgetReader<'a> {
     inner: &'a mut dyn Read,
@@ -31,17 +61,67 @@ pub(crate) struct BudgetReader<'a> {
     count: u64,
     overflowed: bool,
     done: bool,
+    /// How many of the bytes `inner` gave were holes, which `cap` does not
+    /// count, and the most of them there may be.
+    holes: Option<&'a std::cell::Cell<u64>>,
+    hole_cap: u64,
+    /// Bytes past `cap` were read along with the last ones delivered: the
+    /// next read fails.
+    over: bool,
 }
 
 impl<'a> BudgetReader<'a> {
-    fn new(inner: &'a mut dyn Read, cap: u64) -> Self {
+    pub(crate) fn new(inner: &'a mut dyn Read, cap: u64) -> Self {
         Self {
             inner,
             cap,
             count: 0,
             overflowed: false,
             done: false,
+            holes: None,
+            hole_cap: 0,
+            over: false,
         }
+    }
+
+    fn overflow(&mut self) -> io::Error {
+        self.overflowed = true;
+        self.done = true;
+        io::Error::other(BudgetOverflow)
+    }
+
+    /// A read from an `inner` that gives holes. Those are not counted against
+    /// `cap`, and how many of the bytes it gives are is known once it has
+    /// given them, so it is asked for all of `buf`: a stretch of a hole goes
+    /// out in reads as long as the caller's, whatever room is left.
+    fn read_with_holes(&mut self, buf: &mut [u8], room: u64) -> io::Result<usize> {
+        let before = self.holes();
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            self.done = true;
+            return Ok(0);
+        }
+        let real = (n as u64).saturating_sub(self.holes().saturating_sub(before));
+        if real <= room {
+            self.count += n as u64;
+            return Ok(n);
+        }
+        if room == 0 {
+            return Err(self.overflow());
+        }
+        // What fits goes out; the bytes after it are the member's overflow.
+        self.count += room;
+        self.over = true;
+        Ok(room as usize)
+    }
+
+    fn holes(&self) -> u64 {
+        self.holes.map_or(0, std::cell::Cell::get)
+    }
+
+    /// The bytes delivered that `cap` counts.
+    fn counted(&self) -> u64 {
+        self.count.saturating_sub(self.holes())
     }
 
     /// Bytes actually delivered to the caller so far.
@@ -53,11 +133,16 @@ impl<'a> BudgetReader<'a> {
 
 impl Read for BudgetReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.done {
+        if self.done || buf.is_empty() {
             return Ok(0);
         }
-        let room = self.cap - self.count;
-        if room == 0 {
+        if self.over || self.holes() > self.hole_cap {
+            return Err(self.overflow());
+        }
+        let room = self.cap.saturating_sub(self.counted());
+        if self.holes.is_some() {
+            self.read_with_holes(buf, room)
+        } else if room == 0 {
             // At the cap. Probe one byte: if the member has more, it is a bomb.
             let mut probe = [0u8; 1];
             match self.inner.read(&mut probe)? {
@@ -65,11 +150,7 @@ impl Read for BudgetReader<'_> {
                     self.done = true;
                     Ok(0)
                 }
-                _ => {
-                    self.overflowed = true;
-                    self.done = true;
-                    Err(io::Error::other(BUDGET_OVERFLOW))
-                }
+                _ => Err(self.overflow()),
             }
         } else {
             let want = (buf.len() as u64).min(room) as usize;
@@ -103,6 +184,12 @@ pub struct MemberMeta {
     /// matching password, damage part way). What was decoded, if anything,
     /// still comes with it.
     pub unsupported: Option<&'static str>,
+    /// What kind of reason `unsupported` is, when the reader says so:
+    /// `Some(ReasonKind::Unsupported)` for a method or format it does not
+    /// decode. `None` for damage and any other reason, which read as
+    /// `ReasonKind::Damaged`, and for an encrypted member, whose reason is a
+    /// password's.
+    pub reason_kind: Option<crate::tree::ReasonKind>,
     /// When the member was last modified, as its container records it.
     /// Recorded, not checked.
     pub mtime: Option<Mtime>,
@@ -118,6 +205,28 @@ pub struct MemberMeta {
     /// For a ZIP member, the general-purpose flags of its local header, which
     /// can disagree with the central directory's that set `encrypted`.
     pub zip_local_flags: Option<u16>,
+    /// `(offset, length)` when the member's content is that range of the
+    /// source handed to [`walk`], as it stands: a stored ZIP member, a tar
+    /// member. It still comes as a [`Member::Stream`] over the same bytes, so
+    /// a visitor may read either; one that reads the range instead (the
+    /// scanner, for a member too large to hold) charges it to the scan budget
+    /// itself. The range can run past the end of a damaged source. A reader
+    /// sets it with `emit_range`.
+    pub range: Option<(u64, u64)>,
+    /// How to read the member's bytes as pixels, when they are raw samples
+    /// with no file header (a PDF image once its filters are undone), or the
+    /// stream of an image codec that is not decoded here. A description only:
+    /// the bytes are the member's, as for any other, and the pixels are built
+    /// by the consumer that wants them.
+    pub raster: Option<crate::Raster>,
+    /// Whether the member is a PDF object stream, decoded: the text of the
+    /// objects it holds, with their names as written.
+    pub object_stream: bool,
+    /// The one member of a single-stream format (gzip, xz, zstd...). The
+    /// format stores no name for it and `name` is the reader's (`gzip-content`):
+    /// a caller shows the name of the file it came from instead. Not set for
+    /// other names a reader makes up.
+    pub stream_member: bool,
 }
 
 /// When a member was last modified.
@@ -160,10 +269,10 @@ impl Member<'_> {
             Member::Bytes(data) => return Ok((data, false)),
             Member::Stream(reader) => reader,
         };
-        let name = &meta.name;
+        let name = crate::tree::quoted(&meta.name);
         let cap = budget.reserve()?;
         let mut data = Vec::new();
-        let partial = match reader.take(cap.saturating_add(1)).read_to_end(&mut data) {
+        let partial = match crate::source::read_capped(reader, &mut data, cap.saturating_add(1)) {
             Ok(_) => false,
             Err(e) if is_budget_overflow(&e) => {
                 return Err(LimitHit::new(format!("member '{name}': {e}")));
@@ -189,7 +298,10 @@ pub type Visit<'a, T> =
 
 /// Walk the members of `src`, a container of format `fmt`, handing each to
 /// `visit`. `Ok(Some(t))` when the visitor stopped the walk, `Err` when a
-/// budget ran out or the container could not be read.
+/// budget ran out or the container could not be read. A member that goes past
+/// a limit of its own (the compression ratio, a member too large to decode
+/// whole) is left out and the walk goes on; unless the visitor stops it first
+/// it ends with that limit once the other members are visited.
 ///
 /// Every member is counted toward [`crate::Limits::max_members`], and its
 /// decoded bytes are charged to the scan budget as they are produced.
@@ -202,12 +314,38 @@ pub type Visit<'a, T> =
 /// to abort, stack exhaustion, and a loop that neither allocates nor returns.
 /// The daemon bounds those with process limits; a one-shot run and a library
 /// embedding have no equivalent (see `SECURITY.md`).
+///
+/// The readers stop with `()`: this is a shell over the one walk that is
+/// compiled, which keeps the value the visitor stopped with. A reader that
+/// ends in a limit after the visitor stopped it replaces that value with the
+/// limit.
+///
+/// The shell is kept out of line, so that a binary has one of it for each type
+/// its callers stop with, and `make compiled-once` can count them.
+#[inline(never)]
 pub fn walk<T>(
     fmt: Format,
     src: &dyn ByteSource,
     budget: &mut Budget,
     visit: Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
+    let mut stopped = None;
+    let ended = walk_unit(fmt, src, budget, &mut |meta, content, budget| {
+        let value = visit(meta, content, budget)?;
+        stopped = Some(value);
+        Some(())
+    })?;
+    Ok(ended.and(stopped))
+}
+
+/// [`walk`] for a visitor that stops with `()`: the one walk, which every
+/// reader is compiled into once.
+fn walk_unit(
+    fmt: Format,
+    src: &dyn ByteSource,
+    budget: &mut Budget,
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     // A format the caller excluded at runtime is reported, not skipped: the
     // container is there, exav declined to open it, and the scan has to be
     // able to say so. Every walk, nested ones included, passes through here.
@@ -222,15 +360,22 @@ pub fn walk<T>(
         };
         return Ok(visit(&meta, None, budget));
     }
+    // A member left out for a limit of its own is told by `budget.skipped`,
+    // which belongs to the container walked: a walk inside one of its members
+    // starts with none and puts it back.
+    let outer = budget.skipped.take();
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         dispatch(fmt, src, budget, visit)
     }));
+    let skipped = std::mem::replace(&mut budget.skipped, outer);
     match caught {
         // A decoder that met a failed read sees it as the end of its input, so
         // a walk that finished may still have missed the rest of the container.
-        Ok(Ok(None)) => match src.read_error() {
-            Some(e) => Err(LimitHit::corrupt(format!("{fmt:?}: {e}"))),
-            None => Ok(None),
+        // One that finished with a member left out ends with the limit of it.
+        Ok(Ok(None)) => match (src.read_error(), skipped) {
+            (Some(e), _) => Err(LimitHit::corrupt(format!("{fmt:?}: {e}"))),
+            (None, Some(hit)) => Err(hit),
+            (None, None) => Ok(None),
         },
         // A container that is found damaged where the source failed to give it
         // is damaged by the failure: that is the reason to report.
@@ -255,12 +400,12 @@ const PROVOKE_REACH: usize = 64 * 1024 * 1024;
 /// ([`whole`]).
 // In a build with no streamed format, every format takes the last arm.
 #[allow(unreachable_code, unused_variables)]
-fn dispatch<T>(
+fn dispatch(
     fmt: Format,
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     // Fail on demand, to test the containment boundary rather than the
     // decoders. The marker is looked for anywhere in the container's first
     // bytes, so it can be carried inside a well-formed one.
@@ -268,8 +413,8 @@ fn dispatch<T>(
     crate::provoke(&src.window(0, PROVOKE_REACH));
     #[allow(unused_imports)]
     use crate::formats as f;
-    type WalkFn<T> = fn(&dyn ByteSource, &mut Budget, Visit<T>) -> Result<Option<T>, LimitHit>;
-    let walk: WalkFn<T> = match fmt {
+    type WalkFn = fn(&dyn ByteSource, &mut Budget, Visit<()>) -> Result<Option<()>, LimitHit>;
+    let walk: WalkFn = match fmt {
         #[cfg(feature = "gzip")]
         Format::Gzip => f::gzip::walk,
         #[cfg(feature = "bzip2")]
@@ -292,6 +437,8 @@ fn dispatch<T>(
         Format::SevenZip => f::sevenz::walk,
         #[cfg(feature = "cab")]
         Format::Cab => f::cab::walk,
+        #[cfg(feature = "chm")]
+        Format::Chm => f::chm::walk,
         #[cfg(feature = "tar")]
         Format::Tar => f::tar::walk,
         #[cfg(feature = "zip")]
@@ -300,6 +447,14 @@ fn dispatch<T>(
         Format::Lha => f::lha::walk,
         #[cfg(feature = "ar")]
         Format::Ar => f::ar::walk,
+        #[cfg(feature = "applesingle")]
+        Format::AppleSingle => f::applesingle::walk,
+        #[cfg(feature = "ishieldcab")]
+        Format::IshieldCab => f::ishield_cab::walk,
+        #[cfg(feature = "ishieldmsi")]
+        Format::IshieldMsi => f::ishield_msi::walk,
+        #[cfg(feature = "inno")]
+        Format::Inno => f::inno::walk,
         #[cfg(feature = "cpio")]
         Format::Cpio => f::cpio::walk,
         #[cfg(feature = "machofat")]
@@ -350,6 +505,13 @@ fn dispatch<T>(
         Format::Wim => f::wim::walk,
         #[cfg(feature = "xar")]
         Format::Xar => f::xar::walk,
+        #[cfg(feature = "ole")]
+        Format::Ole => f::ole::walk,
+        #[cfg(feature = "email")]
+        Format::Email => f::email_stream::walk,
+        #[cfg(feature = "rar")]
+        Format::Rar => f::rar::walk,
+        Format::CryptFf => f::cryptff::walk,
         _ => return whole(fmt, src, budget, visit),
     };
     walk(src, budget, visit)
@@ -366,6 +528,7 @@ pub(crate) fn single_meta(
         name: name.to_string(),
         comp_size: src.len() as u64,
         unsupported,
+        stream_member: true,
         ..MemberMeta::default()
     }
 }
@@ -397,37 +560,36 @@ pub(crate) fn read_whole<'a>(
 
 /// A format whose parser needs the whole container and decodes each member
 /// whole.
-pub(crate) fn whole<T>(
+pub(crate) fn whole(
     fmt: Format,
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let data = read_whole(fmt, src, budget)?;
-    let stopped = crate::dispatch_extract(fmt, &data, budget, &mut |e: crate::Entry,
-                                                                    budget: &mut Budget|
-     -> Option<
-        Result<T, LimitHit>,
-    > {
+    let stopped = crate::dispatch_extract(fmt, &data, budget, &mut |e, budget| {
         emit_entry(e, budget, visit).transpose()
     })?;
     stopped.transpose()
 }
 
 /// Hand the visitor a member an extractor decoded whole.
-pub(crate) fn emit_entry<T>(
+pub(crate) fn emit_entry(
     e: crate::Entry,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let meta = MemberMeta {
         name: e.name,
         comp_size: e.comp_size,
         size: e.unsupported.is_none().then_some(e.data.len() as u64),
         encrypted: e.encrypted,
         unsupported: e.unsupported,
+        reason_kind: e.reason_kind,
         mtime: e.mtime,
         mode: e.mode,
+        raster: e.raster,
+        object_stream: e.object_stream,
         ..MemberMeta::default()
     };
     // An unsupported member may still carry what was decoded of it.
@@ -437,12 +599,12 @@ pub(crate) fn emit_entry<T>(
 
 /// Hand the visitor a member decoded whole. Its bytes are charged to the scan
 /// budget, as a streamed member's are while it is read.
-pub(crate) fn emit_bytes<T>(
+pub(crate) fn emit_bytes(
     meta: &MemberMeta,
     content: Option<Vec<u8>>,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     if let Some(data) = &content {
         budget.charge_scan(data.len() as u64)?;
     }
@@ -454,13 +616,13 @@ pub(crate) fn emit_bytes<T>(
 /// visitor under a [`BudgetReader`]. The decoder pulls compressed bytes on
 /// demand, so a member decompressing to any size is never materialized here.
 #[allow(dead_code)]
-pub(crate) fn stream_single<R: Read + Seek, T>(
-    source: &mut R,
+pub(crate) fn stream_single<'s>(
+    source: &'s mut dyn Disk,
     budget: &mut Budget,
-    visit: Visit<T>,
+    visit: Visit<()>,
     name: &str,
-    mk: impl for<'a> FnOnce(&'a mut R) -> Result<Box<dyn Read + 'a>, LimitHit>,
-) -> Result<Option<T>, LimitHit> {
+    mk: &mut dyn FnMut(&'s mut dyn Disk) -> Result<Box<dyn Read + 's>, LimitHit>,
+) -> Result<Option<()>, LimitHit> {
     let comp_size = source
         .seek(io::SeekFrom::End(0))
         .and_then(|len| source.seek(io::SeekFrom::Start(0)).map(|_| len))
@@ -470,15 +632,18 @@ pub(crate) fn stream_single<R: Read + Seek, T>(
     let meta = MemberMeta {
         name: name.to_string(),
         comp_size,
+        stream_member: true,
         ..MemberMeta::default()
     };
     emit_stream(&meta, &mut *dec, budget, visit)
 }
 
 /// The most a member `comp_size` bytes long in its container may decode to
-/// before its ratio is a bomb's ([`crate::ratio_guard`]); `None` when its size
-/// in the container is unknown.
-fn ratio_cap(comp_size: u64, budget: &Budget) -> Option<u64> {
+/// before its ratio is a bomb's ([`crate::ratio_guard`]): what its ratio
+/// allows, and never less than the object limit, up to which a member is held
+/// in memory and bounded by the memory limits. `None` when its size in the
+/// container is unknown.
+pub(crate) fn ratio_cap(comp_size: u64, budget: &Budget) -> Option<u64> {
     if comp_size == 0 {
         return None;
     }
@@ -487,7 +652,7 @@ fn ratio_cap(comp_size: u64, budget: &Budget) -> Option<u64> {
         comp_size
             .saturating_mul(ratio)
             .saturating_sub(1)
-            .max(crate::RATIO_FLOOR_BYTES - 1),
+            .max(budget.limits.max_buffer_bytes),
     )
 }
 
@@ -500,31 +665,90 @@ fn ratio_cap(comp_size: u64, budget: &Budget) -> Option<u64> {
 /// that bounds what is held whole. What the visitor reads is charged against
 /// the scan budget, so a container of many large members is still bounded
 /// cumulatively.
-pub(crate) fn emit_stream<T>(
+///
+/// A member that goes past its compression ratio is cut there and left out,
+/// what was decoded of it charged to the scan budget, and the reader goes on
+/// with the next member ([`Budget::skip`]); the other limits end the walk.
+pub(crate) fn emit_stream(
     meta: &MemberMeta,
     inner: &mut dyn Read,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    emit_stream_with_holes(meta, inner, None, budget, visit)
+}
+
+/// [`emit_stream`] for a file of a filesystem, `holes` counting the bytes
+/// of holes `inner` gave: those are charged to [`crate::Limits::max_hole_bytes`]
+/// instead of the scan budget.
+pub(crate) fn emit_stream_with_holes(
+    meta: &MemberMeta,
+    inner: &mut dyn Read,
+    holes: Option<&std::cell::Cell<u64>>,
+    budget: &mut Budget,
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let scan_cap = budget.remaining_scan();
-    let ratio_cap = ratio_cap(meta.comp_size, budget);
+    // A hole decodes from nothing, so the ratio is not asked of a file that
+    // has them.
+    let ratio_cap = ratio_cap(meta.comp_size, budget).filter(|_| holes.is_none());
     let cap = ratio_cap.map_or(scan_cap, |r| r.min(scan_cap));
     let mut br = BudgetReader::new(inner, cap);
+    br.holes = holes;
+    br.hole_cap = budget.remaining_holes();
     let out = visit(meta, Some(Member::Stream(&mut br)), budget);
+    let hole_bytes = br.holes();
+    // The visitor stopped on what it read within the budgets: that stands,
+    // and what the member cost is charged without ending the walk again.
+    if out.is_some() {
+        let _ = budget.charge_scan(br.counted());
+        let _ = budget.charge_holes(hole_bytes);
+        return Ok(out);
+    }
+    if br.overflowed && hole_bytes > br.hole_cap {
+        return Err(LimitHit::new(format!(
+            "member '{}' has more holes than the {} bytes of them a scan may hand over",
+            crate::tree::quoted(&meta.name),
+            budget.limits.max_hole_bytes
+        )));
+    }
     if br.overflowed {
         if ratio_cap.is_some_and(|r| r < scan_cap) {
-            return Err(LimitHit::new(format!(
-                "member '{}': compression ratio > {}",
-                meta.name, budget.limits.max_compression_ratio
-            )));
+            // The member is left; what was decoded of it is charged, so a
+            // container of many of them still ends at the scan budget.
+            budget.charge_scan(br.counted())?;
+            let ratio = budget.limits.max_compression_ratio;
+            budget.skip(format_args!(
+                "member '{}': compression ratio > {ratio}",
+                crate::tree::quoted(&meta.name)
+            ));
+            return Ok(out);
         }
         return Err(LimitHit::new(format!(
             "member '{}' exceeds scan budget {}",
-            meta.name, budget.limits.max_scanned_bytes
+            crate::tree::quoted(&meta.name),
+            budget.limits.max_scanned_bytes
         )));
     }
-    budget.charge_scan(br.count)?;
+    budget.charge_scan(br.counted())?;
+    budget.charge_holes(hole_bytes)?;
     Ok(out)
+}
+
+/// [`emit_stream`] for a member whose content is `[offset, offset + len)` of
+/// the source the walk reads, as it stands, `inner` being a reader of those
+/// bytes. The range goes in [`MemberMeta::range`].
+// Dead in a build without the formats that name ranges.
+#[allow(dead_code)]
+pub(crate) fn emit_range(
+    meta: &mut MemberMeta,
+    (offset, len): (u64, u64),
+    inner: &mut dyn Read,
+    budget: &mut Budget,
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    meta.range = Some((offset, len));
+    emit_stream(meta, inner, budget, visit)
 }
 
 /// A member stored as it stands in its container, `(name, offset, size)`, or
@@ -536,9 +760,14 @@ pub(crate) enum Region {
     Unwalked(String, &'static str),
 }
 
-impl From<(String, u64, u64)> for Region {
-    fn from((name, offset, size): (String, u64, u64)) -> Self {
-        Region::Member(name, offset, size)
+impl Region {
+    /// The members `(name, offset, size)` as regions.
+    #[allow(dead_code)]
+    pub(crate) fn list(members: Vec<(String, u64, u64)>) -> Vec<Region> {
+        members
+            .into_iter()
+            .map(|(name, offset, size)| Region::Member(name, offset, size))
+            .collect()
     }
 }
 
@@ -549,15 +778,44 @@ impl From<(String, u64, u64)> for Region {
 // machofat, pyc, sfx, tnef, partition, iso, onenote); see
 // `crate::cap_prealloc` for why the feature list is not spelled out.
 #[allow(dead_code)]
-pub(crate) fn stream_stored<R: Read + Seek, T>(
-    source: &mut R,
+pub(crate) fn stream_stored(
+    source: &mut dyn Disk,
     budget: &mut Budget,
-    visit: Visit<T>,
-    members: impl IntoIterator<Item = impl Into<Region>>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+    members: Vec<Region>,
+) -> Result<Option<()>, LimitHit> {
+    stored(source, false, budget, visit, &mut members.into_iter())
+}
+
+/// [`stream_stored`] with the offsets in `src`, the source the walk reads:
+/// each member's range is named in [`MemberMeta::range`].
+#[allow(dead_code)]
+pub(crate) fn stream_stored_ranges(
+    src: &dyn ByteSource,
+    budget: &mut Budget,
+    visit: Visit<()>,
+    members: Vec<Region>,
+) -> Result<Option<()>, LimitHit> {
+    stored(
+        &mut crate::source::Reader::new(src),
+        true,
+        budget,
+        visit,
+        &mut members.into_iter(),
+    )
+}
+
+#[allow(dead_code)]
+fn stored(
+    source: &mut dyn Disk,
+    ranges: bool,
+    budget: &mut Budget,
+    visit: Visit<()>,
+    members: &mut dyn Iterator<Item = Region>,
+) -> Result<Option<()>, LimitHit> {
     for region in members {
         budget.count_entry()?;
-        let (name, offset, size) = match region.into() {
+        let (name, offset, size) = match region {
             Region::Member(name, offset, size) => (name, offset, size),
             // Content that was never enumerated arrives as UNSUPPORTED.
             // Emitting it as an ordinary empty member would make "we did not
@@ -583,6 +841,7 @@ pub(crate) fn stream_stored<R: Read + Seek, T>(
             name,
             comp_size: size,
             size: Some(size),
+            range: ranges.then_some((offset, size)),
             ..MemberMeta::default()
         };
         if let Some(t) = emit_stream(&meta, &mut window, budget, visit)? {
@@ -592,12 +851,14 @@ pub(crate) fn stream_stored<R: Read + Seek, T>(
     Ok(None)
 }
 
-/// True if `err` is the [`BudgetReader`] over-budget sentinel (a bomb), as
+/// True if `err` is the `BudgetReader` over-budget sentinel (a bomb), as
 /// opposed to a genuine I/O error from the underlying source. Callers running a
 /// member reader (e.g. a streaming matcher in `exav-core`) use this to map the
 /// stop to `LimitsExceeded` rather than a hard I/O failure.
 pub fn is_budget_overflow(err: &io::Error) -> bool {
-    err.get_ref().map(|e| e.to_string()) == Some(BUDGET_OVERFLOW.to_string())
+    // By its text too: a decoder may pass it on as a new error of the same words.
+    err.get_ref()
+        .is_some_and(|e| e.is::<BudgetOverflow>() || e.to_string() == BUDGET_OVERFLOW)
 }
 
 #[cfg(test)]
@@ -796,6 +1057,211 @@ mod tests {
         assert_eq!(out.len(), 1000);
         assert_eq!(br.count(), 1000);
         assert!(!br.overflowed);
+    }
+
+    /// What a visitor reading all of a member of `len` zeros of `comp_size`
+    /// bytes in its container gets of it, and what `emit_stream` made of the
+    /// member under `limits`.
+    fn stream_of_zeros(
+        limits: Limits,
+        comp_size: u64,
+        len: u64,
+    ) -> (usize, Result<Option<()>, LimitHit>, Budget) {
+        let mut budget = Budget::new(limits);
+        let meta = MemberMeta {
+            name: "z".to_string(),
+            comp_size,
+            ..MemberMeta::default()
+        };
+        let mut got = 0;
+        let out = emit_stream(
+            &meta,
+            &mut io::repeat(0).take(len),
+            &mut budget,
+            &mut |_, content, _| {
+                if let Some(Member::Stream(r)) = content {
+                    let mut all = Vec::new();
+                    let _ = r.read_to_end(&mut all);
+                    got = all.len();
+                }
+                None::<()>
+            },
+        );
+        (got, out, budget)
+    }
+
+    /// A member that goes past its ratio is cut where the ratio allows, what
+    /// was decoded of it is charged to the scan budget, and the reader is told
+    /// to go on: the limit is kept for the walk to end with.
+    #[test]
+    fn a_member_over_the_ratio_is_cut_charged_and_left() {
+        let limits = Limits {
+            max_compression_ratio: 10,
+            max_buffer_bytes: 100,
+            ..Limits::default()
+        };
+        // 50 bytes in the container allow 50 * 11 - 1 = 549 bytes out.
+        let (got, out, budget) = stream_of_zeros(limits.clone(), 50, 10_000);
+        assert_eq!(out.unwrap(), None);
+        assert_eq!((got, budget.scanned), (549, 549));
+        let skipped = budget.skipped.expect("the member is noted");
+        assert_eq!(skipped.reason, "member 'z': compression ratio > 10");
+        // Exactly what the ratio allows is a member within it.
+        let (got, out, budget) = stream_of_zeros(limits, 50, 549);
+        assert_eq!(out.unwrap(), None);
+        assert_eq!((got, budget.scanned), (549, 549));
+        assert!(budget.skipped.is_none());
+    }
+
+    /// A member left out is the business of the container it is in: a
+    /// container in a later member of it ends with no limit of its own, and the
+    /// outer one still ends with the ratio.
+    #[cfg(feature = "zip")]
+    #[test]
+    fn a_member_left_out_is_reported_by_its_own_container() {
+        use std::io::Write;
+        let zip_of = |members: &[(&str, &[u8], ::zip::CompressionMethod)]| {
+            let mut w = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
+            for (name, body, method) in members {
+                let options =
+                    ::zip::write::SimpleFileOptions::default().compression_method(*method);
+                w.start_file(*name, options).unwrap();
+                w.write_all(body).unwrap();
+            }
+            w.finish().unwrap().into_inner()
+        };
+        let stored = ::zip::CompressionMethod::Stored;
+        let deflated = ::zip::CompressionMethod::Deflated;
+        let inner = zip_of(&[("a.txt", b"nothing", stored)]);
+        let outer = zip_of(&[
+            ("zeros.bin", &vec![0u8; 1 << 20], deflated),
+            ("inner.zip", &inner, stored),
+        ]);
+        let mut budget = Budget::new(Limits {
+            max_compression_ratio: 100,
+            max_buffer_bytes: 64 * 1024,
+            ..Limits::default()
+        });
+        let mut inner_end = None;
+        let end = walk::<()>(
+            Format::Zip,
+            &outer.as_slice(),
+            &mut budget,
+            &mut |meta, content, budget| {
+                let mut bytes = Vec::new();
+                if let Some(Member::Stream(r)) = content {
+                    let _ = r.read_to_end(&mut bytes);
+                }
+                if meta.name == "inner.zip" {
+                    let nested =
+                        walk::<()>(Format::Zip, &bytes.as_slice(), budget, &mut |_, _, _| None);
+                    inner_end = Some(nested);
+                }
+                None
+            },
+        );
+        assert!(matches!(inner_end, Some(Ok(None))), "{inner_end:?}");
+        let reason = end.unwrap_err().reason;
+        assert!(reason.contains("zeros.bin"), "{reason}");
+    }
+
+    /// The ratio acts on a member past the object limit, and not before.
+    #[test]
+    fn the_ratio_acts_only_past_the_object_limit() {
+        let limits = Limits {
+            max_compression_ratio: 10,
+            max_buffer_bytes: 1000,
+            ..Limits::default()
+        };
+        // 5 bytes in the container allow 5 * 11 - 1 = 54 out by the ratio,
+        // and 1000 by the object limit.
+        let (got, _, budget) = stream_of_zeros(limits.clone(), 5, 1000);
+        assert_eq!(got, 1000);
+        assert!(budget.skipped.is_none());
+        let (got, _, budget) = stream_of_zeros(limits, 5, 1001);
+        assert_eq!(got, 1000);
+        assert!(budget.skipped.is_some());
+    }
+
+    /// How many members of `blob` name a range, each checked to hold the bytes
+    /// its stream gives.
+    #[allow(dead_code)] // see `members`
+    fn ranges_hold_the_streams(blob: &[u8]) -> usize {
+        let fmt = crate::detect(&blob).expect("a format");
+        let mut budget = Budget::new(Limits::default());
+        let mut named = 0;
+        let mut visit = |m: &MemberMeta, content: Option<Member<'_>>, _: &mut Budget| {
+            if let (Some((off, len)), Some(Member::Stream(r))) = (m.range, content) {
+                let mut d = Vec::new();
+                r.read_to_end(&mut d).unwrap();
+                let (off, len) = (off as usize, len as usize);
+                assert_eq!(d, blob[off..off + len], "{fmt:?} member {}", m.name);
+                named += 1;
+            }
+            None::<()>
+        };
+        walk(fmt, &blob, &mut budget, &mut visit).unwrap();
+        named
+    }
+
+    /// A member that names a range is those bytes of the source, wherever
+    /// the format puts its members.
+    #[cfg(all(feature = "zip", feature = "ar", feature = "rpm"))]
+    #[test]
+    fn a_member_range_is_the_member() {
+        use std::io::Write;
+        let zip = |prefix: &[u8]| {
+            let mut w = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let stored = ::zip::write::SimpleFileOptions::default()
+                .compression_method(::zip::CompressionMethod::Stored);
+            for (name, body) in [("a", &b"first member"[..]), ("b", &[7u8; 5000][..])] {
+                w.start_file(name, stored).unwrap();
+                w.write_all(body).unwrap();
+            }
+            let deflated = ::zip::write::SimpleFileOptions::default()
+                .compression_method(::zip::CompressionMethod::Deflated);
+            w.start_file("c", deflated).unwrap();
+            w.write_all(&[1u8; 4000]).unwrap();
+            [prefix, &w.finish().unwrap().into_inner()].concat()
+        };
+        // Stored members only: a deflated one has no range.
+        assert_eq!(ranges_hold_the_streams(&zip(b"")), 2);
+        // Behind a stub, as a self-extractor has it.
+        let stub = [b"MZ".as_slice(), &[0x90; 3000]].concat();
+        let sfx = zip(&stub);
+        let mut budget = Budget::new(Limits::default());
+        let mut named = 0;
+        let mut visit = |m: &MemberMeta, content: Option<Member<'_>>, _: &mut Budget| {
+            if let (Some((off, len)), Some(Member::Stream(r))) = (m.range, content) {
+                let mut d = Vec::new();
+                r.read_to_end(&mut d).unwrap();
+                assert_eq!(d, sfx[off as usize..(off + len) as usize]);
+                named += 1;
+            }
+            None::<()>
+        };
+        walk(Format::Zip, &sfx.as_slice(), &mut budget, &mut visit).unwrap();
+        assert_eq!(named, 2);
+        let mut ar = b"!<arch>\n".to_vec();
+        for (name, data) in [("a.txt/", &b"abc"[..]), ("b.bin/", b"xy")] {
+            let mut hdr = [b' '; 60];
+            hdr[..name.len()].copy_from_slice(name.as_bytes());
+            let size = data.len().to_string();
+            hdr[48..48 + size.len()].copy_from_slice(size.as_bytes());
+            hdr[58..].copy_from_slice(b"`\n");
+            ar.extend_from_slice(&hdr);
+            ar.extend_from_slice(data);
+            if data.len() % 2 == 1 {
+                ar.push(b'\n');
+            }
+        }
+        assert_eq!(ranges_hold_the_streams(&ar), 2);
+        let rpm = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/rpm/hello.rpm"
+        ))
+        .unwrap();
+        assert!(ranges_hold_the_streams(&rpm) > 0);
     }
 
     #[cfg(feature = "ar")]
@@ -1198,5 +1664,88 @@ mod tests {
         assert!(is_budget_overflow(&err));
         assert_eq!(out.len(), 1000, "must not deliver a byte past the cap");
         assert!(br.overflowed);
+    }
+
+    /// A reader of stretches, `(is a hole, length)`, that counts the bytes of
+    /// holes it gives as a filesystem file does, and its calls.
+    struct Stretches<'a> {
+        left: std::iter::Copied<std::slice::Iter<'a, (bool, usize)>>,
+        cur: (bool, usize),
+        holes: &'a std::cell::Cell<u64>,
+        calls: usize,
+    }
+
+    impl Read for Stretches<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.cur.1 == 0 {
+                self.cur = self.left.next().unwrap_or((false, 0));
+            }
+            let n = out.len().min(self.cur.1);
+            out[..n].fill(if self.cur.0 { 0 } else { 1 });
+            self.cur.1 -= n;
+            if self.cur.0 {
+                self.holes.set(self.holes.get() + n as u64);
+            }
+            Ok(n)
+        }
+    }
+
+    /// What a `BudgetReader` of `cap` over `stretches` delivers, the number
+    /// of reads its `inner` was asked for, and how it ended.
+    fn through_holes(cap: u64, stretches: &[(bool, usize)]) -> (usize, usize, io::Result<()>) {
+        let holes = std::cell::Cell::new(0);
+        let mut inner = Stretches {
+            left: stretches.iter().copied(),
+            cur: (false, 0),
+            holes: &holes,
+            calls: 0,
+        };
+        let mut delivered = 0;
+        let end = {
+            let mut br = BudgetReader::new(&mut inner, cap);
+            br.holes = Some(&holes);
+            br.hole_cap = u64::MAX;
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match br.read(&mut buf) {
+                    Ok(0) => break Ok(()),
+                    Ok(n) => delivered += n,
+                    Err(e) => break Err(e),
+                }
+            }
+        };
+        (delivered, inner.calls, end)
+    }
+
+    /// A hole after the cap is reached goes out in reads as long as the
+    /// caller's, not a byte at a time: reads are bounded by the bytes of the
+    /// hole over the size of the buffer, not by the bytes of the hole.
+    #[test]
+    fn holes_past_the_cap_are_not_read_a_byte_at_a_time() {
+        let hole = 4 << 20;
+        // The cap reached exactly, and with a few bytes of room left.
+        for cap in [100, 105] {
+            let (delivered, calls, end) = through_holes(cap, &[(false, 100), (true, hole)]);
+            end.unwrap();
+            assert_eq!(delivered, 100 + hole, "cap {cap}");
+            assert!(calls < hole / 8192 + 10, "{calls} reads at cap {cap}");
+        }
+    }
+
+    /// Bytes that are not a hole still stop at the cap, and not one is
+    /// delivered past it.
+    #[test]
+    fn data_past_the_cap_after_a_hole_is_still_an_overflow() {
+        let (delivered, _, end) = through_holes(100, &[(false, 100), (true, 50_000), (false, 7)]);
+        assert!(is_budget_overflow(&end.unwrap_err()));
+        assert_eq!(delivered, 100 + 50_000);
+        // Read along with a hole's bytes or alone, the cap holds.
+        let (delivered, _, end) = through_holes(100, &[(false, 300)]);
+        assert!(is_budget_overflow(&end.unwrap_err()));
+        assert_eq!(delivered, 100);
+        let (delivered, _, end) = through_holes(100, &[(true, 20_000), (false, 100)]);
+        end.unwrap();
+        assert_eq!(delivered, 20_100);
     }
 }

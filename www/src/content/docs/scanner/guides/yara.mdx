@@ -74,9 +74,11 @@ first few is printed when the rules are compiled (at load, or at `--build-db`).
 
 ## Limits
 
-A file larger than `--max-object-bytes` is scanned through a block cache, and
-rules that use the `pe`, `elf` or `dotnet` modules cannot run on it: the file is
-reported `LIMITS-EXCEEDED` unless something is found. The same verdict comes
+A file larger than `--max-object-bytes` is scanned through a block cache.
+Rules that use the `pe`, `elf` or `dotnet` modules read the image of the file
+(a PE's headers and sections, an ELF's tables and contents), so only a file
+whose image is past `--max-object-bytes` cannot run them: it is reported
+`LIMITS-EXCEEDED` unless something is found. The same verdict comes
 from a pattern with more than a million matches and from a rule set that runs
 out of evaluation steps. See [Limits and tuning](/scanner/reference/limits/).
 

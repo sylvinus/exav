@@ -1,9 +1,9 @@
-//! FAT — reading the filesystem, not carving the sectors.
+//! FAT: reading the filesystem, not carving the sectors.
 //!
 //! A raw disk is a pile of sectors. Carving finds a file whose magic sits at the
 //! start of a contiguous run and misses everything else, so a **fragmented**
-//! file — one written into a hole left by a deleted file and continuing past it
-//! — comes back as disconnected pieces that will not decompress.
+//! file (one written into a hole left by a deleted file and continuing past it)
+//! comes back as disconnected pieces that will not decompress.
 //!
 //! The fixture is built to be exactly that case: three files written, the middle
 //! one deleted, then a 12 KB payload written so it lands in the 4 KB hole and

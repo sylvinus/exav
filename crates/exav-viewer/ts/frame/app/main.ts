@@ -8,6 +8,7 @@ import { archive } from "../../archive/index.js";
 // The plugins alone: `cad/index.ts` also re-exports the engine.
 import { dwg, dxf } from "../../cad/plugin.js";
 import { BUILTIN_ORDER } from "../../core/formats.js";
+import { createOfficer, createSniffer } from "../../core/sniff-engine.js";
 import type { BuiltinFormat, Controllers, FormatPlugin, Session, Status } from "../../core/types.js";
 import { createViewer } from "../../core/viewer.js";
 import { ifc } from "../../ifc/index.js";
@@ -48,9 +49,11 @@ import { asRasterError, RasterError } from "../../core/pictures.js";
 import {
   checkBytes,
   checkCommand,
+  checkHighlights,
   checkOpen,
   checkRaster,
   checkReplace,
+  checkSniff,
   checkThemeMessage,
   checkUnraster,
   checkWatch,
@@ -78,6 +81,7 @@ import {
   type StatusSnapshot,
 } from "../protocol.js";
 import { portRanges, type PortRanges } from "./ranges.js";
+import { sniffed } from "./sniff.js";
 import { portTree, type PortTree } from "./tree.js";
 import { installWorkers } from "./workers.js";
 
@@ -211,6 +215,12 @@ function drop(relay: Relay) {
 
 /** Plain data only: whatever else a store holds stays here. */
 function snapshot<K extends ControllerKey>(key: K, value: unknown, from: number): Snapshots[K] {
+  if (key === "highlights") {
+    // The host has the labels, colours and quotes: they are its own.
+    const h = value as ReturnType<NonNullable<Controllers["highlights"]>["get"]>;
+    const out: Snapshots["highlights"] = { items: h.items.map(({ id, state, page, rects }) => ({ id, state, page, rects })), current: h.current };
+    return out as Snapshots[K];
+  }
   if (key !== "archive") return value as Snapshots[K];
   const a = value as ReturnType<NonNullable<Controllers["archive"]>["get"]>;
   let relay = members.get(from);
@@ -391,6 +401,14 @@ async function run(m: CommandMessage): Promise<void> {
     case "sheets.select":
       if (isInt(a)) await c.sheets?.select(a);
       return;
+    case "highlights.goTo":
+      if (typeof a === "string") c.highlights?.goTo(a);
+      return;
+    case "highlights.set": {
+      const list = checkHighlights(a);
+      if (list) c.highlights?.set(list);
+      return;
+    }
   }
 }
 
@@ -506,13 +524,25 @@ const ranges = new Set<PortRanges>();
 let around: PortTree | null = null;
 
 function receive(data: unknown) {
+  // What a file is, asked before the first is opened and before each next one.
+  const sniffing = checkSniff(data, BUILTIN_ORDER);
+  if (sniffing) {
+    void sniffed(sniffing, createSniffer(sniffing.sniff.timeoutMs), shipped, createOfficer(sniffing.sniff.timeoutMs)).then((format) => post({ type: "sniffed", call: sniffing.call, format }));
+    return;
+  }
   if (!opened) {
     const open = checkOpen(data, BUILTIN_ORDER);
     if (!open) return;
     opened = true;
     applyTheme(open.theme);
     const formats = shipped ? open.formats.filter((f) => shipped.has(f)) : open.formats;
-    const viewer = createViewer({ plugins: plugins(formats, open.options, open.source), assetBase: new URL("./exav-viewer/", base).href });
+    const viewer = createViewer({
+      plugins: plugins(formats, open.options, open.source),
+      assetBase: new URL("./exav-viewer/", base).href,
+      sniffTimeoutMs: open.options.sniff?.timeoutMs,
+      sniffBytes: open.options.sniff?.bytes,
+      ...open.options.limits,
+    });
     const host = document.getElementById("root")!;
     const { name, type, path, format } = open.file;
     const s = open.source;
@@ -523,7 +553,17 @@ function receive(data: unknown) {
       source = { ranges: first };
     } else source = s.kind === "url" ? { url: s.url } : { blob: s.blob };
     if (open.tree) around = portTree(post, open.tree);
-    const session = viewer.mount(host, { id: "file", name, type, path, ...(format && { format }), source, ...(around && { tree: around.tree }) });
+    const session = viewer.mount(host, {
+      id: "file",
+      name,
+      type,
+      path,
+      ...(format && { format }),
+      source,
+      ...(around && { tree: around.tree }),
+      ...(open.highlights && { highlights: open.highlights }),
+      ...(open.focusHighlight !== undefined && { focusHighlight: open.focusHighlight }),
+    });
     root = session;
     start({ id: 0, session, stop: () => {} });
     addEventListener("resize", () => session.resize());

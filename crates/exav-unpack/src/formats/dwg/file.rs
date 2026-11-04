@@ -34,11 +34,7 @@ impl Sections<'_> {
         }
     }
 
-    fn section(
-        &mut self,
-        name: &str,
-        problems: &mut Vec<String>,
-    ) -> Result<Option<Vec<u8>>, Error> {
+    fn section(&mut self, name: &str, problems: &mut Problems) -> Result<Option<Vec<u8>>, Error> {
         match self {
             Sections::R2004(c) => c.section(name, problems),
             Sections::R2007(c) => c.section(name, problems),
@@ -66,6 +62,40 @@ const PREVIEW_START: [u8; 16] = [
 /// What [`Dwg::open`] lets the compressed sections of an R2004 to R2018
 /// file decompress to, together.
 pub const DEFAULT_MAX_BYTES: u64 = 1 << 30;
+
+/// The damage found while a file is opened, as notes.
+///
+/// A note is either data that was left out, because it could not be read
+/// (the default: [`Problems::lost`]), or a check value that does not match
+/// data that was read and used all the same ([`Problems::mismatch`]). A
+/// reader that goes on to describe the drawing says both
+/// ([`Dwg::problems`]); one that judges whether the drawing was examined
+/// whole looks at the first ([`Dwg::left_out`]).
+#[derive(Clone, Debug, Default)]
+pub(super) struct Problems {
+    pub(super) notes: Vec<String>,
+    pub(super) lost: Vec<String>,
+}
+
+impl Problems {
+    /// Data that could not be read and is left out of what the file gives.
+    pub(super) fn lost(&mut self, what: impl Into<String>) {
+        let what = what.into();
+        self.notes.push(what.clone());
+        self.lost.push(what);
+    }
+
+    /// A CRC or checksum that does not match data that was used as read.
+    pub(super) fn mismatch(&mut self, what: impl Into<String>) {
+        self.notes.push(what.into());
+    }
+
+    /// Take the notes of `other` after these.
+    pub(super) fn append(&mut self, other: &mut Problems) {
+        self.notes.append(&mut other.notes);
+        self.lost.append(&mut other.lost);
+    }
+}
 
 /// The CRC-16 of spec 2.14.1 (its table is the reflected 0xA001 one).
 pub(crate) fn crc8(seed: u16, data: &[u8]) -> u16 {
@@ -211,7 +241,10 @@ pub struct Dwg<'a> {
     /// The AcDb:VBAProject section (R2004 on, spec 15), when the file has
     /// one: its 16-byte header and the project data (an OLE2 compound file).
     vba: Option<Vec<u8>>,
-    problems: Vec<String>,
+    /// The file has an AcDb:VBAProject section, and it is encrypted: not
+    /// read.
+    vba_encrypted: bool,
+    problems: Problems,
 }
 
 impl<'a> Dwg<'a> {
@@ -246,7 +279,8 @@ impl<'a> Dwg<'a> {
             classes: Vec::new(),
             map: Vec::new(),
             vba: None,
-            problems: Vec::new(),
+            vba_encrypted: false,
+            problems: Problems::default(),
         };
         if version <= Version::R2000 {
             dwg.locators = locators(data).ok_or(Error::NotDwg)?;
@@ -256,14 +290,14 @@ impl<'a> Dwg<'a> {
                 let classes = data.get(start..).unwrap_or(&[]);
                 dwg.classes = read_classes(classes, version, 0, &mut dwg.problems);
             } else {
-                dwg.problem("no classes section");
+                dwg.problems.lost("no classes section");
             }
             if let Some((start, size)) = dwg.locator(2) {
                 let end = start.saturating_add(size).min(data.len());
                 let map = data.get(start..end).unwrap_or(&[]);
                 dwg.map = read_object_map(map, data.len(), &mut dwg.problems);
             } else {
-                dwg.problem("no object map");
+                dwg.problems.lost("no object map");
             }
             dwg.measurement = dwg.r15_measurement();
         } else {
@@ -279,7 +313,7 @@ impl<'a> Dwg<'a> {
 
     /// R2004 on: the sections by name (spec 4.5; 5.2 for R2007).
     fn open_sections(&mut self, max_bytes: u64) -> Result<(), Error> {
-        let mut problems = Vec::new();
+        let mut problems = Problems::default();
         let mut c = if self.version == Version::R2007 {
             Sections::R2007(r2007::Container::open(self.data, max_bytes, &mut problems)?)
         } else {
@@ -287,9 +321,7 @@ impl<'a> Dwg<'a> {
         };
         for name in ["AcDb:Header", "AcDb:AcDbObjects", "AcDb:Classes"] {
             if c.is_encrypted(name) {
-                return Err(Error::Damaged(format!(
-                    "section {name} is encrypted (a password-protected drawing)"
-                )));
+                return Err(Error::Encrypted);
             }
         }
         let header = c
@@ -302,7 +334,9 @@ impl<'a> Dwg<'a> {
         let classes = c.section("AcDb:Classes", &mut problems)?;
         let template = c.section("AcDb:Template", &mut problems)?;
         // Optional, and rare: a VBA-enabled drawing (spec 15).
-        if c.has("AcDb:VBAProject") && !c.is_encrypted("AcDb:VBAProject") {
+        if c.is_encrypted("AcDb:VBAProject") {
+            self.vba_encrypted = true;
+        } else if c.has("AcDb:VBAProject") {
             self.vba = c.section("AcDb:VBAProject", &mut problems)?;
         }
         self.problems.append(&mut problems);
@@ -314,13 +348,13 @@ impl<'a> Dwg<'a> {
                 let hi = self.has_high_size();
                 self.classes = read_classes(&classes, self.version, hi, &mut self.problems);
             }
-            None => self.problem("no AcDb:Classes section"),
+            None => self.problems.lost("no AcDb:Classes section"),
         }
         match handles {
             Some(handles) => {
                 self.map = read_object_map(&handles, objects.len(), &mut self.problems);
             }
-            None => self.problem("no AcDb:Handles section"),
+            None => self.problems.lost("no AcDb:Handles section"),
         }
         self.objects = Cow::Owned(objects);
         self.measurement = template.and_then(|t| template_measurement(&t, self.version));
@@ -389,9 +423,23 @@ impl<'a> Dwg<'a> {
         &self.locators
     }
 
-    /// Damage found while opening the file: data that was left out.
+    /// Damage found while opening the file: data that was left out, and
+    /// checksums that do not match data that was used as read.
     pub fn problems(&self) -> &[String] {
-        &self.problems
+        &self.problems.notes
+    }
+
+    /// The part of [`Dwg::problems`] that is data left out: what could not
+    /// be read, and so was not examined. Empty when everything the file
+    /// locates was read (whatever its checksums said).
+    pub fn left_out(&self) -> &[String] {
+        &self.problems.lost
+    }
+
+    /// Whether the file has a VBA project section (R2004 on) that is
+    /// encrypted, and so was not read ([`Dwg::vba_project`] is `None`).
+    pub fn vba_encrypted(&self) -> bool {
+        self.vba_encrypted
     }
 
     /// The file.
@@ -540,10 +588,6 @@ impl<'a> Dwg<'a> {
         (l.offset != 0).then_some((start, size))
     }
 
-    fn problem(&mut self, what: impl Into<String>) {
-        self.problems.push(what.into());
-    }
-
     /// The CRC after the locators (spec 3.2.6), XORed with a constant that
     /// depends on their number.
     fn check_locator_crc(&mut self) {
@@ -561,7 +605,8 @@ impl<'a> Dwg<'a> {
             _ => return,
         };
         if crc8(0, head) ^ magic != u16::from_le_bytes([stored[0], stored[1]]) {
-            self.problem("the file header's CRC does not match");
+            self.problems
+                .mismatch("the file header's CRC does not match");
         }
     }
 
@@ -580,7 +625,8 @@ impl<'a> Dwg<'a> {
         let begin = start.saturating_add(20);
         let end = begin.saturating_add(size).min(self.data.len());
         if end < begin.saturating_add(size) {
-            self.problem("the header variables run past the end of the file");
+            self.problems
+                .lost("the header variables run past the end of the file");
         }
         self.header_data = (begin as u64 * 8, end as u64 * 8);
         Ok(())
@@ -604,28 +650,26 @@ fn template_measurement(t: &[u8], version: Version) -> Option<i16> {
 /// unknown long, R2007 on the data's size in bits, then the highest class
 /// number and three fixed values before the classes, whose strings R2007
 /// moves to a string stream (spec 5.8).
-fn read_classes(
-    data: &[u8],
-    version: Version,
-    high: usize,
-    problems: &mut Vec<String>,
-) -> Vec<Class> {
+fn read_classes(data: &[u8], version: Version, high: usize, problems: &mut Problems) -> Vec<Class> {
     let mut out = Vec::new();
     if slice(data, 0, 16) != Some(&CLASSES_START[..]) {
-        problems.push("the classes do not start with their sentinel".into());
+        problems.lost("the classes do not start with their sentinel");
         return out;
     }
     let Some(size) = le32(data, 16) else {
-        problems.push("the classes section is cut short".into());
+        problems.lost("the classes section is cut short");
         return out;
     };
     let begin = 20 + high;
     let end = (begin as u64 + u64::from(size)) * 8;
+    if end > data.len() as u64 * 8 {
+        problems.lost("the classes section is cut short");
+    }
     let mut b = Bits::window(data, begin as u64 * 8, end);
     let mut strings = None;
     if version >= Version::R2007 {
         let Ok(bits) = b.rl() else {
-            problems.push("the classes section is cut short".into());
+            problems.lost("the classes section is cut short");
             return out;
         };
         let base = begin as u64 * 8;
@@ -637,7 +681,7 @@ fn read_classes(
                 strings = s;
             }
             Err(_) => {
-                problems.push("the classes' strings cannot be found".into());
+                problems.lost("the classes' strings cannot be found");
                 return out;
             }
         }
@@ -652,7 +696,7 @@ fn read_classes(
             Ok(())
         })();
         if head.is_err() {
-            problems.push("the classes section is cut short".into());
+            problems.lost("the classes section is cut short");
             return out;
         }
     }
@@ -664,7 +708,7 @@ fn read_classes(
         match read_class(&mut b, &mut strings, unicode, version) {
             Ok(c) => out.push(c),
             Err(_) => {
-                problems.push("a class runs past the end of the classes section".into());
+                problems.lost("a class runs past the end of the classes section");
                 break;
             }
         }
@@ -706,14 +750,14 @@ fn read_class(
 /// big-endian size, handle and offset deltas as modular chars, and a CRC.
 /// Deltas start from zero in each section. Offsets past `limit` are left
 /// out.
-fn read_object_map(data: &[u8], limit: usize, problems: &mut Vec<String>) -> Vec<(u64, usize)> {
+fn read_object_map(data: &[u8], limit: usize, problems: &mut Problems) -> Vec<(u64, usize)> {
     let mut at = 0usize;
     let mut map = Vec::new();
     // Counted and said once: a note a piece would be the size of the map again.
     let mut outside = 0usize;
     loop {
         let Some(s) = slice(data, at, 2) else {
-            problems.push("the object map is cut short".into());
+            problems.lost("the object map is cut short");
             break;
         };
         let section = usize::from(u16::from_be_bytes([s[0], s[1]]));
@@ -721,14 +765,14 @@ fn read_object_map(data: &[u8], limit: usize, problems: &mut Vec<String>) -> Vec
             break;
         }
         let Some(body) = slice(data, at.saturating_add(2), section - 2) else {
-            problems.push("an object map section runs past its end".into());
+            problems.lost("an object map section runs past its end");
             break;
         };
         let mut b = Bits::new(body);
         let (mut handle, mut offset) = (0u64, 0i64);
         while b.remaining() >= 16 {
             let (Ok(dh), Ok(dl)) = (b.umc(), b.mc()) else {
-                problems.push("an object map entry is cut short".into());
+                problems.lost("an object map entry is cut short");
                 break;
             };
             handle = handle.wrapping_add(dh);
@@ -741,11 +785,14 @@ fn read_object_map(data: &[u8], limit: usize, problems: &mut Vec<String>) -> Vec
         // The size covers itself and the entries; the CRC follows.
         at = at.saturating_add(section + 2);
         if at >= data.len() {
+            // The last section is an empty one, which the check above ends
+            // on: a map that stops short of it was cut.
+            problems.lost("the object map has no end");
             break;
         }
     }
     if outside > 0 {
-        problems.push(format!("{outside} objects are outside the objects"));
+        problems.lost(format!("{outside} objects are outside the objects"));
     }
     // Later entries of a handle replace earlier ones.
     map.reverse();
@@ -850,11 +897,97 @@ mod tests {
         }
         data.extend_from_slice(&[0, 0]); // the CRC
         data.extend_from_slice(&[0, 2]); // a section of nothing ends the map
-        let mut problems = Vec::new();
+        let mut problems = Problems::default();
         let map = read_object_map(&data, 0, &mut problems);
         assert!(map.is_empty());
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].starts_with("1000 "), "{problems:?}");
+        assert_eq!(problems.lost.len(), 1, "{problems:?}");
+        assert!(problems.lost[0].starts_with("1000 "), "{problems:?}");
+    }
+
+    /// One object map section of one entry (handle +1, offset +0), and its
+    /// CRC; the empty section that ends a map is `[0, 2]`.
+    const ONE_ENTRY: [u8; 6] = [0x00, 0x04, 0x01, 0x00, 0x00, 0x00];
+
+    #[test]
+    fn an_object_map_that_ends_has_no_note() {
+        let mut data = ONE_ENTRY.to_vec();
+        data.extend_from_slice(&[0, 2]);
+        let mut problems = Problems::default();
+        assert_eq!(read_object_map(&data, 10, &mut problems), [(1, 0)]);
+        assert_eq!(problems.notes, Vec::<String>::new());
+    }
+
+    /// A map that stops where a section would start has lost its tail, as
+    /// well as the empty section that ends one.
+    #[test]
+    fn an_object_map_with_no_end_is_left_out() {
+        let mut problems = Problems::default();
+        assert_eq!(read_object_map(&ONE_ENTRY, 10, &mut problems), [(1, 0)]);
+        assert_eq!(problems.lost, ["the object map has no end"]);
+    }
+
+    #[test]
+    fn an_object_map_cut_inside_a_size_is_left_out() {
+        let mut data = ONE_ENTRY.to_vec();
+        data.push(0);
+        let mut problems = Problems::default();
+        read_object_map(&data, 10, &mut problems);
+        assert_eq!(problems.lost, ["the object map is cut short"]);
+    }
+
+    #[test]
+    fn an_object_map_section_running_past_its_end_is_left_out() {
+        // A section of 32 bytes, 2 of them there.
+        let mut problems = Problems::default();
+        let map = read_object_map(&[0x00, 0x20, 0x01, 0x00], 10, &mut problems);
+        assert!(map.is_empty());
+        assert_eq!(problems.lost, ["an object map section runs past its end"]);
+    }
+
+    #[test]
+    fn an_object_map_entry_cut_short_is_left_out() {
+        // A handle delta whose bytes all say another follows.
+        let data = [0x00, 0x04, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x02];
+        let mut problems = Problems::default();
+        read_object_map(&data, 10, &mut problems);
+        assert_eq!(problems.lost, ["an object map entry is cut short"]);
+    }
+
+    #[test]
+    fn classes_that_do_not_start_with_their_sentinel_are_left_out() {
+        let mut problems = Problems::default();
+        let classes = read_classes(&[0u8; 40], Version::R2004, 0, &mut problems);
+        assert!(classes.is_empty());
+        assert_eq!(
+            problems.lost,
+            ["the classes do not start with their sentinel"]
+        );
+    }
+
+    /// The classes section's own size is more than the bytes there.
+    #[test]
+    fn a_classes_section_past_its_data_is_left_out() {
+        let mut section = CLASSES_START.to_vec();
+        section.extend_from_slice(&1000u32.to_le_bytes());
+        section.extend_from_slice(&[0x80, 0x00, 0x20, 0, 0]);
+        let mut problems = Problems::default();
+        read_classes(&section, Version::R2004, 0, &mut problems);
+        assert_eq!(problems.lost, ["the classes section is cut short"]);
+    }
+
+    #[test]
+    fn a_class_running_past_the_classes_is_left_out() {
+        // The head, then bits that start a class whose name is 256 long.
+        let mut section = CLASSES_START.to_vec();
+        section.extend_from_slice(&7u32.to_le_bytes());
+        section.extend_from_slice(&[0x80, 0x00, 0x20, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0]);
+        let mut problems = Problems::default();
+        let classes = read_classes(&section, Version::R2004, 0, &mut problems);
+        assert!(classes.is_empty());
+        assert_eq!(
+            problems.lost,
+            ["a class runs past the end of the classes section"]
+        );
     }
 
     #[test]
@@ -964,9 +1097,9 @@ mod tests {
         section.extend_from_slice(&(body.len() as u32).to_le_bytes());
         section.extend_from_slice(&body);
         section.extend_from_slice(&[0; 2]);
-        let mut problems = Vec::new();
+        let mut problems = Problems::default();
         let classes = read_classes(&section, Version::R2004, 0, &mut problems);
-        assert_eq!(problems, Vec::<String>::new());
+        assert_eq!(problems.notes, Vec::<String>::new());
         let read: Vec<(i16, String)> = classes.iter().map(|c| (c.number, c.name())).collect();
         assert_eq!(
             read,

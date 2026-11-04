@@ -14,14 +14,15 @@ fuzz_target!(|data: &[u8]| {
     }
     let unp = u64::from_le_bytes(data[..8].try_into().unwrap());
     let win_bits = u32::from_le_bytes(data[8..12].try_into().unwrap());
-    // Cap declared size so the decoder terminates fast on valid inputs.
     let unp = unp.min(64 * 1024);
     // win_bits must be in 10..=24 for the PPMd allocator.
     let win_bits = 10 + (win_bits % 15);
     let packed = &data[16..];
 
     let mut limits = Limits::default();
-    limits.max_extracted_bytes = 8 * 1024 * 1024;
+    // A member decodes to its stream's end, past the size it declares: the
+    // budget is what keeps a run short.
+    limits.max_extracted_bytes = 64 * 1024;
     limits.max_buffer_bytes = 4 * 1024 * 1024;
     limits.max_compression_ratio = u64::MAX;
     limits.max_members = 100;

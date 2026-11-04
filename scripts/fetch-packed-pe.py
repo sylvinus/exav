@@ -5,7 +5,7 @@ The malware corpus is a poor test set for a packer unpacker: current malware
 uses UPX, MPRESS and the virtualizing protectors, so the older compressors an
 unpacker also has to handle (ASPack, FSG, MEW, NsPack, PECompact, PEtite,
 RLPack, TELock, WinUpack, Yoda) simply are not in it. This pulls a few samples
-per packer from the packing-box dataset — ordinary Windows utilities, packed —
+per packer from the packing-box dataset (ordinary Windows utilities, packed),
 which gives the emulator ground truth it can be checked against: the same
 programs are available unpacked in the dataset's `not-packed` folder.
 
@@ -28,8 +28,8 @@ RAW = f"https://raw.githubusercontent.com/{REPO}/main"
 OUT = corpus_dir("packers")
 
 # Packers worth emulating. The virtualizers (Themida, Enigma Virtual Box) are
-# deliberately absent: they are never emulated — there is no original code in
-# memory to recover — and samples for the *reporting* path come from
+# deliberately absent: they are never emulated (there is no original code in
+# memory to recover), and samples for the *reporting* path come from
 # MalwareBazaar, where they are plentiful.
 DEFAULT_PACKERS = [
     "ASPack", "FSG", "MEW", "MPRESS", "NSPack", "PECompact", "PEtite", "RLPack",

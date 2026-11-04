@@ -73,7 +73,13 @@ struct BitReader {
     in_addr: usize,
 }
 
+/// A stream that does not decode: damage.
 fn err(reason: &str) -> LimitHit {
+    LimitHit::corrupt(format!("rar5: {reason}"))
+}
+
+/// A stream that decodes to more than the scan's budget allows.
+fn over(reason: &str) -> LimitHit {
     LimitHit::new(format!("rar5: {reason}"))
 }
 
@@ -254,7 +260,17 @@ struct Unpacker {
     bit_size: u8,
     // output
     out: Vec<u8>,
+    /// Bytes of the member put out so far; a streamed member's `out` is
+    /// drained as it goes.
+    pushed: u64,
     cap: u64,
+    /// The largest window the member's dictionary allows, and the largest the
+    /// caller allows: a window sized to what the headers declare grows
+    /// towards these when the stream goes on past it ([`Unpacker::make_room`]).
+    dict: u64,
+    window_limit: u64,
+    /// The window had to grow past `window_limit`.
+    over_limit: bool,
 }
 
 impl Unpacker {
@@ -283,15 +299,47 @@ impl Unpacker {
         let cmask = self.window_mask as u64;
         let write_ptr = self.write_ptr;
         let dist = dist as u64;
+        // A distance past the start of the stream: unrar writes the whole
+        // match as zeros, the part past the start included.
+        let zeros = dist > write_ptr;
         for i in 0..len as u64 {
             let write_idx = ((write_ptr + i) & cmask) as usize;
             let read_idx = ((write_ptr + i).wrapping_sub(dist) & cmask) as usize;
-            self.window_buf[write_idx] = self.window_buf[read_idx];
+            self.window_buf[write_idx] = if zeros { 0 } else { self.window_buf[read_idx] };
         }
         self.write_ptr += len as u64;
         Ok(())
     }
+
+    /// Double a window smaller than the dictionary before the next decode
+    /// step can wrap it: a stream longer than its headers declare reaches
+    /// back as far as the dictionary. Nothing has wrapped yet, so every byte
+    /// stays where it is.
+    fn make_room(&mut self) -> Result<(), LimitHit> {
+        let mut size = self.window_size as u64;
+        // A step stops past half the window, after one more match.
+        while size < self.dict && self.write_ptr + size / 2 + MAX_MATCH + 1 > size {
+            size = (size * 2).min(self.dict);
+        }
+        if size == self.window_size as u64 {
+            return Ok(());
+        }
+        if size > self.window_limit {
+            self.over_limit = true;
+            return Err(over(
+                "the stream needs a window over the buffer limit (--max-object-bytes)",
+            ));
+        }
+        let size = usize::try_from(size).map_err(|_| over("window too large"))?;
+        self.window_buf.resize(size, 0);
+        self.window_mask = size - 1;
+        self.window_size = size;
+        Ok(())
+    }
 }
+
+/// The longest match: length code 43 (4,097 bytes) and 3 for a far distance.
+const MAX_MATCH: u64 = 4100;
 
 /// decode_code_length: derive a match/length value from a slot code.
 fn decode_code_length(br: &mut BitReader, p: &[u8], code: u16) -> i32 {
@@ -472,6 +520,9 @@ fn parse_filter_data(br: &mut BitReader, p: &[u8]) -> u32 {
     data
 }
 
+/// Filters a stream may have waiting for their block.
+const MAX_QUEUED_FILTERS: usize = 8192;
+
 /// parse_filter: read a filter descriptor (code 256) and queue it.
 fn parse_filter(u: &mut Unpacker, br: &mut BitReader, p: &[u8]) -> Result<(), LimitHit> {
     let block_start = parse_filter_data(br, p);
@@ -511,6 +562,11 @@ fn parse_filter(u: &mut Unpacker, br: &mut BitReader, p: &[u8]) -> Result<(), Li
         0
     };
 
+    // An encoder queues a few; more is damage, as in RAR3, and each would
+    // hold memory no budget counts.
+    if u.filters.len() >= MAX_QUEUED_FILTERS {
+        return Err(err("too many filters"));
+    }
     u.filters.push_back(FilterInfo {
         kind,
         channels,
@@ -622,9 +678,10 @@ fn push_window_data(u: &mut Unpacker, begin: u64, end: u64) -> Result<(), LimitH
         return Ok(());
     }
     let total = end - begin;
-    if u.out.len() as u64 + total > u.cap {
-        return Err(err("output exceeds budget"));
+    if u.pushed + total > u.cap {
+        return Err(over("output exceeds budget"));
     }
+    u.pushed += total;
     let wmask = u.window_mask as u64;
     let b = (begin & wmask) as usize;
     let e = (end & wmask) as usize;
@@ -719,9 +776,10 @@ fn run_filter(u: &mut Unpacker, flt: &FilterInfo) -> Result<(), LimitHit> {
         }
     }
 
-    if u.out.len() as u64 + blen as u64 > u.cap {
-        return Err(err("filtered output exceeds budget"));
+    if u.pushed + blen as u64 > u.cap {
+        return Err(over("filtered output exceeds budget"));
     }
+    u.pushed += blen as u64;
     u.out.extend_from_slice(&out);
     u.last_write_ptr += blen as u64;
     Ok(())
@@ -756,29 +814,124 @@ fn apply_filters(u: &mut Unpacker) -> Result<bool, LimitHit> {
 /// wrong bytes rather than an error, which is why every member's output is
 /// checked against the CRC the archive records.
 pub struct Unpacker50 {
-    u: Unpacker,
+    /// Boxed so that a walk holding this decoder across the visitor keeps the
+    /// tables out of its stack frame.
+    u: Box<Unpacker>,
+    /// The member [`Self::start_member`] started.
+    stream: Option<Stream5>,
+}
+
+/// Bytes past a block's end kept with it: the bit reader looks a few bytes
+/// ahead of the last symbol it decodes, and sees there what the whole-input
+/// path sees.
+const BLOCK_LOOKAHEAD: usize = 64;
+
+/// A streamed member's place in its packed data.
+struct Stream5 {
+    /// Packed bytes read from the source and not yet behind the current
+    /// block, from `pend_at` in the member's packed data.
+    pending: Vec<u8>,
+    pend_at: u64,
+    /// The member's packed size, as much of it as the source holds.
+    packed_len: u64,
+    /// Where the next block header is.
+    consumed: u64,
+    /// The current block from its data, and bytes after it up to
+    /// [`BLOCK_LOOKAHEAD`]. Reads past it are zeros, as past the padded input.
+    block: Vec<u8>,
+    br: BitReader,
+    out_pos: usize,
+    done: bool,
+}
+
+impl Stream5 {
+    /// The packed bytes `[from, to)` (fewer where the data ends), reading
+    /// from `src` as far as `to`.
+    fn bytes(&mut self, src: &mut dyn std::io::Read, from: u64, to: u64) -> Vec<u8> {
+        let to = to.min(self.packed_len);
+        while self.pend_at + (self.pending.len() as u64) < to {
+            let at = self.pending.len();
+            let want = (to - self.pend_at - at as u64).min(1 << 20) as usize;
+            self.pending.resize(at + want, 0);
+            let n = loop {
+                match src.read(&mut self.pending[at..]) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    // The walk reports a source that failed.
+                    Err(_) => break 0,
+                }
+            };
+            self.pending.truncate(at + n);
+            if n == 0 {
+                // What the source does not give reads as zeros.
+                self.packed_len = self.pend_at + self.pending.len() as u64;
+                break;
+            }
+        }
+        let a = from.saturating_sub(self.pend_at) as usize;
+        let b = to.saturating_sub(self.pend_at) as usize;
+        self.pending
+            .get(a.min(self.pending.len())..b.min(self.pending.len()))
+            .unwrap_or(&[])
+            .to_vec()
+    }
+
+    /// Forget the packed bytes before `at`.
+    fn drop_before(&mut self, at: u64) {
+        let n = (at.saturating_sub(self.pend_at) as usize).min(self.pending.len());
+        self.pending.drain(..n);
+        self.pend_at += n as u64;
+    }
+}
+
+/// Run what filters can run and move what is ready of the window to `out`.
+fn drain_output(u: &mut Unpacker) -> Result<(), LimitHit> {
+    loop {
+        if apply_filters(u)? {
+            continue;
+        }
+        let max_end_pos = match u.filters.front() {
+            Some(flt) => flt.block_start.min(u.write_ptr),
+            None => u.write_ptr,
+        };
+        if max_end_pos > u.last_write_ptr {
+            let lw = u.last_write_ptr;
+            push_window_data(u, lw, max_end_pos)?;
+            u.last_write_ptr = max_end_pos;
+        }
+        return Ok(());
+    }
+}
+
+/// Where a decode stands: an iteration that changes none of it made no
+/// progress, and would make none again.
+type Progress = (u64, usize, i32, u64, u64, usize, bool);
+
+fn progress(u: &Unpacker, br: &BitReader, consumed: u64) -> Progress {
+    (
+        consumed,
+        br.in_addr,
+        br.bit_addr,
+        u.write_ptr,
+        u.last_write_ptr,
+        u.filters.len(),
+        u.block_parsing_finished,
+    )
 }
 
 impl Unpacker50 {
-    /// A decoder for the member whose file header holds `comp_info`: its window
-    /// and its algorithm version. All members of a solid group share the
-    /// window, so it is sized once, from the first member.
-    pub fn for_member(comp_info: u64) -> Result<Self, LimitHit> {
-        let mut dec = Self::new(window_size_from_comp_info(comp_info))?;
-        if rar7_algorithm(comp_info) {
-            dec.u.dist_codes = HUFF_DCX;
-        }
-        Ok(dec)
-    }
-
     /// A decoder for the RAR 5.0 algorithm on a `window_size` window.
+    ///
+    /// Not inlined: the tables are built in this call's frame, which a caller
+    /// that recurses into the visitor must not inherit.
+    #[inline(never)]
     pub fn new(window_size: u64) -> Result<Self, LimitHit> {
         if window_size == 0 || window_size > MAX_WINDOW_SIZE || !window_size.is_power_of_two() {
             return Err(err("invalid window size"));
         }
         let ws = window_size as usize;
         Ok(Unpacker50 {
-            u: Unpacker {
+            u: Box::new(Unpacker {
                 window_buf: vec![0u8; ws],
                 window_mask: ws - 1,
                 window_size: ws,
@@ -801,13 +954,26 @@ impl Unpacker50 {
                 last_block: false,
                 bit_size: 0,
                 out: Vec::new(),
+                pushed: 0,
                 cap: 0,
-            },
+                dict: window_size,
+                window_limit: window_size,
+                over_limit: false,
+            }),
+            stream: None,
         })
     }
 
-    /// Decode one member. `solid` says the member continues the previous one's
-    /// stream, in which case the window and tables are kept.
+    /// Whether the stream needed a window over the limit the decoder was
+    /// given.
+    pub fn window_over_limit(&self) -> bool {
+        self.u.over_limit
+    }
+
+    /// Decode one member, its whole stream: the bytes it holds past its
+    /// declared size too, and as far as it goes when it ends before. `solid` says the member continues the previous one's
+    /// stream, in which case the window and tables are kept. A declared size,
+    /// or output, over what the budget has left is a limit.
     pub fn member(
         &mut self,
         packed: &[u8],
@@ -815,31 +981,12 @@ impl Unpacker50 {
         solid: bool,
         budget: &mut Budget,
     ) -> Result<Vec<u8>, LimitHit> {
-        // Bound output to the budget. We refuse members whose declared unpacked
-        // size already exceeds what the budget allows.
         let cap = budget.reserve()?;
         if unpacked_size > cap {
-            return Err(err("declared size exceeds budget"));
+            return Err(over("declared size exceeds budget"));
         }
-        if !solid {
-            // A fresh stream: forget the previous member's window position, its
-            // repeat-distance history and any half-run filters.
-            self.u.write_ptr = 0;
-            self.u.last_write_ptr = 0;
-            self.u.last_len = 0;
-            self.u.dist_cache = [0; 4];
-            self.u.last_block_start = 0;
-            self.u.last_block_length = 0;
-            self.u.window_buf.fill(0);
-        }
-        self.u.file_start = self.u.last_write_ptr;
-        self.u.filters.clear();
-        self.u.block_parsing_finished = true;
-        self.u.last_block = false;
-        self.u.out = Vec::new();
-        self.u.cap = unpacked_size;
+        self.reset_for(cap, solid);
         let u = &mut self.u;
-        let _ = cap;
 
         // Pad the input so the bit reader can always read 4 bytes past in_addr.
         let mut input = Vec::with_capacity(packed.len() + 8);
@@ -851,17 +998,8 @@ impl Unpacker50 {
         // Slice covering the current block's data (set when a block starts).
         let mut block_off: usize = 0;
 
-        let max_iters: u64 = unpacked_size.saturating_mul(2) + (packed.len() as u64) * 4 + 1024;
-        let mut iters: u64 = 0;
-
-        while u.out.len() as u64 + (u.write_ptr - u.last_write_ptr) < unpacked_size
-            || !u.filters.is_empty()
-        {
-            iters += 1;
-            if iters > max_iters {
-                return Err(err("decode made no progress"));
-            }
-
+        loop {
+            let before = progress(u, &br, consumed as u64);
             if u.block_parsing_finished {
                 if consumed >= packed.len() {
                     break;
@@ -895,42 +1033,178 @@ impl Unpacker50 {
                 consumed = data_start + u.cur_block_size;
             }
 
+            u.make_room()?;
             let finished = {
                 let p = &input[block_off..];
                 do_uncompress_block(u, &mut br, p)?
             };
             u.block_parsing_finished = finished;
-
-            // Drain output: run filters / push window data, looping until no more
-            // progress can be made without further decoding.
-            loop {
-                if apply_filters(u)? {
-                    continue;
-                }
-                // No filter could run. Determine how far we can safely write.
-                let max_end_pos = match u.filters.front() {
-                    Some(flt) => flt.block_start.min(u.write_ptr),
-                    None => u.write_ptr,
-                };
-                if max_end_pos > u.last_write_ptr {
-                    let lw = u.last_write_ptr;
-                    push_window_data(u, lw, max_end_pos)?;
-                    u.last_write_ptr = max_end_pos;
-                }
-                break;
-            }
+            drain_output(u)?;
 
             if finished && u.last_block && u.filters.is_empty() {
                 break;
             }
-            if u.out.len() as u64 >= unpacked_size {
-                break;
+            if progress(u, &br, consumed as u64) == before {
+                return Err(err("decode made no progress"));
             }
         }
 
-        u.out.truncate(unpacked_size as usize);
         budget.commit(u.out.len() as u64);
         Ok(std::mem::take(&mut u.out))
+    }
+
+    /// A decoder on a window of `window` bytes, a power of two, for the
+    /// algorithm `comp_info` names, the caller having charged the window to
+    /// its limit. The window grows towards the dictionary when a stream goes
+    /// on past it, up to `limit` bytes.
+    pub fn with_window(window: u64, comp_info: u64, limit: u64) -> Result<Self, LimitHit> {
+        if window == 0 || !window.is_power_of_two() || usize::try_from(window).is_err() {
+            return Err(err("invalid window size"));
+        }
+        let mut dec = Self::new_unchecked(window as usize);
+        if rar7_algorithm(comp_info) {
+            dec.u.dist_codes = HUFF_DCX;
+        }
+        dec.u.dict = dictionary_size(comp_info).max(window);
+        dec.u.window_limit = limit;
+        Ok(dec)
+    }
+
+    fn new_unchecked(ws: usize) -> Self {
+        let mut d = Self::new(G_UNPACK_WINDOW_SIZE).expect("the smallest window is valid");
+        d.u.window_buf = vec![0u8; ws];
+        d.u.window_mask = ws - 1;
+        d.u.window_size = ws;
+        d
+    }
+
+    /// The state a member starts from, `cap` the most it may put out: a solid
+    /// one keeps the window.
+    fn reset_for(&mut self, cap: u64, solid: bool) {
+        if !solid {
+            // A fresh stream: forget the previous member's window position, its
+            // repeat-distance history and any half-run filters.
+            self.u.write_ptr = 0;
+            self.u.last_write_ptr = 0;
+            self.u.last_len = 0;
+            self.u.dist_cache = [0; 4];
+            self.u.last_block_start = 0;
+            self.u.last_block_length = 0;
+            self.u.window_buf.fill(0);
+        }
+        self.u.file_start = self.u.last_write_ptr;
+        self.u.filters.clear();
+        self.u.block_parsing_finished = true;
+        self.u.last_block = false;
+        self.u.out = Vec::new();
+        self.u.pushed = 0;
+        self.u.cap = cap;
+    }
+
+    /// Start a member of `packed_len` packed bytes, read from a source as
+    /// they are needed with [`Self::read_member`]: the streaming form of
+    /// [`Self::member`], holding the window, one block of input (at most
+    /// 16 MiB, the format's largest) and the output of one decode step. What
+    /// reads it bounds its output.
+    pub fn start_member(&mut self, packed_len: u64, solid: bool) {
+        self.reset_for(u64::MAX, solid);
+        self.stream = Some(Stream5 {
+            pending: Vec::new(),
+            pend_at: 0,
+            packed_len,
+            consumed: 0,
+            block: Vec::new(),
+            br: BitReader::new(),
+            out_pos: 0,
+            done: false,
+        });
+    }
+
+    /// The next decoded bytes of the member [`Self::start_member`] started
+    /// from its packed bytes in `src`, 0 at its end. The same steps as
+    /// [`Self::member`], the output handed over as each step makes it.
+    pub fn read_member(
+        &mut self,
+        buf: &mut [u8],
+        src: &mut dyn std::io::Read,
+    ) -> Result<usize, LimitHit> {
+        let Some(s) = self.stream.as_mut() else {
+            return Ok(0);
+        };
+        let u = &mut self.u;
+        loop {
+            if s.out_pos < u.out.len() {
+                let n = (u.out.len() - s.out_pos).min(buf.len());
+                buf[..n].copy_from_slice(&u.out[s.out_pos..s.out_pos + n]);
+                s.out_pos += n;
+                return Ok(n);
+            }
+            u.out.clear();
+            s.out_pos = 0;
+            if s.done || buf.is_empty() {
+                return Ok(0);
+            }
+            let before = progress(u, &s.br, s.consumed);
+            if u.block_parsing_finished {
+                if s.consumed >= s.packed_len {
+                    s.done = true;
+                    continue;
+                }
+                // Past the data, zeros, as the whole-input path pads.
+                let mut head = s.bytes(src, s.consumed, s.consumed + 6);
+                head.resize(6, 0);
+                let Some((block_size, hdr_len, flags)) = parse_block_header(&head, 0) else {
+                    s.done = true;
+                    return Err(err("bad block header"));
+                };
+                let table_present = (flags >> 7) & 1 == 1;
+                u.last_block = (flags >> 6) & 1 == 1;
+                u.bit_size = 1 + (flags & 7);
+                let data_start = s.consumed + hdr_len as u64;
+                if data_start > s.packed_len {
+                    s.done = true;
+                    return Err(err("block header past end"));
+                }
+                let avail = s.packed_len - data_start;
+                u.cur_block_size = (block_size as u64).min(avail) as usize;
+                let end = data_start + u.cur_block_size as u64;
+                s.block = s.bytes(src, data_start, end + BLOCK_LOOKAHEAD as u64);
+                // A source that gave less than it holds reads as zeros.
+                if s.block.len() < u.cur_block_size + 8 {
+                    s.block.resize(u.cur_block_size + 8, 0);
+                }
+                s.drop_before(end);
+                u.block_parsing_finished = false;
+                s.br.in_addr = 0;
+                s.br.bit_addr = 0;
+                if table_present && let Err(e) = parse_tables(u, &mut s.br, &s.block) {
+                    s.done = true;
+                    return Err(e);
+                }
+                s.consumed = end;
+            }
+            let step = u
+                .make_room()
+                .and_then(|()| do_uncompress_block(u, &mut s.br, &s.block));
+            let finished = match step {
+                Ok(f) => f,
+                Err(e) => {
+                    s.done = true;
+                    return Err(e);
+                }
+            };
+            u.block_parsing_finished = finished;
+            if let Err(e) = drain_output(u) {
+                s.done = true;
+                return Err(e);
+            }
+            if finished && u.last_block && u.filters.is_empty() {
+                s.done = true;
+            } else if progress(u, &s.br, s.consumed) == before {
+                s.done = true;
+                return Err(err("decode made no progress"));
+            }
+        }
     }
 }
 
@@ -944,6 +1218,12 @@ pub fn unpack50(
     Unpacker50::new(window_size)?.member(packed, unpacked_size, false, budget)
 }
 
+/// Whether `comp_info`'s algorithm version (bits 0..5) is one this decoder
+/// has: 0 (RAR 5.0) or 1 (RAR 7).
+pub(crate) fn known_version(comp_info: u64) -> bool {
+    comp_info & 0x3f <= 1
+}
+
 /// Whether `comp_info` selects the RAR 7 algorithm: version 1 (bits 0..5),
 /// unless bit 20 says the data is the version 0 algorithm all the same.
 fn rar7_algorithm(comp_info: u64) -> bool {
@@ -954,7 +1234,7 @@ fn rar7_algorithm(comp_info: u64) -> bool {
 /// dictionary, 128 KiB << bits 10..14, plus for version 1 that size times bits
 /// 15..19 over 32, rounded up to a power of two. No distance reaches past the
 /// dictionary, so the larger window decodes the same bytes. 0 for a dictionary
-/// over [`MAX_WINDOW_SIZE`].
+/// over `MAX_WINDOW_SIZE`.
 pub fn window_size_from_comp_info(comp_info: u64) -> u64 {
     let base = G_UNPACK_WINDOW_SIZE << ((comp_info >> 10) & 0x1f);
     let mut dict = base;
@@ -968,10 +1248,93 @@ pub fn window_size_from_comp_info(comp_info: u64) -> u64 {
     }
 }
 
+/// The window [`window_size_from_comp_info`] gives, without its cap: the
+/// streaming path charges it to the buffer limit instead.
+pub fn dictionary_size(comp_info: u64) -> u64 {
+    let base = G_UNPACK_WINDOW_SIZE << ((comp_info >> 10) & 0x1f);
+    let mut dict = base;
+    if comp_info & 0x3f == 1 {
+        dict += base / 32 * ((comp_info >> 15) & 0x1f);
+    }
+    dict.next_power_of_two()
+}
+
+/// The window for a decoder started at the member whose header holds
+/// `comp_info`, `output` being the bytes it produces from there to the end of
+/// its solid run, when they are known: a distance past the bytes produced
+/// writes zeros (`copy_string`), so a window that holds them all
+/// decodes what the dictionary would. The dictionary when it is smaller, never less than 128 KiB. A
+/// stream longer than its headers declare grows the window as it goes.
+pub fn window_for(comp_info: u64, output: Option<u64>) -> u64 {
+    let dict = dictionary_size(comp_info);
+    output
+        .and_then(|n| n.max(G_UNPACK_WINDOW_SIZE).checked_next_power_of_two())
+        .map_or(dict, |w| w.min(dict))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Limits;
+
+    /// A stream that does not decode is damage; a member that declares more
+    /// than the scan's budget allows is a limit.
+    #[test]
+    fn a_stream_that_does_not_decode_is_damage_and_a_huge_member_is_a_limit() {
+        let mut budget = Budget::new(Limits::default());
+        let e = unpack50(&[0xff; 4], 1000, 1 << 17, &mut budget).expect_err("not a stream");
+        assert!(e.is_corrupt(), "{}", e.reason);
+        let mut budget = Budget::new(Limits {
+            max_extracted_bytes: 10,
+            ..Limits::default()
+        });
+        let e = unpack50(&[0; 8], 1000, 1 << 17, &mut budget).expect_err("over the budget");
+        assert!(!e.is_corrupt(), "{}", e.reason);
+    }
+
+    /// The filters waiting for their block are capped, and one more is damage.
+    #[test]
+    fn a_filter_past_the_queue_cap_is_damage() {
+        let mut d = Unpacker50::new(1 << 17).unwrap();
+        let u = &mut d.u;
+        let queued = || FilterInfo {
+            kind: FilterType::E8,
+            channels: 0,
+            block_start: 0,
+            block_length: 4,
+        };
+        // A descriptor: start 16 and length 8, one byte each, then type E8.
+        let p = [0b0000_0100, 0b0000_0000, 0b1000_0010, 0, 0, 0, 0, 0];
+        let one = |u: &mut Unpacker| {
+            // No block before it for this one to overlap.
+            (u.last_block_start, u.last_block_length) = (0, 0);
+            parse_filter(u, &mut BitReader::new(), &p)
+        };
+        u.filters
+            .extend(std::iter::repeat_with(queued).take(MAX_QUEUED_FILTERS - 1));
+        one(u).expect("the last one in the queue");
+        assert_eq!(u.filters.back().map(|f| f.block_length), Some(8));
+        let e = one(u).expect_err("past the cap");
+        assert!(
+            e.is_corrupt() && e.reason.contains("too many"),
+            "{}",
+            e.reason
+        );
+        assert_eq!(u.filters.len(), MAX_QUEUED_FILTERS);
+    }
+
+    /// A match from before the start of the stream is all zeros, the bytes
+    /// that would come from the start included, as unrar writes it.
+    #[test]
+    fn a_match_from_before_the_start_writes_zeros() {
+        let mut d = Unpacker50::new(1 << 17).unwrap();
+        let u = &mut d.u;
+        u.window_buf[..5].copy_from_slice(b"mjof ");
+        u.write_ptr = 5;
+        u.copy_string(8, 5).unwrap();
+        u.copy_string(9, 15).unwrap();
+        assert_eq!(&u.window_buf[..22], b"mjof mjof mjo\0\0\0\0\0\0\0\0\0");
+    }
 
     #[test]
     fn window_size_calc() {

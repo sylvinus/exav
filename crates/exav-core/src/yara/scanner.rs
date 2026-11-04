@@ -6,9 +6,11 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 
 use crate::byte_source::ByteSource;
+use crate::engine::WholeLimits;
 use crate::yara::atoms::PatternGate;
 use crate::yara::compiler::ExternalValue;
 use crate::yara::error::{Error, Result};
+use crate::yara::feed::{FeedPlan, YaraFeed, YaraPass};
 use crate::yara::ir::{Cond, EvalCtx, Value};
 use crate::yara::matcher::{Match, PatternDef, PatternMatcher, StreamRegexes, find_all_windowed};
 use crate::yara::modules::{ModuleCtx, ModuleKind};
@@ -44,6 +46,9 @@ pub struct Rules {
     /// Required-literal prefilter: which patterns even need to be
     /// scanned for a given buffer (see [`crate::yara::atoms`]).
     pub(crate) gate: PatternGate,
+    /// How the patterns are searched as an object is read, worked out on first
+    /// use (see [`crate::yara::feed`]).
+    pub(crate) feed_plan: OnceLock<FeedPlan>,
 }
 
 /// The serialized form of a compiled [`Rules`] set. Everything here is cheap to
@@ -117,7 +122,19 @@ impl Rules {
             imported: blob.imported,
             uses_entrypoint: blob.uses_entrypoint,
             gate: blob.gate,
+            feed_plan: OnceLock::new(),
         })
+    }
+
+    /// The search of the patterns in `src`, to be fed it as it is read, and
+    /// the answer handed back to [`Scanner::scan_source`]. `None` when there
+    /// is no pattern to search for.
+    pub(crate) fn feed<'a>(
+        &'a self,
+        src: &'a dyn ByteSource,
+        whole: &WholeLimits,
+    ) -> Option<YaraFeed<'a>> {
+        YaraFeed::new(self, src, whole)
     }
 
     /// Number of rules (including private/global ones).
@@ -143,6 +160,8 @@ pub struct Scanner<'r> {
     /// Host-supplied external variable values applied to every scan until
     /// changed (see [`Scanner::set_global`]).
     externals: HashMap<String, Value>,
+    /// Whether the object scanned was cut out of a host at an offset.
+    carved: bool,
 }
 
 impl<'r> Scanner<'r> {
@@ -150,7 +169,15 @@ impl<'r> Scanner<'r> {
         Self {
             rules,
             externals: HashMap::new(),
+            carved: false,
         }
+    }
+
+    /// Says the objects scanned from now on were cut out of a host at an
+    /// offset: an import table of a PE that lies past its bytes is then
+    /// absent, not unread.
+    pub(crate) fn set_carved(&mut self, carved: bool) {
+        self.carved = carved;
     }
 
     /// Sets the value of an external variable for subsequent scans (mirrors
@@ -171,7 +198,7 @@ impl<'r> Scanner<'r> {
     }
 
     fn scan_inner<'d>(&self, data: &'d [u8]) -> ScanResults<'r, 'd> {
-        let e = self.evaluate(&data, usize::MAX);
+        let e = self.evaluate(&data, &WholeLimits::NONE, None);
         ScanResults {
             rules: self.rules,
             data,
@@ -182,14 +209,18 @@ impl<'r> Scanner<'r> {
         }
     }
 
-    /// Scans an object that need not be held in memory. `materialize` is the
-    /// largest such object read whole where a search or a module needs it so.
+    /// Scans an object that need not be held in memory. `whole.materialize`
+    /// is the largest such object read whole where a search or a module needs
+    /// it so, and `whole.regex_steps` the steps the searches of a regexp
+    /// pattern may make. `pass` is what a read of the object has found of the
+    /// patterns already (see [`Rules::feed`]).
     pub(crate) fn scan_source(
         &self,
         src: &dyn ByteSource,
-        materialize: usize,
+        whole: &WholeLimits,
+        pass: Option<YaraPass>,
     ) -> SourceResults<'r> {
-        let e = self.evaluate(src, materialize);
+        let e = self.evaluate(src, whole, pass);
         SourceResults {
             matching: e
                 .matching
@@ -201,22 +232,34 @@ impl<'r> Scanner<'r> {
         }
     }
 
-    fn evaluate(&self, data: &dyn ByteSource, materialize: usize) -> Evaluated {
+    fn evaluate(
+        &self,
+        data: &dyn ByteSource,
+        whole: &WholeLimits,
+        pass: Option<YaraPass>,
+    ) -> Evaluated {
         let rules = self.rules;
+        let materialize = whole.materialize;
 
         // 1. Find matches for every pattern. The atom prefilter first tells us
         //    which patterns can possibly match this buffer; the rest are known to
         //    have zero matches (a required literal is absent), so we skip their
         //    O(n) scan and hand them an empty match list, an identical result.
-        let run = rules.gate.select(data);
+        //    A read of the object may have made the prefilter's search and
+        //    found some of the matches already.
+        let (run, mut fed) = match pass {
+            Some(p) => (p.run, p.found),
+            None => (rules.gate.select(data), Vec::new()),
+        };
+        fed.resize_with(rules.patterns.len(), || None);
         let mut complete = true;
         // Over an object not held in memory, the literal and base64 patterns
-        // are searched in one read of it together.
+        // the read did not search are searched in one read of it together.
         let mut windowed = vec![Vec::new(); rules.patterns.len()];
         let together: Vec<usize> = match data.as_slice() {
             Some(_) => Vec::new(),
             None => (0..rules.patterns.len())
-                .filter(|&i| run[i] && rules.patterns[i].windowed())
+                .filter(|&i| run[i] && fed[i].is_none() && rules.patterns[i].windowed())
                 .collect(),
         };
         let pats: Vec<&PatternMatcher> = together.iter().map(|&i| &rules.patterns[i]).collect();
@@ -232,6 +275,10 @@ impl<'r> Scanner<'r> {
                 if !run[i] {
                     return Vec::new();
                 }
+                if let Some(found) = fed[i].take() {
+                    complete &= found.complete;
+                    return found.matches;
+                }
                 if together.contains(&i) {
                     return std::mem::take(&mut windowed[i]);
                 }
@@ -240,7 +287,7 @@ impl<'r> Scanner<'r> {
                         .get_or_init(|| rules.defs[i].stream_regexes())
                         .as_ref()
                 };
-                let found = p.find_all(data, &stream, materialize);
+                let found = p.find_all(data, &stream, materialize, whole.regex_steps);
                 complete &= found.complete;
                 found.matches
             })
@@ -250,8 +297,13 @@ impl<'r> Scanner<'r> {
         let modules = if rules.imported.is_empty() && !rules.uses_entrypoint {
             ModuleCtx::empty()
         } else {
-            let (modules, built) =
-                ModuleCtx::build(data, &rules.imported, rules.uses_entrypoint, materialize);
+            let (modules, built) = ModuleCtx::build(
+                data,
+                &rules.imported,
+                rules.uses_entrypoint,
+                materialize,
+                self.carved,
+            );
             complete &= built;
             modules
         };
@@ -350,9 +402,10 @@ impl<'r, 'd> ScanResults<'r, 'd> {
     ///
     /// When this is true the results are a LOWER BOUND: the conditions cut short
     /// evaluated to *undefined* and so did not match, and a rule that would have
-    /// matched given unlimited time may be missing. It takes a rule with a range
-    /// loop in the hundreds of millions to reach the budget, so this reports a
-    /// ruleset that needs fixing rather than a property of the scanned file.
+    /// matched given unlimited time may be missing. A loop with literal bounds
+    /// needs hundreds of millions of iterations to reach the budget; one bounded
+    /// by the file (`#a`, `filesize`) reaches it with a file of a few million
+    /// matches or bytes.
     pub fn budget_exhausted(&self) -> bool {
         self.steps_exhausted
     }
@@ -536,6 +589,69 @@ mod budget_tests {
         );
     }
 
+    /// `at`, `in` and a count over a range look for the offsets of a pattern's
+    /// matches, which are sorted.
+    #[test]
+    fn anchors_and_ranges_find_the_matches_that_start_in_them() {
+        // `a` starts at 1, 4 and 8.
+        let data = b"xaxxaxxxa";
+        let holds = |cond: &str| {
+            let rule = format!(r#"rule r {{ strings: $a = "a" condition: {cond} }}"#);
+            !scan(&rule, data).0.is_empty()
+        };
+        for (cond, want) in [
+            ("$a at 4", true),
+            ("$a at 8", true),
+            ("$a at 1", true),
+            ("$a at 0", false),
+            ("$a at 5", false),
+            ("$a at 9", false),
+            ("$a at -1", false),
+            ("$a in (2..4)", true),
+            ("$a in (2..3)", false),
+            ("$a in (5..7)", false),
+            ("$a in (8..100)", true),
+            ("$a in (0..1)", true),
+            ("$a in (9..20)", false),
+            ("$a in (4..4)", true),
+            ("$a in (5..4)", false),
+            ("#a in (0..8) == 3", true),
+            ("#a in (2..8) == 2", true),
+            ("#a in (2..7) == 1", true),
+            ("#a in (5..7) == 0", true),
+            ("#a in (4..4) == 1", true),
+            ("#a in (5..4) == 0", true),
+            ("#a in (-5..0) == 0", true),
+            ("#a in (-5..100) == 3", true),
+        ] {
+            assert_eq!(holds(cond), want, "{cond}");
+        }
+    }
+
+    /// A loop over a pattern's matches asks about those of another pattern
+    /// once per iteration. A pass over them for each question is quadratic in
+    /// their number, and the step budget, which counts a question as one step,
+    /// does not stop it. Searched, the work takes milliseconds; passed over,
+    /// tens of seconds. The time allowed is far above the first.
+    #[test]
+    fn a_loop_over_many_matches_does_not_scan_them_per_iteration() {
+        let mut data = vec![b'a'; 100_000];
+        data.extend(vec![b'b'; 100_000]);
+        let start = std::time::Instant::now();
+        let (ids, exhausted) = scan(
+            r#"rule r {
+                 strings: $a = "a" $b = "b"
+                 condition: for any i in (1..#a) : (
+                     $b at @a[i] or $b in (@a[i]..@a[i]) or #b in (@a[i]..@a[i]) > 0
+                 )
+               }"#,
+            &data,
+        );
+        assert!(!exhausted);
+        assert!(ids.is_empty());
+        assert!(start.elapsed().as_secs() < 10, "took {:?}", start.elapsed());
+    }
+
     /// The counterweight: the budget must be invisible to rules that do a normal
     /// amount of work, including loops sized from the file rather than the rule.
     #[test]
@@ -557,7 +673,9 @@ mod source_tests {
     use std::io::Cursor;
 
     use crate::byte_source::{BlockCache, CHUNK};
+    use crate::engine::WholeLimits;
     use crate::yara::compiler::Compiler;
+    use crate::yara::feed::YaraPass;
     use crate::yara::scanner::{Evaluated, Rules, Scanner};
 
     const RULES: &str = r#"
@@ -638,7 +756,11 @@ mod source_tests {
         src: &dyn crate::byte_source::ByteSource,
         materialize: usize,
     ) -> Evaluated {
-        Scanner::new(rules).evaluate(src, materialize)
+        let whole = WholeLimits {
+            materialize,
+            ..WholeLimits::NONE
+        };
+        Scanner::new(rules).evaluate(src, &whole, None)
     }
 
     /// Pattern text, one of each kind the rules look for, and near misses
@@ -685,6 +807,11 @@ mod source_tests {
 
     /// A haystack of noise with `plants()[kind]` planted at each `(at, kind)`.
     fn haystack(len: usize, spots: &[(usize, usize)], seed: u64) -> Vec<u8> {
+        haystack_of(&plants(), len, spots, seed)
+    }
+
+    /// [`haystack`] of any `plants`.
+    fn haystack_of(plants: &[Vec<u8>], len: usize, spots: &[(usize, usize)], seed: u64) -> Vec<u8> {
         let mut state = seed | 1;
         let mut h: Vec<u8> = (0..len)
             .map(|_| {
@@ -694,7 +821,6 @@ mod source_tests {
                 b"abcdehlnorwxyz \x00\n.MZPE"[(state % 20) as usize]
             })
             .collect();
-        let plants = plants();
         for &(at, kind) in spots {
             let plant = &plants[kind % plants.len()];
             let at = at.min(len.saturating_sub(plant.len()));
@@ -757,6 +883,486 @@ mod source_tests {
                 "literals", "b64", "hexes", "regexes", "counts", "reads", "maths", "hashes"
             ]
         );
+    }
+
+    /// More patterns than [`RULES`] has: atoms in the middle of long needles,
+    /// regexps whose atom is not at their start, bounded and unbounded ones,
+    /// anchors, boundaries, and hex patterns with jumps or wildcards first.
+    const MORE_RULES: &str = r#"
+        rule long_literals {
+            strings:
+                $a = "the quick brown fox jumps over the lazy dog"
+                $b = "THE QUICK BROWN FOX JUMPS" nocase
+                $c = "long wide needle text" wide
+                $d = "another quite long literal" fullword
+            condition: any of them
+        }
+        rule mid_atom {
+            strings:
+                $a = "                    \xde\xad\xbe\xef\xca\xfe\xba\xbe\x01\x02\x03\x04\x05\x06\x07\x08\x09"
+                $b = "                    \xde\xad\xbe\xef\xca\xfe\xba\xbe\x01\x02\x03\x04\x05\x06\x07\x08\x0a" nocase
+                $c = "                    \xde\xad\xbe\xef\xca\xfe\xba\xbe\x01\x02\x03\x04\x05\x06\x07\x08\x0b" wide
+            condition: any of them
+        }
+        rule bounded {
+            strings:
+                $a = /[a-z]{3}needle[0-9]{2}/
+                $b = /ab[0-9]{2,5}cd/
+                $c = /\bfoo(bar|baz)\b/
+                $d = /^MZ.{0,8}PE/
+                $e = /end$/
+                $f = /[a-z0-9]{12,}/
+                $g = /Z[a-z]{2}Q|[0-9]{3}needle/
+            condition: any of them
+        }
+        rule more_hexes {
+            strings:
+                $a = { 61 62 63 [2-6] 64 65 66 }
+                $b = { ?? ?? 61 62 ( 63 | 64 ) }
+                $c = { 61 [-] 7A 7A }
+            condition: any of them
+        }
+    "#;
+
+    /// [`plants`], and one of each of the patterns of [`MORE_RULES`].
+    fn fed_plants() -> Vec<Vec<u8>> {
+        let mut plants = plants();
+        for s in [
+            &b"the quick brown fox jumps over the lazy dog"[..],
+            b"THE QUICK BROWN FOX JUMPS",
+            b" another quite long literal ",
+            b"abcneedle42",
+            b"ab123cd",
+            b" foobar ",
+            b"MZ12345678PE",
+            b"xxabc12def",
+            b"a1b2c3d4e5f6g7h8i9",
+            b"Zabc!",
+            b"123needle",
+            b"a very long gap zz",
+        ] {
+            plants.push(s.to_vec());
+        }
+        plants.push(
+            b"long wide needle text"
+                .iter()
+                .flat_map(|&b| [b, 0])
+                .collect(),
+        );
+        // The literals of `mid_atom`: the atom of each is its tail.
+        let tail = b"\xde\xad\xbe\xef\xca\xfe\xba\xbe\x01\x02\x03\x04\x05\x06\x07\x08";
+        for last in [0x09, 0x0a, 0x0b] {
+            let text: Vec<u8> = [&[b' '; 20][..], tail, &[last]].concat();
+            plants.push(match last {
+                0x0b => text.iter().flat_map(|&b| [b, 0]).collect(),
+                _ => text,
+            });
+        }
+        plants
+    }
+
+    /// The object read once: `h`, in pieces of `piece` bytes, and the answer.
+    fn fed(
+        rules: &Rules,
+        cache: &BlockCache<Cursor<Vec<u8>>>,
+        h: &[u8],
+        piece: usize,
+        whole: &WholeLimits,
+    ) -> YaraPass {
+        let mut feed = rules.feed(cache, whole).expect("patterns");
+        for (i, w) in h.chunks(piece).enumerate() {
+            feed.feed(i * piece, w);
+        }
+        feed.finish().expect("all of the object was fed")
+    }
+
+    /// What the read found of the patterns, and what is left to search after
+    /// it, give the matches of the object held in memory.
+    fn assert_same_fed(rules: &Rules, h: &[u8], block: usize, piece: usize, what: &str) {
+        let want = evaluate(rules, &h, usize::MAX);
+        let cache = BlockCache::with_sizes(Cursor::new(h.to_vec()), block, 8 * block).unwrap();
+        // Nothing may be read whole: every search runs through the cache.
+        let whole = WholeLimits {
+            materialize: 0,
+            ..WholeLimits::NONE
+        };
+        let pass = fed(rules, &cache, h, piece, &whole);
+        for (i, (&run, found)) in pass.run.iter().zip(&pass.found).enumerate() {
+            let ctx = format!(
+                "{what}, piece {piece}: pattern {i} ({})",
+                rules.pattern_names[i]
+            );
+            assert!(run || want.matches[i].is_empty(), "{ctx} was not slated");
+            assert!(
+                !run || found.is_some(),
+                "{ctx} was left to the search after the read"
+            );
+            if let Some(found) = found {
+                assert_eq!(found.matches, want.matches[i], "{ctx}");
+                assert!(found.complete, "{ctx}");
+            }
+        }
+        let got = Scanner::new(rules).evaluate(&cache, &whole, Some(pass));
+        assert!(
+            want.complete && got.complete,
+            "{what}: a search was cut short"
+        );
+        assert_eq!(want.matches, got.matches, "{what}, piece {piece}");
+        assert_eq!(want.matching, got.matching, "{what}, piece {piece}");
+    }
+
+    /// Every pattern found in a read of the object, handed over in pieces of
+    /// any size, equals the object searched whole in memory: with the plants
+    /// of each kind straddling the seams between segments, pieces and blocks,
+    /// at the start of the object and at its end.
+    #[test]
+    fn the_matches_found_while_the_object_is_read_are_those_of_a_search_of_it() {
+        let rules = rules(&format!("{RULES}{MORE_RULES}"));
+        let plants = fed_plants();
+        let kinds = plants.len();
+        for seed in 1..4u64 {
+            let spots: Vec<(usize, usize)> =
+                (0..kinds).map(|k| (k * 23, k + seed as usize)).collect();
+            let h = haystack_of(&plants, kinds * 23 + seed as usize * 7, &spots, seed);
+            for piece in [1, 7, 64, 1000] {
+                assert_same_fed(&rules, &h, 7, piece, &format!("small seed {seed}"));
+            }
+        }
+        // Each kind of plant straddling a multiple of 1024 at every split, so
+        // that it crosses a segment, and pieces and blocks of other sizes.
+        let mut spots = Vec::new();
+        for (kind, plant) in plants.iter().enumerate() {
+            for cut in 1..plant.len() {
+                spots.push(((1 + spots.len()) * 1024 - cut, kind));
+            }
+        }
+        let seams = spots.len();
+        // And at the very start and end.
+        spots.extend((0..kinds).map(|k| (0, k)));
+        spots.extend((0..kinds).map(|k| (usize::MAX, k)));
+        let mut h = haystack_of(&plants, (seams + 2) * 1024, &spots, 99);
+        h.extend_from_slice(b"end");
+        for (block, piece) in [(509, 64), (509, 100), (64, 1024), (4096, 509), (61, 1)] {
+            assert_same_fed(&rules, &h, block, piece, "seams");
+        }
+        // Every kind of rule had something to find, or the comparison proves little.
+        let e = evaluate(&rules, &h, usize::MAX);
+        let found = e.matches.iter().filter(|m| !m.is_empty()).count();
+        assert!(
+            found + 4 >= e.matches.len(),
+            "{found} of {} patterns matched",
+            e.matches.len()
+        );
+    }
+
+    /// Runs of one byte, long and short, at the ends of the object and in the
+    /// middle of it, are searched for the literals made of that byte as the
+    /// object goes by, without one entry for each of its segments.
+    #[test]
+    fn runs_of_one_byte_are_searched_as_the_object_goes_by() {
+        let rules = rules(
+            r#"rule runs {
+                strings:
+                    $z = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+                    $a = "aaaaaaaaaaaa" nocase
+                    $w = "\x00\x00\x00\x00\x00\x00\x00\x00" wide
+                    $b = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                condition: any of them
+            }"#,
+        );
+        let mut state = 17u64;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    b"bcdxyz\n"[(state % 7) as usize]
+                })
+                .collect()
+        };
+        let mut h = Vec::new();
+        // At the start, between noise, mixed in case, and at the end.
+        for (byte, len) in [
+            (0u8, 9),
+            (0, 3000),
+            (b'a', 11),
+            (b'a', 200),
+            (0, 64),
+            (0, 10_000),
+            (b'A', 130),
+            (0, 70),
+        ] {
+            h.extend(noise(17));
+            h.extend(std::iter::repeat_n(byte, len));
+            if len == 130 {
+                h.extend(b"aAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaA");
+            }
+        }
+        h.extend(std::iter::repeat_n(b'a', 1000));
+        h.extend(noise(5));
+        h.extend(std::iter::repeat_n(0u8, 5000));
+        for (block, piece) in [(61, 1), (509, 7), (64, 100), (4096, 5000), (509, 64)] {
+            assert_same_fed(&rules, &h, block, piece, "runs");
+        }
+        let e = evaluate(&rules, &h, usize::MAX);
+        assert!(
+            e.matches.iter().all(|m| m.len() > 100),
+            "{:?}",
+            e.matches.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+    }
+
+    /// The read hands the bytes in windows that leave gaps, overlap and
+    /// repeat, as the sweep that drives it does: what lies in a gap is read
+    /// from the object, and the matches after a gap are found.
+    #[test]
+    fn the_matches_after_a_window_that_skips_ahead_are_found() {
+        use crate::pass::{Fed, Tap};
+        struct Fead<'a>(crate::yara::YaraFeed<'a>);
+        impl Tap for Fead<'_> {
+            fn feed(&mut self, at: usize, w: &[u8]) {
+                self.0.feed(at, w)
+            }
+            fn wants_more(&self) -> bool {
+                self.0.wants_more()
+            }
+        }
+        let rules = rules(&format!("{RULES}{MORE_RULES}"));
+        let plants = fed_plants();
+        let spots: Vec<(usize, usize)> = (0..plants.len() * 4).map(|k| (200 + k * 41, k)).collect();
+        let h = haystack_of(&plants, 6000, &spots, 5);
+        let want = evaluate(&rules, &h, usize::MAX);
+        let cache = BlockCache::with_sizes(Cursor::new(h.clone()), 61, 61 * 8).unwrap();
+        let whole = WholeLimits {
+            materialize: 0,
+            ..WholeLimits::NONE
+        };
+        let mut tap = Fead(rules.feed(&cache, &whole).expect("patterns"));
+        let mut fed = Fed::new(&mut tap, &cache);
+        // The first window, one inside it, a repeat, then windows that
+        // skip over stretches holding plants, the last cut short of the end.
+        for (a, b) in [
+            (0, 150),
+            (20, 60),
+            (0, 150),
+            (700, 900),
+            (880, 1200),
+            (2500, 2600),
+            (4000, 5900),
+        ] {
+            fed.feed(a, &h[a..b]);
+        }
+        fed.drain();
+        let pass = tap.0.finish().expect("all of the object was fed");
+        for (i, found) in pass.found.iter().enumerate() {
+            assert!(!pass.run[i] || found.is_some(), "pattern {i}");
+            if let Some(found) = found {
+                assert_eq!(
+                    found.matches, want.matches[i],
+                    "pattern {i} ({})",
+                    rules.pattern_names[i]
+                );
+            }
+        }
+        let got = Scanner::new(&rules).evaluate(&cache, &whole, Some(pass));
+        assert_eq!(want.matches, got.matches);
+    }
+
+    /// The matches of `rules` over `cache`, as the search after a read gives them,
+    /// with `steps` for the regexp patterns and the read's answer if there is one.
+    fn evaluate_steps(
+        rules: &Rules,
+        cache: &BlockCache<Cursor<Vec<u8>>>,
+        steps: usize,
+        pass: Option<YaraPass>,
+    ) -> Evaluated {
+        let whole = WholeLimits {
+            materialize: 0,
+            regex_steps: steps,
+            ..WholeLimits::NONE
+        };
+        Scanner::new(rules).evaluate(cache, &whole, pass)
+    }
+
+    /// The object read once and handed to the feed, as the pass hands it.
+    fn read_once(
+        rules: &Rules,
+        cache: &BlockCache<Cursor<Vec<u8>>>,
+        whole: &WholeLimits,
+    ) -> Option<YaraPass> {
+        use crate::pass::{Fed, Tap};
+        struct Fead<'a>(crate::yara::YaraFeed<'a>);
+        impl Tap for Fead<'_> {
+            fn feed(&mut self, at: usize, w: &[u8]) {
+                self.0.feed(at, w)
+            }
+            fn wants_more(&self) -> bool {
+                self.0.wants_more()
+            }
+        }
+        let mut tap = Fead(rules.feed(cache, whole)?);
+        Fed::new(&mut tap, cache).drain();
+        tap.0.finish()
+    }
+
+    /// A pattern whose searches reach their limit is searched again after the
+    /// read, so the limit falls where it always fell: at the same number of
+    /// steps, with the same matches kept, whether the read found the pattern
+    /// or not.
+    #[test]
+    fn a_regexp_pattern_reaches_its_limit_at_the_same_step_with_or_without_the_read() {
+        // A run of capitals, a wide and ascii pattern, one whose atom comes
+        // late, and a hex pattern with an open jump.
+        let mut h = vec![0u8];
+        h.extend(vec![b'A'; 300]);
+        h.extend(b"\0\0QAAAA\0");
+        h.extend((0..2500u32).map(|i| b"bcdefg"[(i * i % 6) as usize]));
+        h.extend(b"abcneedle42 and the rest\0");
+        let cache = BlockCache::with_sizes(Cursor::new(h.clone()), 61, 61 * 8).unwrap();
+        let (mut used, mut left_to_search) = (0, 0);
+        for pattern in [
+            "/[A-Z]{40,}/",
+            "/Q[A-Z]{2,}/ wide ascii",
+            "/[a-z]{3}needle[0-9]{2}/",
+            "{ 41 41 [-] 51 41 }",
+        ] {
+            let rules = rules(&format!(
+                "rule r {{ strings: $a = {pattern} condition: $a }}"
+            ));
+            let complete = |steps| evaluate_steps(&rules, &cache, steps, None).complete;
+            // The fewest steps that finish the search of the pattern.
+            let (mut lo, mut hi) = (0, 1_000_000);
+            assert!(!complete(lo) && complete(hi), "{pattern}");
+            while hi - lo > 1 {
+                let mid = (lo + hi) / 2;
+                match complete(mid) {
+                    true => hi = mid,
+                    false => lo = mid,
+                }
+            }
+            for steps in [0, 1, lo / 2, lo - 1, lo, hi, hi + 1, 2 * hi, usize::MAX] {
+                let want = evaluate_steps(&rules, &cache, steps, None);
+                let whole = WholeLimits {
+                    materialize: 0,
+                    regex_steps: steps,
+                    ..WholeLimits::NONE
+                };
+                let pass = read_once(&rules, &cache, &whole).expect("the object was read");
+                if pass.found.iter().all(Option::is_some) {
+                    used += 1;
+                } else {
+                    left_to_search += 1;
+                }
+                let got = evaluate_steps(&rules, &cache, steps, Some(pass));
+                let ctx = format!("{pattern}, {steps} steps (the limit is at {hi})");
+                assert_eq!(want.matches, got.matches, "{ctx}");
+                assert_eq!(want.complete, got.complete, "{ctx}");
+                assert_eq!(want.matching, got.matching, "{ctx}");
+            }
+        }
+        // Both happened: the read had the result where the limit was not
+        // reached, and left the pattern to the search where it was.
+        assert!(
+            used >= 8 && left_to_search >= 8,
+            "{used} and {left_to_search}"
+        );
+    }
+
+    /// The state tables of the regexp searches that follow the read take no
+    /// more memory than they are given: a pattern whose search does not fit
+    /// is searched after the read, with the same matches.
+    #[test]
+    fn regexp_patterns_that_do_not_fit_in_the_memory_given_are_searched_after_the_read() {
+        let rules = rules(&format!("{RULES}{MORE_RULES}"));
+        let plants = fed_plants();
+        let spots: Vec<(usize, usize)> = (0..plants.len() * 3).map(|k| (100 + k * 47, k)).collect();
+        let h = haystack_of(&plants, 5000, &spots, 7);
+        let cache = BlockCache::with_sizes(Cursor::new(h.clone()), 61, 61 * 8).unwrap();
+        let want = evaluate(&rules, &h, usize::MAX);
+        let regex = |i: usize| rules.patterns[i].regex_fullword().is_some();
+        let mut seen = [0; 2];
+        for search_bytes in [0, 2000, 20_000, usize::MAX] {
+            let whole = WholeLimits {
+                materialize: 0,
+                search_bytes,
+                ..WholeLimits::NONE
+            };
+            let pass = read_once(&rules, &cache, &whole).expect("the object was read");
+            let held = |i: usize| pass.found[i].is_some();
+            seen[0] += (0..rules.patterns.len())
+                .filter(|&i| pass.run[i] && regex(i) && held(i))
+                .count();
+            seen[1] += (0..rules.patterns.len())
+                .filter(|&i| pass.run[i] && regex(i) && !held(i))
+                .count();
+            if search_bytes == 0 {
+                assert!((0..rules.patterns.len()).all(|i| !(regex(i) && held(i))));
+            }
+            if search_bytes == usize::MAX {
+                assert!((0..rules.patterns.len()).all(|i| !pass.run[i] || held(i)));
+            }
+            let got = evaluate_steps(&rules, &cache, usize::MAX, Some(pass));
+            assert_eq!(want.matches, got.matches, "{search_bytes} bytes");
+        }
+        assert!(seen[0] > 0 && seen[1] > 0, "{seen:?}");
+    }
+
+    /// A pattern with more matches than the search keeps is left to the
+    /// search after the read, which says it is incomplete.
+    #[test]
+    fn a_pattern_past_the_match_cap_is_left_to_the_search_after_the_read() {
+        let rules = rules(
+            r#"rule z { strings: $a = { 00 00 } $b = "\x00\x00\x00" $c = /\x00\x00\x00\x00/
+               condition: #a > 5 and #b > 5 and #c > 5 }"#,
+        );
+        let h = vec![0u8; super::super::matcher::MAX_MATCHES + 10];
+        let cache = BlockCache::with_sizes(Cursor::new(h.clone()), 1 << 16, 1 << 20).unwrap();
+        let whole = WholeLimits {
+            materialize: 0,
+            ..WholeLimits::NONE
+        };
+        let pass = read_once(&rules, &cache, &whole).expect("the object was read");
+        assert!(pass.run.iter().all(|&r| r));
+        assert!(
+            pass.found.iter().all(Option::is_none),
+            "{}",
+            pass.found.iter().flatten().count()
+        );
+        let e = evaluate_steps(&rules, &cache, usize::MAX, Some(pass));
+        assert!(!e.complete);
+        assert!(
+            e.matches
+                .iter()
+                .all(|m| m.len() == super::super::matcher::MAX_MATCHES)
+        );
+    }
+
+    /// A regexp the lazy DFAs cannot follow over these bytes is left to the
+    /// search after the read, which reads the object whole or reports it.
+    #[test]
+    fn a_regexp_the_read_cannot_follow_is_left_to_the_search_after_it() {
+        let rules =
+            rules(r#"rule u { strings: $a = /(?u)\bcaf/ $b = "caf" condition: all of them }"#);
+        let h = b"\xe9caf caf".to_vec();
+        let cache = BlockCache::with_sizes(Cursor::new(h.clone()), 3, 12).unwrap();
+        let want = evaluate(&rules, &h, usize::MAX);
+        for materialize in [usize::MAX, 0] {
+            let whole = WholeLimits {
+                materialize,
+                ..WholeLimits::NONE
+            };
+            let pass = read_once(&rules, &cache, &whole).expect("the object was read");
+            assert!(pass.found[0].is_none() && pass.found[1].is_some());
+            let got = Scanner::new(&rules).evaluate(&cache, &whole, Some(pass));
+            let without = Scanner::new(&rules).evaluate(&cache, &whole, None);
+            assert_eq!(got.matches, without.matches);
+            assert_eq!(got.complete, without.complete);
+            assert_eq!(got.complete, materialize == usize::MAX);
+            if materialize == usize::MAX {
+                assert_eq!(got.matches, want.matches);
+            }
+        }
     }
 
     #[test]

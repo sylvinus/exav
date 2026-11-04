@@ -31,10 +31,10 @@ What happens past `--max-object-bytes` (256 MiB), by kind of input:
 
 | Input | Held in memory | Needs disk | A 20 GB input |
 |---|---|---|---|
-| A file on disk: executable, script, document, raw disk or filesystem image | Block cache, 8 MiB | No | Every signature on its bytes is matched. A PE, ELF or .NET file is not [parsed](#past-it-through-a-block-cache), so the signatures and rules on its structure (sections, imports, YARA's `pe`, `elf` and `dotnet`) are not evaluated; if nothing is found, the verdict is `LIMITS-EXCEEDED` |
-| ZIP, tar, CAB, ISO, LHA, `ar`, cpio, 7z, WIM, xar, the single-stream compressors, self-extracting executables, and the formats built on them | One member, up to 256 MiB | Only for a member over 256 MiB, up to `--max-spill-bytes` (2 GiB) | Scanned member by member. A member past the spill ceiling, or any member with `--spill-dir off`, is not scanned and the file is `LIMITS-EXCEEDED`. A 7z folder with an encrypted coder or several packed streams (BCJ2) is decoded whole, under 256 MiB |
-| Disk images (VHD, VHDX, QCOW2, VMDK, DMG) and the filesystems inside them or on their own: FAT, exFAT, NTFS, ext, SquashFS, cramfs, romfs, EROFS, HFS+, APFS | A cache of up to 32 MiB (8 MiB for a raw image), and one file up to 256 MiB | Only for a file over 256 MiB, up to `--max-spill-bytes` (2 GiB) | Walked in place, each file read from where the volume has it, and one past 256 MiB goes to a spill file as a ZIP member does. A file stored compressed by the filesystem (HFS+, APFS, NTFS, EROFS) is decoded whole under the limit and reported past it. A raw image's own bytes are matched as part of the image |
-| RAR, OLE, PDF, CHM, ARJ, email and the other formats [read whole](/scanner/reference/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole) | Not held: the container is not opened | No | The file's own bytes are scanned, its members are not unpacked, and the result is `LIMITS-EXCEEDED` unless something is found. Raising `--max-object-bytes` to cover it takes that much RAM |
+| A file on disk: executable, script, document, raw disk or filesystem image | Block cache, 32 MiB | No | Every signature on its bytes is matched. A PE is [parsed](#past-it-through-a-block-cache) from its image (the headers and sections, up to the end of the last section's data), and YARA's `elf` module reads an ELF's own image, so a small executable with a large overlay gets every check; a PE whose image is past the limit, and an ELF or Mach-O past it for the packer checks, are `LIMITS-EXCEEDED` if nothing is found |
+| ZIP, tar, CAB, ISO, LHA, `ar`, cpio, 7z, WIM, xar, RAR (and RAR volume sets), CHM, OLE (MSI included), email and mailboxes, the single-stream compressors, self-extracting executables, and the formats built on them | One member, up to 256 MiB | Only for a compressed member over 256 MiB, up to `--max-spill-bytes` (2 GiB) | Scanned member by member. A [stored member](#archive-members) over 256 MiB is read where it lies, with no copy, no disk and no spill ceiling (`--max-matcher-bytes` counts it). A compressed member past the spill ceiling, or with `--spill-dir off`, has only its first 256 MiB scanned and the file is `LIMITS-EXCEEDED` unless they hold a detection. A RAR with encrypted headers, encrypted members or RAR5 links is decoded whole, under 256 MiB |
+| Disk images (VHD, VHDX, QCOW2, VMDK, DMG) and the filesystems inside them or on their own: FAT, exFAT, NTFS, ext, SquashFS, cramfs, romfs, EROFS, HFS+, APFS | A cache of up to 32 MiB, and one file up to 256 MiB | Only for a file over 256 MiB, up to `--max-spill-bytes` (2 GiB) | Walked in place, each file read from where the volume has it, and one past 256 MiB goes to a spill file as a ZIP member does. A file stored compressed is read a unit at a time: a block of HFS+ and APFS (decmpfs), an extent of EROFS, a compression unit of NTFS. A raw image's own bytes are matched as part of the image |
+| PDF, ARJ and the other formats [read whole](/scanner/reference/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole) | Not held: the container is not opened | No | The file's own bytes are scanned, its members are not unpacked, and the result is `LIMITS-EXCEEDED` unless something is found. Raising `--max-object-bytes` to cover it takes that much RAM |
 | Stdin, `INSTREAM`, an ICAP body | 16 MiB | Yes: the stream is written to a temporary file to make it seekable | The first 2 GiB is scanned and the result is `LIMITS-EXCEEDED PARTIAL`. With `--spill-dir off`, the first 16 MiB. Raise `--max-spill-bytes` and give it the disk, or hand the daemon a path instead |
 | An `http(s)://` URL | See [HTTP sources](#http-sources) | No | Scanned in full, over the network about twice |
 
@@ -60,28 +60,29 @@ scanned in full.
 
 ## Past it: through a block cache
 
-A larger file is read through a cache of 1 MiB blocks, of which at most 8 MiB
-are held, least recently used dropped first. So are an HTTP source of that size
-and a spill file (below). Verifying a match can still look anywhere in the
+A larger file is read through a cache of 1 MiB blocks, of which at most 32 MiB
+are held. So are an HTTP source of that size, a spill file (below) and a stored
+archive member past the limit. Verifying a match can still look anywhere in the
 file: the cache bounds what is held at once, not how far a check may reach, and
 a block that was dropped is read again when it is needed. The scan is the same
-one, with the same results, only slower, since the file is read a few times
-over: once for format detection's search, carving and the digests (when a hash
-signature has its size), once for the signature sweep (every anchor at once),
-twice more for YARA's prefilter when rules are loaded, and again in the parts a
-check needs. [The block cache](#the-block-cache) below says how it works and
+one, with the same results, only slower: the file is read once for format
+detection's search, carving, the digests, the signature sweep (every anchor at
+once), YARA's patterns, the UPX header search and the static model's byte
+counts, and again in the parts a check needs. A signature with an unbounded gap
+adds a walk over the rest of the object after the sweep, and a PE's image can
+add a read. [The block cache](#the-block-cache) below says how it works and
 what its three settings trade.
 
 <div class="diagram">
 <svg viewBox="0 0 790 392" role="img" aria-labelledby="bcn bcd" style="width:100%;height:auto;max-width:790px">
   <title id="bcn">One source, read through a block cache</title>
   <desc id="bcd">A file or an HTTP source past --max-object-bytes, or a spill
-  file, is read through a block cache of 1 MiB blocks holding 8 MiB. Every
+  file, is read through a block cache of 1 MiB blocks holding 32 MiB. Every
   check asks it for bytes at an offset: the signature sweep a chunk at a time
   in order, verification and the container walk at any offset, the regexes
   stepped through, the hashes, typing's search and carving in one shared pass.
-  The checks that parse an object whole run only when it fits within
-  --max-object-bytes.</desc>
+  The checks that parse an object whole run only when it, or a PE's image,
+  fits within --max-object-bytes.</desc>
   <defs>
     <marker id="bc-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M0 0 L8 4 L0 8 z" fill="currentColor"/>
@@ -119,8 +120,8 @@ what its three settings trade.
     <text x="93" y="66" text-anchor="middle">past --max-object-bytes</text>
     <text x="93" y="134" text-anchor="middle">past the limit too</text>
     <text x="93" y="202" text-anchor="middle">a large member or view</text>
-    <text x="345" y="136" text-anchor="middle">1 MiB blocks, 8 MiB held,</text>
-    <text x="345" y="154" text-anchor="middle">least recently used dropped;</text>
+    <text x="345" y="136" text-anchor="middle">1 MiB blocks, 32 MiB held,</text>
+    <text x="345" y="154" text-anchor="middle">a pass streamed through;</text>
     <text x="345" y="172" text-anchor="middle">bytes at any offset, or in</text>
     <text x="345" y="190" text-anchor="middle">1 MiB chunks in order</text>
     <text x="532" y="64">chunks in order, one pass</text>
@@ -128,7 +129,7 @@ what its three settings trade.
     <text x="532" y="176">lazy DFAs stepped through</text>
     <text x="532" y="232">one shared pass; start and end</text>
     <text x="532" y="288">headers and members, by offset</text>
-    <text x="532" y="366">held whole only: PE, RAR, OLE</text>
+    <text x="532" y="366">held whole only: PE image</text>
   </g>
   <g fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#bc-arrow)">
     <path d="M178 52 H200 V120 H226"/>
@@ -145,13 +146,14 @@ what its three settings trade.
 
 A few things need the file whole and are not done past the limit:
 
-- the structure of a PE: entry-point and section offsets, section hashes,
-  imports, icons, the Authenticode signature, UPX and packer unpacking;
-- YARA's `pe`, `elf` and `dotnet` modules;
+- the structure of a PE whose image, the part up to the end of its last
+  section, is past the limit: entry-point and section offsets, section hashes,
+  imports, icons; and UPX and packer unpacking, which takes the executable
+  whole;
+- YARA's `pe`, `elf` and `dotnet` modules, when the image is past the limit;
 - a PCRE subsignature with a lookaround or a backreference, and the
   `fuzzy_img` image hash;
-- containers whose format is read whole (RAR, OLE, PDF, CHM, ARJ, email and
-  others; see
+- containers whose format is read whole (PDF, ARJ and others; see
   [Supported formats](/scanner/reference/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole)).
 
 A file for which one of these applied is reported `LIMITS-EXCEEDED`, naming
@@ -169,11 +171,18 @@ memory of the blocks it has just left.
 - **What it is.** Each object read in place (a file, an HTTP source, a spill
   file) has one cache. It cuts the object into aligned blocks of
   `--object-cache-block-bytes` (1 MiB) and keeps up to `--object-cache-bytes`
-  (8 MiB) of them, so 8 blocks by default. Never fewer than two.
+  (32 MiB) of them, so 32 blocks by default. Never fewer than two. A stored
+  archive member read in place goes through its archive's cache.
 - **A read.** Every check asks for bytes at an offset. If the block holding them
   is held, the bytes are copied out of memory. If not, the whole block is read
-  from the source, in one request over HTTP, and the least recently used block
-  is dropped to make room. A read that spans two blocks takes both.
+  from the source, in one request over HTTP. A read that spans two blocks
+  takes both.
+- **What it drops.** Once the cache is full, a block read right after the one
+  before it is part of a pass, which will not need it again until it has read
+  everything else: it goes into two blocks set apart for passes, and the pass
+  streams through them. Any other block replaces the least recently used. So
+  a pass leaves the rest of the cache in place: what an earlier pass left, and
+  the places scattered reads come back to.
 - **Two kinds of read.** The sweeps (signature sweep, hashes, typing, carving)
   go through the object in order, so each block is read once per pass and is
   never asked for again. Verifying a match, reading a ZIP's directory and then
@@ -183,10 +192,14 @@ memory of the blocks it has just left.
   request stopped asks for twice as much as that one did, from one block up to
   `--http-request-bytes` (8 MiB). A pass over a large object costs one request
   per 8 MiB, not one per block, while scattered reads stay one block each.
-- **Passes.** An object larger than the cache is read again from the source at
-  each pass, as the blocks of the previous pass have been dropped by the time it
-  ends. An object that fits in the cache is read from the source once and held,
-  so every pass after the first costs no request at all.
+- **Passes.** An object past `--max-object-bytes` is read once for the type
+  search, carving, the digests, the signature sweep, YARA's patterns, the UPX
+  header search and the static model's byte counts; a signature with an
+  unbounded gap adds a walk over the rest of the object after the sweep, and a
+  PE's image can add a read. An object larger than the cache is read again from
+  the source at each of those, except the blocks the cache kept from the pass
+  before (all but two). An object that fits in the cache is read from the source once and
+  held, so every pass after the first costs no request at all.
 - **What it costs in memory.** The cache's size for each object being scanned in
   place, plus up to one request held by the HTTP reader while it is read, plus
   a copy of the bytes a check is looking at (a 1 MiB chunk for the sweep).
@@ -212,13 +225,15 @@ request, so the delay stands for the round trip. The first object is a 300 MB
 file under a database with a pattern, a logical signature with a gap and the
 hash of that size. It is read about 4.4 times over, and 300 MB is past
 `--max-object-bytes`, so it goes through the cache. Block, cache and request
-sizes in the first three columns, defaults in bold:
+sizes in the first three columns. These two tables were measured when the cache
+dropped the least recently used block in every case, before passes were
+streamed through it (below):
 
 | Block | Cache | Request | Requests | Fetched | No delay | 20 ms | 100 ms |
 |---|---|---|---|---|---|---|---|
 | 64K | 8M | 8M | 506 | 1.23 GB | 4.4 s | 15.0 s | 55.9 s |
 | 256K | 8M | 8M | 361 | 1.29 GB | 4.1 s | 12.0 s | 41.2 s |
-| **1M** | **8M** | **8M** | 176 | 1.33 GB | 4.0 s | 8.0 s | 22.1 s |
+| 1M | 8M | 8M | 176 | 1.33 GB | 4.0 s | 8.0 s | 22.1 s |
 | 4M | 8M | 8M | 170 | 1.35 GB | 4.1 s | 7.9 s | 21.4 s |
 | 1M | 32M | 8M | 176 | 1.33 GB | 4.2 s | 8.2 s | 22.1 s |
 | 1M | 8M | 1M | 1,275 | 1.33 GB | 4.4 s | 31.7 s | 136.0 s |
@@ -232,10 +247,28 @@ it reads it once:
 | Block | Cache | Requests | Fetched | No delay | 20 ms | 100 ms |
 |---|---|---|---|---|---|---|
 | 64K | 8M | 56 | 121 MB | 0.7 s | 1.8 s | 6.3 s |
-| **1M** | **8M** | 32 | 122 MB | 0.7 s | 1.3 s | 4.0 s |
+| 1M | 8M | 32 | 122 MB | 0.7 s | 1.3 s | 4.0 s |
 | 4M | 8M | 20 | 125 MB | 0.7 s | 1.1 s | 2.7 s |
 | 64K | 32M | 10 | 20 MB | 0.6 s | 0.8 s | 1.7 s |
-| 1M | 32M | 6 | 20 MB | 0.6 s | 0.7 s | 1.3 s |
+| **1M** | **32M** | 6 | 20 MB | 0.6 s | 0.7 s | 1.3 s |
+
+How much the cache keeps from one pass to the next: the blocks those two scans
+asked for, without a YARA rule, replayed through each way of dropping blocks,
+and the blocks read from the source (1 MiB blocks):
+
+| Object | Cache | Least recently used | Passes streamed through (now) | The fewest possible |
+|---|---|---|---|---|
+| 300 MB file | 8M | 865 | 853 | 845 |
+| 300 MB file | 32M | 865 | 805 | 797 |
+| 300 MB file | 64M | 865 | 741 | 733 |
+| 20 MB ZIP | 8M | 124 | 92 | 82 |
+| 20 MB ZIP | 16M | 122 | 52 | 40 |
+| 20 MB ZIP | 32M | 20 | 20 | 20 |
+
+Dropping the least recently used block throws out each block of a pass just
+before the next pass needs it, so on an object larger than the cache it keeps
+nothing from one pass to the next. Kept apart, a pass leaves all but two blocks
+in place.
 
 On a local disk the block size changed nothing measurable (the operating
 system's page cache absorbs it), so the defaults are chosen for the network. The
@@ -245,8 +278,8 @@ at several GB/s.
 ## HTTP sources
 
 An `http(s)://` target (`--allow-http-scan`, and `SCANURL` on the daemon) is
-read by range requests and never written to disk. It takes the same two paths
-as a file, with the network in place of the disk:
+read by range requests, and written to disk only with `--http-spill`. It takes
+the same two paths as a file, with the network in place of the disk:
 
 - **Up to `--max-object-bytes`:** fetched in full into memory, once. A 100 MB
   object cost 16 requests, 1.0 times its size on the wire, and a 226 MB peak.
@@ -257,37 +290,70 @@ as a file, with the network in place of the disk:
   database: detection and the signature sweep make two at least, and rules that
   need more (YARA's prefilter reads the file twice more) transfer more. So a
   20 GB object is tens of gigabytes of egress or more. To pay in disk instead,
-  [download it and scan the file](/scanner/guides/scanning/#scanning-over-http).
-  `--object-cache-block-bytes`, `--object-cache-bytes` and `--http-request-bytes`
-  set how many requests that takes.
+  `--http-spill` downloads it once into a [spill file](#spill-files), up to
+  `--max-spill-bytes`, and scans it from there; one that does not fit is read
+  by range requests. `--object-cache-block-bytes`, `--object-cache-bytes` and
+  `--http-request-bytes` set how many requests that takes.
 
 What the source must and must not do:
 
-- It must answer range requests with `206` and a `Content-Range` that carries
-  the total size. A server that does not is an error, not a fallback to a full
-  download.
-- The transfer has no timeout of its own. Only `--max-scan-secs` bounds it
-  (set by default for a daemon job, off for a one-shot run).
-- Up to 10 redirects are followed, and the destination is not filtered, so a
-  daemon with `--allow-http-scan` fetches any address it is given, including
-  ones only it can reach.
-- The object is not pinned. exav does not check an `ETag` or `Last-Modified`
-  between ranges, so a server can answer differently on each pass. What was
-  scanned is then not what a later download receives. For an object from a
-  server you do not control, download it once and scan the file.
+- It should answer range requests with `206` and a `Content-Range` that
+  carries the total size. A server that answers with all of the object instead
+  has it downloaded whole, into memory up to `--max-object-bytes` and into a
+  spill file past it; with nowhere to spill it, the URL is an error. Past
+  `--max-input-bytes` only the bytes up to it are kept and the transfer stops
+  there. `--http-spill` does not download an object past that limit either:
+  its head is read by range requests.
+- Each request has a timeout of its own, `--http-timeout-secs` (120 s, from
+  connecting to the last byte of the body). `--max-scan-secs` bounds the scan
+  as a whole (set by default for a daemon job, off for a one-shot run).
+- Up to `--http-max-redirects` (10) redirects are followed, once, when the
+  object is first asked for; later requests go where they led. A redirect to
+  another scheme is not followed. A redirect to another host is refused if
+  the host has a loopback, private, link-local, shared-address (100.64.0.0/10)
+  or unspecified address, an IPv6 address that carries one of these included,
+  unless `--http-redirect-private` is set. The addresses are filtered where
+  each connection is made, the first and every one after it, so a name whose
+  answer changes between requests cannot lead the scan to a refused address.
+  The URL itself is not filtered: a daemon with `--allow-http-scan` fetches
+  any address a client names, including ones only it can reach, and the host
+  it names is not filtered when a redirect leads back to it. Behind a proxy
+  named by the environment (`HTTPS_PROXY`), the proxy looks the host up, and
+  the filter sees only an address written out in the redirect.
+- The object is checked for change while it is read. Each answer must give the
+  range asked for of an object of the size the first one gave, or it is an
+  error. When the first answer has a strong `ETag`, or failing that a
+  `Last-Modified`, every request after it carries that as `If-Range`: a server
+  that honours it answers a changed object with all of it, which is an error,
+  not a scan, and an answer that carries another `ETag` than the first is one
+  too. A weak `ETag` is not used. A server that gives neither header, or
+  ignores `If-Range` and sends no `ETag`, is held to the object's size and no
+  further: a change that keeps the size goes unseen. For such a server,
+  download the object once and scan the file.
 
 ## Archive members
 
 Archives decoded as they are read (ZIP, tar, CAB, ISO/UDF, LHA, `ar`, cpio, 7z,
 WIM, xar, the disk images and filesystems, the single-stream compressors,
 self-extracting executables) are walked member by member at any size and any
-depth. Such a member is held in memory up to the same limit, and past it written
-to a temporary file and scanned from there. With `--spill-dir off`, or past
-`--max-spill-bytes`, it is not scanned and the file is `LIMITS-EXCEEDED`.
+depth. Such a member is held in memory up to the same limit. Past it, a member
+stored as it stands in the archive (a ZIP member with no compression, a tar,
+`ar`, cpio, ISO, RPM, OneNote, TNEF or fat Mach-O member, a self-extractor's
+payload) is read where it lies, through the archive's own reads: no copy, no
+disk, and `--max-spill-bytes` does not apply. `--max-matcher-bytes` and
+`--max-scan-secs` still count it. It is read over a file or HTTP alike, and an
+archive inside it is opened there too. A compressed
+member past the limit is written to a temporary file and scanned from there;
+with `--spill-dir off`, or past `--max-spill-bytes`, only its first
+`--max-object-bytes` bytes are scanned and the file is `LIMITS-EXCEEDED` unless
+they hold a detection. A stored member past the limit whose size runs past
+the end of its archive is scanned as far as the archive goes and reported
+`UNSCANNABLE`.
 
-A member that has to be decoded whole (an encrypted ZIP member, a 7z folder with
-an encrypted coder, a file a filesystem stores compressed, a member of a format
-read whole) is `LIMITS-EXCEEDED` past `--max-object-bytes`.
+A member that has to be decoded whole (a decrypted ZIP member, a file HFS+ or
+APFS keeps compressed in its attribute, a member of a format read whole) is
+left out past `--max-object-bytes`, and the other members of its container are
+still scanned; the file is `LIMITS-EXCEEDED` unless something is found.
 
 ## Stdin, `INSTREAM` and ICAP bodies
 
@@ -312,8 +378,8 @@ buffered stream then goes through the same scan as a file. A stream past
   text views of a large text file, are written to spill files and read back
   through a block cache. A stream past its budget, or past the threshold with
   --spill-dir off, has what was held scanned; with --spill-dir off, such a
-  member or view is not scanned. Either way a scan that finds nothing is
-  LIMITS-EXCEEDED.</desc>
+  member has its first --max-object-bytes bytes scanned and such a view is not
+  scanned. Either way a scan that finds nothing is LIMITS-EXCEEDED.</desc>
   <defs>
     <marker id="sp-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M0 0 L8 4 L0 8 z" fill="currentColor"/>
@@ -372,8 +438,10 @@ buffered stream then goes through the same scan as a file. A stream past
 The library never writes to disk itself: the host hands a scan somewhere to
 spill (the `exav` binary passes its `--spill-dir` files and budgets). Only a
 member decoded as it is read can spill; one decoded whole is bounded by
-`--max-object-bytes`. Without a spill, a member that decodes past
-`--max-object-bytes` is not scanned, the normalised views of a text file that
+`--max-object-bytes`, and one stored as it stands needs no spill. Without a
+spill, a compressed member that decodes past
+`--max-object-bytes` has only its first `--max-object-bytes` bytes scanned, the
+normalised views of a text file that
 large are skipped, and a scan that found nothing is `LIMITS-EXCEEDED` rather
 than `OK`.
 

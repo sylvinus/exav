@@ -33,8 +33,8 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek};
 
+use super::ext_super::{Geometry, geometry};
 use super::vol::{Attrs, Emit, Got, Next, Piece, Pieces, Plan, Vol, give, le16, le32, read_file};
 use crate::source::{ByteSource, Reader};
 use crate::stream::Visit;
@@ -58,15 +58,13 @@ const MAX_EXTENT_DEPTH: u16 = 5;
 /// How many descriptor blocks are kept.
 const DESC_CACHE: usize = 64;
 
-/// `s_feature_incompat` bits.
-const INCOMPAT_JOURNAL_DEV: u32 = 0x8;
+/// `s_feature_incompat` bits (those of the superblock check are in
+/// `ext_super`).
 const INCOMPAT_META_BG: u32 = 0x10;
-const INCOMPAT_64BIT: u32 = 0x80;
 const INCOMPAT_LARGEDIR: u32 = 0x4000;
 /// `s_feature_compat` and `s_feature_ro_compat` bits.
 const COMPAT_SPARSE_SUPER2: u32 = 0x200;
 const RO_COMPAT_SPARSE_SUPER: u32 = 0x1;
-const RO_COMPAT_BIGALLOC: u32 = 0x200;
 
 /// `i_flags` bits.
 const ENCRYPT_FL: u32 = 0x800;
@@ -331,7 +329,7 @@ impl Fs {
             return if whole {
                 Got::Whole(data)
             } else {
-                Got::Short(data)
+                Got::Partial(data, "ext file whose inline data is shorter than its size")
             };
         }
         let (runs, intact) = self.runs(v, ino, ino.size.div_ceil(self.bs));
@@ -689,55 +687,20 @@ impl Map<'_> {
 /// The volume's superblock, or `None` where it is not one a system would mount.
 fn open(v: &mut Vol) -> Option<Fs> {
     let sb = v.at(1024, 1024)?;
-    if le16(&sb, 56) != 0xEF53 {
-        return None;
-    }
-    let bs = 1024u64
-        .checked_shl(le32(&sb, 24))
-        .filter(|&b| b <= 1 << 16)?;
-    let (compat, incompat, ro_compat) = (le32(&sb, 92), le32(&sb, 96), le32(&sb, 100));
-    // A journal kept apart from the files it journals holds none of them.
-    if incompat & INCOMPAT_JOURNAL_DEV != 0 {
-        return None;
-    }
-    let wide = incompat & INCOMPAT_64BIT != 0;
-    let hi = if wide { u64::from(le32(&sb, 336)) } else { 0 };
-    let blocks = (u64::from(le32(&sb, 4)) | hi.checked_shl(32)?).min(v.len.checked_div(bs)?);
-    let first_data = u64::from(le32(&sb, 20));
-    let (bpg, ipg) = (u64::from(le32(&sb, 32)), u64::from(le32(&sb, 40)));
-    // A bitmap bit stands for a cluster, which is a block unless bigalloc says more.
-    let ratio = if ro_compat & RO_COMPAT_BIGALLOC != 0 {
-        let shift = le32(&sb, 28).checked_sub(le32(&sb, 24))?;
-        1u64.checked_shl(shift).filter(|&r| r <= 1 << 16)?
-    } else {
-        1
-    };
-    let per_bitmap = bs.checked_mul(8)?;
-    if bpg == 0
-        || ipg == 0
-        || bpg > per_bitmap.checked_mul(ratio)?
-        || ipg > per_bitmap
-        || blocks <= first_data
-    {
-        return None;
-    }
-    let inode_size = if le32(&sb, 76) == 0 {
-        128
-    } else {
-        usize::from(le16(&sb, 88))
-    };
-    if !inode_size.is_power_of_two() || inode_size < 128 || inode_size as u64 > bs {
-        return None;
-    }
-    let desc_size = if wide {
-        usize::from(le16(&sb, 254))
-    } else {
-        32
-    };
-    if !desc_size.is_power_of_two() || desc_size < 32 || (wide && desc_size < 64) {
-        return None;
-    }
-    if desc_size as u64 > bs {
+    let Geometry {
+        bs,
+        blocks,
+        first_data,
+        bpg,
+        ipg,
+        inode_size,
+        desc_size,
+        compat,
+        incompat,
+        ro_compat,
+    } = geometry(&sb)?;
+    let blocks = blocks.min(v.len.checked_div(bs)?);
+    if blocks <= first_data {
         return None;
     }
     let groups = blocks.saturating_sub(first_data).div_ceil(bpg);
@@ -778,30 +741,24 @@ pub(crate) fn is_volume(src: &dyn ByteSource) -> bool {
 }
 
 /// Walk an ext volume given whole as a source.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
-    super::volumes::entries(budget, visit, "", |budget, sink| {
-        walk_volume(Reader::new(src), src.len() as u64, budget, sink)
-    })
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    super::volumes::walk_source(src, budget, visit, walk_volume)
 }
 
 /// Walk the ext volume `disk`, which is `len` bytes long, handing each file to
 /// `visit`.
-pub(crate) fn walk_volume<D: Read + Seek, R>(
-    mut disk: D,
+pub(crate) fn walk_volume(
+    disk: &mut dyn super::vol::Disk,
     len: u64,
     budget: &mut Budget,
-    visit: Emit<R>,
-) -> Result<Option<R>, LimitHit> {
+    visit: Emit,
+) -> crate::Extracted {
     let max = crate::bytes::to_usize(budget.limits().max_buffer_bytes);
-    let mut v = Vol {
-        disk: &mut disk,
-        len,
-        max,
-    };
+    let mut v = Vol { disk, len, max };
     match v.at(1080, 2) {
         Some(magic) if magic == [0x53, 0xEF] => {}
         _ => return Ok(None),

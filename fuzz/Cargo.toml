@@ -55,7 +55,7 @@ exav-imagehash = { path = "../crates/exav-imagehash", default-features = false, 
 exav-render = { path = "../crates/exav-render", default-features = false, features = ["dwg", "image", "raw", "jp2", "jbig2", "ccitt", "jxl", "ifc", "stl", "obj", "ply", "gltf", "markdown", "text-pdf", "text-office", "office", "office-test-util"] }
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder"] }
 # `zip` wraps the Numbers target's input and reads the XLSX back.
-zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+zip = { version = ">=9.0.5, <9.1", default-features = false, features = ["deflate-flate2"] }
 
 # Keep fuzz binaries debuggable while optimized.
 [profile.release]
@@ -101,6 +101,13 @@ bench = false
 [[bin]]
 name = "fsimage"
 path = "fuzz_targets/fsimage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "installers"
+path = "fuzz_targets/installers.rs"
 test = false
 doc = false
 bench = false
@@ -241,6 +248,13 @@ bench = false
 [[bin]]
 name = "rar3_ppmd"
 path = "fuzz_targets/rar3_ppmd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar_walk"
+path = "fuzz_targets/rar_walk.rs"
 test = false
 doc = false
 bench = false

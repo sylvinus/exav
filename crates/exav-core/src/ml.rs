@@ -6,6 +6,7 @@
 //! is a weighted combination of interpretable signals, not a trained
 //! classifier.
 
+use crate::byte_source::ByteSource;
 use crate::pe::PeInfo;
 
 /// A fixed-length static feature vector.
@@ -42,21 +43,46 @@ impl Features {
 
 /// Extract static features from raw bytes plus optional parsed PE info.
 pub fn extract(data: &[u8], pe: Option<&PeInfo>) -> Features {
-    let mut hist = [0u64; 256];
-    for &b in data {
-        hist[b as usize] += 1;
-    }
-    let len = data.len().max(1) as f32;
+    extract_source(&data, pe)
+}
+
+/// [`extract`] of an object that need not be held in memory: its byte counts
+/// are made in one read of it.
+pub(crate) fn extract_source(src: &dyn ByteSource, pe: Option<&PeInfo>) -> Features {
+    extract_counted(src, None, pe)
+}
+
+/// [`extract_source`], given how often each byte occurs in `src` if that is
+/// known already.
+pub(crate) fn extract_counted(
+    src: &dyn ByteSource,
+    counts: Option<&[u64; 256]>,
+    pe: Option<&PeInfo>,
+) -> Features {
+    let mut counted = [0u64; 256];
+    let hist = match counts {
+        Some(counts) => counts,
+        None => {
+            src.chunks(0, src.len(), &mut |_, chunk| {
+                for &b in chunk {
+                    counted[b as usize] += 1;
+                }
+                true
+            });
+            &counted
+        }
+    };
+    let len = src.len().max(1) as f32;
     let mut byte_histogram = [0f32; 256];
     for i in 0..256 {
         byte_histogram[i] = hist[i] as f32 / len;
     }
-    let file_entropy = crate::pe::shannon_entropy(data) as f32;
+    let file_entropy = crate::pe::entropy_of_counts(hist, src.len()) as f32;
 
     let mut f = Features {
         byte_histogram,
         file_entropy,
-        size: data.len() as u64,
+        size: src.len() as u64,
         is_pe: false,
         section_count: 0.0,
         max_section_entropy: 0.0,
@@ -83,7 +109,7 @@ pub trait Model: Send + Sync {
 /// suspicious imports, each contributing a fixed amount to a score.
 ///
 /// The weights are hand-chosen, not learned. That is a design point rather than
-/// a gap — every contribution is inspectable, so a detection can be explained
+/// a gap: every contribution is inspectable, so a detection can be explained
 /// by naming which signals fired, and the score cannot drift with a retrain.
 /// The [`Model`] trait exists so a trained classifier can replace this without
 /// touching the callers, and nothing here reports itself as one: the detection
@@ -126,6 +152,23 @@ mod tests {
         let f = extract(b"AAAA", None);
         assert!((f.byte_histogram[b'A' as usize] - 1.0).abs() < 1e-6);
         assert_eq!(f.to_vec().len(), 256 + 7);
+    }
+
+    /// Counts made by someone else give the features the object's own
+    /// read gives.
+    #[test]
+    fn counts_given_are_those_counted() {
+        let data: Vec<u8> = (0..5000u32).map(|i| (i * i % 251) as u8).collect();
+        let mut counts = [0u64; 256];
+        data.iter().for_each(|&b| counts[b as usize] += 1);
+        let src: &[u8] = &data;
+        let given = extract_counted(&src, Some(&counts), None);
+        let own = extract_counted(&src, None, None);
+        assert_eq!(given.to_vec(), own.to_vec());
+        assert!(given.file_entropy > 5.0);
+        // Counts that are not the object's change the features: they are used.
+        counts[0] += 9;
+        assert_ne!(extract_counted(&src, Some(&counts), None).to_vec(), own.to_vec());
     }
 
     #[test]

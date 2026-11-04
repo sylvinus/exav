@@ -1,4 +1,4 @@
-//! Virtual disk images — QCOW2, VMDK and VHDX.
+//! Virtual disk images: QCOW2, VMDK and VHDX.
 //!
 //! These matter to a scanner rather than merely to a hypervisor: `qemu-img
 //! convert -c` deflates each QCOW2 cluster, and a streamOptimized VMDK (the
@@ -10,7 +10,7 @@
 //! sit in arbitrary file order, and Windows mounts the format on double-click.
 //!
 //! The fixtures come from **qemu-img** and the expected digest is the digest of
-//! the raw image qemu-img itself produces — not this crate's output. A decoder
+//! the raw image qemu-img itself produces, not this crate's output. A decoder
 //! checked against a matching encoder can agree on a shared misreading; a
 //! mismatch here is exav's.
 //!
@@ -88,7 +88,7 @@ fn disk(fmt: Format, name: &str) -> Vec<u8> {
             .collect::<Vec<_>>()
     );
     let d = e.into_iter().next().unwrap_or_else(|| {
-        panic!("{name} produced no member at all — its contents would go unscanned")
+        panic!("{name} produced no member at all: its contents would go unscanned")
     });
     d.data
 }
@@ -99,7 +99,7 @@ fn a_compressed_qcow2_reconstructs_byte_for_byte() {
     assert_eq!(
         sha256_hex(&d),
         RAW_SHA256,
-        "the guest disk must match `qemu-img convert -O raw` — a cluster \
+        "the guest disk must match `qemu-img convert -O raw`: a cluster \
          descriptor read subtly wrong still yields plausible-looking output"
     );
 }
@@ -122,7 +122,7 @@ fn a_dynamic_vhdx_reconstructs_byte_for_byte() {
     assert_eq!(
         sha256_hex(&d),
         RAW_SHA256,
-        "the guest disk must match `qemu-img convert -O raw` — a block \
+        "the guest disk must match `qemu-img convert -O raw`: a block \
          allocation table misread as empty yields a full-size disk of zeroes, \
          which scans clean"
     );
@@ -223,7 +223,7 @@ fn a_metadata_marker_that_skips_past_the_end_of_the_file_ends_the_walk() {
 
 #[test]
 fn a_compressed_cluster_at_an_odd_host_offset_is_not_dropped() {
-    // Bit 0 of an L2 entry means "this cluster reads as zeroes" — but only for a
+    // Bit 0 of an L2 entry means "this cluster reads as zeroes", but only for a
     // *plain* entry. In a compressed descriptor it is part of the host offset,
     // so testing it unconditionally drops every compressed cluster that happens
     // to start at an odd byte. The cluster does not error: it becomes a hole of

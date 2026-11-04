@@ -53,7 +53,7 @@ fn a_real_documents_body_is_decompressed() {
     // right on a document exav did not write.
     assert!(
         m[0].data.len() > 40_000,
-        "body inflated to only {} bytes from a {} byte file — the preamble \
+        "body inflated to only {} bytes from a {} byte file: the preamble \
          offsets are wrong",
         m[0].data.len(),
         REAL.len()
@@ -78,7 +78,7 @@ fn content_hidden_behind_the_compression_becomes_scannable() {
     assert!(
         found_in_body_only > 32,
         "only {found_in_body_only}/64 sampled windows were absent from the raw \
-         file — the body does not look compressed, so this fixture no longer \
+         file: the body does not look compressed, so this fixture no longer \
          tests what it claims"
     );
 }

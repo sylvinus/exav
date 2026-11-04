@@ -86,6 +86,8 @@ export default defineConfig({
     '/file-viewer/api/': '/viewer/api/',
     '/file-viewer/security/': '/viewer/security/',
     '/project/design-principles/': '/scanner/concepts/design-principles/',
+    // The format matrix became the site's formats page, with the demo.
+    '/project/formats/': '/formats/',
   },
   integrations: [
     starlight({
@@ -222,6 +224,17 @@ export default defineConfig({
             ],
           },
           {
+            label: 'Formats',
+            link: '/formats/',
+            icon: 'list-format',
+            items: [
+              { label: 'All formats', slug: 'formats' },
+              { label: 'Scanner formats', link: '/scanner/reference/formats/' },
+              { label: 'Extractor formats', link: '/unpack/formats/' },
+              { label: 'Viewer example files', link: '/viewer/examples/' },
+            ],
+          },
+          {
             label: 'Subprojects',
             link: '/subprojects/',
             icon: 'puzzle',
@@ -233,6 +246,7 @@ export default defineConfig({
                   { label: 'exav-grep', slug: 'subprojects/exav-grep' },
                   { label: 'exav-imagehash', slug: 'subprojects/exav-imagehash' },
                   { label: 'exav-pe-emu', slug: 'subprojects/exav-pe-emu' },
+                  { label: 'exav-qr', slug: 'subprojects/exav-qr' },
                 ],
               },
               {
@@ -252,7 +266,6 @@ export default defineConfig({
             icon: 'open-book',
             items: [
               { label: 'Technical architecture', slug: 'project/architecture' },
-              { label: 'Format matrix', slug: 'project/formats' },
               { label: 'Roadmap', slug: 'project/roadmap' },
               { label: 'Contributing', slug: 'project/contributing' },
               { label: 'Security', slug: 'project/security' },

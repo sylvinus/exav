@@ -1,6 +1,6 @@
 use std::io::{self, Read, Seek, SeekFrom};
 
-use byteorder::{LittleEndian, ReadBytesExt};
+use crate::formats::cab_parse::ReadLe;
 
 use crate::formats::cab_parse::consts;
 use crate::formats::cab_parse::ctype::CompressionType;
@@ -26,22 +26,22 @@ impl Cabinet {
         reader.seek(SeekFrom::Start(0))?;
 
         // === Fixed CFHEADER (36 bytes) ===
-        let signature = reader.read_u32::<LittleEndian>()?;
+        let signature = reader.read_u32_le()?;
         if signature != consts::FILE_SIGNATURE {
             invalid_data!("Cabinet has invalid signature");
         }
-        let _reserved1 = reader.read_u32::<LittleEndian>()?;
-        let _total_size = reader.read_u32::<LittleEndian>()?;
-        let _reserved2 = reader.read_u32::<LittleEndian>()?;
-        let first_file_offset = reader.read_u32::<LittleEndian>()?;
-        let _reserved3 = reader.read_u32::<LittleEndian>()?;
+        let _reserved1 = reader.read_u32_le()?;
+        let _total_size = reader.read_u32_le()?;
+        let _reserved2 = reader.read_u32_le()?;
+        let first_file_offset = reader.read_u32_le()?;
+        let _reserved3 = reader.read_u32_le()?;
         let _minor_version = reader.read_u8()?;
         let _major_version = reader.read_u8()?;
-        let num_folders = reader.read_u16::<LittleEndian>()?;
-        let num_files = reader.read_u16::<LittleEndian>()?;
-        let flags = reader.read_u16::<LittleEndian>()?;
-        let _set_id = reader.read_u16::<LittleEndian>()?;
-        let _cabinet_index = reader.read_u16::<LittleEndian>()?;
+        let num_folders = reader.read_u16_le()?;
+        let num_files = reader.read_u16_le()?;
+        let flags = reader.read_u16_le()?;
+        let _set_id = reader.read_u16_le()?;
+        let _cabinet_index = reader.read_u16_le()?;
 
         if flags & consts::FLAG_PREV_CABINET != 0 {
             invalid_input!("Multi-cabinet files are not supported");
@@ -52,7 +52,7 @@ impl Cabinet {
         let mut folder_reserve_size: usize = 0;
         let mut _data_reserve_size: u8 = 0;
         if flags & consts::FLAG_RESERVE_PRESENT != 0 {
-            header_reserve_size = reader.read_u16::<LittleEndian>()?;
+            header_reserve_size = reader.read_u16_le()?;
             folder_reserve_size = reader.read_u8()? as usize;
             _data_reserve_size = reader.read_u8()?;
         }
@@ -70,9 +70,9 @@ impl Cabinet {
         // === CFFOLDER entries (contiguous; data blocks are read later) ===
         let mut folder_metas = Vec::with_capacity(num_folders as usize);
         for _ in 0..num_folders {
-            let first_data_offset = reader.read_u32::<LittleEndian>()?;
-            let num_data_blocks = reader.read_u16::<LittleEndian>()?;
-            let compression_bits = reader.read_u16::<LittleEndian>()?;
+            let first_data_offset = reader.read_u32_le()?;
+            let num_data_blocks = reader.read_u16_le()?;
+            let compression_bits = reader.read_u16_le()?;
             let compression_type = CompressionType::from_bitfield(compression_bits)?;
             if folder_reserve_size > 0 {
                 let mut skip = vec![0u8; folder_reserve_size];
@@ -89,12 +89,12 @@ impl Cabinet {
         reader.seek(SeekFrom::Start(first_file_offset as u64))?;
         let mut file_entries = Vec::new();
         for _ in 0..num_files {
-            let uncompressed_size = reader.read_u32::<LittleEndian>()?;
-            let uncompressed_offset = reader.read_u32::<LittleEndian>()?;
-            let folder_index = reader.read_u16::<LittleEndian>()?;
-            let date = reader.read_u16::<LittleEndian>()?;
-            let time = reader.read_u16::<LittleEndian>()?;
-            let attributes = reader.read_u16::<LittleEndian>()?;
+            let uncompressed_size = reader.read_u32_le()?;
+            let uncompressed_offset = reader.read_u32_le()?;
+            let folder_index = reader.read_u16_le()?;
+            let date = reader.read_u16_le()?;
+            let time = reader.read_u16_le()?;
+            let attributes = reader.read_u16_le()?;
             let is_utf8 = (attributes & consts::ATTR_NAME_IS_UTF) != 0;
             let name = read_null_terminated_string(reader, is_utf8)?;
             file_entries.push(FileEntry::new(

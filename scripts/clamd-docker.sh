@@ -30,7 +30,7 @@ cmd_start() {
     return
   fi
 
-  # Write clamd config — the container will see this path via mount.
+  # Write clamd config: the container will see this path via mount.
   mkdir -p "$SOCK_DIR"
   cat > "$CONF" <<CONF
 DatabaseDirectory /var/lib/clamav
@@ -43,7 +43,7 @@ MaxFileSize 2000M
 CONF
 
   # Run clamd directly (override the entrypoint) so the image's freshclam does
-  # NOT download extra databases into $DBDIR — clamd loads only what we mounted,
+  # NOT download extra databases into $DBDIR: clamd loads only what we mounted,
   # keeping the DB set identical to exav's for a valid comparison.
   docker run -d \
     --name "$CONTAINER" \
@@ -76,7 +76,7 @@ wait_for_socket() {
     fi
     # Check container is still alive
     if ! docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true; then
-      echo " FAILED — container exited"
+      echo " FAILED: container exited"
       docker logs "$CONTAINER" 2>&1 | tail -20
       return 1
     fi

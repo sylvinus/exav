@@ -34,7 +34,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::SeekFrom;
 
 use super::decmpfs;
 use super::vol::{
@@ -493,19 +493,6 @@ impl Hfs {
         map
     }
 
-    /// The whole of a fork, or `None` when it is longer than `bound` or its
-    /// extents do not give it.
-    fn read_fork(&self, v: &mut Vol, fork: &Fork, id: u32, ty: u8, bound: u64) -> Option<Vec<u8>> {
-        if fork.size > bound {
-            return None;
-        }
-        let mut out = Vec::new();
-        let len = crate::bytes::to_usize(fork.size);
-        self.map(v, fork, id, ty)
-            .read(v, 0, len, &mut out)
-            .then_some(out)
-    }
-
     /// The `com.apple.decmpfs` attribute of file `id`.
     fn decmpfs_attr(&self, v: &mut Vol, id: u32) -> Option<Vec<u8>> {
         let tree = self.attributes.as_ref()?;
@@ -535,21 +522,37 @@ impl Hfs {
     }
 }
 
+/// The resource fork of a compressed file, read where its table says.
+struct ResourceFork {
+    map: Map,
+    size: u64,
+}
+
+impl decmpfs::Fork for ResourceFork {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read(&self, v: &mut Vol, off: u64, len: usize, out: &mut Vec<u8>) -> bool {
+        off.checked_add(len as u64)
+            .is_some_and(|end| end <= self.size)
+            && self.map.read(v, off, len, out)
+    }
+}
+
 impl Hfs {
     /// The bytes of `f`: held when they are at most `cap`, else read as they
-    /// go. A compressed file is unpacked, and is not read as it goes.
+    /// go. A compressed file is read a block at a time.
     fn file<'a>(&self, v: &'a mut Vol<'_>, f: &File, cap: u64) -> Got<'a> {
         if f.compressed {
             if let Some(attr) = self.decmpfs_attr(v, f.id) {
-                let kind = decmpfs::header(&attr).map(|h| h.kind);
-                let fork = kind
-                    .filter(|&k| decmpfs::in_fork(k))
-                    // A fork holds the bytes in blocks, a little over their number.
-                    .and_then(|_| {
-                        let bound = cap.saturating_add(cap / 32).saturating_add(4096);
-                        self.read_fork(v, &f.resource, f.id, RESOURCE, bound)
+                let fork = decmpfs::header(&attr)
+                    .filter(|h| decmpfs::in_fork(h.kind))
+                    .map(|_| ResourceFork {
+                        map: self.map(v, &f.resource, f.id, RESOURCE),
+                        size: f.resource.size,
                     });
-                return decmpfs::unpack(&attr, fork.as_deref(), cap);
+                return decmpfs::file(v, &attr, fork, cap);
             }
             if f.data.size == 0 {
                 return Got::Why("compressed file (decmpfs) without its attribute");
@@ -587,20 +590,16 @@ pub(crate) fn is_hfsplus(head: &[u8]) -> bool {
 
 /// Walk the HFS+ or HFSX volume `disk`, which starts at its boot area,
 /// handing each file to `visit`.
-pub(crate) fn walk_volume<D: Read + Seek, R>(
-    mut disk: D,
+pub(crate) fn walk_volume(
+    disk: &mut dyn super::vol::Disk,
     budget: &mut Budget,
-    visit: Emit<R>,
-) -> Result<Option<R>, LimitHit> {
+    visit: Emit,
+) -> crate::Extracted {
     let len = disk
         .seek(SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("HFS+ volume: {e}")))?;
     let max = crate::bytes::to_usize(budget.limits().max_buffer_bytes);
-    let mut v = Vol {
-        disk: &mut disk,
-        len,
-        max,
-    };
+    let mut v = Vol { disk, len, max };
     let Some((hfs, catalog)) = open(&mut v) else {
         return Err(LimitHit::corrupt(
             "hfs+ open: the volume header or a tree is unreadable".into(),
@@ -704,7 +703,7 @@ mod tests {
     use super::super::vol::collected;
     use super::*;
     use crate::Limits;
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Write};
 
     /// The allocation block and the node size of the volumes built here.
     const B: usize = 512;
@@ -872,9 +871,9 @@ mod tests {
     fn run(img: &[u8], limits: Limits) -> (Vec<Entry>, Result<(), LimitHit>) {
         let mut budget = Budget::new(limits);
         let mut out = Vec::new();
-        let end = walk_volume(Cursor::new(img.to_vec()), &mut budget, &mut |e, _| {
+        let end = walk_volume(&mut Cursor::new(img.to_vec()), &mut budget, &mut |e, _| {
             out.push(e.whole());
-            None::<()>
+            None
         });
         (out, end.map(|_| ()))
     }
@@ -1115,6 +1114,95 @@ mod tests {
         assert!(entries.iter().all(|e| e.unsupported.is_none()));
     }
 
+    /// A volume that records the longest read made of it.
+    struct Counting {
+        inner: Cursor<Vec<u8>>,
+        biggest: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl std::io::Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.biggest.set(self.biggest.get().max(buf.len()));
+            self.inner.read(buf)
+        }
+    }
+
+    impl std::io::Seek for Counting {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    /// A compressed file whose resource fork is long, in three extents with
+    /// other data between them: past the buffer limit it is read as it goes,
+    /// a block at a time, and no read of the volume is longer than a block.
+    #[test]
+    fn a_compressed_file_is_read_a_block_at_a_time_from_its_fragmented_fork() {
+        const BLOCK: usize = 0x1_0000;
+        let text: Vec<u8> = (0..6 * BLOCK + 100)
+            .map(|i| (i * 7 % 251) as u8 ^ (i >> 12) as u8)
+            .collect();
+        // Type 10: the offsets of the blocks, then each behind a marker byte.
+        let blocks: Vec<Vec<u8>> = text
+            .chunks(BLOCK)
+            .map(|c| [&[0u8][..], c].concat())
+            .collect();
+        let mut rsrc = Vec::new();
+        let mut at = 4 * (blocks.len() + 1);
+        for b in &blocks {
+            rsrc.extend_from_slice(&(at as u32).to_le_bytes());
+            at += b.len();
+        }
+        rsrc.extend_from_slice(&(at as u32).to_le_bytes());
+        for b in &blocks {
+            rsrc.extend_from_slice(b);
+        }
+
+        let mut img = Img::new();
+        let mut extents = Vec::new();
+        let cuts = [0, 200 * B, 500 * B, rsrc.len()];
+        for w in cuts.windows(2) {
+            extents.push(img.add(&rsrc[w[0]..w[1]]));
+            img.add(&[0x55; 700]);
+        }
+        let none = fork(0, &[]);
+        let rsrc_fork = fork(rsrc.len() as u64, &extents);
+        let recs = [
+            folder(1, "V", 2),
+            file(2, "big", 40, FILE, 0x20, &none, &rsrc_fork),
+        ];
+        let cat = tree(1, 1, 1, &[leaf(0, &recs)]);
+        let a = decmpfs_attr(10, text.len(), &[]);
+        let attrs = tree(1, 1, 1, &[leaf(0, &[attr(40, "com.apple.decmpfs", &a)])]);
+        let vol = img.finish(&cat, &[], &attrs);
+
+        for (cap, streamed) in [(100, true), (u64::MAX, false)] {
+            let biggest = std::rc::Rc::new(std::cell::Cell::new(0));
+            let mut disk = Counting {
+                inner: Cursor::new(vol.clone()),
+                biggest: std::rc::Rc::clone(&biggest),
+            };
+            let mut budget = Budget::new(Limits {
+                max_buffer_bytes: cap,
+                ..Limits::default()
+            });
+            let (e, end) = collected(|emit| walk_volume(&mut disk, &mut budget, emit));
+            end.unwrap();
+            assert_eq!(e.len(), 1);
+            let (big, was) = &e[0];
+            assert!(big.unsupported.is_none(), "{:?}", big.unsupported);
+            assert_eq!(*was, streamed, "cap {cap}");
+            assert!(big.data == text, "cap {cap}");
+            if streamed {
+                assert!(
+                    biggest.get() <= BLOCK + 1,
+                    "a read of {} bytes of the volume",
+                    biggest.get()
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_compressed_file_whose_attribute_is_missing_is_reported_not_empty() {
         let img = Img::new();
@@ -1202,7 +1290,8 @@ mod tests {
             max_buffer_bytes: 100,
             ..Limits::default()
         });
-        let (e, end) = collected(|emit| walk_volume(Cursor::new(vol.clone()), &mut budget, emit));
+        let (e, end) =
+            collected(|emit| walk_volume(&mut Cursor::new(vol.clone()), &mut budget, emit));
         end.unwrap();
         let (big, was) = e.iter().find(|(m, _)| m.name == "/big").unwrap();
         assert!(*was, "past the limit, so not held");
@@ -1313,14 +1402,14 @@ mod tests {
         img[extent_count..extent_count + 4].copy_from_slice(&be32(1 << 26));
         img[fork_at..fork_at + 8].copy_from_slice(&(512u64 << 26).to_be_bytes());
         img[1024 + 44..1024 + 48].copy_from_slice(&be32(u32::MAX));
-        let disk = Padded {
+        let mut disk = Padded {
             image: img,
             len: 1 << 40,
             at: 0,
         };
         let mut budget = Budget::new(Limits::default());
         let started = std::time::Instant::now();
-        let end = walk_volume(disk, &mut budget, &mut |_, _| None::<()>);
+        let end = walk_volume(&mut disk, &mut budget, &mut |_, _| None);
         assert!(started.elapsed().as_secs() < 2, "{:?}", started.elapsed());
         assert!(end.expect_err("a loop").is_corrupt());
     }

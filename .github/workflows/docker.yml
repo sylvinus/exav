@@ -4,7 +4,7 @@
 # clamd-compatible daemon end-to-end (PING + an EICAR INSTREAM scan) so a broken
 # image can't merge. On `v*` tags, `binaries` cross-compiles the static musl
 # binaries natively on amd64 (via `cross`, NOT under QEMU) and `publish`
-# assembles the multi-arch image around them with `COPY` — compiling the
+# assembles the multi-arch image around them with `COPY`: compiling the
 # Rust+ring tree emulated for arm64 is what used to make publishing slow.
 # `publish` then re-checks the pushed tag, because the image must carry Docker
 # (not OCI) mediatypes for podman to honour its HEALTHCHECK; see that step.
@@ -39,15 +39,28 @@ jobs:
         run: |
           # Empty volume + no mirror (no EXAV_SIG_SOURCES/EXAV_DB_URL = nothing
           # to fetch): explicitly opt into serving the built-in EICAR-only
-          # baseline (--allow-no-db — refused by default) and skip the wait for a
+          # baseline (--allow-no-db, refused by default) and skip the wait for a
           # sidecar that is not coming, so CI is fast.
+          # Run as the guides recommend: read-only root, the spill dir a tmpfs,
+          # no capabilities. A change that needs root or writes elsewhere fails.
           docker run -d --name exav -p 3310:3310 \
+            --read-only --tmpfs /tmp --cap-drop ALL \
+            --security-opt no-new-privileges \
             -e EXAV_STARTUP_WAIT_SECS=0 -e EXAV_ALLOW_NO_DB=1 exav:ci
           if ! python3 .github/docker-smoke.py 127.0.0.1 3310; then
             docker logs exav
             exit 1
           fi
           docker logs exav
+          # The image's user, the process's, and the owner of the directories a
+          # named volume takes its owner from.
+          [ "$(docker inspect --format '{{.Config.User}}' exav:ci)" = 65532:65532 ]
+          [ "$(ps -o uid=,gid= -p "$(docker inspect --format '{{.State.Pid}}' exav)" | xargs)" = "65532 65532" ]
+          for d in /var/lib/exav /run/exav; do
+            owner=$(docker cp "exav:$d" - | tar -tvf - --numeric-owner | head -1 | awk '{print $2}')
+            echo "$d: $owner"
+            [ "$owner" = 65532/65532 ]
+          done
           # The image's HEALTHCHECK is on the container, and its command works.
           # Not `docker inspect .State.Health`: the first probe is 30s away.
           HC=$(docker inspect --format '{{json .Config.Healthcheck.Test}}' exav)
@@ -57,7 +70,7 @@ jobs:
           docker rm -f exav
 
   # Static musl binaries for the published image, cross-compiled natively on
-  # amd64 via `cross` (real cross toolchains in containers — the same mechanism
+  # amd64 via `cross` (real cross toolchains in containers, the same mechanism
   # the `release` workflow already uses for its musl legs). Tag-only: ordinary
   # pushes/PRs only need `build-test` above.
   binaries:
@@ -145,9 +158,9 @@ jobs:
           # the OCI image spec. Nothing strips it: flipping this exporter
           # option leaves the config blob byte-identical (same sha256), and
           # only the declared mediatype changes. But podman reads the field
-          # back solely from a schema2 config — containers/common fills
+          # back solely from a schema2 config: containers/common fills
           # `HealthCheck` in the `DockerV2Schema2MediaType` branch of
-          # libimage/inspect.go and in no other branch — so under OCI
+          # libimage/inspect.go and in no other branch, so under OCI
           # mediatypes it reports "has no defined healthcheck" however healthy
           # the daemon actually is. That leaves a rootless podman deployment
           # with no readiness signal at all: the image is distroless, so a
@@ -167,7 +180,7 @@ jobs:
           outputs: type=image,oci-mediatypes=false,push=true
 
       # The `build-test` job above smoke-tests a locally `load`ed image, which
-      # cannot catch a *push-time* mediatype change — the exporter is what
+      # cannot catch a *push-time* mediatype change: the exporter is what
       # differs. These two steps therefore run against the pushed tag.
       - name: Assert the published manifest is a Docker manifest list
         env:

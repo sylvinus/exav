@@ -10,8 +10,6 @@ export interface Limits {
   maxMembers?: number;
   /** How deep an archive inside an archive may nest. */
   maxRecursion?: number;
-  /** Largest decompressed:compressed ratio tolerated. */
-  maxCompressionRatio?: number;
   /**
    * Formats that may be opened, named as `detectFormat` reports them. Anything
    * absent is refused rather than extracted. An unknown name is ignored, so a
@@ -28,6 +26,13 @@ export interface MemberInfo {
   /** As the archive declares it; -1 where it declares none (a gzip or xz stream). */
   uncompressedSize: number;
   encrypted: boolean;
+  /**
+   * True for the one member of a single-stream format (gzip, bzip2, xz, zstd,
+   * lzip, lzma, lz4, compress, CryptFF). The format stores no name for it:
+   * `name` is the library's (`gzip-content`), and a caller shows the name of
+   * the file it opened instead.
+   */
+  synthetic: boolean;
 }
 
 /** One extracted member. */
@@ -39,7 +44,7 @@ export interface Entry {
   readonly data: ReadableStream<Uint8Array>;
   encrypted: boolean;
   /**
-   * Empty when the member decoded. Otherwise why it did not — unsupported
+   * Empty when the member decoded. Otherwise why it did not: unsupported
    * compression, a missing password, a limit reached. The member is still
    * reported: a container whose contents could not be read is not an empty
    * container.
@@ -49,7 +54,7 @@ export interface Entry {
 
 /**
  * A caller-supplied source over bytes the caller owns, read in-process with no
- * Worker. `read` is SYNCHRONOUS — it returns bytes, not a Promise of them —
+ * Worker. `read` is SYNCHRONOUS (it returns bytes, not a Promise of them)
  * because the archive readers beneath it are `Read + Seek`.
  */
 export interface SyncReader {
@@ -105,6 +110,14 @@ export function unpack(
 
 /** The archive/container format these magic bytes name, if any. */
 export function detectFormat(data: Uint8Array): string | undefined;
+
+/**
+ * A ZIP's central directory, read from the last bytes (`tail`) of a
+ * `size`-byte file: where its members' local headers are, or the offset from
+ * which more bytes are needed; `undefined` for what the ZIP reader does not
+ * open. Builds with the `zip` feature.
+ */
+export function zipTail(tail: Uint8Array, size: number): { headers: number[] } | { needs: number } | undefined;
 
 /** Rejoin the multi-volume archives among a group of files. */
 export function joinVolumes(

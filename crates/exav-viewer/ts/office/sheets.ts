@@ -6,6 +6,7 @@
  * shrinks.
  */
 import { createWorkerHost, type WorkerHost } from "../core/worker-host.js";
+import { isCompound, isZip } from "./zip.js";
 
 /** What the converter reads: "xml" is Excel's XML Spreadsheet 2003, "slk" SYLK. */
 export type SheetFormat = "xls" | "ods" | "fods" | "numbers" | "xml" | "html" | "slk";
@@ -30,11 +31,14 @@ export type SheetErrorKind = "not-format" | "encrypted" | "unsupported" | "too-l
 
 const KINDS: readonly string[] = ["not-format", "encrypted", "unsupported", "too-large", "malformed"];
 
-/** A spreadsheet exav-render's `sheets` recognised and could not convert. */
+/**
+ * A spreadsheet exav-render's `sheets` recognised and could not convert, or
+ * a CSV or TSV ("csv") its reader could not read.
+ */
 export class SheetConversionError extends Error {
   readonly kind: SheetErrorKind;
   constructor(
-    readonly format: SheetFormat,
+    readonly format: SheetFormat | "csv",
     cause: unknown,
   ) {
     const reason = cause instanceof Error ? cause.message : String(cause);
@@ -81,30 +85,22 @@ function textHead(bytes: Uint8Array, n = 4096): string {
   return s.trimStart().toLowerCase();
 }
 
+/** The formats `sniffSheet` takes from `officeKinds`, in the order it prefers them. */
+const FROM_KINDS = ["xls", "xlsx", "numbers", "ods"] as const;
+
 /**
  * What the bytes are: a spreadsheet the converter reads, an XLSX shown as
  * it is, or `null` for anything else (left to the external converter, which
- * may read more: CSV, DIF, dBase and the like saved as .xls).
+ * may read more: CSV, DIF, dBase and the like saved as .xls). `kinds` are
+ * what the file's container says it may be (`officeKinds`): a compound file
+ * or a ZIP is told by them alone.
  */
-export function sniffSheet(bytes: Uint8Array): SheetFormat | "xlsx" | null {
-  // A compound file, or a BIFF2 to BIFF4 worksheet's BOF record.
-  if (bytes[0] === 0xd0 && bytes[1] === 0xcf && bytes[2] === 0x11 && bytes[3] === 0xe0) return "xls";
+export function sniffSheet(bytes: Uint8Array, kinds: readonly string[] | null): SheetFormat | "xlsx" | null {
+  // A compound file too large to look into is taken as its name says.
+  if (kinds === null) return isCompound(bytes) ? "xls" : null;
+  if (isCompound(bytes) || isZip(bytes)) return FROM_KINDS.find((kind) => kinds.includes(kind)) ?? null;
+  // A BIFF2 to BIFF4 worksheet's BOF record.
   if (bytes[0] === 0x09 && [0x00, 0x02, 0x04].includes(bytes[1]!) && bytes[2]! < 0x20 && bytes[3] === 0) return "xls";
-  if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
-    // OpenDocument: the stored "mimetype" member first.
-    // Stored, as the specification asks; a deflated one (some tools zip it
-    // so) is told by the members below.
-    const stored = bytes[8] === 0 && bytes[9] === 0;
-    if (ascii(bytes, 30, "mimetype") && stored) return contains(bytes, 38, 120, "spreadsheet") ? "ods" : null;
-    // The central directory, at the end, names the members.
-    const from = bytes.length - (1 << 20);
-    if (contains(bytes, from, bytes.length, "[Content_Types].xml") && contains(bytes, from, bytes.length, "xl/")) return "xlsx";
-    if (contains(bytes, from, bytes.length, ".iwa") || contains(bytes, from, bytes.length, "Index.zip")) return "numbers";
-    // Numbers '08 and '09: index.xml, or index.xml.gz.
-    if (contains(bytes, from, bytes.length, "index.xml")) return "numbers";
-    if (contains(bytes, from, bytes.length, "content.xml")) return "ods";
-    return null;
-  }
   // Flat OpenDocument, after a BOM and an XML declaration.
   if (contains(bytes, 0, 2048, "office:document") && contains(bytes, 0, 4096, "opendocument.spreadsheet")) return "fods";
   // The text formats Excel opens whatever their name says.

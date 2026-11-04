@@ -23,6 +23,22 @@ pub(super) fn is_known_codec(id: &[u8]) -> bool {
         || id == ID_DELTA
 }
 
+/// Why a folder whose LZMA dictionary is over the buffer limit is not decoded.
+const DICT_OVER_LIMIT: &str =
+    "7z member's LZMA dictionary is over the buffer limit (--max-object-bytes)";
+
+/// The LZMA window to allocate for a coder declaring `dict` bytes and
+/// `expected` bytes of output. A dictionary larger than the output is never
+/// consulted, so the output bounds it; past that it is memory the scan may
+/// not claim, and the coder is refused: decoding with a smaller window fails
+/// on the first match that reaches further back, on a valid stream.
+fn window(dict: u32, expected: usize, max_buffer: u64) -> Result<u32, LimitHit> {
+    if u64::from(dict).min(expected as u64) > max_buffer {
+        return Err(LimitHit::new(DICT_OVER_LIMIT.into()));
+    }
+    Ok(crate::bounded_dict(dict, expected as u64))
+}
+
 /// Wrap a coder around an existing reader, returning a new boxed reader.
 /// `password` is the passphrase to try for an AES-encrypted coder (ignored by
 /// every other codec); `None` (or a build without the `decrypt` feature) leaves
@@ -67,20 +83,9 @@ pub(super) fn wrap_coder<'a>(
                     1u32 << 11
                 }
             };
-            // Bound the up-front dictionary allocation. `expected_size` is a
-            // header var-int and nothing else bounds it, so it is no ceiling on
-            // its own; `max_buffer` is. Keep the declared output as the tighter
-            // of the two: a dictionary larger than the bytes it will be used to
-            // look back into cannot be consulted.
-            let dict_size = crate::bounded_dict(dict_size, (expected_size as u64).min(max_buffer));
-            let lzma = lzma_rust2::LzmaStream::new_with_props(
-                expected_size as u64,
-                props,
-                dict_size,
-                None,
-            )
-            .map_err(|e| LimitHit::corrupt(format!("7z: LZMA init: {e}")))?;
-            Ok(Box::new(SansIo::new(inner, lzma)))
+            let dict_size = window(dict_size, expected_size, max_buffer)?;
+            crate::formats::lzma::member_reader(inner, expected_size as u64, props, dict_size)
+                .ok_or_else(|| LimitHit::corrupt("7z: LZMA init: bad properties".into()))
         }
 
         x if x == ID_LZMA2 => {
@@ -95,10 +100,7 @@ pub(super) fn wrap_coder<'a>(
             } else {
                 (2 | (dict_size_bits & 1)) << (dict_size_bits / 2 + 11)
             };
-            // As for LZMA: a dictionary larger than what the stream can fill
-            // is allocated for nothing, and 4 GiB is declared by one byte.
-            let dict_size = crate::bounded_dict(dict_size, (expected_size as u64).min(max_buffer));
-            let lzma2 = lzma_rust2::Lzma2Stream::new(dict_size);
+            let lzma2 = lzma_rust2::Lzma2Stream::new(window(dict_size, expected_size, max_buffer)?);
             Ok(Box::new(SansIo::new(inner, lzma2)))
         }
 

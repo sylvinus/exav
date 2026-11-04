@@ -222,6 +222,6 @@ fn main() {
         rows.len()
     );
     println!(
-        "  of which {ran_clean} clean, {false_pos} set a name (trigger-gated programs run standalone — not false positives)"
+        "  of which {ran_clean} clean, {false_pos} set a name (trigger-gated programs run standalone, not false positives)"
     );
 }

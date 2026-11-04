@@ -20,7 +20,7 @@ fn parse_object_depth(lex: &mut Lexer, depth: usize) -> Option<Primitive> {
         Token::Integer(n) => {
             // An integer may begin an indirect reference `n g R` (e.g. a dict
             // value like `/Root 1 0 R`). Consume the `g R` so the enclosing dict
-            // or array stays token-aligned — otherwise the dangling `g R` derails
+            // or array stays token-aligned; otherwise the dangling `g R` derails
             // the rest of the parse (this dropped the trailer's `/ID`, breaking
             // encrypted-PDF key derivation). The reference target isn't resolved
             // here, so it surfaces as the leading integer.
@@ -33,7 +33,7 @@ fn parse_object_depth(lex: &mut Lexer, depth: usize) -> Option<Primitive> {
             lex.set_pos(saved);
             Some(Primitive::Integer(n))
         }
-        Token::Real(_) => Some(Primitive::Real),
+        Token::Real(r) => Some(Primitive::Real(r)),
         Token::Name(n) => Some(Primitive::Name(n)),
         Token::String(s) => Some(Primitive::String(s)),
         Token::ArrayStart => Some(parse_array(lex, depth)),
@@ -60,17 +60,17 @@ fn parse_object_depth(lex: &mut Lexer, depth: usize) -> Option<Primitive> {
             }
         }
         Token::Obj => {
-            // Bare "obj" keyword — skip and try again
+            // Bare "obj" keyword: skip and try again
             parse_object_depth(lex, depth)
         }
         Token::EndObj | Token::EndStream | Token::Eof | Token::DictEnd | Token::ArrayEnd => None,
         Token::Stream => {
-            // Bare "stream" without dict — read and ignore
+            // Bare "stream" without dict: read and ignore
             let _ = read_stream_data(lex);
             Some(Primitive::Null)
         }
         Token::R => {
-            // Bare "R" without preceding numbers — shouldn't happen in valid parse
+            // Bare "R" without preceding numbers: shouldn't happen in valid parse
             Some(Primitive::Null)
         }
     }
@@ -111,7 +111,7 @@ fn parse_dict_entries(lex: &mut Lexer, depth: usize) -> HashMap<String, Primitiv
                 }
             }
             _ => {
-                // Not a name — might be end of dict, skip
+                // Not a name: might be end of dict, skip
                 lex.set_pos(saved);
                 break;
             }
@@ -141,7 +141,7 @@ fn read_stream_data(lex: &mut Lexer) -> Vec<u8> {
         let _ = lex.next_token();
         data
     } else {
-        // No endstream found — take remaining
+        // No endstream found: take remaining
         let data = remaining.to_vec();
         lex.set_pos(lex.data().len());
         data
@@ -165,6 +165,29 @@ fn find_endstream(data: &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+/// Moves past the data of a stream whose `stream` keyword was just read: to
+/// after its `endstream`, or to the end of the data when it has none. This is
+/// the extent [`parse_object`] gives the stream.
+pub(crate) fn skip_stream_data(lex: &mut Lexer) {
+    match find_endstream(lex.remaining()) {
+        Some(end) => {
+            lex.set_pos(lex.pos() + end);
+            let _ = lex.next_token();
+        }
+        None => lex.set_pos(lex.data().len()),
+    }
+}
+
+/// The dictionary of a stream object, read without the stream's data. `None`
+/// when the object is not a dictionary followed by the `stream` keyword.
+pub(crate) fn parse_stream_head(lex: &mut Lexer) -> Option<HashMap<String, Primitive>> {
+    if lex.next_token() != Token::DictStart {
+        return None;
+    }
+    let dict = parse_dict_entries(lex, 0);
+    (lex.next_token() == Token::Stream).then_some(dict)
 }
 
 /// Parse a PDF indirect object body: after "N G obj", read until "endobj".

@@ -216,16 +216,16 @@ fn read(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
         (Channels::LumaAlpha, DecodingResult::U8(v)) if associated => unpremultiply(v, 2),
         (Channels::LumaAlpha, DecodingResult::U8(v)) if unspecified => opaque(v, 2),
         (Channels::LumaAlpha, DecodingResult::U8(v)) => v,
-        (Channels::Luma, DecodingResult::U16(v)) => stretch(&v, f64::from, nodata),
-        (Channels::Luma, DecodingResult::U32(v)) => stretch(&v, f64::from, nodata),
-        (Channels::Luma, DecodingResult::U64(v)) => stretch(&v, |x| x as f64, nodata),
-        (Channels::Luma, DecodingResult::I8(v)) => stretch(&v, f64::from, nodata),
-        (Channels::Luma, DecodingResult::I16(v)) => stretch(&v, f64::from, nodata),
-        (Channels::Luma, DecodingResult::I32(v)) => stretch(&v, f64::from, nodata),
-        (Channels::Luma, DecodingResult::I64(v)) => stretch(&v, |x| x as f64, nodata),
-        (Channels::Luma, DecodingResult::F16(v)) => stretch(&v, half, nodata),
-        (Channels::Luma, DecodingResult::F32(v)) => stretch(&v, f64::from, nodata),
-        (Channels::Luma, DecodingResult::F64(v)) => stretch(&v, |x| x, nodata),
+        (Channels::Luma, DecodingResult::U16(v)) => stretch(v.len(), &|i| f64::from(v[i]), nodata),
+        (Channels::Luma, DecodingResult::U32(v)) => stretch(v.len(), &|i| f64::from(v[i]), nodata),
+        (Channels::Luma, DecodingResult::U64(v)) => stretch(v.len(), &|i| v[i] as f64, nodata),
+        (Channels::Luma, DecodingResult::I8(v)) => stretch(v.len(), &|i| f64::from(v[i]), nodata),
+        (Channels::Luma, DecodingResult::I16(v)) => stretch(v.len(), &|i| f64::from(v[i]), nodata),
+        (Channels::Luma, DecodingResult::I32(v)) => stretch(v.len(), &|i| f64::from(v[i]), nodata),
+        (Channels::Luma, DecodingResult::I64(v)) => stretch(v.len(), &|i| v[i] as f64, nodata),
+        (Channels::Luma, DecodingResult::F16(v)) => stretch(v.len(), &|i| half(v[i]), nodata),
+        (Channels::Luma, DecodingResult::F32(v)) => stretch(v.len(), &|i| f64::from(v[i]), nodata),
+        (Channels::Luma, DecodingResult::F64(v)) => stretch(v.len(), &|i| v[i], nodata),
         _ => return Err(Error::Undecodable),
     };
     if samples.len() as u64 != pixels * channels.count() as u64 {
@@ -607,7 +607,7 @@ fn first_band(
     let grey = if bits == 8 {
         band.iter().map(|&v| v as u8).collect()
     } else {
-        stretch(&band, f64::from, nodata)
+        stretch(band.len(), &|i| f64::from(band[i]), nodata)
     };
     Ok(Pixels {
         width,
@@ -747,16 +747,16 @@ fn half(bits: u16) -> f64 {
     }
 }
 
-/// Grey bytes from values: `lo` to `hi` (the 0.5th and 99.5th percentiles of
-/// those that are numbers and not nodata) is 0 to 255, values outside it are
-/// clipped, nodata and what is not a number are 0.
-fn stretch<T: Copy>(values: &[T], f: impl Fn(T) -> f64, nodata: Option<f64>) -> Vec<u8> {
+/// Grey bytes from the `len` values `value(0)` to `value(len - 1)`: `lo` to
+/// `hi` (the 0.5th and 99.5th percentiles of those that are numbers and not
+/// nodata) is 0 to 255, values outside it are clipped, nodata and what is not a
+/// number are 0. Not generic over the sample type: one copy serves them all.
+fn stretch(len: usize, value: &dyn Fn(usize) -> f64, nodata: Option<f64>) -> Vec<u8> {
     let valid = |x: f64| x.is_finite() && nodata != Some(x);
-    let step = values.len().div_ceil(RANGE_SAMPLE).max(1);
-    let mut sample: Vec<f64> = values
-        .iter()
+    let step = len.div_ceil(RANGE_SAMPLE).max(1);
+    let mut sample: Vec<f64> = (0..len)
         .step_by(step)
-        .map(|&x| f(x))
+        .map(value)
         .filter(|&x| valid(x))
         .collect();
     sample.sort_by(f64::total_cmp);
@@ -766,13 +766,12 @@ fn stretch<T: Copy>(values: &[T], f: impl Fn(T) -> f64, nodata: Option<f64>) -> 
     };
     let (lo, hi) = match (at(0.005), at(0.995)) {
         (Some(lo), Some(hi)) => (lo, hi),
-        _ => return vec![0; values.len()],
+        _ => return vec![0; len],
     };
     let scale = if hi > lo { 255.0 / (hi - lo) } else { 0.0 };
-    values
-        .iter()
-        .map(|&x| {
-            let x = f(x);
+    (0..len)
+        .map(|i| {
+            let x = value(i);
             if valid(x) {
                 ((x - lo) * scale).clamp(0.0, 255.0).round() as u8
             } else {

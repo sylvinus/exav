@@ -2,7 +2,7 @@
 //! and the compile-time schema.
 //!
 //! `elf` is the standard module for Linux-focused rulesets, so a rule that uses
-//! it must either evaluate correctly or fail to compile — never silently
+//! it must either evaluate correctly or fail to compile, never silently
 //! evaluate to undefined.
 
 const TINY_ELF: &[u8] = include_bytes!("testdata/tiny_elf64");
@@ -40,7 +40,7 @@ fn header_fields() {
 #[test]
 fn entry_point_is_a_file_offset_not_a_virtual_address() {
     // The fixture's entry VA is 0x400080, mapped by the PT_LOAD segment at
-    // vaddr 0x400000 / offset 0 — so the file offset is 0x80. Reporting the raw
+    // vaddr 0x400000 / offset 0, so the file offset is 0x80. Reporting the raw
     // e_entry here is the classic mistake; YARA reports the offset.
     assert!(matches(
         r#"import "elf" rule t { condition: elf.entry_point == 0x80 }"#,

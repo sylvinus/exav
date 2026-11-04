@@ -2,16 +2,17 @@
 //!
 //! An archive split across `x.7z.001`, `.002`, … is one file cut into pieces at
 //! arbitrary byte offsets. Scanned a piece at a time, nothing decodes and every
-//! piece reports clean — the payload is never reassembled, so the whole set
+//! piece reports clean: the payload is never reassembled, so the whole set
 //! passes as harmless. Each test below therefore splits its payload *through the
 //! middle of the signature bytes*, so no individual part can match and only the
 //! rejoin can find it. Anything less would pass with the collector removed.
 //!
 //! The other half of the contract is what happens when a set cannot be
 //! rejoined: those bytes were withheld from the scan, and dropping them there
-//! would be a silent clean — the exact failure this scanner exists to prevent.
+//! would be a silent clean, the exact failure this scanner exists to prevent.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze};
+use std::io::Write;
 
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()
@@ -32,38 +33,72 @@ fn crc32(data: &[u8]) -> u32 {
     !c
 }
 
+/// A ZIP member as the file records it: how it is packed, the CRC-32 and
+/// length of what it holds, and the bytes stored.
+struct Packed<'a> {
+    name: &'a str,
+    method: u16,
+    crc: u32,
+    size: u32,
+    stored: &'a [u8],
+}
+
+impl<'a> Packed<'a> {
+    fn stored(name: &'a str, data: &'a [u8]) -> Self {
+        Packed {
+            name,
+            method: 0,
+            crc: crc32(data),
+            size: data.len() as u32,
+            stored: data,
+        }
+    }
+}
+
 /// A stored-only ZIP holding the given members, in order.
 fn zip_with(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let packed: Vec<Packed<'_>> = members.iter().map(|(n, d)| Packed::stored(n, d)).collect();
+    zip_packed(&packed)
+}
+
+/// A ZIP holding the given members, in order.
+fn zip_packed(members: &[Packed<'_>]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
     let mut count = 0u16;
-    for (name, data) in members {
-        let crc = crc32(data);
+    for Packed {
+        name,
+        method,
+        crc,
+        size,
+        stored,
+    } in members
+    {
         let offset = out.len() as u32;
         out.extend_from_slice(b"PK\x03\x04");
         out.extend_from_slice(&20u16.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&method.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(stored.len() as u32).to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(data);
+        out.extend_from_slice(stored);
 
         central.extend_from_slice(b"PK\x01\x02");
         central.extend_from_slice(&20u16.to_le_bytes());
         central.extend_from_slice(&20u16.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&method.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
         central.extend_from_slice(&crc.to_le_bytes());
-        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(stored.len() as u32).to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
         central.extend_from_slice(&(name.len() as u16).to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
@@ -130,11 +165,11 @@ fn no_single_part_of_the_fixture_carries_the_payload() {
     for (name, part) in split_zip("x", 3) {
         assert!(
             !part.windows(eicar().len()).any(|w| w == eicar()),
-            "{name} contains the whole payload — the fixture proves nothing"
+            "{name} contains the whole payload: the fixture proves nothing"
         );
         assert!(
             !matches!(scan(&part).verdict, Verdict::Infected { .. }),
-            "{name} is detectable on its own — the fixture proves nothing"
+            "{name} is detectable on its own: the fixture proves nothing"
         );
     }
 }
@@ -158,6 +193,31 @@ fn a_byte_split_archive_inside_a_zip_is_rejoined_and_scanned() {
     }
 }
 
+/// The file a set is rejoined into is named for the set, and is where the
+/// walk of its own members starts: a detection in it is located there.
+#[test]
+fn a_detection_in_a_rejoined_set_is_located_by_the_set_and_the_member_inside_it() {
+    let parts = split_zip("payload", 3);
+    let outer = zip_with(
+        &parts
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect::<Vec<_>>(),
+    );
+    let (report, location) = exav_core::scan_seekable_located(
+        &Scanner::builtin(),
+        std::io::Cursor::new(outer.clone()),
+        outer.len() as u64,
+        &ScanOptions::default(),
+    )
+    .expect("scan");
+    assert!(
+        matches!(report.verdict, Verdict::Infected { .. }),
+        "{report:?}"
+    );
+    assert_eq!(location.as_deref(), Some("payload.zip/payload.txt"));
+}
+
 #[test]
 fn parts_out_of_order_in_the_container_still_rejoin() {
     // A container yields members in whatever order it was written, which need
@@ -177,7 +237,7 @@ fn parts_out_of_order_in_the_container_still_rejoin() {
 #[test]
 fn a_prefix_that_looks_complete_is_not_joined_early() {
     // `.001`+`.002` are contiguous, so a collector that joins as soon as the
-    // positions line up would emit a truncated prefix — which still parses as a
+    // positions line up would emit a truncated prefix, which still parses as a
     // ZIP and would then be scanned as if it were the whole archive, with the
     // payload in `.003` never reached. Splitting into four parts and putting the
     // signature in the last one makes that failure visible.
@@ -254,7 +314,7 @@ fn a_lone_numbered_file_is_still_scanned_and_not_flagged() {
 fn format_aware_volumes_are_not_concatenated() {
     // RAR volumes carry their own headers and a member's data resumes *past*
     // the next volume's header, so concatenating them yields garbage that still
-    // looks like an archive. They pass through and are scanned individually —
+    // looks like an archive. They pass through and are scanned individually,
     // which is what finds this payload.
     let outer = zip_with(&[
         ("a.part1.rar", b"Rar!\x1a\x07\x00"),
@@ -284,6 +344,138 @@ fn two_sets_in_one_container_do_not_mix() {
     );
 }
 
+/// A ZIP of the stored `parts`, then `last` deflated. With `cut`, the deflate
+/// stream ends after all of `last` without its final block, as if the input
+/// ran out.
+fn zip_ending_deflated(parts: &[(&str, &[u8])], last: (&str, &[u8]), cut: bool) -> Vec<u8> {
+    let mut w = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    w.write_all(last.1).unwrap();
+    let stream = if cut {
+        w.flush().unwrap();
+        w.get_ref().clone()
+    } else {
+        w.finish().unwrap()
+    };
+    let mut members: Vec<Packed<'_>> = parts.iter().map(|(n, d)| Packed::stored(n, d)).collect();
+    members.push(Packed {
+        name: last.0,
+        method: 8,
+        crc: crc32(last.1),
+        size: last.1.len() as u32,
+        stored: &stream,
+    });
+    zip_packed(&members)
+}
+
+#[derive(Debug, PartialEq)]
+enum Ended {
+    Found,
+    Clean,
+    Unscannable(String),
+    Other(String),
+}
+
+/// How `blob` ends on each route that walks a container: from memory, from a
+/// seekable source, and with every match collected.
+fn routes(blob: &[u8]) -> [(&'static str, Ended); 3] {
+    let from = |verdict: Verdict| match verdict {
+        Verdict::Infected { .. } => Ended::Found,
+        Verdict::Clean => Ended::Clean,
+        Verdict::Unscannable { reason } => Ended::Unscannable(reason),
+        other => Ended::Other(format!("{other:?}")),
+    };
+    let (names, outcome) = exav_core::analyze_all_seekable(
+        &Scanner::builtin(),
+        std::io::Cursor::new(blob.to_vec()),
+        blob.len() as u64,
+        &ScanOptions::default(),
+    )
+    .expect("scan");
+    let all = if !names.is_empty() {
+        Ended::Found
+    } else {
+        match outcome {
+            exav_core::AllMatchOutcome::Complete => Ended::Clean,
+            exav_core::AllMatchOutcome::Unscannable(reason) => Ended::Unscannable(reason),
+            other => Ended::Other(format!("{other:?}")),
+        }
+    };
+    [
+        ("analyze", from(scan(blob).verdict)),
+        ("scan_seekable", from(scan_streamed(blob).verdict)),
+        ("all matches", all),
+    ]
+}
+
+/// A part of a set whose stream ends before its last block is held and scanned
+/// as far as it goes, but it is not offered to the collector: joining the
+/// others without it would hand a file with its tail missing to the scan. When
+/// it is the last part, the indices of the others run on without a gap, so the
+/// join would look whole and nothing would say a part was lost.
+#[test]
+fn a_set_whose_part_is_cut_short_is_reported_not_joined_without_it() {
+    let filler = vec![b'A'; 4096];
+    let plain = vec![b'B'; 4096];
+    let mut payload = eicar().to_vec();
+    payload.resize(4096, b'.');
+    let first_two = [("cut.bin.001", &filler[..]), ("cut.bin.002", &filler[..])];
+    let rejoin_refused = |got: &Ended| matches!(got, Ended::Unscannable(r) if r.contains("could not be held for rejoining"));
+    let mut wrong = Vec::new();
+    // The payload in the last part is found whole, and found in what a cut
+    // part decoded, as for any cut member.
+    for (what, cut) in [("whole", false), ("cut after the payload", true)] {
+        let zip = zip_ending_deflated(&first_two, ("cut.bin.003", &payload), cut);
+        assert!(
+            !zip.windows(eicar().len()).any(|w| w == eicar()),
+            "plain text"
+        );
+        for (route, got) in routes(&zip) {
+            if got != Ended::Found {
+                wrong.push(format!("{what}, {route}: {got:?}"));
+            }
+        }
+    }
+    // Nothing to find: a cut last part is a lost part, not a clean set.
+    let zip = zip_ending_deflated(&first_two, ("cut.bin.003", &plain), false);
+    for (route, got) in routes(&zip) {
+        if got != Ended::Clean {
+            wrong.push(format!("whole, nothing to find, {route}: {got:?}"));
+        }
+    }
+    let zip = zip_ending_deflated(&first_two, ("cut.bin.003", &plain), true);
+    for (route, got) in routes(&zip) {
+        if !rejoin_refused(&got) {
+            wrong.push(format!("last of three cut, {route}: {got:?}"));
+        }
+    }
+    // Two parts are a set. A part in the middle leaves a gap in the indices as
+    // well, which is reported either way.
+    let zip = zip_ending_deflated(&first_two[..1], ("cut.bin.002", &plain), true);
+    for (route, got) in routes(&zip) {
+        if !rejoin_refused(&got) {
+            wrong.push(format!("last of two cut, {route}: {got:?}"));
+        }
+    }
+    let zip = zip_ending_deflated(
+        &[first_two[0], ("cut.bin.003", &filler[..])],
+        ("cut.bin.002", &plain),
+        true,
+    );
+    for (route, got) in routes(&zip) {
+        if !matches!(&got, Ended::Unscannable(r) if r.contains("multi-volume set")) {
+            wrong.push(format!("middle of three cut, {route}: {got:?}"));
+        }
+    }
+    // One numbered file is no set.
+    let zip = zip_ending_deflated(&[], ("cut.bin.001", &plain), true);
+    for (route, got) in routes(&zip) {
+        if got != Ended::Clean {
+            wrong.push(format!("one numbered file, cut, {route}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn an_ordinary_container_is_unaffected() {
     let outer = zip_with(&[("a.txt", b"hello"), ("b.bin", &[0u8; 64])]);
@@ -308,7 +500,7 @@ fn split_set(stem: &str, n: usize) -> Vec<(String, Vec<u8>)> {
 /// A set whose payload lives entirely in the LAST part, the rest being ordinary
 /// text that scans clean on its own.
 ///
-/// A truncated archive usually gives itself away — a ZIP with no central
+/// A truncated archive usually gives itself away: a ZIP with no central
 /// directory does not parse, and exav says so. This set has no such tell: drop
 /// its last part and what remains is a plain text file, complete and harmless
 /// looking, with nothing in it to suggest more was meant to follow.
@@ -445,7 +637,7 @@ fn a_set_none_of_whose_parts_fits_the_budget_is_not_clean_part_by_part() {
         ("big.7z.002".to_string(), vec![b'B'; 5000]),
     ];
     let mut opts = ScanOptions::default();
-    opts.deep_analysis_max = 4096;
+    opts.limits.max_buffer_bytes = 4096;
     let v = sets_with(&parts, &[], &opts);
     assert_eq!(v.len(), 2, "a verdict for each part: {v:?}");
     for e in &v {

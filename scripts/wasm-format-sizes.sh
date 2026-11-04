@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build exav-unpack to WebAssembly with EACH format feature in isolation and
-# report the resulting `.wasm` size — i.e. "how big is a minimal <fmt> extractor".
+# report the resulting `.wasm` size, i.e. "how big is a minimal <fmt> extractor".
 #
 # It compiles a tiny generated `wasm32-wasip1` binary that only calls
 # `exav_unpack::detect` + `extract` (so the whole extractor for the enabled

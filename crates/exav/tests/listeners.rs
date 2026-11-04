@@ -42,7 +42,7 @@ fn exav_bin() -> &'static str {
 /// A free localhost port, taken by binding and releasing one. The window between
 /// releasing and the daemon binding is a race in principle; in practice the
 /// kernel does not hand the same ephemeral port straight back, and the
-/// alternative — a fixed port — collides with whatever else is on the machine.
+/// alternative (a fixed port) collides with whatever else is on the machine.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("a localhost port")
@@ -84,6 +84,27 @@ impl Server {
         }
     }
 
+    /// The same, run under a limit of `nofile` open descriptors, which is how a
+    /// test makes the process run out of them.
+    fn start_with_descriptor_limit(dir: TempDir, nofile: u32, args: &[&str]) -> Server {
+        let log = dir.path().join("stderr.log");
+        let child = Command::new("sh")
+            .args(["-c", "ulimit -n \"$0\" && exec \"$@\"", &nofile.to_string()])
+            .arg(exav_bin())
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(&log).expect("create the log"),
+            ))
+            .spawn()
+            .expect("start exav");
+        Server {
+            child,
+            log,
+            _dir: dir,
+        }
+    }
+
     fn stderr(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
@@ -94,6 +115,12 @@ impl Server {
     /// is under test: a `SIGKILL` leaves its children orphaned and still holding
     /// their listeners, which says nothing about whether it took them down.
     fn terminate(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        // SAFETY: `kill` has no memory precondition. The child is not reaped
+        // (`try_wait` just found it running or a zombie), so its pid is not
+        // another process's.
         unsafe {
             libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
         }
@@ -137,7 +164,7 @@ fn dial(port: u16, what: &str) -> TcpStream {
 /// Retry `f` until it answers or the deadline passes.
 ///
 /// `dial` succeeds as soon as the listener is bound, which the daemon does
-/// *before* it warms the database and forks its pool — so a connection made in
+/// *before* it warms the database and forks its pool, so a connection made in
 /// that window can be reset. Under a loaded test host, every suite running at
 /// once and each daemon forking one worker per core, that window is wide enough
 /// to hit. A real client retries a reset against a daemon that has just started;
@@ -241,7 +268,7 @@ fn wait_for_log(server: &Server, needle: &str) {
 /// serve them together is the database: loading a full signature set costs
 /// seconds and gigabytes, and paying that twice to answer the same questions on
 /// two sockets is the cost a second container exists to avoid. So the check is
-/// not only that both answer — it is that both answer *the same detection*,
+/// not only that both answer: it is that both answer *the same detection*,
 /// which is what says they are reading one database.
 #[test]
 fn one_process_serves_both_protocols() {
@@ -281,7 +308,7 @@ fn one_process_serves_both_protocols() {
         );
 
         // Both listeners belong to the one process the test started, so asking
-        // that process to stop takes both down — including, under the pool, the
+        // that process to stop takes both down, including, under the pool, the
         // separate child the ICAP listener runs in.
         server.terminate();
         wait_until_closed(clamd, "clamd");
@@ -369,6 +396,98 @@ fn auto_update_waits_for_a_sidecar_to_write_the_signatures() {
     assert!(
         verdict.contains("Exav.Test.Alpha") && verdict.contains("FOUND"),
         "the daemon came up on the signatures that arrived, got {verdict:?}"
+    );
+}
+
+/// In the pool, `--auto-update`'s re-check is a process of its own: the
+/// supervisor forks its workers with no other thread running, which POSIX asks
+/// of a process that forks, and what the re-check installs reaches them at
+/// once, not at the supervisor's next look at the directory (every 10 s).
+#[cfg(all(target_os = "linux", feature = "http-update"))]
+#[test]
+fn a_pool_rechecks_its_signatures_in_a_child_and_reloads_on_an_update() {
+    use std::sync::{Arc, Mutex};
+    let served = Arc::new(Mutex::new(SIGNATURES.to_string()));
+    let delta_served: Arc<Mutex<Option<Instant>>> = Arc::default();
+    let source = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/test.ndb", source.local_addr().unwrap());
+    let body = Arc::clone(&served);
+    let served_at = Arc::clone(&delta_served);
+    std::thread::spawn(move || {
+        for conn in source.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") && conn.read(&mut byte).unwrap_or(0) == 1 {
+                request.push(byte[0]);
+            }
+            let text = body.lock().unwrap().clone();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                text.len()
+            );
+            let _ = conn.write_all(head.as_bytes());
+            if !request.starts_with(b"HEAD") {
+                let _ = conn.write_all(text.as_bytes());
+                if text.contains("Delta") {
+                    served_at.lock().unwrap().get_or_insert_with(Instant::now);
+                }
+            }
+        }
+    });
+    let sigs = TempDir::new().unwrap();
+    let clamd = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--auto-update",
+            "--sig-sources",
+            &url,
+            // Off the supervisor's 10 s look at the directory, so a reload
+            // there would come about 5 s after the fetch.
+            "--update-interval-secs",
+            "65",
+            "--workers",
+            "2",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    wait_for_log(&server, "prefork daemon");
+    assert!(clamd_instream(clamd, ALPHA).contains("Exav.Test.Alpha"));
+    let status = std::fs::read_to_string(format!("/proc/{}/status", server.child.id())).unwrap();
+    let threads = status.lines().find(|l| l.starts_with("Threads:")).unwrap();
+    assert_eq!(threads.split_whitespace().nth(1), Some("1"), "{threads}");
+
+    // A signature added at the source reaches the workers at the next check.
+    served
+        .lock()
+        .unwrap()
+        .push_str("Exav.Test.Delta:0:*:6d616c7761726544\n");
+    let deadline = Instant::now() + Duration::from_secs(150);
+    loop {
+        let verdict = clamd_instream(clamd, b"malwareD");
+        if verdict.contains("Exav.Test.Delta") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the update never reached the pool: {verdict:?}\n{}",
+            server.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let served = delta_served
+        .lock()
+        .unwrap()
+        .expect("the new source was fetched");
+    let after = served.elapsed();
+    assert!(
+        after < Duration::from_secs(3),
+        "the reload came {after:?} after the update was fetched, not at once\n{}",
+        server.stderr()
     );
 }
 
@@ -531,9 +650,12 @@ fn a_file_written_during_the_first_load_is_reloaded() {
 /// acted on as soon as it is free, not at the end of its next idle poll.
 ///
 /// Busy means reloading a database big enough to take seconds, started by a
-/// `SIGUSR2`; the poll is ten seconds, well past what either answer may take.
-/// The worker a reload retires is kept in a job, so its exit is not what wakes
-/// the supervisor.
+/// `SIGUSR2`. What is timed is the wait from the end of that reload to the
+/// start of the next (the supervisor reading the signatures again), or to the
+/// exit, against the ten-second poll: one left for the poll waits all of it,
+/// and a slow machine only slows the reloads, which are not timed. The worker
+/// a reload retires is kept in a job, so its exit is not what wakes the
+/// supervisor.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_request_while_the_supervisor_is_busy_is_not_left_for_the_next_poll() {
@@ -609,14 +731,20 @@ fn a_request_while_the_supervisor_is_busy_is_not_left_for_the_next_poll() {
         0,
         "the first reload ended before the second request"
     );
+    // The supervisor's idle poll.
+    const POLL: Duration = Duration::from_secs(10);
     let first = when("the first reload", &mut || reloads(&server) >= 1);
-    let second = when("the second reload", &mut || reloads(&server) >= 2);
+    // Half the file: the second reload may have begun reading by the time the
+    // first one's line is seen.
+    let read = bytes_read(pid) + big.len() as u64 / 2;
+    let second = when("the second reload", &mut || bytes_read(pid) >= read);
     assert!(
-        second - first < Duration::from_secs(8),
-        "the second reload waited {:?} after the first:\n{}",
+        second - first < POLL,
+        "the second reload started {:?} after the first ended:\n{}",
         second - first,
         server.stderr()
     );
+    when("the second reload's end", &mut || reloads(&server) >= 2);
 
     // The idle worker of the first reload, retired by the second, is gone.
     when("the idle worker's exit", &mut || {
@@ -631,7 +759,7 @@ fn a_request_while_the_supervisor_is_busy_is_not_left_for_the_next_poll() {
         matches!(server.child.try_wait(), Ok(Some(_)))
     });
     assert!(
-        exit - third < Duration::from_secs(5),
+        exit - third < POLL,
         "SIGTERM waited {:?} after the reload:\n{}",
         exit - third,
         server.stderr()
@@ -1084,9 +1212,13 @@ fn a_worker_whose_supervisor_dies_mid_job_answers() {
         std::thread::sleep(Duration::from_millis(50));
     }
     let gone = !Path::new(&proc).exists();
-    // SAFETY: the worker this test started, if it is still there.
-    unsafe {
-        libc::kill(workers[0] as libc::pid_t, libc::SIGKILL);
+    // Not a worker that is gone: init has reaped it, and its pid may already be
+    // another process's.
+    if !gone {
+        // SAFETY: `kill` has no memory precondition.
+        unsafe {
+            libc::kill(workers[0] as libc::pid_t, libc::SIGKILL);
+        }
     }
     assert!(
         reply.contains("stopped before it finished ERROR"),
@@ -1136,8 +1268,95 @@ fn configured_sources_without_auto_update_are_reported() {
     );
 }
 
+/// `?idle-secs=` on the clamd address is how long a client that sends nothing
+/// keeps its connection, in the pool and in the thread model.
+#[test]
+fn a_clamd_client_that_sends_nothing_is_let_go_after_the_address_idle_wait() {
+    for workers in ["1", "threads"] {
+        let sigs = sig_dir();
+        let port = free_port();
+        let _server = Server::start(
+            TempDir::new().unwrap(),
+            &[
+                "--workers",
+                workers,
+                "--listen",
+                &format!("clamd://127.0.0.1:{port}?idle-secs=1"),
+                "-d",
+                sigs.path().to_str().unwrap(),
+            ],
+        );
+        assert_eq!(clamd_ping(port), "PONG", "workers={workers}");
+        let mut quiet = dial(port, "clamd");
+        let start = Instant::now();
+        let mut buf = [0u8; 16];
+        let got = quiet.read(&mut buf);
+        let waited = start.elapsed();
+        assert!(matches!(got, Ok(0) | Err(_)), "workers={workers}: {got:?}");
+        assert!(
+            waited >= Duration::from_millis(800) && waited < Duration::from_secs(20),
+            "workers={workers}: {waited:?}"
+        );
+    }
+}
+
+/// `?idle-secs=` on a `--listen-health` address is how long its client has, in
+/// the pool and in the thread model.
+#[test]
+fn a_health_client_that_sends_nothing_is_let_go_after_the_address_idle_wait() {
+    for workers in ["1", "threads"] {
+        let sigs = sig_dir();
+        let (port, health) = (free_port(), free_port());
+        let _server = Server::start(
+            TempDir::new().unwrap(),
+            &[
+                "--workers",
+                workers,
+                "--listen",
+                &format!("clamd://127.0.0.1:{port}"),
+                "--listen-health",
+                &format!("clamd://127.0.0.1:{health}?idle-secs=1"),
+                "-d",
+                sigs.path().to_str().unwrap(),
+            ],
+        );
+        assert_eq!(clamd_ping(health), "PONG", "workers={workers}");
+        let mut quiet = dial(health, "health");
+        let start = Instant::now();
+        let mut buf = [0u8; 16];
+        let got = quiet.read(&mut buf);
+        let waited = start.elapsed();
+        assert!(matches!(got, Ok(0) | Err(_)), "workers={workers}: {got:?}");
+        // Under the 5 s the listener gives without it.
+        assert!(
+            waited >= Duration::from_millis(800) && waited < Duration::from_millis(4000),
+            "workers={workers}: {waited:?}"
+        );
+    }
+}
+
+/// `--build-db` makes the directories its output goes in, as a volume mounted
+/// empty in a container has none.
+#[test]
+fn a_database_is_built_into_a_directory_that_does_not_exist_yet() {
+    let sigs = sig_dir();
+    let out = sigs.path().join("new").join("dir").join("out.exavdb");
+    let run = Command::new(exav_bin())
+        .args(["--sig-dir", sigs.path().to_str().unwrap(), "--build-db"])
+        .arg(&out)
+        .env_remove("EXAV_SIG_SOURCES")
+        .output()
+        .expect("run exav");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(exav_core::database::is_database_file(&out));
+}
+
 /// The environment configures a container, and a flag on the command line
-/// overrides it — never the other way round, and never by refusing the flag.
+/// overrides it, never the other way round, and never by refusing the flag.
 ///
 /// This is the same rule the parser tests pin, checked where it actually lands:
 /// against a running process whose listener is the one the flag named.
@@ -1424,6 +1643,632 @@ fn a_health_listener_without_a_scan_listener_is_refused() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// What a client that sends a command a byte at a time is answered, per
+/// protocol: `INSTREAM` on clamd, a `RESPMOD` body on ICAP. Each byte arrives
+/// well inside the per-read timeouts, so only a limit on the whole command can
+/// stop it. After the last byte each client ends its command properly. Returns
+/// the two answers.
+fn slow_clients(clamd: u16, icap: u16, bytes: usize, gap: Duration) -> (String, String) {
+    fn drip(
+        s: &TcpStream,
+        bytes: usize,
+        gap: Duration,
+        end: &'static [u8],
+    ) -> std::thread::JoinHandle<()> {
+        let mut w = s.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..bytes {
+                if w.write_all(b"a").is_err() {
+                    return;
+                }
+                std::thread::sleep(gap);
+            }
+            let _ = w.write_all(end);
+        })
+    }
+    fn read_all(mut s: TcpStream) -> String {
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).trim_end_matches('\0').into()
+    }
+
+    let mut s = dial(clamd, "clamd");
+    s.write_all(b"zINSTREAM\0").unwrap();
+    s.write_all(&(bytes as u32).to_be_bytes()).unwrap();
+    // The terminating zero-length chunk.
+    let sender = drip(&s, bytes, gap, &[0, 0, 0, 0]);
+    let on_clamd = read_all(s);
+    sender.join().unwrap();
+
+    let mut s = dial(icap, "icap");
+    let http = "HTTP/1.1 200 OK\r\n\r\n";
+    s.write_all(
+        format!(
+            "RESPMOD icap://127.0.0.1:{icap}/avscan ICAP/1.0\r\nHost: h\r\nConnection: close\r\n\
+             Encapsulated: res-hdr=0, res-body={}\r\n\r\n{http}{bytes:x}\r\n",
+            http.len()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let sender = drip(&s, bytes, gap, b"\r\n0\r\n\r\n");
+    let on_icap = read_all(s);
+    sender.join().unwrap();
+    (on_clamd, on_icap)
+}
+
+/// A client that sends a command a byte at a time, each inside the per-read
+/// timeout, is cut off at `?request-secs=`: on both protocols, in both worker
+/// models. The answer says why, the log says it too, and the daemon serves the
+/// next client.
+#[test]
+fn a_client_that_sends_a_byte_at_a_time_is_cut_off_at_the_command_read_limit() {
+    for workers in ["2", "threads"] {
+        let sigs = sig_dir();
+        let (clamd, icap) = (free_port(), free_port());
+        let server = Server::start(
+            TempDir::new().unwrap(),
+            &[
+                "--workers",
+                workers,
+                "--listen",
+                &format!("clamd://127.0.0.1:{clamd}?request-secs=1"),
+                "--listen",
+                &format!("icap://127.0.0.1:{icap}?request-secs=1"),
+                "-d",
+                sigs.path().to_str().unwrap(),
+            ],
+        );
+        assert_eq!(clamd_ping(clamd), "PONG", "workers={workers}");
+        wait_for_log(&server, "serving ICAP on tcp:");
+
+        // 100 bytes at 100 ms would take ten seconds.
+        let (on_clamd, on_icap) = slow_clients(clamd, icap, 100, Duration::from_millis(100));
+        assert_eq!(on_clamd, "COMMAND READ TIMED OUT\n", "workers={workers}");
+        assert!(
+            on_icap.starts_with("ICAP/1.0 408 Request Timeout"),
+            "workers={workers}: {on_icap}"
+        );
+        wait_for_log(&server, "took longer than ?request-secs=");
+
+        let verdict = clamd_instream(clamd, ALPHA);
+        assert!(
+            verdict.contains("Exav.Test.Alpha"),
+            "workers={workers}: the daemon serves the next client, got {verdict:?}"
+        );
+    }
+}
+
+/// The same slow clients are served when the limit is off.
+#[test]
+fn a_slow_client_is_served_when_the_command_read_limit_is_off() {
+    let sigs = sig_dir();
+    let (clamd, icap) = (free_port(), free_port());
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "threads",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}?request-secs=off"),
+            "--listen",
+            &format!("icap://127.0.0.1:{icap}?request-secs=off"),
+            "-d",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(clamd_ping(clamd), "PONG");
+    wait_for_log(&server, "serving ICAP on tcp:");
+    // 10 bytes at 150 ms is more than the 1 second the other test allows.
+    let (on_clamd, on_icap) = slow_clients(clamd, icap, 10, Duration::from_millis(150));
+    assert_eq!(on_clamd, "stream: OK");
+    assert!(on_icap.starts_with("ICAP/1.0 200 OK"), "{on_icap}");
+}
+
+/// A one-shot scan of an EICAR file, with `env` set and `args` added: the
+/// output, and the file's name for the verdict to be found in.
+fn scan_eicar_with(env: &[(&str, &str)], args: &[&str]) -> (std::process::Output, String) {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("eicar.txt");
+    std::fs::write(&file, eicar()).unwrap();
+    let file = file.to_str().unwrap().to_string();
+    let out = Command::new(exav_bin())
+        .args(["--allow-no-db"])
+        .args(args)
+        .arg(&file)
+        .envs(env.iter().copied())
+        .output()
+        .expect("run exav");
+    (out, file)
+}
+
+/// An image that sets a listener's settings for its daemon also runs one-shot
+/// scans. A setting that only the environment gave is dropped with a warning,
+/// and the scan runs and finds what is there; `EXAV_LISTEN` set too, as the
+/// published image does, changes nothing.
+#[test]
+fn a_listener_setting_in_the_environment_does_not_stop_a_one_shot_scan() {
+    for with_listen in [false, true] {
+        let mut env = vec![
+            ("EXAV_MAX_JOBS_PER_WORKER", "5"),
+            ("EXAV_LISTEN_HEALTH", "clamd://127.0.0.1:2"),
+            ("EXAV_WORKERS", "2"),
+        ];
+        if with_listen {
+            env.push(("EXAV_LISTEN", "clamd://127.0.0.1:1"));
+        }
+        let (out, file) = scan_eicar_with(&env, &[]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "listen {with_listen}: {stderr}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&format!("{file}: ")),
+            "the scan ran"
+        );
+        for var in [
+            "EXAV_MAX_JOBS_PER_WORKER",
+            "EXAV_LISTEN_HEALTH",
+            "EXAV_WORKERS",
+        ] {
+            assert!(
+                stderr.contains(&format!("ignoring {var}:")),
+                "listen {with_listen}, {var}: {stderr}"
+            );
+        }
+    }
+}
+
+/// The same settings typed on the command line are a contradiction and stay
+/// refused, also when the variable is set to something else.
+#[test]
+fn a_listener_setting_on_the_command_line_stops_a_one_shot_scan() {
+    for (flag, var) in [
+        ("--workers", "EXAV_WORKERS"),
+        ("--max-jobs-per-worker", "EXAV_MAX_JOBS_PER_WORKER"),
+    ] {
+        for env in [&[][..], &[(var, "9")][..]] {
+            let (out, _) = scan_eicar_with(env, &[flag, "5"]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{flag}: {stderr}");
+            assert!(stderr.contains(flag), "{flag}: {stderr}");
+            assert!(!stderr.contains("ignoring"), "{flag}: {stderr}");
+        }
+    }
+}
+
+/// A clamd session that sends commands and never reads the replies. The
+/// replies fill the sockets and the server's write blocks. The stream is
+/// returned to keep the connection open; the sender stops when it closes.
+fn client_that_never_reads(port: u16) -> TcpStream {
+    let s = dial(port, "clamd");
+    flood_without_reading(s.try_clone().unwrap());
+    s
+}
+
+/// The same over a Unix socket.
+fn unix_client_that_never_reads(path: &Path) -> std::os::unix::net::UnixStream {
+    let s = until_answered("connection", || {
+        std::os::unix::net::UnixStream::connect(path)
+    });
+    flood_without_reading(s.try_clone().unwrap());
+    s
+}
+
+/// Sends a session's worth of commands from a thread of its own, stopping when
+/// the connection closes.
+fn flood_without_reading(mut w: impl Write + Send + 'static) {
+    std::thread::spawn(move || {
+        if w.write_all(b"zIDSESSION\0").is_err() {
+            return;
+        }
+        let burst = b"zVERSIONCOMMANDS\0".repeat(1000);
+        for _ in 0..100 {
+            if w.write_all(&burst).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// A clamd `PING` over a Unix socket.
+fn unix_ping(path: &Path) -> String {
+    until_answered("ping", || {
+        let mut s = std::os::unix::net::UnixStream::connect(path)?;
+        s.set_read_timeout(Some(Duration::from_secs(30)))?;
+        s.write_all(b"zPING\0")?;
+        let mut out = Vec::new();
+        s.read_to_end(&mut out)?;
+        Ok(String::from_utf8_lossy(&out).trim_end_matches('\0').into())
+    })
+}
+
+const NOT_READING: &str = "did not read its reply within ?idle-secs=";
+
+/// A client that stops reading is cut off once a write has waited
+/// `?idle-secs=`, in both worker models and on both kinds of socket; the log
+/// says why and the daemon serves the next client.
+#[test]
+fn a_client_that_never_reads_is_cut_by_the_idle_wait() {
+    for workers in ["2", "threads"] {
+        for unix in [false, true] {
+            let sigs = sig_dir();
+            let dir = TempDir::new().unwrap();
+            let sock = dir.path().join("clamd.sock");
+            let clamd = free_port();
+            let address = if unix {
+                format!("{}?idle-secs=1", sock.display())
+            } else {
+                format!("clamd://127.0.0.1:{clamd}?idle-secs=1")
+            };
+            let server = Server::start(
+                TempDir::new().unwrap(),
+                &[
+                    "--workers",
+                    workers,
+                    "--listen",
+                    &address,
+                    "-d",
+                    sigs.path().to_str().unwrap(),
+                ],
+            );
+            let what = format!("workers={workers}, unix={unix}");
+            let ping = || {
+                if unix {
+                    unix_ping(&sock)
+                } else {
+                    clamd_ping(clamd)
+                }
+            };
+            assert_eq!(ping(), "PONG", "{what}");
+            let _tcp;
+            let _unix;
+            if unix {
+                _unix = Some(unix_client_that_never_reads(&sock));
+            } else {
+                _tcp = Some(client_that_never_reads(clamd));
+            }
+            wait_for_log(&server, NOT_READING);
+            assert_eq!(ping(), "PONG", "{what}");
+        }
+    }
+}
+
+/// Within the default idle wait (120 s) the same client holds its connection,
+/// and a daemon in the thread model still serves others meanwhile.
+#[test]
+fn a_client_that_never_reads_keeps_its_connection_within_the_idle_wait() {
+    let sigs = sig_dir();
+    let clamd = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "threads",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "-d",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(clamd_ping(clamd), "PONG");
+    let _stuck = client_that_never_reads(clamd);
+    // Longer than the 1 second the other test allows.
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        !server.stderr().contains(NOT_READING),
+        "{}",
+        server.stderr()
+    );
+    assert_eq!(clamd_ping(clamd), "PONG");
+}
+
+/// `?reply-secs=` on the clamd address cuts a client that stops reading in
+/// the time it names, though each write has the 120 s of the idle wait; in
+/// both worker models and on both kinds of socket.
+#[test]
+fn a_client_that_never_reads_is_cut_by_the_address_reply_budget() {
+    for workers in ["2", "threads"] {
+        for unix in [false, true] {
+            let sigs = sig_dir();
+            let dir = TempDir::new().unwrap();
+            let sock = dir.path().join("clamd.sock");
+            let clamd = free_port();
+            let address = if unix {
+                format!("{}?reply-secs=1", sock.display())
+            } else {
+                format!("clamd://127.0.0.1:{clamd}?reply-secs=1")
+            };
+            let server = Server::start(
+                TempDir::new().unwrap(),
+                &[
+                    "--workers",
+                    workers,
+                    "--listen",
+                    &address,
+                    "-d",
+                    sigs.path().to_str().unwrap(),
+                ],
+            );
+            let what = format!("workers={workers}, unix={unix}");
+            let ping = || {
+                if unix {
+                    unix_ping(&sock)
+                } else {
+                    clamd_ping(clamd)
+                }
+            };
+            assert_eq!(ping(), "PONG", "{what}");
+            let _tcp;
+            let _unix;
+            if unix {
+                _unix = Some(unix_client_that_never_reads(&sock));
+            } else {
+                _tcp = Some(client_that_never_reads(clamd));
+            }
+            wait_for_log(&server, NOT_READING);
+            assert_eq!(ping(), "PONG", "{what}");
+        }
+    }
+}
+
+/// `?session-secs=` on the clamd address ends a connection after that long,
+/// whatever the idle wait, in both worker models.
+#[test]
+fn a_clamd_connection_is_closed_at_the_address_lifetime() {
+    for workers in ["1", "threads"] {
+        let sigs = sig_dir();
+        let port = free_port();
+        let _server = Server::start(
+            TempDir::new().unwrap(),
+            &[
+                "--workers",
+                workers,
+                "--listen",
+                &format!("clamd://127.0.0.1:{port}?session-secs=1"),
+                "-d",
+                sigs.path().to_str().unwrap(),
+            ],
+        );
+        assert_eq!(clamd_ping(port), "PONG", "workers={workers}");
+        let mut session = dial(port, "clamd");
+        let start = Instant::now();
+        session.write_all(b"zIDSESSION\0").unwrap();
+        // A client that keeps talking: the idle wait never runs out.
+        let mut answered = 0;
+        let ended = loop {
+            if start.elapsed() > Duration::from_secs(20) {
+                break false;
+            }
+            let mut reply = [0u8; 32];
+            if session.write_all(b"zPING\0").is_err() {
+                break true;
+            }
+            match session.read(&mut reply) {
+                Ok(n) if n > 0 => answered += 1,
+                _ => break true,
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let lived = start.elapsed();
+        assert!(ended, "workers={workers}: still answering after {lived:?}");
+        assert!(answered >= 1, "workers={workers}");
+        assert!(
+            lived >= Duration::from_millis(800) && lived < Duration::from_secs(15),
+            "workers={workers}: {lived:?}"
+        );
+    }
+}
+
+/// A process out of descriptors cannot accept, and the connection it fails
+/// for stays queued. The listener waits and tries again rather than ending the
+/// daemon, and serves the queued client once descriptors are free.
+#[test]
+fn a_clamd_listener_out_of_descriptors_keeps_accepting() {
+    let sigs = sig_dir();
+    let clamd = free_port();
+    let mut server = Server::start_with_descriptor_limit(
+        TempDir::new().unwrap(),
+        24,
+        &[
+            "--workers",
+            "threads",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "-d",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(clamd_ping(clamd), "PONG");
+    // More idle connections than the server has descriptors for.
+    let mut idle: Vec<TcpStream> = (0..40).map(|_| dial(clamd, "clamd")).collect();
+    wait_for_log(&server, "accept failed, trying again");
+    let mut last = idle.pop().unwrap();
+    last.write_all(b"zPING\0").unwrap();
+    // The others hang up, which frees the descriptors of the accepted ones.
+    drop(idle);
+    let mut out = Vec::new();
+    last.read_to_end(&mut out).unwrap();
+    assert_eq!(out, b"PONG\0", "{}", server.stderr());
+    assert!(
+        matches!(server.child.try_wait(), Ok(None)),
+        "the daemon ended:\n{}",
+        server.stderr()
+    );
+}
+
+/// A process's limit of kind `resource` (a `libc::RLIMIT_*` as an `i32`), after
+/// setting its soft limit to `soft` when given. The hard limit stays.
+#[cfg(target_os = "linux")]
+fn soft_limit(pid: u32, resource: i32, soft: Option<u64>) -> u64 {
+    let pid = pid as libc::pid_t;
+    let mut old = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: both pointers are valid for the call; the new limit is null.
+    let rc = unsafe { libc::prlimit(pid, resource as _, std::ptr::null(), &mut old) };
+    assert_eq!(rc, 0, "prlimit: {}", io::Error::last_os_error());
+    if let Some(rlim_cur) = soft {
+        let new = libc::rlimit {
+            rlim_cur,
+            rlim_max: old.rlim_max,
+        };
+        // SAFETY: as above, with the old limit pointer null.
+        let rc = unsafe { libc::prlimit(pid, resource as _, &new, std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "prlimit: {}", io::Error::last_os_error());
+    }
+    old.rlim_cur
+}
+
+/// The lowest descriptor number a process has not got open, which is the next
+/// it gets: a limit of this many leaves it unable to open anything more.
+#[cfg(target_os = "linux")]
+fn next_descriptor(pid: u32) -> u64 {
+    let open: std::collections::BTreeSet<u64> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("the process's descriptors")
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    (0..).find(|n| !open.contains(n)).unwrap()
+}
+
+/// Ten idle connections to `port`. They stay open until the vector is dropped.
+#[cfg(target_os = "linux")]
+fn hold_connections(port: u16, what: &str) -> Vec<TcpStream> {
+    (0..10).map(|_| dial(port, what)).collect()
+}
+
+/// An ICAP `OPTIONS` request and its whole answer.
+#[cfg(target_os = "linux")]
+fn icap_options(port: u16) -> String {
+    let mut s = dial(port, "icap");
+    s.write_all(
+        format!(
+            "OPTIONS icap://127.0.0.1:{port}/avscan ICAP/1.0\r\nHost: 127.0.0.1\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The ICAP listener and the health listener also fail an accept when the
+/// process is out of descriptors. They wait between attempts instead of
+/// spinning, which would fill the log and use a core, and serve again once
+/// descriptors are free.
+///
+/// The limit is set to the next descriptor number, so that no accept can
+/// succeed and each keeps failing until it is lifted.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_icap_and_health_listeners_wait_between_accepts_that_fail() {
+    let sigs = sig_dir();
+    let (clamd, icap, health) = (free_port(), free_port(), free_port());
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "threads",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--listen",
+            &format!("icap://127.0.0.1:{icap}"),
+            "--listen-health",
+            &format!("clamd://127.0.0.1:{health}"),
+            "-d",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(clamd_ping(health), "PONG");
+    wait_for_log(&server, "serving ICAP on tcp:");
+    let pid = server.child.id();
+    let nofile = libc::RLIMIT_NOFILE as i32;
+    let usual = soft_limit(pid, nofile, None);
+
+    for (name, port, needle) in [
+        ("icap", icap, "icap: accept failed"),
+        ("health", health, "health: accept on"),
+    ] {
+        // Whatever the last round left open has closed.
+        std::thread::sleep(Duration::from_millis(500));
+        soft_limit(pid, nofile, Some(next_descriptor(pid)));
+        let held = hold_connections(port, name);
+        wait_for_log(&server, needle);
+        std::thread::sleep(Duration::from_millis(1500));
+        // A pause that doubles from 5 ms to 1 s allows about ten lines in the
+        // time; a loop with no pause writes thousands.
+        let n = server.stderr().matches(needle).count();
+        assert!(n <= 40, "{n} lines of {needle:?}");
+
+        // Back to the usual limit, and the held connections closed: the
+        // listener serves again.
+        soft_limit(pid, nofile, Some(usual));
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let answered = if name == "icap" {
+                icap_options(port).starts_with("ICAP/1.0 200 OK")
+            } else {
+                clamd_ping(port) == "PONG"
+            };
+            if answered {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{name} never answered again");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// A process that cannot start a thread for a connection drops that connection
+/// and keeps listening: the thread model gives each connection a thread, and a
+/// failed spawn would otherwise end the accepting thread and leave a daemon with
+/// no listener that still looks alive. The limit on processes is lowered once
+/// the daemon is up, so that only the new connection's thread fails.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_clamd_listener_that_cannot_start_a_thread_keeps_accepting() {
+    let sigs = sig_dir();
+    let clamd = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "threads",
+            "--listen",
+            // Two connections at most: a connection that failed to start must
+            // give its place back, or the third would find none.
+            &format!("clamd://127.0.0.1:{clamd}?max-connections=2"),
+            "-d",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(clamd_ping(clamd), "PONG");
+    let pid = server.child.id();
+    let nproc = libc::RLIMIT_NPROC as i32;
+    let usual = soft_limit(pid, nproc, None);
+    soft_limit(pid, nproc, Some(1));
+    let answers: Vec<Vec<u8>> = (0..3)
+        .map(|_| {
+            let mut refused = dial(clamd, "clamd");
+            let _ = refused.write_all(b"zPING\0");
+            let mut out = Vec::new();
+            let _ = refused.read_to_end(&mut out);
+            out
+        })
+        .collect();
+    // Restored before anything is asserted, so a failure does not leave the
+    // daemon unable to start threads.
+    soft_limit(pid, nproc, Some(usual));
+    assert!(
+        answers.iter().all(Vec::is_empty),
+        "answered without a thread: {answers:?}"
+    );
+    wait_for_log(&server, "no thread for a new connection");
+    assert_eq!(clamd_ping(clamd), "PONG", "{}", server.stderr());
 }
 
 /// Paths outside a temp dir are never touched by this suite; the helper exists

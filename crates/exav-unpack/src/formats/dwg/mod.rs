@@ -13,7 +13,14 @@
 //! and the object map (spec 23); it reads any object the map holds as an
 //! [`Object`]: its type and handle, extended data, the common entity data
 //! (spec 20.4.1 and 20.4.2), and the streams its own data, strings (R2007
-//! on) and handles are read from. Nothing here says what an object means.
+//! on) and handles are read from. Nothing here says what an object means,
+//! but for the hyperlinks of [`Dwg::hyperlinks`] (extended data under the
+//! application `PE_URL`).
+//!
+//! What a file locates and cannot be read is left out of the sections, and
+//! said: [`Dwg::problems`] holds every note, [`Dwg::left_out`] the ones that
+//! are data not read (a checksum that does not match data read all the same
+//! is a note and not that).
 //!
 //! Every offset, size and count a file gives is checked against the data it
 //! claims to describe before it is used; what compressed sections expand to
@@ -25,14 +32,20 @@
 //! `thumbnail.wmf`, `thumbnail.png`, and `thumbnail-<code>.bin` for an entry
 //! of another code; and the object each OLE2FRAME entity embeds,
 //! `ole2frame-<HANDLE>.ole` from the compound file's signature on (`.bin`
-//! when there is none). A drawing whose objects cannot be read gives an
-//! unsupported `dwg-objects` entry, since what they embed was not examined;
-//! a drawing of a release before R13 ([`pre_r13_version`]) an unsupported
+//! when there is none), the VBA project as `vbaproject.ole`, and a text
+//! member, `dwg-metadata`. A drawing whose objects cannot be read gives an
+//! unsupported `dwg-objects` entry, since what they embed was not examined
+//! (marked encrypted when the drawing has a password);
+//! one of which only a part could be read (a page, the object map, the
+//! classes) an unsupported `dwg-damaged` entry; one whose VBA project is
+//! encrypted an unsupported `vbaproject.ole` entry marked encrypted; a
+//! drawing of a release before R13 ([`pre_r13_version`]) an unsupported
 //! `dwg-<version ID>` entry.
 
 mod bits;
 mod extract;
 mod file;
+mod links;
 mod object;
 mod r2004;
 mod r2007;
@@ -43,6 +56,7 @@ pub(crate) use extract::extract_dwg;
 pub use file::{
     Class, DEFAULT_MAX_BYTES, Dwg, Locator, PreviewImage, PreviewKind, preview, trim_zeros,
 };
+pub use links::{Hyperlink, Hyperlinks};
 pub use object::{Eed, EedValue, EntityColor, EntityCommon, HeaderStreams, Object, Text};
 
 pub use super::codepage::Decoder;
@@ -101,6 +115,9 @@ pub enum Error {
     UnsupportedVersion(String),
     /// The file header is there, the sections it locates are not.
     Damaged(String),
+    /// A section the drawing needs is encrypted: a password-protected
+    /// drawing.
+    Encrypted,
     /// The compressed sections expand past the limit [`Dwg::open_with`]
     /// was given.
     LimitExceeded(String),
@@ -112,6 +129,7 @@ impl std::fmt::Display for Error {
             Error::NotDwg => f.write_str("not a DWG file"),
             Error::UnsupportedVersion(v) => write!(f, "DWG version {v} is not supported"),
             Error::Damaged(why) => write!(f, "damaged DWG file: {why}"),
+            Error::Encrypted => f.write_str("password-protected DWG file"),
             Error::LimitExceeded(why) => write!(f, "DWG file past the size limit: {why}"),
         }
     }

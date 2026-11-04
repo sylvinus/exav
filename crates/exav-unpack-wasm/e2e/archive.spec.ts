@@ -185,7 +185,7 @@ test.describe('WASM E2E', () => {
   // A budget that cannot be set is a budget the page cannot honour. The
   // browser is the tightest memory environment exav runs in, and running out of
   // it aborts the module rather than returning an error, so the caller gets no
-  // verdict at all — which is why this is settable and why it has to work.
+  // verdict at all, which is why this is settable and why it has to work.
   test('Archive.open honours a caller-supplied limit', async ({ page }) => {
     await setupPage(page);
     const result = await page.evaluate(`
@@ -531,8 +531,8 @@ unsupported=${JSON.stringify(result.unsupported)}`).toBe(false);
   });
 
   // A set like `big.zip.001`, `.002`, `.003` is one archive cut into pieces at
-  // arbitrary byte offsets. Opened one file at a time — which is what a
-  // multi-file drop gives you — none of them is a recognisable archive at all.
+  // arbitrary byte offsets. Opened one file at a time (which is what a
+  // multi-file drop gives you), none of them is a recognisable archive at all.
   test('isVolumePart recognises a byte-split part by name alone', async ({ page }) => {
     await setupPage(page);
     const result = await page.evaluate(`
@@ -628,7 +628,7 @@ unsupported=${JSON.stringify(result.unsupported)}`).toBe(false);
     expect(result).toBe(0);
   });
 
-  // A decoder panic traps the module on this target — `panic = "abort"`, so
+  // A decoder panic traps the module on this target (`panic = "abort"`), so
   // nothing in Rust catches it. The containment is in JS, and these are the
   // parts of it that can be exercised without a decoder that actually panics.
 
@@ -702,7 +702,7 @@ unsupported=${JSON.stringify(result.unsupported)}`).toBe(false);
       `);
       if (result.skipped) {
         throw new Error(
-          'built without the testing-faults feature — run `npm run build:e2e`',
+          'built without the testing-faults feature: run `npm run build:e2e`',
         );
       }
       // Reported as a failure of this archive, not returned as an empty result.
@@ -732,7 +732,7 @@ unsupported=${JSON.stringify(result.unsupported)}`).toBe(false);
         worker.dispatchEvent(new ErrorEvent("error", { message: "simulated trap" }));
 
         // The stale archive must SAY it is stale rather than post into a worker
-        // that can never answer — an unsettled promise is worse than an error,
+        // that can never answer: an unsettled promise is worse than an error,
         // because nothing ever reports that the scan did not happen.
         let stale = "";
         try {

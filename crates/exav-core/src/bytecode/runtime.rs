@@ -133,10 +133,10 @@ impl BytecodeRuntime {
     }
 
     /// Run the programs whose triggers `fired` on `data`, then the hook
-    /// programs of its type; returns as [`Self::scan`]. A PE is read whole
-    /// for its header data when it is at most `materialize` bytes; a larger
-    /// one runs its programs without it, and the scan is marked incomplete.
-    /// `limits.total` is shared by every program run here.
+    /// programs of its type; returns as [`Self::scan`]. A PE's header data is
+    /// read from its headers, whatever its size, unless they are over
+    /// `materialize` bytes: its programs then run without it, and the scan is
+    /// marked incomplete. `limits.total` is shared by every program run here.
     pub(crate) fn scan_source(
         &self,
         data: &dyn ByteSource,
@@ -151,13 +151,14 @@ impl BytecodeRuntime {
             return (detection, extracted);
         }
         let pe = if ft == FileType::Pe {
-            match data.materialize(materialize) {
-                Some(whole) => pe::bytecode_pe(&whole),
-                None => {
+            match pe::bytecode_pe_in(data, materialize) {
+                Ok(pe) => pe,
+                Err(headers) => {
                     crate::engine::mark_over_size(|| {
                         format!(
-                            "object is {} bytes, over the {materialize}-byte deep-analysis \
-                             limit (--max-object-bytes): bytecode ran without its PE header data",
+                            "the PE headers of this {}-byte object end at byte {headers}, over \
+                             the {materialize}-byte object limit (--max-object-bytes): \
+                             bytecode ran without its PE header data",
                             data.len()
                         )
                     });
@@ -169,7 +170,7 @@ impl BytecodeRuntime {
         };
         let pe_missing = ft == FileType::Pe && pe.is_none();
         let pdf = if ft == FileType::Pdf {
-            Some(exec::pdf_ctx(data))
+            Some(exec::pdf_ctx_within(data, materialize))
         } else {
             None
         };
@@ -181,6 +182,18 @@ impl BytecodeRuntime {
             let Some(bc) = self.programs.get(idx) else {
                 return;
             };
+            // A program that runs over a table lacking objects has seen a part
+            // of the file.
+            if pdf.as_ref().is_some_and(|table| table.truncated) {
+                crate::engine::mark_over_size(|| {
+                    format!(
+                        "the object table of this {}-byte PDF does not hold all its objects \
+                         (at most {materialize} bytes of table, --max-object-bytes, and \
+                         offsets under 4 GiB): bytecode ran with the objects before the cut",
+                        data.len()
+                    )
+                });
+            }
             let limits = exec::WriteLimits { total: left, ..limits };
             let o = run_program(bc, data, pe.as_ref(), pe_missing, pdf.as_ref(), match_offs, limits);
             let written: u64 = o.extracted.iter().map(|b| b.len() as u64).sum();
@@ -434,6 +447,55 @@ mod tests {
             assert_eq!(det.is_some(), found, "{ft:?}");
             assert_eq!(crate::engine::scan_was_truncated(), !found, "{ft:?}");
         }
+    }
+
+    /// A PE too large to hold runs its programs with the header data its
+    /// headers give, and without it only when the headers are over the limit.
+    #[test]
+    fn a_pe_past_the_limit_runs_its_programs_with_its_header_data() {
+        use crate::byte_source::BlockCache;
+        let (rt, triggers) = BytecodeRuntime::standalone(vec![pedata_reader()]);
+        let mut file = include_bytes!("../../tests/testdata/tiny_pe32.exe").to_vec();
+        file.extend(b"PEDATA");
+        file.extend(vec![b'z'; 20_000]);
+        let layout = pe::layout(&file);
+        let fired = triggers.bytecode_triggers(&file, FileType::Pe, layout.as_ref());
+        assert_eq!(fired.len(), 1);
+        let cache = BlockCache::with_sizes(std::io::Cursor::new(file.clone()), 509, 8 * 509).unwrap();
+        for (limit, found) in [(4096, true), (100, false)] {
+            crate::engine::reset_scan_truncated();
+            let (det, _) = rt.scan_source(&cache, FileType::Pe, limit, &fired, exec::WriteLimits::NONE);
+            assert_eq!(det.is_some(), found, "limit {limit}");
+            assert_eq!(crate::engine::scan_was_truncated(), !found, "limit {limit}");
+        }
+    }
+
+    /// A PDF with more objects than the table may hold runs its programs over
+    /// the first ones and marks the scan incomplete; with room for all of them,
+    /// or no limit, it does not.
+    #[test]
+    fn a_pdf_with_more_objects_than_the_table_holds_is_incomplete() {
+        let (rt, triggers) = BytecodeRuntime::standalone(vec![pedata_reader()]);
+        let mut file = b"%PDF-1.7\n".to_vec();
+        for i in 1..=100 {
+            file.extend(format!("{i} 0 obj\n<<>>\nendobj\n").into_bytes());
+        }
+        file.extend(b"PEDATA");
+        let fired = triggers.bytecode_triggers(&file, FileType::Pdf, None);
+        assert_eq!(fired.len(), 1);
+        let entry = std::mem::size_of::<(u32, u32)>();
+        for (limit, cut) in [(usize::MAX, false), (100 * entry, false), (100 * entry - 1, true)] {
+            crate::engine::reset_scan_truncated();
+            let (det, _) = rt.scan_source(&file, FileType::Pdf, limit, &fired, exec::WriteLimits::NONE);
+            assert!(det.is_some(), "the program ran, limit {limit}");
+            assert_eq!(crate::engine::scan_was_truncated(), cut, "limit {limit}");
+            assert_eq!(
+                crate::engine::scan_over_size().is_some_and(|r| r.contains("--max-object-bytes")),
+                cut,
+                "limit {limit}"
+            );
+        }
+        crate::engine::reset_scan_truncated();
     }
 
     #[test]

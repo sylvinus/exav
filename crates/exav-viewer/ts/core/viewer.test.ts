@@ -135,8 +135,17 @@ describe("a session", () => {
     expect(f.log).toEqual([]);
     expect(pending.status.get()).toEqual({ phase: "loading" });
     const unknown = viewer.mount(document.createElement("div"), { id: "b", name: "b.zzz", source: { bytes: new Uint8Array() } });
+    // The first bytes of a file the viewer holds are read before it gives up.
+    await tick();
     expect(unknown.format).toBeNull();
     expect(unknown.status.get().phase).toBe("error");
+    // So are those of a file read by an address (a range request).
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(new Uint8Array(4), { status: 206, headers: { "content-range": "bytes 0-3/4" } })));
+    const link = viewer.mount(document.createElement("div"), { id: "c", name: "c.zzz", source: { url: "/c.zzz" } });
+    expect(link.format).toBeNull();
+    await tick();
+    expect(link.status.get().phase).toBe("error");
+    vi.unstubAllGlobals();
   });
 
   it("ends the nested sessions with their parent", async () => {
@@ -340,7 +349,15 @@ describe("the file step", () => {
         send = (chunk) => (chunk ? controller.enqueue(chunk) : controller.close());
       },
     });
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { headers: { "content-length": "4" } })));
+    // The first request is for the file's first bytes (a range), the second is the plugin's download.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) =>
+        new Headers(init?.headers).has("range")
+          ? new Response(new Uint8Array(4), { status: 206, headers: { "content-range": "bytes 0-3/4" } })
+          : new Response(body, { headers: { "content-length": "4" } }),
+      ),
+    );
     const seen: Status[] = [];
     const reading: FormatPlugin = {
       id: "r",
@@ -383,6 +400,51 @@ describe("a source", () => {
     expect(await r.url()).toBe("https://example.test/f");
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(r.progress.get()).toEqual({ loaded: 5, total: 5 });
+    vi.unstubAllGlobals();
+  });
+
+  it("asks for the first bytes of an address by a range request, and downloads the file whole later", async () => {
+    const file = Uint8Array.from({ length: 5000 }, (_, i) => i % 251);
+    const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
+      const range = new Headers(init?.headers).get("range");
+      const m = /^bytes=0-(\d+)$/.exec(range ?? "");
+      if (!m) return new Response(file, { headers: { "content-length": "5000" } });
+      const end = Math.min(Number(m[1]), file.length - 1);
+      return new Response(file.slice(0, end + 1), { status: 206, headers: { "content-range": `bytes 0-${end}/${file.length}` } });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const r = createSourceReader({ url: "https://example.test/f", init: { headers: { authorization: "x" } } }, new AbortController().signal);
+    const head = await r.head(1024);
+    expect(head!.bytes).toEqual(file.slice(0, 1024));
+    expect(head!.size).toBe(5000);
+    const sent = new Headers(fetcher.mock.calls[0]![1]!.headers);
+    expect([sent.get("range"), sent.get("authorization")]).toEqual(["bytes=0-1023", "x"]);
+    expect((await r.bytes()).length).toBe(5000);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(new Headers(fetcher.mock.calls[1]![1]?.headers).has("range")).toBe(false);
+    vi.unstubAllGlobals();
+  });
+
+  it("reads no more than the first bytes of an address whose server ignores the range, and drops the rest of the answer", async () => {
+    let pulled = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1;
+        controller.enqueue(new Uint8Array(512).fill(pulled));
+        if (pulled === 200) controller.close();
+      },
+      cancel: () => void (cancelled = true),
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 200, headers: { "content-length": String(200 * 512) } })));
+    const r = createSourceReader({ url: "https://example.test/f" }, new AbortController().signal);
+    const head = await r.head(1000);
+    expect(head!.bytes.length).toBe(1000);
+    expect([head!.bytes[0], head!.bytes[600]]).toEqual([1, 2]);
+    // The whole size is the one the server declares.
+    expect(head!.size).toBe(200 * 512);
+    expect(cancelled).toBe(true);
+    expect(pulled).toBeLessThan(10);
     vi.unstubAllGlobals();
   });
 

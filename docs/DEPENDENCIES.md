@@ -1,7 +1,7 @@
 # Dependency policy
 
 exav aims to stay in control of its own codebase. Dependencies are where that
-control is easiest to lose — to code we don't read, `unsafe` we don't audit,
+control is easiest to lose: to code we don't read, `unsafe` we don't audit,
 supply-chain risk we don't track, and compile time / binary size we don't want.
 So we are deliberate about what we pull in.
 
@@ -27,22 +27,22 @@ So we are deliberate about what we pull in.
      build is `--no-default-features --features zip`; it drops every non-ZIP
      extractor and its deps. (A recognised-but-not-compiled format is reported
      `UNSCANNABLE`, never silently clean.)
-   - **YARA** (`yara`, on by default) — see the outlier note below.
-   - **HTTP(S) range scanning** (`http`, off by default) — the only feature that
+   - **YARA** (`yara`, on by default): see the outlier note below.
+   - **HTTP(S) range scanning** (`http`, off by default): the only feature that
      links a TLS stack (`ureq → rustls → ring`).
    - **Visible text** (`visible-text` in `exav-core` and `exav`, `text` in
-     `exav-grep`, on by default) — the text a reader sees in Markdown
+     `exav-grep`, on by default): the text a reader sees in Markdown
      (pulldown-cmark, `forbid(unsafe_code)` as built), HTML (html5gum's
      tokenizer alone: `forbid(unsafe_code)`, no dependency), XML parts (quick-xml, already
      in) and drawings (exav-render's model, already in). No C.
    - **Office formats** (exav-render's `office-sheets`, `office-slides`,
      `office-docs`, off by default; `visible-text-office` and `text-office` add
-     their text) — `zip`, `quick-xml`, `encoding_rs`, `md-5` and `sha1`
+     their text): `zip`, `quick-xml`, `encoding_rs`, `md-5` and `sha1`
      (Numbers and iWork) and what they pull in: 21 more crates than the
      default `exav-render` tree (`cargo tree -p exav-render --features
      office`). The viewer builds them for the browser; the scanner reads them
      only when `visible-text-office` is on.
-   - **PDF text** (`visible-text-pdf`, `text-pdf`, off by default) — hayro. Its
+   - **PDF text** (`visible-text-pdf`, `text-pdf`, off by default): hayro. Its
      `hayro-interpret` turns on `hayro-syntax`'s `unsafe` feature itself, which
      switches every `flate2` to zlib-rs and adds SIMD to the image decoders, and
      adds some 40 crates. It is built without the predefined CJK CMaps so that
@@ -52,10 +52,12 @@ So we are deliberate about what we pull in.
 4. **Prefer pure-Rust, and keep the tree pruned.** The default build links no C
    and no native JIT. Concretely:
    - The daemon's stream-spill temp file is in-tree (`exav/src/tmpfile.rs`,
-     a page of `std::fs`) and `tar` is built without `xattr`. Together those keep
-     the `rustix`/`linux-raw-sys` syscall crates out — 8,624 `unsafe`
+     a page of `std::fs`), and so is the tar reader (`formats/tar.rs`; the
+     `tar` crate builds test fixtures, without `xattr`). Together those keep
+     the `rustix`/`linux-raw-sys` syscall crates out: 8,624 `unsafe`
      occurrences, which would outweigh the rest of the tree twice over, for code
-     that never touches a scanned byte.
+     that never touches a scanned byte. The reader also keeps `tar` and its
+     `filetime` out of what ships.
    - Decryption cipher/KDF crates are in, but no RNG path is ever enabled, so
      the default tree is `getrandom`-free.
    - YARA is an in-tree native engine rather than the `yara-x` runtime (see
@@ -66,7 +68,7 @@ So we are deliberate about what we pull in.
 
 A YARA engine can be a dependency outlier: running compiled rule conditions on a
 WASM runtime **with Cranelift** pulls a ~200-crate subtree (a WASM runtime plus a
-codegen backend) — squarely at odds with principle 2.
+codegen backend), squarely at odds with principle 2.
 
 exav avoids that. It has its **own native, in-tree YARA engine**: it uses the
 YARA-X parser and compiles rule conditions to a native tree-walking evaluator. As
@@ -84,14 +86,14 @@ a result:
   still-useful compatible scanner.
 
 See [YARA.md](YARA.md) for the engine's design and coverage. The `yara-x` parser
-is BSD-3-Clause (permissive, MIT-compatible), reused with attribution — the
+is BSD-3-Clause (permissive, MIT-compatible), reused with attribution: the
 clean-room "never derive from GPL" rule is GPL-specific and does not apply to it.
 
 ## Filesystem readers: a costed decision
 
 Reconstructing a disk image gives a pile of sectors. Reading the *filesystem* on
 it is what turns those into files with names, and what reassembles a
-**fragmented** file — which a raw carve can only see as disconnected pieces.
+**fragmented** file, which a raw carve can only see as disconnected pieces.
 
 **Since then every filesystem reader is in-tree** (`formats/vol.rs` and one
 file for each of NTFS, FAT, exFAT, ext, HFS+, APFS, SquashFS, cramfs, romfs and
@@ -125,14 +127,14 @@ the kind of expansion this project has spent effort removing.
 Four alternatives were measured the same way. `ntfs-reader` is +13 but pulls the
 **`windows`** bindings, which is a non-starter for a cross-platform scanner.
 `mft` is the most downloaded at 748k and the heaviest at **+54**, because it is a
-forensics *tool* crate — `csv`, `dialoguer`, `rkyv`, `sonic-rs`, `simplelog`.
+forensics *tool* crate: `csv`, `dialoguer`, `rkyv`, `sonic-rs`, `simplelog`.
 `ntfs-core` is the cheapest at **+6** and the only one that handles compression,
 but the crate and its whole dependency chain were published within the preceding
 two months by a single author, with sixteen releases in seven weeks; accepting it
 after rejecting `newtua-mscompress` and `xpress-huffman` on exactly that ground
 would be incoherent.
 
-**What was taken instead: an in-tree MFT walk plus `lznt1` — one crate.** A
+**What was taken instead: an in-tree MFT walk plus `lznt1`, one crate.** A
 scanner does not need a filesystem driver. Walking the MFT record by record
 gets every file's bytes without index B-trees, `$Upcase` or case-insensitive
 lookup, and it picks up deleted-but-resident records, which no directory walk
@@ -149,10 +151,10 @@ fixtures, `ntfsls` and `ntfscat` are an independent oracle, all without root.
 answered them better:
 
 - **Tree**: zero dependencies. `cargo tree -i ext4-view` adds one node.
-- **`unsafe`**: none, and no write path at all — the crate cannot corrupt an
+- **`unsafe`**: none, and no write path at all: the crate cannot corrupt an
   image because it has no code that could.
 - **Validatable**: `mke2fs` builds fixtures, `debugfs` populates and deletes
-  inside them, and `filefrag`/`debugfs stat` are an independent oracle — all
+  inside them, and `filefrag`/`debugfs stat` are an independent oracle, all
   without root, exactly like the NTFS case. The regression fixture's payload
   really does span two non-adjacent extents, and `debugfs` says so.
 - **Scope**: read-only access to files by path is precisely what a scanner
@@ -167,14 +169,15 @@ the image was copied once rather than borrowed, and an image past
 `unarc-rs` has a working ZOO reader and was tried as a dependency first. It
 brought in a second `zip` with **default features**, and Cargo's feature
 unification then enabled the `zip` crate's own LZMA/bzip2/deflate64 decoders
-inside exav — which bypass exav's per-member budget, and which exav deliberately
+inside exav, which bypass exav's per-member budget, and which exav deliberately
 turns off (`default-features = false`) so its own budgeted decoders handle those
 methods. The ZIP-codec suite went red immediately.
 
 The fix was to vendor the ~200 lines of ZOO structures instead, as the ARJ
-reader already was, leaving two leaf crates: `salzweg` (LZW, dependency-free)
-and `delharc`, which exav already had for LHA. **Feature unification is a real
-cost of a dependency and it does not show up in `cargo tree`** — this is the
+reader already was, leaving `delharc`, which exav already had for LHA. ZOO's
+LZW (LZD) was `salzweg`'s until it was found to stop at 12-bit codes where LZD
+goes to 13; the decoder is in-tree now. **Feature unification is a real
+cost of a dependency and it does not show up in `cargo tree`**: this is the
 case to remember when weighing one.
 
 ## x86 decoding: `iced-x86` costed
@@ -182,13 +185,13 @@ case to remember when weighing one.
 `iced-x86` was the largest single `unsafe` surface exav linked. **No shipped
 binary links it now.** Both x86 call sites run on `exav-x86`:
 
-- `crates/exav-pe-emu/src/cpu.rs` — the packer emulator's fetch step.
-- `crates/exav-core/src/bytecode/disasm.rs` — the bytecode `disasm_x86` API,
+- `crates/exav-pe-emu/src/cpu.rs`: the packer emulator's fetch step.
+- `crates/exav-core/src/bytecode/disasm.rs`: the bytecode `disasm_x86` API,
   translating one instruction into the 64-byte `DISASM_RESULT` ABI.
 
 `iced-x86` remains in the workspace in exactly one role, as a **test oracle**:
 `exav-x86`'s differential suite, its table generator, and the `x86_decode` fuzz
-target. It is a dev-dependency of one crate and reaches no shipped artifact —
+target. It is a dev-dependency of one crate and reaches no shipped artifact:
 `cargo tree -e no-dev -p exav` does not list it.
 
 The emulator move was gated on output, not on the tests passing:
@@ -210,7 +213,7 @@ decoders produce **byte-identical results on every one**.
 The build cost is the point that changes the argument: `iced-x86` is expensive in
 `unsafe` and cheap in everything else. Both `unsafe` categories have safe
 equivalents upstream (a `match`, a `TryFrom`, an index into a slice) at some
-decode-speed cost — this is a performance posture, not a necessity.
+decode-speed cost: this is a performance posture, not a necessity.
 
 ### What we actually use
 
@@ -223,12 +226,12 @@ disambiguation, instruction length, normalisation of every encoding of an
 operation into one `Code`, and the valid/invalid decision.
 
 The *demand* on that machinery was measured by instrumenting the decode point in
-`cpu.rs` and running the emulator over all 276 packed corpus samples —
+`cpu.rs` and running the emulator over all 276 packed corpus samples:
 **1,916,485,956 instructions decoded**:
 
 | | |
 |---|---|
-| distinct encodings (`Code`) reached | **253** of iced's 4,936 — **5.1%** |
+| distinct encodings (`Code`) reached | **253** of iced's 4,936, **5.1%** |
 | distinct mnemonics | 114 |
 | encodings covering 50% of decodes | 8 |
 | …90% / 99% / 99.9% | 42 / 87 / 111 |
@@ -236,15 +239,15 @@ The *demand* on that machinery was measured by instrumenting the decode point in
 The shape is unremarkable and that is the finding: `Pop_r32`, `Mov_r32_rm32`,
 `Inc_r32`, `Push_r32`, `Retnd` and three more are half of two billion decodes.
 The tail is 16-bit operand-size forms (`Add_AX_imm16`, `And_rm16_imm16`),
-`moffs` forms, and `cmovcc` — mundane, not exotic.
+`moffs` forms, and `cmovcc`: mundane, not exotic.
 
 **No SSE or MMX encoding appears anywhere in the corpus**, and x87 shows up only
 as `Fninit`, `Fnop`, `Ftst`, `Fxam` and `Wait`. `cpu.rs` implements a full
 `simd()` path; no corpus sample exercises it, so its only coverage is unit tests.
 Check that before relying on it.
 
-`instr_info` is pulled in for exactly seven `Register` predicates — `is_gpr8`,
-`is_gpr16`, `is_gpr32`, `is_xmm`, `is_mm`, `is_segment_register`, `number()` —
+`instr_info` is pulled in for exactly seven `Register` predicates (`is_gpr8`,
+`is_gpr16`, `is_gpr32`, `is_xmm`, `is_mm`, `is_segment_register`, `number()`)
 plus `size()`, across 42 call sites. All are pure classification over a finite
 enum, so an in-tree table replaces them and the feature (43 occurrences) with it.
 
@@ -252,19 +255,19 @@ enum, so an in-tree table replaces them and the feature (43 occurrences) with it
 
 **`yaxpeax-x86` 2.2.0** (0BSD): 104 `unsafe` across all three modes plus the
 formatters. With `default-features = false` (no `fmt`, `colors`, `use-serde`) and
-only `protected_mode` reachable, that falls to roughly 20–35 — mostly
+only `protected_mode` reachable, that falls to roughly 20–35, mostly
 `unreachable_unchecked()`, which is the sharpest kind on hostile input but the
 easiest to replace. It adds `yaxpeax-arch`, `num-traits` and `cfg-if`. The port
 is concentrated rather than diffuse: the operand-access helpers in `cpu.rs`, the
 131-arm mnemonic match, and the `real_op` mapping in `disasm.rs`.
 
-**An in-tree decoder — written, and measured rather than estimated.** A
+**An in-tree decoder, written, and measured rather than estimated.** A
 prototype covering the emulator's demand is **732 lines** of dependency-free,
 `#![forbid(unsafe_code)]` Rust (912 with comments and blanks):
 
 | region | code |
 |---|---|
-| `decode()` — prefixes, dispatch, x87 escapes | 178 |
+| `decode()`: prefixes, dispatch, x87 escapes | 178 |
 | operand-form decode | 114 |
 | group / condition-code / arithmetic tables | 104 |
 | one-byte opcode map | 103 |
@@ -275,34 +278,34 @@ prototype covering the emulator's demand is **732 lines** of dependency-free,
 | operand-form enum (26 variants) | 30 |
 
 It decodes **all 253 encodings the corpus executes**, and against `iced-x86` over
-every byte offset of all 276 samples — **94,245,255 sites where iced decoded
-something** — it produces **zero disagreements** in length, mnemonic, memory
+every byte offset of all 276 samples (**94,245,255 sites where iced decoded
+something**), it produces **zero disagreements** in length, mnemonic, memory
 operand or register operand, and **declines nothing**. The sweep asserts both,
 so either is a test failure rather than a number in a report.
 
 The line count is the cheap part of the answer. The expensive part is that a
 decoder is only as good as what it is checked against, and the rules that decide
-correctness are not visible in the tables — they are prefix interactions:
+correctness are not visible in the tables; they are prefix interactions:
 
 - `/6` in the shift group is `sal`, not a second `shl`
 - `lock` is only legal on a read-modify-write to memory, for a fixed set of ops
-- `8D` with `mod=3` is not an instruction — `lea` needs an address
+- `8D` with `mod=3` is not an instruction: `lea` needs an address
 - a `66` prefix renames `pushad`/`popad`/`pushfd`/`popfd`/`cdq`/`cwde`
-- **`66 E9` takes an `imm16`, not an `imm32`** — a length error, the class that
+- **`66 E9` takes an `imm16`, not an `imm32`**: a length error, the class that
   desynchronises every instruction after it
 - `F2` and `F3` are one prefix class: the last one wins, so `F3 F2 90` is `nop`
 - `F3 0F BC`/`BD` are `tzcnt`/`lzcnt`, not `rep bsf`/`bsr`
 - `67 E3` branches on CX, so it is `jcxz`, not `jecxz`
 
 Every one of those is a silent wrong answer, not a crash, and none is visible by
-inspection — which is why `exav-x86` keeps `iced-x86` as a dev-dependency oracle
+inspection, which is why `exav-x86` keeps `iced-x86` as a dev-dependency oracle
 and sweeps the opcode maps under every prefix combination on each test run.
 
 The harder cost was never the 253 encodings; it is **correctly saying no to
 everything else**, which is the part a decoder gets wrong quietly. The emulator
 has the right shape for it either way: `Stop::Unsupported` is not delivered to
 the stub's SEH handler, so an encoding the in-tree decoder does not claim is an
-honest `UNSCANNABLE`, not a fabricated fault. The 253 is a floor, not a ceiling —
+honest `UNSCANNABLE`, not a fabricated fault. The 253 is a floor, not a ceiling:
 it is what *these* 276 samples execute, and every packer added extends it, which
 is why the decoder covers the whole of 32-bit mode rather than that measured
 subset.
@@ -323,7 +326,7 @@ report.
 
 ### Where this stands
 
-The decoder is `crates/exav-x86` — 32-bit, decode-only, dependency-free,
+The decoder is `crates/exav-x86`: 32-bit, decode-only, dependency-free,
 `#![forbid(unsafe_code)]`. It covers 32-bit protected mode in full: the integer
 and control-flow set, port I/O, far transfers, segment-register loads, both
 address sizes, the whole x87 escape map, the system-instruction space, SSE/MMX
@@ -334,7 +337,7 @@ decode sites) it agrees on **every one**: no disagreements and nothing declined.
 
 The SIMD and system regions are not hand-written. `scripts/gen-x86-tables.sh`
 runs `crates/exav-x86/tools/gen-tables`, which probes `iced-x86` for every
-(prefix, opcode, `/digit`, `mod`) combination and records what came back —
+(prefix, opcode, `/digit`, `mod`) combination and records what came back:
 hand-transcribing an opcode table is how a decoder acquires quiet errors, and
 the differential tests that catch them are cheaper to run than to write. The
 attribution is in `NOTICE`; the generator is its own workspace so it stays
@@ -342,7 +345,7 @@ runnable while a table-layout change has the crate not compiling.
 
 The tables record only what a decoder cannot infer from the bytes: which
 instruction an encoding names, how many immediate bytes follow, which register
-file each operand belongs to, how wide a memory operand is, and — for EVEX — the
+file each operand belongs to, how wide a memory operand is, and, for EVEX, the
 factor its compressed `disp8` is scaled by. Never a displacement, so a change to
 the addressing rules cannot be contradicted by a stale table.
 
@@ -363,7 +366,7 @@ iterating a hash map, which made the *unpacked image itself* differ between runs
 The one behavioural rule that swap depends on: a declined decode marks the
 bytecode run **unsupported**, so `run_program` discards its result. Returning the
 ABI's `-1` instead would let a program take a branch it would not have taken with
-a full decoder and report a verdict built on it — a false negative with nothing
+a full decoder and report a verdict built on it: a false negative with nothing
 to show for it.
 
 `iced-x86` stays in the workspace as `exav-x86`'s **dev-dependency oracle**. It
@@ -373,7 +376,7 @@ against it on each test run.
 ## Adding a dependency: checklist
 
 - Is there a smaller/leaf alternative, or can we do it in-crate over our bounded
-  byte arena? (Several parsers are vendored for exactly this reason — see
+  byte arena? (Several parsers are vendored for exactly this reason; see
   `NOTICE`.)
 - Run `cargo tree -e no-dev -i <crate>` and look at what it pulls in. Huge tree →
   justify or decline.
@@ -417,7 +420,8 @@ source of every crate in them and crates.io (`make deps-review`).
 ### The numbers
 
 Compared with the last `[[review]]` entry of the register, and written there
-at the end of every late pass:
+at the end of every late pass, and of the early pass (`pass = "early"`) so
+that the late pass compares with it:
 
 - crates in the default shipped tree of the CLI, and in the tree with every
   feature on;
@@ -507,7 +511,9 @@ small reader. It is done in this form:
 - the license file and a `NOTICE` entry (upstream, version, copyright);
 - upstream's tests where its license allows;
 - an entry in `docs/dependencies.toml` with `version` filled in (the upstream
-  release or commit) and a `return_when` that can be checked.
+  release or commit) and a `return_when` that can be checked. A later release
+  read against the copy with nothing to take goes in `reviewed`, with a comment
+  saying what it changed; the script then flags only a release after it.
 
 **Un-vendor.** When the `return_when` holds, or the script shows a release
 newer than the copy: point the module at the crate, run the tests that
@@ -531,7 +537,7 @@ replacement is replaced in the next early pass, not left to the ignore.
 
 ## Measuring WASM size fairly
 
-A plain `cargo build --release` `.wasm` is **not** the shipped size — it still
+A plain `cargo build --release` `.wasm` is **not** the shipped size: it still
 carries the `__wasm_bindgen_unstable` metadata section and the `name` section,
 which `wasm-bindgen`/`wasm-pack` and `wasm-opt` strip. Measure the real artifact:
 
@@ -542,6 +548,6 @@ wasm-opt -Oz --all-features pkg/exav_unpack_wasm_bg.wasm -o out.wasm   # final s
 
 For reference (release profile `opt-level="z"` + LTO, then `wasm-opt -Oz`): the
 ZIP-only extractor is ~**323 KiB** vs ~**1.21 MiB** for the full all-formats
-build — the per-format features earn their keep. Roughly a third of an
+build: the per-format features earn their keep. Roughly a third of an
 unoptimised `cargo build` `.wasm` is transient tooling data, so always strip +
 `wasm-opt` before quoting a number.

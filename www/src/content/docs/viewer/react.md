@@ -22,6 +22,11 @@ One viewer for the components inside it.
 | `plugins` | The plugins, run in the page. Keep the list stable (a module constant, or `useMemo`): a new list starts a new viewer. |
 | `viewer` | Instead of `plugins`: a viewer built elsewhere, used as it is (`createViewer`, or `createSandboxedViewer` from `@exav/viewer/frame`). |
 | `assetBase` | Where the [runtime files](/viewer/integration/) are served. Default `"/exav-viewer/"`. Not used with `viewer`. |
+| `sniffBytes` | Bytes read from the start of a file to tell what it is, as the option of the same name of `createViewer` (default 65,536; `0`: files are told by their name and type alone). Not used with `viewer`. |
+| `sniffTimeoutMs` | How long the detection of a file's first bytes may take, in milliseconds, before the file's name and type decide, as the option of the same name of `createViewer` (default 30,000; `0`: no timeout). Not used with `viewer`. |
+| `maxExtractedBytes` | The most bytes all the members of a ZIP (an Office file, an archive) may come to once inflated, read off its directory before the file reaches its engine; past it the file is refused as `too_large`. As the option of the same name of `createViewer` (default 536,870,912; `0`: no limit). Not used with `viewer`. |
+| `maxMembers` | The most members a ZIP may have; past it the file is refused as `too_many_entries`. As the option of the same name of `createViewer` (default 20,000; `0`: no limit). Not used with `viewer`. |
+| `maxCompressionRatio` | The most a member of a ZIP may inflate to, as a multiple of its compressed size; past it the file is refused as `too_compressed`. As the option of the same name of `createViewer` (default 1000; `0`: no limit). Not used with `viewer`. |
 | `locale` | Picks the built-in strings by language (`"fr"`, `"de-AT"`...): English, French, German, Spanish or Dutch; English otherwise. |
 | `translate` | Replaces the built-in strings: `(key, vars) => string`, for a host with its own i18n. |
 | `components` | Replaces pieces of the UI (below). |
@@ -40,6 +45,7 @@ under 1024 px. A button among the zoom buttons folds and unfolds them.
 | `onPages(pages)` | The page or slide counter, for a host showing it elsewhere. With an archive member open, the member's. |
 | `className` | |
 | `children` | Drawn in the stage, over the surface: a node, or `({ session, status, controllers }) => node` for a host's own controls, such as zoom buttons that call `controllers.zoom.setScale(...)`. With an archive member open these are the archive's: follow `controllers.archive.opened.session` to reach the member's. |
+| `ref` | A `ViewerBodyHandle`: `goToPage(page)` and `goToHighlight(id)`, on the session on screen (an archive member's when one is open), applied once its document is shown when called before. |
 
 A PDF's section rail shows from two entries: an outline of one only jumps to
 where the reader already is.
@@ -50,6 +56,35 @@ host's styles and tests.
 The same `file.id` with another `source` is the same document with other
 bytes: it is replaced in place, and a PDF or an image keeps its zoom and
 position ([Replacing the document](/viewer/api/#replacing-the-document)).
+
+### Highlights
+
+The file's [`highlights`](/viewer/api/#highlights) are shown when it opens,
+and the view goes to `focusHighlight`, or the first. A new list or focus on
+the same `file.id` is given to the session in place: the list is replaced and
+the view goes to the new focus (a new object with the same values changes
+nothing). To go back to a highlight the reader scrolled away from, call the
+handle:
+
+```tsx
+import { useRef } from "react";
+import { ViewerDialog, type ViewerBodyHandle } from "@exav/viewer/react";
+
+const viewer = useRef<ViewerBodyHandle>(null);
+const items = documents.map((d) => ({
+  id: d.id,
+  title: d.name,
+  name: d.name,
+  source: { url: d.url },
+  highlights: d.evidence.map((e) => ({ id: e.id, page: e.page, text: e.quote, label: e.field })),
+}));
+
+<ViewerDialog ref={viewer} items={items} index={index} onIndexChange={setIndex} />;
+// on a click on a value already shown
+viewer.current?.goToHighlight(evidence.id);
+```
+
+`ViewerDialog` takes the same `ref`, for the body of the file it shows.
 
 ## In a sandboxed frame
 
@@ -68,7 +103,7 @@ import { SandboxedViewer, SandboxedViewerProvider } from "@exav/viewer/react/san
 <SandboxedViewer sandbox={{ url: "https://viewer-frame.example-files.com/exav-frame/index.html" }} file={file} locale="fr" />
 ```
 
-`sandbox` is `{ url, formats?, options?, confirmLink?, startTimeoutMs?, delivery?, origins?, keys?, theme? }`
+`sandbox` is `{ url, formats?, options?, confirmLink?, linkQuietMs?, startTimeoutMs?, sniffTimeoutMs?, sniffBytes?, maxExtractedBytes?, maxMembers?, maxCompressionRatio?, delivery?, origins?, keys?, theme? }`
 ([Core API](/viewer/api/#the-viewer-in-a-sandboxed-frame), [Security](/viewer/security/)),
 read once. The question before a document's link opens is the `link_confirm`
 string; `confirmLink` replaces it. `SandboxedViewerProvider` takes the
@@ -202,6 +237,7 @@ Every colour, radius and size is a custom property, set on an ancestor or
 | `--exav-viewer-error`, `--exav-viewer-warning` | `#b91c1c`, `#b45309` |
 | `--exav-viewer-media-bg` | `#0f172a`, behind video |
 | `--exav-viewer-model-bg` | a light radial gradient, behind models |
+| `--exav-viewer-highlight`, `--exav-viewer-highlight-current` | `rgb(250 204 21 / 0.45)`, a highlight's fill; `#ca8a04`, the outline of the one gone to |
 | `--exav-viewer-radius` | `0.375rem` |
 | `--exav-viewer-rail-width` | `15rem` |
 | `--exav-viewer-tap` | `2.75rem`, the smallest control |

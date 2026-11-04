@@ -67,11 +67,15 @@ members of members the same way, within the budget of the scan. A document that
 has a text view is scanned as its text too. A format that is recognised and not
 opened is reported, never passed as clean.
 
-**View.** The viewer sniffs the file in TypeScript (`ts/core/formats.ts`, kept
-equal to the registry by a test), picks the plugin, and hands the bytes to the
-WebAssembly module built from `exav-render` for that kind of file: pixels for
-an image, geometry for a drawing, a DOCX, XLSX or PPTX for an office document.
-The viewer draws those. Archives are listed through `exav-unpack-wasm`.
+**View.** The viewer picks the plugin by the file's name and type, and by its
+first bytes where it holds them: exav's own detection (`exav-unpack`'s
+`detect`, `exav-render`'s image detection and the models' readers, `is_ply`,
+`is_glb` and `is_ifc`) runs in `exav_viewer_sniff`, a WebAssembly module in a
+worker, and the registry test checks its answers against
+`formats/registry.json`. It then hands the bytes to the WebAssembly module
+built from `exav-render` for that kind of file: pixels for an image, geometry
+for a drawing, a DOCX, XLSX or PPTX for an office document. The viewer draws
+those. Archives are listed through `exav-unpack-wasm`.
 
 ## Budgets
 

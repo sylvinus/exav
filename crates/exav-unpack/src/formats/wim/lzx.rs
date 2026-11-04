@@ -429,7 +429,7 @@ pub(super) fn decompress(data: &[u8], out_len: usize) -> Option<Vec<u8>> {
             _ => return None,
         }
         if want == 0 {
-            return None; // no progress — malformed
+            return None; // no progress: malformed
         }
     }
     out.truncate(out_len);

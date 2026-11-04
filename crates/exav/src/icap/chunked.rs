@@ -23,7 +23,7 @@ use crate::spill::{self, SpillError, SpillFile};
 /// The same policy, and the same [`StreamPayload`], as the daemon's stream
 /// verbs. An object arriving over ICAP is therefore buffered exactly the way the
 /// same object arriving over `INSTREAM` is, and gets the same seekable
-/// container-aware scan — a ZIP's central directory is at its end, so a scan
+/// container-aware scan: a ZIP's central directory is at its end, so a scan
 /// that cannot seek is a scan that cannot open the archive.
 ///
 /// What this buys the listener is a memory bound that does not depend on what
@@ -75,7 +75,7 @@ impl Body {
         }
 
         // Crossing the threshold: fill RAM to the brim, then move the whole body
-        // — head included, so the file alone is the object — to disk.
+        // (head included, so the file alone is the object) to disk.
         let (fits, rest) = bytes.split_at(room);
         self.ram.extend_from_slice(fits);
         self.len += fits.len() as u64;
@@ -143,7 +143,7 @@ pub(super) struct BodyOutcome {
     /// discarding so the stream still reaches the next request boundary, exactly
     /// as it does for a body past its size limit. Aborting instead would leave
     /// the client mid-send, and answering into a socket that still has unread
-    /// bytes makes the kernel reset the connection — taking the verdict with it.
+    /// bytes makes the kernel reset the connection, taking the verdict with it.
     pub(super) rejected: Option<String>,
     /// The body's size as the chunk headers declared it, kept or not. A lower
     /// bound when `abandoned`.
@@ -215,7 +215,7 @@ fn trim_eol(line: &[u8]) -> &[u8] {
 /// more than `limit` bytes.
 ///
 /// `limit` is `--max-input-bytes`, the same ceiling every other surface scans
-/// under, and `None` — the default — means the object's size is not a reason to
+/// under, and `None` (the default) means the object's size is not a reason to
 /// stop. Memory does not depend on it: `out` spills past the shared threshold.
 ///
 /// Past `limit` the decoding continues with the bytes thrown away, up to
@@ -223,7 +223,7 @@ fn trim_eol(line: &[u8]) -> &[u8] {
 /// already decided is what leaves the stream at a request boundary, and that is
 /// what lets the verdict be *delivered*: answer and close with the client still
 /// sending, and the close resets the connection with the answer still in
-/// flight — the client learns nothing. It is worth a bounded amount of work and
+/// flight: the client learns nothing. It is worth a bounded amount of work and
 /// no more, since an unbounded discard is an invitation to keep a thread busy
 /// forever with reads that individually never time out.
 ///
@@ -466,8 +466,8 @@ mod tests {
         Ok((bytes(out), outcome))
     }
 
-    /// The decoded body, read back the way the scanner would get it — through
-    /// the payload, so a test says nothing about whether it spilled.
+    /// The decoded body, read back the way the scanner would get it (through
+    /// the payload), so a test says nothing about whether it spilled.
     fn bytes(body: Body) -> Vec<u8> {
         match body.finish().expect("materialise the body") {
             StreamPayload::Mem(v) => v,

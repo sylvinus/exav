@@ -3,7 +3,7 @@
 #
 # The module was built this way rather than checked afterwards, and it mattered:
 # four fields were wrong on the first pass and every one of them was a semantic
-# trap rather than a coding slip —
+# trap rather than a coding slip:
 #
 #   number_of_classes  excludes the `<Module>` pseudo-type at TypeDef row 0
 #   constants          is only the *string* rows of the Constant table (95 of 568)

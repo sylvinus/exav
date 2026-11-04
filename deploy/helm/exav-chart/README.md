@@ -120,8 +120,9 @@ password list. `archivePasswords.key` names the key inside that Secret. The
 file holds one password per line, byte for byte, with no trimming.
 
 The chart mounts the file read-only at `/etc/exav/passwords/<key>` with mode
-0440. This needs `podSecurityContext.fsGroup` to stay at 65532. The chart
-sets `EXAV_PASSWORDS_FROM` to that path.
+0440, owned by the `podSecurityContext.fsGroup` group. This needs an fsGroup:
+the default 65532, or the one OpenShift assigns. The chart sets
+`EXAV_PASSWORDS_FROM` to that path.
 
 ## Storage
 
@@ -148,9 +149,45 @@ node needs memory for two signature loads at once. When persistence is on
 and `accessModes` lacks `ReadWriteMany`, the chart picks the `Recreate`
 strategy instead: only one pod runs at a time in that case.
 
-Some CSI drivers ignore `fsGroup`. Check that your storage class makes the
-volume writable by uid 65532, the user exav runs as. Do not assume
-`fsGroup` alone is enough.
+exav runs as uid 65532 and writes `/var/lib/exav`: the signatures it
+fetches, a pulled `.exavdb`, and the temp files it renames into place. With
+`fsGroup` set, Kubernetes makes a volume that supports it writable by group
+65532 at each mount, so an existing claim filled by root or by ClamAV's
+`clamav` user works as it is. Some volume types and CSI drivers ignore
+`fsGroup` (NFS among them). On those, exav can read the files but every
+update fails with `Permission denied` in the pod log. Change the owner once,
+with the Deployment scaled to 0 for a `ReadWriteOnce` claim. Replace `exav`
+in `claimName` with the claim's name:
+
+```sh
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: exav-chown
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsUser: 0
+  containers:
+    - name: chown
+      image: busybox
+      command: ["chown", "-R", "65532:65532", "/data"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: exav
+EOF
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/exav-chown
+kubectl delete pod exav-chown
+```
+
+This pod runs as root, so a namespace that enforces the `restricted` Pod
+Security Standard refuses it, and an NFS export with `root_squash` refuses the
+`chown`. In either case, change the owner on the storage server instead.
 
 ### Spill
 
@@ -231,6 +268,17 @@ default:
 - `readOnlyRootFilesystem: true`.
 - `allowPrivilegeEscalation: false`.
 - `automountServiceAccountToken: false` on the pod's ServiceAccount.
+
+The image runs as the same uid and gid, 65532, and needs neither root nor a
+capability at any point. With a read-only root filesystem, exav writes only
+to two volumes: `/var/lib/exav` (an `emptyDir` or the PVC, see
+[Storage](#storage)) and `/tmp` (the `emptyDir` of [Spill](#spill)).
+
+On OpenShift, the `restricted-v2` SCC assigns each namespace its own uid
+range and refuses a pod that asks for 65532. Set
+`podSecurityContext.runAsUser`, `podSecurityContext.runAsGroup`, and
+`podSecurityContext.fsGroup` to `null` in your values file, and the SCC fills
+them in. The pod still runs as non-root with the other settings above.
 
 The chart never sets `EXAV_ALLOW_SHUTDOWN`. Any client that can reach the
 port could otherwise stop the daemon. The chart never sets
@@ -365,9 +413,9 @@ each time.
 | `serviceAccount.name` | string | `""` | Name of the ServiceAccount to use. Empty string uses the generated fullname. |
 | `serviceAccount.annotations` | object | `{}` | Extra annotations for the ServiceAccount. Values are rendered as strings. |
 | `podSecurityContext.runAsNonRoot` | bool | `true` | Require the pod to run as a non-root user. |
-| `podSecurityContext.runAsUser` | int | `65532` | User ID to run the container process as. |
-| `podSecurityContext.runAsGroup` | int | `65532` | Group ID to run the container process as. |
-| `podSecurityContext.fsGroup` | int | `65532` | Group ID that owns mounted volumes. |
+| `podSecurityContext.runAsUser` | int | `65532` | User ID to run the container process as. The image's own user. `null` lets the platform assign one (OpenShift). |
+| `podSecurityContext.runAsGroup` | int | `65532` | Group ID to run the container process as. `null` lets the platform assign one. |
+| `podSecurityContext.fsGroup` | int | `65532` | Group ID that owns mounted volumes. Kubernetes makes a volume that supports it writable by this group. `null` lets the platform assign one. |
 | `podSecurityContext.seccompProfile.type` | string | `RuntimeDefault` | Seccomp profile type. |
 | `securityContext.allowPrivilegeEscalation` | bool | `false` | Forbid privilege escalation from the container process. |
 | `securityContext.readOnlyRootFilesystem` | bool | `true` | Mount the root filesystem read-only. |

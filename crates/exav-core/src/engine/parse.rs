@@ -24,7 +24,7 @@ pub(super) enum ParsedSub {
 pub(super) fn classify_failure_reason(s: &str) -> &'static str {
     // Attribution is a feature ("counted and attributable by cause"), so it has
     // to name the real cause. An earlier version guessed from punctuation and
-    // called anything containing '(' a byte-compare subsignature — which
+    // called anything containing '(' a byte-compare subsignature, which
     // mislabelled every *alternation* as byte-compare, i.e. 6 of the 16 skipped
     // signatures in a live daily set were filed under the wrong missing feature.
     if s.starts_with("fuzzy_img#") {
@@ -77,7 +77,7 @@ pub(super) fn classify_subsig(s: &str) -> Option<ParsedSub> {
 
 /// Parse the body of a `fuzzy_img#<16-hex>[#<distance>]` subsignature (the
 /// `fuzzy_img#` prefix already stripped). Returns the 8-byte perceptual hash and
-/// the max Hamming distance at which it matches — the optional `#distance` suffix,
+/// the max Hamming distance at which it matches: the optional `#distance` suffix,
 /// defaulting to 0 (exact) when absent. A signature that specifies a tolerance is
 /// honored (perceptual hashing is meant to match near-duplicates), where before
 /// any non-zero distance dropped the whole signature.
@@ -91,7 +91,7 @@ pub(super) fn parse_fuzzy_subsig(rest: &str) -> Option<([u8; 8], u32)> {
     if parts.next().is_some() || hash.len() != 16 {
         return None;
     }
-    // Reject non-ASCII input — multi-byte UTF-8 chars would cause byte-index
+    // Reject non-ASCII input: multi-byte UTF-8 chars would cause byte-index
     // panics in the hex-decode loop below.
     if !hash.is_ascii() {
         return None;
@@ -140,7 +140,7 @@ pub(super) fn parse_pcre(s: &str) -> Result<PcreSub, &'static str> {
     };
     // Only offsets resolvable from the file length alone. `EP`/`Sx` need a PE
     // layout `PcreSub::count` does not carry, and matching one without it
-    // would silently never fire — so it stays counted-unsupported instead.
+    // would silently never fire, so it stays counted-unsupported instead.
     if matches!(
         &offset,
         Offset::Constrained(k)
@@ -280,7 +280,7 @@ pub(super) fn parse_subsig(s: &str) -> Option<Vec<Compiled>> {
     let nocase = flags.contains('i');
     let wide = flags.contains('w');
     let ascii = flags.contains('a') || !wide;
-    // `f` — fullword: the match must be bounded by non-alphanumeric bytes.
+    // `f`, fullword: the match must be bounded by non-alphanumeric bytes.
     // Carried through to the verifier rather than dropped; dropping it makes the
     // subsignature match as a plain substring, i.e. fire on strictly more than
     // its author asked for.
@@ -360,7 +360,7 @@ pub(super) fn widen_elems(elems: Vec<Elem>) -> Vec<Elem> {
                 neg,
             }),
             // Widening a masked branch interleaves a literal NUL after each
-            // byte, and a NUL is fully known — mask 0xff.
+            // byte, and a NUL is fully known: mask 0xff.
             Elem::AltMasked { opts } => out.push(Elem::AltMasked {
                 opts: opts
                     .iter()
@@ -424,7 +424,7 @@ pub(super) fn parse_elems(hex: &str) -> Option<Vec<Elem>> {
                 elems.push(parse_gap(&hex[i + 1..end])?);
                 i = end + 1;
             }
-            // `[n-m]` (or `[n]`) is a byte-range gap — same matching semantics
+            // `[n-m]` (or `[n]`) is a byte-range gap, same matching semantics
             // as `{n-m}`. It is used as an AC boundary (anchoring distance)
             // but for what actually matches it is just a variable gap.
             b'[' => {
@@ -440,7 +440,7 @@ pub(super) fn parse_elems(hex: &str) -> Option<Vec<Elem>> {
                 // ClamAV special character classes (negated):
                 // !(B) = negated word boundary, !(L) = negated line boundary,
                 // !(W) = negated non-alphanumeric word marker.
-                // These are boundary markers, not hex alternations — skip them.
+                // These are boundary markers, not hex alternations: skip them.
                 if inner.len() == 1 && matches!(inner.as_bytes()[0], b'B' | b'L' | b'W') {
                     i = end + 1;
                     continue;
@@ -455,7 +455,7 @@ pub(super) fn parse_elems(hex: &str) -> Option<Vec<Elem>> {
                 // ClamAV special character classes:
                 // (B) = word boundary, (L) = CR/CRLF line boundary,
                 // (W) = non-alphanumeric word marker.
-                // These are boundary markers, not hex alternations — skip them.
+                // These are boundary markers, not hex alternations: skip them.
                 if inner.len() == 1 && matches!(inner.as_bytes()[0], b'B' | b'L' | b'W') {
                     i = end + 1;
                     continue;
@@ -538,7 +538,7 @@ pub(super) fn parse_alt(spec: &str, neg: bool) -> Option<Elem> {
     }
     // An empty branch means "or nothing": `(2d4120|)` makes the run optional.
     // The alternation is then variable-width, which the matchers already handle
-    // for unequal-length branches — but a *negated* one has a single fixed width
+    // for unequal-length branches, but a *negated* one has a single fixed width
     // by definition, so it cannot have one.
     if neg && parts.iter().any(|p| p.is_empty()) {
         return None;
@@ -646,7 +646,7 @@ pub(super) fn pick_anchor(
         && let Some((any_score, _, idx)) = best_any {
             // No fixed-prefix candidate at all must lose to every real one:
             // scores are signed, so a `0` floor here would reject a merely
-            // common internal anchor and leave the body with no anchor — i.e.
+            // common internal anchor and leave the body with no anchor, i.e.
             // silently drop the signature rather than prefilter it poorly.
             let fixed_score = best_fixed.as_ref().map(|(s, ..)| *s).unwrap_or(isize::MIN);
             if any_score > fixed_score {
@@ -696,7 +696,7 @@ pub(super) fn parse_offset(s: &str) -> Option<Offset> {
         }))
     } else if let Some(rest) = spec.strip_prefix('S') {
         if let Some(n) = rest.strip_prefix('E') {
-            // `SEn` — anywhere inside section n. No delta and no shift: the
+            // `SEn`: anywhere inside section n. No delta and no shift: the
             // whole section IS the window.
             Some(boxed(OffsetKind::SecIn {
                 idx: n.trim().parse().ok()?,
@@ -742,7 +742,7 @@ pub(super) fn is_pua(name: &str) -> bool {
 /// `min-max` flevel window (LDB `Engine:` TDB, or trailing `:min:max` fields on
 /// `.ndb` lines); ClamAV loads a sig only when its flevel falls in that window.
 /// We match that with the flevel of the ClamAV release whose databases we read
-/// (1.4.x ⇒ 213), so we load exactly the sigs ClamAV would — skipping ones meant
+/// (1.4.x ⇒ 213), so we load exactly the sigs ClamAV would, skipping ones meant
 /// for a newer engine (features we may lack) and also *deprecated* ones
 /// (`max < 213`) that ClamAV no longer runs, which would otherwise false-positive.
 pub(crate) const EXAV_FLEVEL: u32 = 213;
@@ -786,16 +786,16 @@ pub(super) const TDB_SECTION_ATTRS: &[&str] = &[
 ///
 /// This exists because the alternative is worse than a missing feature. TDB
 /// parsing works by looking for the attributes we know, so an attribute we do
-/// NOT know was simply never read — and its constraint silently vanished. A
+/// NOT know was simply never read, and its constraint silently vanished. A
 /// signature restricted to `NumberOfSections:3` then fired on any section count,
 /// matching more broadly than ClamAV would allow. That is a false positive
 /// waiting to happen, and unlike a missing decoder it is invisible.
 ///
 /// Reporting it turns a silent behavioural difference into a counted, named
-/// skip — the same treatment every other unsupported construct gets.
+/// skip: the same treatment every other unsupported construct gets.
 ///
-/// An attribute name the format does not define at all — a typo, or one added
-/// by a newer engine — is refused for the same reason, and no engine does
+/// An attribute name the format does not define at all (a typo, or one added
+/// by a newer engine) is refused for the same reason, and no engine does
 /// anything else with it either.
 pub(super) fn unsupported_tdb_attr(tdb: &str) -> Option<&'static str> {
     for field in tdb.split(',') {
@@ -818,13 +818,13 @@ pub(super) fn unsupported_tdb_attr(tdb: &str) -> Option<&'static str> {
 /// `NumberOfSections`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum TdbRange {
-    /// Attribute not present — no constraint.
+    /// Attribute not present: no constraint.
     Absent,
     /// Present and well-formed; inclusive on both ends.
     Range(u64, u64),
     /// Present but not of the form `min-max` with digits-only sides. The
     /// signature is refused, because a constraint we cannot read is a
-    /// constraint we would otherwise drop — and dropping it makes the signature
+    /// constraint we would otherwise drop, and dropping it makes the signature
     /// fire more widely than intended.
     Malformed,
 }
@@ -836,8 +836,8 @@ pub(super) enum TdbRange {
 /// must be digits or empty, and empty means zero. That last rule is the one
 /// worth stating, because it is not what it looks like: `FileSize:100-` is not
 /// an open-ended upper bound, it is the range 100..=0, which matches nothing.
-/// Reading it as `100..=u64::MAX` — the intuitive interpretation, and the
-/// tempting one — turns a signature that never fires into one that fires on
+/// Reading it as `100..=u64::MAX` (the intuitive interpretation, and the
+/// tempting one) turns a signature that never fires into one that fires on
 /// every file above 100 bytes. `-100` really is 0..=100.
 ///
 /// A bare `Attr:100` with no hyphen is malformed and aborts the whole database
@@ -869,7 +869,7 @@ fn digits_or_empty(s: &str) -> Option<u64> {
     if !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    // Saturate rather than fail — a bound that large is nonsense either way.
+    // Saturate rather than fail: a bound that large is nonsense either way.
     Some(s.parse().unwrap_or(u64::MAX))
 }
 

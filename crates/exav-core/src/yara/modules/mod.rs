@@ -9,6 +9,7 @@
 //!
 //! Portions derived from yara-x (BSD-3-Clause), see LICENSE-YARA-X.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,53 @@ impl ModuleKind {
     }
 }
 
+/// The bytes that the module values copy out of the object. A name that many
+/// entries refer to (an import name that thousands of thunks point at, a
+/// string of a table that thousands of rows index) is copied for each of
+/// them, so a crafted object makes the copies many times its own size. They
+/// are charged to a limit (`--max-object-bytes`), and from the first that
+/// does not fit nothing more is copied.
+pub(crate) struct Copies {
+    left: std::cell::Cell<usize>,
+    cut: std::cell::Cell<bool>,
+}
+
+impl Copies {
+    pub(crate) fn new(limit: usize) -> Self {
+        Copies {
+            left: std::cell::Cell::new(limit),
+            cut: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Whether `n` more bytes may be copied; if not, none may be, then or later.
+    pub(crate) fn take(&self, n: usize) -> bool {
+        if self.cut.get() {
+            return false;
+        }
+        match self.left.get().checked_sub(n) {
+            Some(left) => {
+                self.left.set(left);
+                true
+            }
+            None => {
+                self.cut.set(true);
+                false
+            }
+        }
+    }
+
+    /// Some copy was refused, so the values are not all of the object's.
+    pub(crate) fn cut(&self) -> bool {
+        self.cut.get()
+    }
+
+    /// The bytes that may still be copied.
+    pub(crate) fn room(&self) -> usize {
+        self.left.get()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-scan module state
 // ---------------------------------------------------------------------------
@@ -82,16 +130,28 @@ impl ModuleCtx {
     /// rule set imported; `need_entrypoint` is set when any rule uses the
     /// `entrypoint` keyword (which needs a PE parse even without `import "pe"`).
     ///
-    /// The format parsers read the object whole. One not held in memory is
-    /// read whole when it is at most `materialize` bytes. A larger one gets
-    /// the value the parser gives when the object is not of its format, which
-    /// is exact when the object does not start with that format's magic, and
-    /// the build is otherwise incomplete (the `bool`).
+    /// The format parsers read the object in memory. One not held there is
+    /// read whole when it is at most `materialize` bytes. A larger one gives
+    /// each parser the part of it that holds its format's structure (a PE's
+    /// image, [`crate::pe::image_in`]; an ELF's, [`crate::pe::elf_image_in`]),
+    /// when that is at most `materialize` bytes. For a format whose part is
+    /// longer, or cannot be found, it gets the value the parser gives when the
+    /// object is not of its format, which is exact when the object does not
+    /// start with that format's magic, and the build is otherwise incomplete
+    /// (the `bool`).
+    ///
+    /// The values copy names out of the object, at most `materialize` bytes
+    /// of them in all; the build is incomplete when it had to stop copying.
+    /// It is incomplete too when the `pe` module could not read a table of the
+    /// PE. If the parser had the whole object, that table is malformed, and the
+    /// scan is marked unreadable rather than only incomplete: no limit makes it
+    /// readable. `carved` says the object was cut out of a host at an offset.
     pub(crate) fn build(
         src: &dyn ByteSource,
         imported: &[ModuleKind],
         need_entrypoint: bool,
         materialize: usize,
+        carved: bool,
     ) -> (Self, bool) {
         let wants_pe = need_entrypoint
             || imported.contains(&ModuleKind::Pe)
@@ -103,19 +163,56 @@ impl ModuleCtx {
             None
         };
         let mut complete = true;
-        let data: &[u8] = match &whole {
-            Some(data) => data,
+        let (pe_data, elf_data) = match &whole {
+            Some(data) => (Cow::Borrowed(&data[..]), Cow::Borrowed(&data[..])),
             None => {
                 let head = src.window(0, 4);
-                complete = !(wants_pe && head.starts_with(b"MZ")
-                    || wants_elf && head.starts_with(b"\x7fELF"));
-                &[]
+                let none = || Some(Cow::Borrowed(&[][..]));
+                let pe = if wants_pe && head.starts_with(b"MZ") {
+                    crate::pe::image_in(src, materialize)
+                } else {
+                    none()
+                };
+                let elf = if wants_elf && head.starts_with(b"\x7fELF") {
+                    crate::pe::elf_image_in(src, materialize)
+                } else {
+                    none()
+                };
+                complete = pe.is_some() && elf.is_some();
+                (pe.unwrap_or_default(), elf.unwrap_or_default())
             }
         };
-        (Self::build_from(data, imported, need_entrypoint), complete)
+        let copies = Copies::new(materialize);
+        let ctx = Self::build_from(&pe_data, &elf_data, imported, need_entrypoint, &copies);
+        // A table that does not parse from an image may be fine in the object
+        // it is cut from, and one too large to parse is a limit. Only a table
+        // of the whole object that is malformed is unreadable.
+        // An import table that starts past the end of a PE carved out of a
+        // host is not in the PE's bytes: nothing was left unread.
+        let absent = carved && ctx.pe.as_ref().is_some_and(pe::PeExtra::absent);
+        match ctx.pe.as_ref().and_then(pe::PeExtra::unread) {
+            _ if absent => {}
+            Some((table, crate::pe::Unread::Malformed)) if whole.is_some() => {
+                crate::engine::mark_unreadable(|| {
+                    format!(
+                        "the YARA pe module could not read the {table} table of the PE: it does not parse"
+                    )
+                });
+                complete = false;
+            }
+            Some(_) => complete = false,
+            None => {}
+        }
+        (ctx, complete && !copies.cut())
     }
 
-    fn build_from(data: &[u8], imported: &[ModuleKind], need_entrypoint: bool) -> Self {
+    fn build_from(
+        pe_data: &[u8],
+        elf_data: &[u8],
+        imported: &[ModuleKind],
+        need_entrypoint: bool,
+        copies: &Copies,
+    ) -> Self {
         let mut roots = HashMap::new();
         let mut pe_extra = None;
 
@@ -134,21 +231,21 @@ impl ModuleCtx {
                     roots.insert(kind, timemod::root());
                 }
                 ModuleKind::Pe => {
-                    let (root, extra) = pe::build(data);
+                    let (root, extra) = pe::build(pe_data, copies);
                     roots.insert(kind, root);
                     pe_extra = Some(extra);
                 }
                 ModuleKind::Elf => {
-                    roots.insert(kind, elf::build(data));
+                    roots.insert(kind, elf::build(elf_data, copies));
                 }
                 ModuleKind::DotNet => {
-                    roots.insert(kind, dotnet::build(data));
+                    roots.insert(kind, dotnet::build(pe_data, copies));
                 }
             }
         }
 
         let entry_point = if need_entrypoint {
-            pe::entry_point_offset(data)
+            pe::entry_point_offset(pe_data)
         } else {
             None
         };
@@ -510,5 +607,88 @@ pub(crate) fn call(func: FuncId, ctx: &EvalCtx, args: &[Value]) -> Option<Value>
 
         PeImphash | PeImportsDll | PeImportsFunc | PeImportsOrdinal | PeExportsFunc
         | PeExportsOrdinal | PeSectionIndexName => pe::call(func, ctx.modules.pe_extra(), args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::byte_source::BlockCache;
+
+    const PE: &[u8] = include_bytes!("../testdata/tiny_pe32.exe");
+    const ELF: &[u8] = include_bytes!("../../../tests/testdata/tiny_elf64");
+
+    fn cached(data: &[u8]) -> BlockCache<std::io::Cursor<Vec<u8>>> {
+        BlockCache::with_sizes(std::io::Cursor::new(data.to_vec()), 509, 8 * 509).unwrap()
+    }
+
+    /// Whether the `is_pe` of the `pe` module is true, and how many sections
+    /// it counts (`None` when the module did not parse a PE).
+    fn pe_sections(ctx: &ModuleCtx) -> Option<i64> {
+        let Some(Value::Struct(f)) = ctx.root(ModuleKind::Pe) else {
+            return None;
+        };
+        match (f.get("is_pe"), f.get("number_of_sections")) {
+            (Some(Value::Bool(true)), Some(Value::Int(n))) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// The `elf` module's number of sections, `None` for an empty value.
+    fn elf_sections(ctx: &ModuleCtx) -> Option<i64> {
+        let Some(Value::Struct(f)) = ctx.root(ModuleKind::Elf) else {
+            return None;
+        };
+        match f.get("number_of_sections") {
+            Some(Value::Int(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// An object too large to hold gives each module the image of its format,
+    /// and is a complete build when that fits; else the value for an object
+    /// that is not of the format, and a build that says it is not complete.
+    #[test]
+    fn a_module_parses_the_image_of_an_object_too_large_to_hold() {
+        let all = [ModuleKind::Pe, ModuleKind::Elf, ModuleKind::DotNet];
+        let overlay = vec![b'z'; 100_000];
+        let pe = [PE, &overlay].concat();
+        let elf = [ELF, &overlay].concat();
+        // A PE's image reaches a page past its last section's data.
+        let pe_image = crate::pe::extent(&cached(&pe), 1 << 20).unwrap().image;
+        assert!(pe_image > PE.len() && pe_image < pe.len());
+        for (file, held, image, wants) in [
+            (&pe, PE, pe_image, ModuleKind::Pe),
+            (&elf, ELF, ELF.len(), ModuleKind::Elf),
+        ] {
+            let (whole, complete) = ModuleCtx::build(&held, &all, true, 1 << 20, false);
+            assert!(complete);
+            let (ctx, complete) = ModuleCtx::build(&cached(file), &all, true, image, false);
+            assert!(complete, "{wants:?}");
+            assert_eq!(pe_sections(&ctx), pe_sections(&whole), "{wants:?}");
+            assert_eq!(elf_sections(&ctx), elf_sections(&whole), "{wants:?}");
+            assert_eq!(ctx.entry_point, whole.entry_point, "{wants:?}");
+            // One byte under the image's length.
+            let (ctx, complete) = ModuleCtx::build(&cached(file), &all, true, image - 1, false);
+            assert!(!complete, "{wants:?}");
+            assert_eq!(
+                (pe_sections(&ctx), elf_sections(&ctx)),
+                (None, None),
+                "{wants:?}"
+            );
+        }
+        assert_eq!(
+            pe_sections(&ModuleCtx::build(&cached(&pe), &all, true, pe_image, false).0),
+            Some(1)
+        );
+        assert_eq!(
+            elf_sections(&ModuleCtx::build(&cached(&elf), &all, true, ELF.len(), false).0),
+            Some(3)
+        );
+        // Another format's object is complete either way, and has no value
+        // for a module that is not of its format.
+        let (ctx, complete) = ModuleCtx::build(&cached(&overlay), &all, true, 10, false);
+        assert!(complete);
+        assert_eq!((pe_sections(&ctx), elf_sections(&ctx)), (None, None));
     }
 }

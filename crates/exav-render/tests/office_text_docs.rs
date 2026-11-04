@@ -883,9 +883,11 @@ fn encrypted() -> Vec<(&'static str, Vec<u8>, Format)> {
     let p = || para("x\r", vec![], vec![]);
     let manifest = "<m><manifest:encryption-data xmlns:manifest=\"x\"/></m>";
     let storage = W::default().bytes(3, b"text").msg(5, table(&[(0, None)]));
+    // A Pages document with a password has its verifier, `.iwpv2`.
     let mut z = PackageWriter::new(1 << 20);
     z.put("Index/Document.iwa", &iwa(&[(2, 2001, storage)]), true)
         .unwrap();
+    z.put(".iwpv2", b"x", true).unwrap();
     vec![
         (
             "doc97",

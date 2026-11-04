@@ -2,7 +2,7 @@
 //!
 //! The limit is the operator's guard against an archive with a million tiny
 //! members, and it only means what it says if one member costs one. Counting
-//! several per member cuts a scan short early — reporting LIMITS-EXCEEDED on an
+//! several per member cuts a scan short early, reporting LIMITS-EXCEEDED on an
 //! archive that was well inside the configured bound, which looks like a
 //! resource problem and is really an accounting one.
 //!
@@ -53,14 +53,14 @@ fn a_flat_archive_costs_one_per_member() {
     assert!(hits_limit(&blob, Format::Tar, 9), "ten members fit under 9");
     assert!(
         !hits_limit(&blob, Format::Tar, 10),
-        "ten members cost more than ten — the limit counts something other than objects"
+        "ten members cost more than ten: the limit counts something other than objects"
     );
 }
 
 /// A member that is *itself* an archive still costs one.
 ///
-/// This layer hands members out; it does not descend — the scanner does that,
-/// and it charges the inner members as it goes. So the cost here is the member
+/// This layer hands members out; it does not descend (the scanner does that,
+/// and it charges the inner members as it goes). So the cost here is the member
 /// count either way, and a container member must not be charged for what it
 /// might contain.
 #[test]

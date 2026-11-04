@@ -10,9 +10,9 @@ Peak **memory** and scan **reach** are separate, because a streamed member is
 never held in RAM.
 
 **1. `--max-object-bytes`: the largest *single* buffer.**
-- API: `unpack::Limits::max_buffer_bytes` and core
-  `ScanOptions::deep_analysis_max`, both **256 MiB** by default.
-  `--max-object-bytes` sets both, and a scan holds the first to the second.
+- API: `unpack::Limits::max_buffer_bytes` (core
+  `ScanOptions::limits.max_buffer_bytes`), **256 MiB** by default.
+  `--max-object-bytes` sets it; it is also what core holds an object whole up to.
 - Every forced-materialization site caps its largest allocation here.
 
   It is **not** a cap on peak memory. Several buffers are alive at once (a
@@ -34,7 +34,7 @@ never held in RAM.
 - Bounds the cumulative bytes fed to the matcher for one top-level input
   (members plus re-carved/re-scanned regions). Not a memory cost: a member
   decoded as it is read is bounded by a `BudgetReader`, and `exav-core` holds
-  at most `deep_analysis_max` of it. Raising this knob buys scan time only;
+  at most `max_buffer_bytes` of it. Raising this knob buys scan time only;
   its job is DoS resistance.
 
 ## How an input reaches the extractors
@@ -43,15 +43,16 @@ Every entry point runs `exav-core::scan_seekable` (`scan_path` opens the file an
 hands it over), and every object, the input and whatever is unpacked from it,
 goes through the same pipeline (`scan_object`).
 
-- **Up to `deep_analysis_max`** the input is read whole and analysed in memory.
-- **Past it** the input is read through a `source::BlockCache` (64 KiB blocks,
-  8 MiB held) and gets the same scan: every check runs over a
+- **Up to `max_buffer_bytes`** the input is read whole and analysed in memory.
+- **Past it** the input is read through a `source::BlockCache` (32 MiB held by
+  default; blocks of 64 KiB in the library, 1 MiB in the scanner) and gets the
+  same scan: every check runs over a
   `source::ByteSource`, reading what it needs of the object. The cache bounds
   memory, not reach: a block evicted is read again. Typing is exact (`detect`
   reads the start, the end, or searches the object).
 - **Containers** are walked by `walk` over the same source, at every depth.
 - **What cannot run over a source** needs the object in memory and is skipped
-  past `deep_analysis_max`, which makes the result `LIMITS-EXCEEDED` naming the
+  past `max_buffer_bytes`, which makes the result `LIMITS-EXCEEDED` naming the
   size limit unless something is found: goblin-parsed PE structure (layout,
   icons, section hashes, imphash, Authenticode, UPX and packer detection),
   YARA's `pe`/`elf`/`dotnet` modules, the structural heuristics that parse a
@@ -127,13 +128,17 @@ goes through the same pipeline (`scan_object`).
   `Bytes`.
 
 Every member is charged to the scan budget; a streamed one is also held to the
-compression-ratio guard. A read that failed on the source ends the walk as an
-error, never as the end of the container.
+compression-ratio guard once it is past `max_buffer_bytes`, and one over it is
+left out (what was decoded of it is charged) while the walk goes on to the next.
+A read that failed on the source ends the walk as an error, never as the end of
+the container.
 
-**Members, in exav-core.** One that fits in `deep_analysis_max` is held and
+**Members, in exav-core.** One that fits in `max_buffer_bytes` is held and
 fully analysed. A larger one is written to a spill file and scanned from there
-like any object too large to hold. With no spill it is not scanned, and the
-scan is reported `LIMITS-EXCEEDED`.
+like any object too large to hold, up to a decode error if it has one. With
+no spill, or when the spill fails, its first `max_buffer_bytes` bytes are
+scanned and the scan is reported `LIMITS-EXCEEDED` unless they hold a
+detection.
 
 **Panic containment**: `walk` runs its dispatch inside `catch_unwind`, so a
 decoder panic becomes `Unscannable`.
@@ -155,10 +160,10 @@ it.
 
 ## Enforcement status
 
-### Bounded by the knob (`max_buffer_bytes` / `deep_analysis_max`)
+### Bounded by the knob (`max_buffer_bytes`)
 
 - **exav-core buffers**: the whole input and a member are each held up to
-  `deep_analysis_max`; one larger is read through a block cache (the input, a
+  `max_buffer_bytes`; one larger is read through a block cache (the input, a
   spilled member). A check that needs a larger object whole reads it only up
   to the same limit.
 - **Streaming member API**: `BudgetReader` caps each member and errors (never
@@ -176,6 +181,16 @@ it.
   (`read_encrypted_member`), ARJ (the whole archive on entry), VBA
   (`decompress`, `build_artifacts`), the `ar` name table, the RAR3 window
   (rejected past the limit), ISO and UDF directory reads.
+- **PDF object streams read to follow a reference**: each is decoded once, to
+  at most `max_buffer_bytes` and within what `max_extracted_bytes` has left in
+  all, kept for the rest of the document and charged to `max_extracted_bytes`
+  as bytes parsed again. One that does not fit ends the scan with a limit.
+- **PDF active content** (`pdf-javascript`, `pdf-uris`): each string is charged
+  to `max_extracted_bytes` as it is taken, and a member stays within
+  `max_buffer_bytes`. A string that does not fit ends the scan with a limit.
+  Following a reference ends the scan with a limit once the bytes parsed since
+  the object began, object streams read for it included, reach the room of one
+  member.
 - **Bounded by the default limit, not the knob**: the 7z encoded header (a
   header carries no `Budget`) and the DMG decrypt block size.
 
@@ -190,7 +205,8 @@ These copy a slice of their input, which the caller already capped at
 ### Fixed literals, at or below the knob's default
 
 Routing these through the knob would only let an operator lower them:
-- `rar5_unpack.rs` `MAX_WINDOW_SIZE` (64 MiB), the `xar.rs` TOC (64 MiB),
+- `rar5_unpack.rs` `MAX_WINDOW_SIZE` (64 MiB, in the one-call `unpack50`
+  only: the walk bounds a RAR5 window by the buffer limit), the `xar.rs` TOC (64 MiB),
   `udif.rs` runs and xz dictionary (64 MiB), the decoded runs `DmgReader`
   keeps (32 MiB), the LZ4 streaming reader's block (8 MiB decoded, 16 MiB
   read);

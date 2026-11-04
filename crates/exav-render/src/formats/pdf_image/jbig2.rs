@@ -41,8 +41,7 @@ pub fn decode_jbig2(
         Err(_) => return Err(failed()),
     };
     let page = u64::from(image.width()) * u64::from(image.height());
-    let regions =
-        region_pixels(data, false).saturating_add(globals.map_or(0, |g| region_pixels(g, false)));
+    let regions = declared_pixels(data, globals);
     // Decoding a region costs time per pixel, whatever the memory its bitmap
     // takes, so the declared pixels are charged at a byte each as well. The
     // budget may be a gigabyte (the viewer's), but the time is bounded as it
@@ -98,6 +97,55 @@ fn clip_last_segment(data: &[u8]) -> Option<Vec<u8>> {
         }
         at = end;
     }
+}
+
+/// The pixels the regions of an embedded stream `data` and of its `globals`
+/// declare ([`region_pixels`]).
+pub(crate) fn declared_pixels(data: &[u8], globals: Option<&[u8]>) -> u64 {
+    region_pixels(data, false).saturating_add(globals.map_or(0, |g| region_pixels(g, false)))
+}
+
+/// The pixels of the page bitmap that the page information segments of an
+/// embedded stream `data` and of its `globals` declare (T.88 7.4.8), the
+/// largest of them: hayro-jbig2 allocates the bitmap of one of them, the
+/// size the stream gives, not the image dictionary's. A height of
+/// `0xFFFFFFFF` is the last row of the end of stripe segments plus one, as
+/// hayro-jbig2 reads it (0 pixels when there is none).
+#[cfg(feature = "qr")]
+pub(crate) fn declared_page_pixels(data: &[u8], globals: Option<&[u8]>) -> u64 {
+    let mut pages = Vec::new();
+    let mut stripes = 0u64;
+    for part in globals.into_iter().chain([data]) {
+        let be32 = |at: usize| {
+            Some(u64::from(u32::from_be_bytes(
+                part.get(at..at.checked_add(4)?)?.try_into().ok()?,
+            )))
+        };
+        let mut at = 0;
+        while let Some((_, h, length)) = segment_header(part, at) {
+            match part[at + 4] & 0x3F {
+                48 => pages.extend(be32(h).zip(be32(h + 4))),
+                50 => stripes = stripes.max(be32(h).map_or(0, |last| last + 1)),
+                _ => {}
+            }
+            match h.checked_add(length as usize) {
+                Some(end) if length != u32::MAX => at = end,
+                _ => break,
+            }
+        }
+    }
+    pages
+        .into_iter()
+        .map(|(width, height)| {
+            let height = if height == u64::from(u32::MAX) {
+                stripes
+            } else {
+                height
+            };
+            width * height
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The pixels of the bitmaps the region segments of `segments` declare

@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 # Simple payload (same as the old inline XzWriter tests)
 echo -n "hello exav inside xz" | xz -c > simple.xz
 
-# Bomb: 4096 zero bytes, highly compressible — trips the budget cap
+# Bomb: 4096 zero bytes, highly compressible; trips the budget cap
 dd if=/dev/zero bs=1024 count=4 2>/dev/null | xz -c > bomb.xz
 
 # Concatenated multi-member stream (simulates pixz/parallel-xz output)

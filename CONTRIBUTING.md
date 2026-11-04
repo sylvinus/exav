@@ -102,6 +102,7 @@ make lint     # the clippy passes and cargo fmt --check CI runs
 | `make test-wasm` | the extractor + core unit tests on 32-bit `wasm32-wasip1` | `wasmtime` |
 | `make test-js` | the WASM bindings' vitest units and playwright browser e2e | node, wasm-pack, python3 |
 | `make test-www` | `astro check`, a full docs build, and a check that every internal link and anchor resolves | node |
+| `make compiled-once` | the readers and the rest of exav's code are compiled once in each release binary and in the wasm, not once per type they are used with (`scripts/compiled-once.py`) | `nm`, `c++filt` |
 
 The two **differential** harnesses are not in `make test`: they measure exav
 against another engine, so they can go red because the *other* engine changed.

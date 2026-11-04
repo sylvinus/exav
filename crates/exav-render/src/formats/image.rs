@@ -355,19 +355,21 @@ fn within(needed: u64, max_alloc: u64) -> Result<(), Error> {
     }
 }
 
-/// CMYK (or CMYKA) bytes to RGB (or RGBA): `255 - min(255, C + K)` and the
-/// same for M and Y, as PDF's DeviceCMYK to DeviceRGB.
+/// One CMYK pixel as RGB: `255 - min(255, C + K)` and the same for M and Y, as
+/// PDF's DeviceCMYK to DeviceRGB.
+#[cfg(any(feature = "jp2", feature = "raster"))]
+fn cmyk_pixel(c: u8, m: u8, y: u8, k: u8) -> [u8; 3] {
+    let k = u16::from(k);
+    [c, m, y].map(|c| 255 - (u16::from(c) + k).min(255) as u8)
+}
+
+/// CMYK (or CMYKA) bytes to RGB (or RGBA), by [`cmyk_pixel`].
 #[cfg(feature = "jp2")]
 fn cmyk_to_rgb(cmyk: &[u8], alpha: bool) -> Vec<u8> {
     let n = if alpha { 5 } else { 4 };
     let mut out = Vec::with_capacity(cmyk.len() / n * (n - 1));
     for p in cmyk.chunks_exact(n) {
-        let k = u16::from(p[3]);
-        out.extend(
-            p[..3]
-                .iter()
-                .map(|&c| 255 - (u16::from(c) + k).min(255) as u8),
-        );
+        out.extend(cmyk_pixel(p[0], p[1], p[2], p[3]));
         if alpha {
             out.push(p[4]);
         }
@@ -518,6 +520,8 @@ fn image_format(f: Format) -> Option<ImageFormat> {
 mod bmp_view;
 #[cfg(feature = "dds")]
 mod dds_view;
+#[cfg(feature = "qr")]
+mod header;
 #[cfg(feature = "ico")]
 mod ico_view;
 #[cfg(feature = "jbig2")]
@@ -528,6 +532,10 @@ mod jp2;
 mod jxl;
 #[cfg(feature = "pnm")]
 mod pnm_view;
+#[cfg(feature = "raster")]
+mod raster;
+#[cfg(feature = "raster")]
+pub use raster::from_raster;
 #[cfg(feature = "raw")]
 pub mod raw;
 #[cfg(test)]

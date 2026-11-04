@@ -82,6 +82,13 @@ These are properties of the browser, not of the viewer's code:
   installed engine when the package is built. Origins given when the frame
   is deployed (below) are added: media origins to `img-src` and
   `media-src`, connect origins to `connect-src`. None by default.
+
+  A page's policy does not restrict where the page navigates itself. The
+  host page's policy does, for its frames: with `frame-src` and `child-src`
+  naming the frame's origin and nothing else, the browser refuses any
+  navigation of the frame to another address before a request is made. That
+  host policy is required for every statement on this page that nothing is
+  sent elsewhere.
 - **Trusted Types.** Every sink that turns a string into markup or a script
   URL needs a policy's value. There are two: `exav-worker`, which accepts
   only the `blob:` URLs the frame makes to start its workers, and
@@ -89,9 +96,16 @@ These are properties of the browser, not of the viewer's code:
   is inert SVG (shapes and their geometry and paint, no event handler, no
   link, no style, no text) and refuses the rest. The Office engine clears
   elements and draws an arrow that way, the IFC engine its logo.
+- **pdf.js options.** Every PDF is opened with `isEvalSupported: false` and
+  `enableXfa: false`, in the page and in the rasteriser's worker.
 - **One frame per file.** A new file gets a new frame; closing a file
   removes its frame, and its workers, wasm memory and WebGL contexts go
   with it. Nothing of one file is in the realm the next one opens in.
+  `session.replace` is the exception: it gives the next document to the
+  same frame, in the realm the one before ran in, to keep the zoom and
+  scroll position. A host that needs each file isolated from the others
+  mounts a new session for it (the React components do so for every new
+  file id).
 
 ### The messages
 
@@ -101,12 +115,17 @@ be named) and carries nothing else. Everything else goes over the port:
 
 | From | Messages |
 |---|---|
-| host | `open` (the file as its delivery says, below; its name and type, the paths of the files around it when it has a tree, the formats, the plugin options as plain data, the theme), `command` (go to a page, zoom, fit, a layer on or off, a layout, the ground, open or leave an archive member, a sheet, play, pause, seek, the volume), `bytes` (the answer to a `read` or a `fetch`), `theme` (the page's colours again), `replace` (the next document of the session, delivered as `open` delivers the first), `raster` and `unraster` (a page as a picture, with its size and region; stop drawing it), `watch` and `unwatch` (follow the viewport, whose upkeep costs: from a first listener or a read to the last one leaving) |
-| frame | `ready` (with its page's policy, and the formats it was published for), `status`, `controllers` and `state` (each controller's value; the viewport's only while the host watches it), `done` (a command finished), `replaced` (a `replace` finished, or refused), `link`, `read` and `cancel` (bytes of a file read by ranges, the read naming the document it is for), `fetch` (a whole file of the tree the host listed, by its path), `key` (a key the document did not use), `rastered` (the picture asked for, with the region it shows, or why there is none) |
+| host | `open` (the file as its delivery says, below; its name and type, the paths of the files around it when it has a tree, the formats, the plugin options as plain data, the theme, its highlights), `command` (go to a page, zoom, fit, a layer on or off, a layout, the ground, open or leave an archive member, a sheet, play, pause, seek, the volume, set the highlights or go to one), `bytes` (the answer to a `read` or a `fetch`), `theme` (the page's colours again), `replace` (the next document of the session, delivered as `open` delivers the first), `raster` and `unraster` (a page as a picture, with its size and region; stop drawing it), `watch` and `unwatch` (follow the viewport, whose upkeep costs: from a first listener or a read to the last one leaving), `sniff` (what a file is, from its first bytes or its address) |
+| frame | `ready` (with its page's policy, and the formats it was published for), `status`, `controllers` and `state` (each controller's value; the viewport's only while the host watches it), `done` (a command finished), `replaced` (a `replace` finished, or refused), `link`, `read` and `cancel` (bytes of a file read by ranges, the read naming the document it is for), `fetch` (a whole file of the tree the host listed, by its path), `key` (a key the document did not use), `rastered` (the picture asked for, with the region it shows, or why there is none), `sniffed` (the format a `sniff` found, or none) |
 
-The protocol is versioned: the frame says which in `ready` (`PROTOCOL`, now 5),
+The protocol is versioned: the frame says which in `ready` (`PROTOCOL`, now 7),
 and a host that does not speak it refuses the frame, so the page and the frame
-must come from the same release. Version 5 added `replace`, `raster`,
+must come from the same release. Version 7 added the file's highlights to
+`open`, the `highlights` controller (where each one is: its id, state, page
+and boxes, never its label or text, which the host keeps) and its `set` and
+`goTo` commands. Version 6 added `sniff` and `sniffed` (the detection below),
+the `sniff` and `limits` options and the errors `damaged`, `wrong_type`,
+`too_large`, `too_compressed` and `too_many_entries`. Version 5 added `replace`, `raster`,
 `unraster`, `watch`, `unwatch` and the `viewport` controller, put the formats
 a frame was published for in `ready`, put the document
 in each `read`, and replaced `draw` and `drawn`. A `raster` the frame finds
@@ -163,8 +182,14 @@ A link the user follows in a document (a PDF's links, Word, Excel and
 PowerPoint hyperlinks) becomes a `link` message. The host takes absolute `http:` and
 `https:` URLs only, asks first (`confirmLink`, by default the browser's
 `confirm`, translated in the React UI), one question at a time, and opens
-it with `noopener,noreferrer`. Downloads and "open in a new tab" are the
-host's, from the URLs and bytes it already has.
+it with `noopener,noreferrer`. It asks only when the user has just clicked
+or pressed a key, in the page or in the frame (an activation in a frame
+activates the pages around it): a frame cannot ask by itself. Browsers
+without `navigator.userActivation` (before Chrome 72, Firefox 120, Safari
+16.4) skip that check. After each answer the frame's links are dropped for
+`linkQuietMs` (2 seconds by default), so that a frame cannot ask again as
+soon as one is answered. Downloads and "open in a new tab" are the host's,
+from the URLs and bytes it already has.
 
 ### How a file reaches the frame
 
@@ -304,10 +329,25 @@ take the strings from `frameHeaders` rather than from this page when the
 package is updated. The frame's files are named without hashes: serve them
 `Cache-Control: no-cache`, or under a path with the package's version.
 
-The host page needs `frame-src` (or `child-src`) to allow the frame's
-origin. In this mode it needs none of what the engines need: no
-`'wasm-unsafe-eval'`, no `worker-src blob:`, no `blob:` sources, no
+The host page's `frame-src` and `child-src` must name the frame's origin
+and nothing else: they are what keeps the frame from navigating to any
+other address (see "Its own policy"). In this mode the page needs none of
+what the engines need: no `worker-src blob:`, no `blob:` sources, no
 `'unsafe-inline'` styles; `img-src blob:` only to print (`printPictures`).
+
+The page runs no WebAssembly and starts no worker. What a file is, so that
+a PDF named `.png` is shown as a PDF, is told in the frame, by exav's own
+detection (`exav_viewer_sniff`, in a worker of the frame), from the first
+64 KiB of the file (`sniffBytes`). The page sends the frame those bytes
+where it reads the file anyway: a Blob, bytes or ranges it holds, or an
+address it fetches for the frame (`delivery` "blob" or "ranges"), with a
+range request to that address. A file the frame is given the address of
+(`delivery` "url") is read by the frame where its policy lets it fetch the
+address (a PDF, an image on an origin that is also a connect origin); video
+and audio, and an image on a media origin alone, are told by their name and
+type. The page takes from the frame only a format the frame was published
+for; past `sniffTimeoutMs` (default 30,000, 0 for none) without an answer,
+the name and type decide.
 
 ## Per browser
 
@@ -324,6 +364,7 @@ Playwright runs:
 | no `eval`, `new Function`, string timer, `data:` import | tested | tested | tested |
 | Trusted Types: no markup or script URL from a string | tested | tested | tested |
 | nothing fetched, loaded or sent elsewhere (fetch, image, font, WebSocket, beacon) | tested | tested | tested |
+| a navigation of the frame to another origin refused by the host page's policy (`frame-src`, `child-src`), before a request | tested | tested | tested |
 | no popup, top navigation, download or form | tested | tested | tested |
 | links only through the host, asked first, `noopener` | tested | tested | tested |
 | a video by URL plays and seeks from its origin; an address elsewhere refused by the host and blocked by the policy | tested | tested | tested |
@@ -367,7 +408,7 @@ policy's SVG rule, and the reviewed sinks in the dependencies (below).
 
   | Module | May import | Memory |
   |---|---|---|
-  | exav_viewer_image, exav_viewer_dwg, exav_viewer_model, exav_viewer_text, exav_viewer_sheets, exav_viewer_slides, exav_viewer_docs, the two pdf.js decoders | wasm-bindgen's plumbing (errors, its tables): no global, clock, randomness or I/O | capped: 1 GiB, 2 GiB, 3 GiB, 256 MiB, 2 GiB, 2 GiB, 2 GiB, 1 GiB, 1 GiB |
+  | exav_viewer_image, exav_viewer_dwg, exav_viewer_model, exav_viewer_text, exav_viewer_sheets, exav_viewer_slides, exav_viewer_docs, exav_viewer_table, exav_viewer_sniff, the two pdf.js decoders | wasm-bindgen's plumbing (errors, its tables, an array of strings for exav_viewer_sniff): no global, clock, randomness or I/O | capped: 1 GiB, 2 GiB, 3 GiB, 256 MiB, 2 GiB, 2 GiB, 2 GiB, 256 MiB, 256 MiB, 1 GiB, 1 GiB |
   | @exav/unpack-wasm | plumbing, `FileReaderSync` on the archive's `Blob`, a reader function the caller passes, arrays of members | 4 GiB |
   | @silurus/ooxml's three parsers | plumbing, and a panic's message to `console.error` | 4 GiB |
   | pdf.js's qcms | plumbing, a callback copying converted colours out | 4 GiB |
@@ -412,8 +453,9 @@ policy's SVG rule, and the reviewed sinks in the dependencies (below).
   presentations, drawings, text documents) need none.
 - **Misleading content.** A document draws what it likes in its frame,
   including what looks like the host's own UI or a message telling the user
-  to visit an address. It cannot submit a form, open a window or send
-  anything; its links go through the host's question.
+  to visit an address. It cannot submit a form or open a window, nor, under
+  the host page's `frame-src` and `child-src`, send anything; its links go
+  through the host's question.
 - **The clipboard.** On a key press or a click in it, a frame can put
   text on the clipboard, as any page can: the copy of a selection, or of a
   spreadsheet's cells, goes through it. It reads the clipboard only from a

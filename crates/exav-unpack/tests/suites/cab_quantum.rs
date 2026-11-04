@@ -6,7 +6,7 @@
 //! Quantum cabinets byte-exactly today**, so a victim opens the archive while a
 //! scanner that skips the codec sees nothing.
 //!
-//! The fixture is libmspack's `mszip_lzx_qtm.cab` — three tiny members, one per
+//! The fixture is libmspack's `mszip_lzx_qtm.cab`: three tiny members, one per
 //! CAB codec, so it also guards MSZIP and LZX from regressions.
 //!
 //! **What this fixture does NOT cover**, and why the real validation lives
@@ -14,7 +14,7 @@
 //! rescale, never triggers the periodic model reordering, and never wraps the
 //! window. Those were covered by differential testing against
 //! `cabextract` on 107 generated streams spanning every window size 10–21 with
-//! outputs up to 11 KB — zero disagreements. Treat a pass here as "still
+//! outputs up to 11 KB: zero disagreements. Treat a pass here as "still
 //! wired up", not as "the codec is correct".
 
 use exav_unpack::{Budget, Format, Limits, extract};
@@ -64,7 +64,7 @@ fn decodes_quantum_mszip_and_lzx() {
     );
 }
 
-/// Nothing is reported unsupported now that the codec is implemented — the
+/// Nothing is reported unsupported now that the codec is implemented: the
 /// whole point of the exercise was to stop reporting `UNSCANNABLE` here.
 #[test]
 fn no_member_is_reported_unscannable() {

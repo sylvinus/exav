@@ -19,7 +19,7 @@
 //! matching — nothing here resolves one against a filesystem.
 
 use crate::bytes::at;
-use crate::{Budget, Entry, LimitHit, Sink};
+use crate::{Budget, Entry, Sink};
 
 /// Bound on the member walk; hitting it is reported, never a quiet stop.
 const MAX_ENTRIES: usize = 20_000;
@@ -105,11 +105,7 @@ fn read_toc(data: &[u8]) -> Option<Toc> {
     Some(Toc::Members(members))
 }
 
-pub(crate) fn extract_ishield_z<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_ishield_z(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     if !is_ishield_z(data) {
         return Ok(None);
     }
@@ -155,10 +151,9 @@ pub(crate) fn extract_ishield_z<R>(
         // under it.
         if comp_size > cap {
             if let Some(r) = visit(
-                Entry::unsupported(
+                Entry::over_limit(
                     name,
                     comp_size,
-                    false,
                     "InstallShield Z member exceeds the per-member size budget",
                 ),
                 budget,
@@ -180,11 +175,11 @@ pub(crate) fn extract_ishield_z<R>(
         let range_cut = raw.len() < m.size;
         let s = super::dcl_explode::explode(raw, cap);
         if s.over_cap {
+            budget.commit(s.data.len() as u64);
             if let Some(r) = visit(
-                Entry::unsupported(
+                Entry::over_limit(
                     name,
                     comp_size,
-                    false,
                     "InstallShield Z member decompressed past the per-member \
                      size budget",
                 ),

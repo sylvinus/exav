@@ -17,11 +17,14 @@ describe("the frame's engines", () => {
   });
 
   it("bring the engines a format needs, and no others", () => {
-    expect([...engineClosure(["pdf"])]).toEqual(["pdf"]);
-    expect([...engineClosure(["stl"])].sort()).toEqual(["meshes", "model", "three"]);
+    // The detection the host asks the frame for comes with any format.
+    expect([...engineClosure(["pdf"])]).toEqual(["pdf", "sniff"]);
+    expect([...engineClosure(["stl"])].sort()).toEqual(["meshes", "model", "sniff", "three"]);
     // CSV and XLSX are one engine, and the Office viewers' shared page comes with it.
-    expect([...engineClosure(["csv"])].sort()).toEqual(["office", "xlsx"]);
-    expect([...engineClosure(["ppt"])].sort()).toEqual(["convert", "office", "pptx", "slides"]);
+    expect([...engineClosure(["csv"])].sort()).toEqual(["office", "sniff", "xlsx"]);
+    expect([...engineClosure(["ppt"])].sort()).toEqual(["convert", "office", "pptx", "slides", "sniff"]);
+    // What tells an archive's members, and the Office page's ZIP reader, is one module.
+    expect([...engineClosure(["archive"])].sort()).toEqual(["archive", "sniff"]);
     expect([...engineClosure([])]).toEqual([]);
   });
 

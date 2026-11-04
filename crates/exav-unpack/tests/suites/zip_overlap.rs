@@ -1,4 +1,4 @@
-//! Overlapping ZIP local file records — the signal behind ClamAV's
+//! Overlapping ZIP local file records: the signal behind ClamAV's
 //! `Heuristics.Zip.OverlappingFiles`, which is on by default there.
 //!
 //! A well-formed ZIP lays its local records out end to end. Overlapping them is
@@ -8,7 +8,7 @@
 //! writer produces this.
 //!
 //! Both directions are pinned. A detector that fires on ordinary archives is
-//! worse than none — every `.jar`, `.docx` and `.apk` is a ZIP.
+//! worse than none: every `.jar`, `.docx` and `.apk` is a ZIP.
 
 use exav_unpack::overlapping_local_records;
 use std::io::Write;
@@ -84,7 +84,7 @@ fn overlapping_records_are_counted() {
 fn a_deferred_size_member_is_not_an_overlap() {
     // Bit 3 defers the sizes to a trailing data descriptor, so the record's end
     // is not knowable from the header. Guessing an extent here would invent
-    // overlaps on ordinary streamed archives — the common shape for a ZIP
+    // overlaps on ordinary streamed archives, the common shape for a ZIP
     // written to a pipe.
     let mut out = Vec::new();
     for i in 0..10 {

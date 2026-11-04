@@ -91,11 +91,7 @@ fn looks_upx(data: &[u8]) -> bool {
 /// reader, which needs the header to find the compressed blocks, but it does not
 /// defeat the stub, which still has to decompress the image to run it. Only
 /// when that comes back empty too is the file reported unopened.
-fn report_packed<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+fn report_packed(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     #[cfg(feature = "pe-emu")]
     {
         match super::pepack::emulated_unpack(data, budget, visit, "UPX")? {
@@ -350,11 +346,7 @@ fn first_section_rva(data: &[u8]) -> Option<u32> {
     Some(u32_le(data, st + 12))
 }
 
-pub(crate) fn extract_upx<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_upx(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     let Some(li) = find_packheader(data) else {
         // No `l_info` chain. Try the PackHeader layout before giving up; if that
         // fails too and the image still advertises UPX, the payload is there and
@@ -565,7 +557,7 @@ impl<'a> Br<'a> {
     fn bit(&mut self) -> Result<u32, LimitHit> {
         if self.bc == 0 {
             if self.ip + 4 > self.src.len() {
-                return Err(LimitHit::new(NRV_UNDERRUN.into()));
+                return Err(LimitHit::corrupt(NRV_UNDERRUN.into()));
             }
             self.bb = u32::from_le_bytes([
                 self.src[self.ip],
@@ -584,7 +576,7 @@ impl<'a> Br<'a> {
         let b = *self
             .src
             .get(self.ip)
-            .ok_or_else(|| LimitHit::new(NRV_UNDERRUN.into()))?;
+            .ok_or_else(|| LimitHit::corrupt(NRV_UNDERRUN.into()))?;
         self.ip += 1;
         Ok(b as usize)
     }
@@ -600,7 +592,7 @@ fn copy_match(
     dst_len: usize,
 ) -> Result<bool, LimitHit> {
     if off == 0 || off > out.len() {
-        return Err(LimitHit::new("upx nrv: bad back-reference".into()));
+        return Err(LimitHit::corrupt("upx nrv: bad back-reference".into()));
     }
     let start = out.len() - off;
     for k in 0..count {
@@ -899,6 +891,24 @@ mod tests {
                 assert_eq!(got.unwrap() as u64, m);
             }
         }
+    }
+
+    /// A packed stream that runs out of input, or points before its own start,
+    /// is damage, not a limit.
+    #[test]
+    fn a_damaged_nrv_stream_is_damage_not_a_limit() {
+        let mut out = Vec::new();
+        for src in [&[][..], &[0xff; 3][..]] {
+            let e = nrv2b_decompress(src, 100, &mut out).expect_err("no input");
+            assert!(e.is_corrupt(), "{}", e.reason);
+        }
+        let e = copy_match(&mut vec![1, 2, 3], 4, 2, 100).expect_err("before the start");
+        assert!(e.is_corrupt(), "{}", e.reason);
+        // The byte read of a stream whose bit buffer is full but whose literal
+        // is missing: one word of 1 bits (literal flags), no byte after.
+        let e = nrv2b_decompress(&[0xff, 0xff, 0xff, 0xff], 100, &mut out)
+            .expect_err("no literal byte");
+        assert!(e.is_corrupt(), "{}", e.reason);
     }
 
     #[test]

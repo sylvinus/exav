@@ -5,80 +5,32 @@
 //! hold, and those have to go somewhere they can be read back at any offset. A
 //! host that allows that hands a [`Spill`] in [`crate::ScanOptions::spill`].
 //! Without one, what would have needed it is reported as not fully scanned.
+//!
+//! The traits are those of [`exav_unpack::spill`], which also has a spill that
+//! writes to a directory.
 
-use std::io::{Read, Seek};
+pub(crate) use exav_unpack::spill::Spilled;
+pub use exav_unpack::spill::{Spill, SpillReader, SpillWriter};
 
-use crate::byte_source::{BlockCache, CHUNK};
+use exav_unpack::spill::SpillBatch;
 
-/// Makes spill files.
-pub trait Spill: Send + Sync {
-    /// A new, empty spill file, or why there cannot be one.
-    fn create(&self) -> Result<Box<dyn SpillWriter>, String>;
-}
-
-/// A spill file being written.
-pub trait SpillWriter {
-    /// Append `bytes`, or say why they cannot be kept.
-    fn write(&mut self, bytes: &[u8]) -> Result<(), String>;
-
-    /// Stop writing and read back what was written. The file lasts as long as
-    /// the reader.
-    fn finish(self: Box<Self>) -> Result<Box<dyn SpillReader>, String>;
-}
-
-/// A spill file read back.
-pub trait SpillReader: Read + Seek {}
-
-impl<T: Read + Seek> SpillReader for T {}
-
-/// A spill file read back through a block cache.
-pub(crate) type Spilled = BlockCache<Box<dyn SpillReader>>;
-
-/// Collects bytes for a spill file a batch at a time.
+/// Collects the bytes of a normalised view for a spill file.
 pub(crate) struct SpillOut {
-    file: Box<dyn SpillWriter>,
-    batch: Vec<u8>,
+    batch: SpillBatch,
     last: Option<u8>,
-    /// Why a write failed. Everything after it is dropped.
-    failed: Option<String>,
 }
 
 impl SpillOut {
     pub(crate) fn new(file: Box<dyn SpillWriter>) -> Self {
         SpillOut {
-            file,
-            batch: Vec::with_capacity(CHUNK),
+            batch: SpillBatch::new(file),
             last: None,
-            failed: None,
         }
-    }
-
-    pub(crate) fn write(&mut self, bytes: &[u8]) {
-        self.batch.extend_from_slice(bytes);
-        if self.batch.len() >= CHUNK {
-            self.flush();
-        }
-    }
-
-    fn flush(&mut self) {
-        if self.failed.is_none()
-            && !self.batch.is_empty()
-            && let Err(e) = self.file.write(&self.batch)
-        {
-            self.failed = Some(e);
-        }
-        self.batch.clear();
     }
 
     /// What was written, to read back.
-    pub(crate) fn finish(mut self, cache: (usize, usize)) -> Result<Spilled, String> {
-        self.flush();
-        if let Some(e) = self.failed {
-            return Err(e);
-        }
-        let reader = self.file.finish()?;
-        BlockCache::with_sizes(reader, cache.0, cache.1)
-            .map_err(|e| format!("spill file unreadable: {e}"))
+    pub(crate) fn finish(self, cache: (usize, usize)) -> Result<Spilled, String> {
+        self.batch.finish(cache)
     }
 }
 
@@ -87,9 +39,6 @@ impl crate::normalize::Out for SpillOut {
     fn push(&mut self, b: u8) {
         self.batch.push(b);
         self.last = Some(b);
-        if self.batch.len() >= CHUNK {
-            self.flush();
-        }
     }
 
     fn last(&self) -> Option<u8> {
@@ -97,86 +46,25 @@ impl crate::normalize::Out for SpillOut {
     }
 }
 
-/// Why a stream could not be spilled.
-#[derive(Debug)]
-pub(crate) enum SpillStreamError {
-    /// Reading the stream failed.
-    Read(std::io::Error),
-    /// The spill file could not be made, written or read back.
-    Spill(String),
-}
-
-/// Write all of `reader` to a new spill file, and read it back.
-pub(crate) fn spill_stream(
-    spill: &dyn Spill,
-    reader: &mut dyn Read,
-    cache: (usize, usize),
-) -> Result<Spilled, SpillStreamError> {
-    let mut out = SpillOut::new(spill.create().map_err(SpillStreamError::Spill)?);
-    let mut buf = vec![0u8; CHUNK];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => out.write(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(SpillStreamError::Read(e)),
-        }
-        if let Some(e) = out.failed.take() {
-            return Err(SpillStreamError::Spill(e));
-        }
-    }
-    out.finish(cache).map_err(SpillStreamError::Spill)
-}
-
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use crate::byte_source::ByteSource;
-    use std::io::Cursor;
-    use std::sync::{Arc, Mutex};
-
-    /// A spill held in memory, with a byte budget, for tests.
-    pub(crate) struct MemSpill {
-        pub budget: usize,
-        pub made: Arc<Mutex<usize>>,
-    }
-
-    struct MemWriter(Vec<u8>, usize);
-
-    impl Spill for MemSpill {
-        fn create(&self) -> Result<Box<dyn SpillWriter>, String> {
-            *self.made.lock().unwrap() += 1;
-            Ok(Box::new(MemWriter(Vec::new(), self.budget)))
-        }
-    }
-
-    impl SpillWriter for MemWriter {
-        fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
-            if self.0.len() + bytes.len() > self.1 {
-                return Err("spill budget".into());
-            }
-            self.0.extend_from_slice(bytes);
-            Ok(())
-        }
-
-        fn finish(self: Box<Self>) -> Result<Box<dyn SpillReader>, String> {
-            Ok(Box::new(Cursor::new(self.0)))
-        }
-    }
+    use crate::normalize::Out;
 
     #[test]
-    fn a_stream_spilled_reads_back_whole_or_says_why_not() {
-        let data: Vec<u8> = (0..3 * CHUNK + 5).map(|i| i as u8).collect();
-        let spill = MemSpill {
-            budget: usize::MAX,
-            made: Arc::default(),
-        };
-        let back = spill_stream(&spill, &mut Cursor::new(&data), (64 * 1024, 8 << 20)).unwrap();
+    fn a_view_written_a_byte_at_a_time_reads_back_whole_and_knows_its_last_byte() {
+        let spill = exav_unpack::spill::MemSpill::new();
+        let mut out = SpillOut::new(spill.create().unwrap());
+        assert_eq!(out.last(), None);
+        let data: Vec<u8> = (0..3 * crate::byte_source::CHUNK + 1)
+            .map(|i| i as u8)
+            .collect();
+        for &b in &data {
+            out.push(b);
+        }
+        assert_eq!(out.last(), Some(data[data.len() - 1]));
+        let back = out.finish((4096, 1 << 20)).unwrap();
         assert_eq!(back.window(0, back.len()), &data[..]);
-        let small = MemSpill {
-            budget: CHUNK,
-            made: Arc::default(),
-        };
-        assert!(spill_stream(&small, &mut Cursor::new(&data), (64 * 1024, 8 << 20)).is_err());
     }
 }

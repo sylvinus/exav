@@ -385,10 +385,15 @@ pub struct Drawing {
     /// The thumbnail the writer saved with the drawing, when it saved one
     /// a browser can show.
     pub preview: Option<Preview>,
+    /// The hyperlinks on the drawing's objects, each distinct one once (DWG
+    /// only: the DXF reader does not read them).
+    pub hyperlinks: Vec<Hyperlink>,
     pub warnings: Vec<Warning>,
     /// Warnings past [`Limits::max_warnings`](super::Limits), counted only.
     pub warnings_dropped: usize,
 }
+
+pub use exav_unpack::dwg::Hyperlink;
 
 /// A drawing's thumbnail, as a whole image file.
 #[derive(Clone, Debug, PartialEq, Eq)]

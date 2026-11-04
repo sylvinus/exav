@@ -16,7 +16,7 @@
 //! # Scope
 //!
 //! 32-bit protected mode: no REX, no RIP-relative addressing, no 64-bit forms.
-//! Everything else — the integer and control-flow instruction set, port I/O,
+//! Everything else (the integer and control-flow instruction set, port I/O,
 //! far transfers and segment-register loads, both address sizes, the whole x87
 //! escape map, the system-instruction space, SSE/MMX with the `0F 38` and
 //! `0F 3A` escapes, 3DNow!, VEX, EVEX and AMD's XOP.
@@ -31,17 +31,17 @@
 //!
 //! The scope was measured, not guessed: instrumenting the emulator across the
 //! packed-sample corpus records which encodings real stubs actually execute,
-//! and this decoder covers all of them. The set is far smaller than the ISA —
+//! and this decoder covers all of them. The set is far smaller than the ISA:
 //! a packer's stub is a decompressor, not a compiler's output.
 //!
 //! # Verification
 //!
 //! Correctness here means agreeing with a decoder that has seen far more code
 //! than this one, so the tests are differential: `tests/differential.rs` decodes
-//! the same bytes with `iced-x86` and compares length and mnemonic — over
+//! the same bytes with `iced-x86` and compares length and mnemonic, over
 //! exhaustive opcode sweeps under every prefix combination, pseudo-random bytes,
 //! and (behind `--ignored`) every byte offset of the sample corpus. It agrees
-//! at every corpus decode site, with no disagreements and no declines — which
+//! at every corpus decode site, with no disagreements and no declines, which
 //! the sweep asserts rather than merely reports, and prints the counts for.
 //!
 //! Corpus agreement is agreement on bytes that OCCUR, which is narrower than it
@@ -56,8 +56,8 @@
 //!
 //! The SIMD and system regions come from `generated.rs`, which is checked in
 //! and produced by `scripts/gen-x86-tables.sh` from `iced-x86` (MIT; attributed
-//! in `NOTICE`). It records only what a decoder cannot infer from the bytes —
-//! which instruction an encoding names, and how many immediate bytes follow —
+//! in `NOTICE`). It records only what a decoder cannot infer from the bytes
+//! (which instruction an encoding names, and how many immediate bytes follow)
 //! and never a displacement, so a change to the addressing rules cannot be
 //! contradicted by a stale table.
 
@@ -84,7 +84,7 @@ mod generated;
 /// crate avoids. Names match the spelling used by common x86 tooling, so a decode can
 /// be compared against another decoder's output directly.
 ///
-/// The name is INTERNED — the value held is an index into the two name tables,
+/// The name is INTERNED: the value held is an index into the two name tables,
 /// so `mn == Mn::Lea` is an integer comparison. Holding the `&'static str`
 /// itself would make every such test a string comparison, and a decoder tests
 /// its mnemonic several times per instruction while an emulator runs millions
@@ -122,7 +122,7 @@ impl Mn {
     ///
     /// [`generated::OF_NAMES`] is searched first, so a name in both tables gets
     /// the generated maps' index and the constant below compares equal to what
-    /// a decode of those maps produces. `OF_NAMES` holds no duplicates —
+    /// a decode of those maps produces. `OF_NAMES` holds no duplicates:
     /// `name_indices_are_unique` is what keeps that true.
     const fn intern(name: &'static str) -> Mn {
         let mut i = 0;
@@ -168,8 +168,8 @@ impl core::fmt::Debug for Mn {
 macro_rules! mnemonics {
     ($($v:ident),* $(,)?) => {
         /// The mnemonics the hand-written maps name directly. Those the
-        /// generated maps also reach resolve to the generated index; the rest —
-        /// the one-byte map's own, the x87 stack — are indexed from here.
+        /// generated maps also reach resolve to the generated index; the rest
+        /// (the one-byte map's own, the x87 stack) are indexed from here.
         const HAND_NAMES: &[&str] = &[$(stringify!($v)),*];
 
         #[allow(non_upper_case_globals)]
@@ -533,7 +533,7 @@ mnemonics![
     Fndisi,
     Fnsetpm,
     // SSE and MMX. Every mnemonic the generated map can produce is already a
-    // valid `Mn` — one is built from a name — but only the ones listed here
+    // valid `Mn` (one is built from a name), but only the ones listed here
     // have a constant a caller can write in a `match` pattern. These are the
     // ones a packer stub uses: vector moves as a wide `memcpy`, the lane
     // shuffles and whole-register shifts that move the bytes around
@@ -726,7 +726,7 @@ enum F {
     RmReg,
     /// ModRM, reg first then r/m.
     RegRm,
-    /// ModRM r/m only — the `reg` field is a group digit, not an operand.
+    /// ModRM r/m only: the `reg` field is a group digit, not an operand.
     Rm,
     /// r/m, then an immediate of the operand size.
     RmImmZ,
@@ -738,9 +738,9 @@ enum F {
     RmOne,
     /// r/m, then CL (`D2`/`D3`).
     RmCl,
-    /// reg, r/m, CL — the double-shift register form.
+    /// reg, r/m, CL: the double-shift register form.
     RegRmCl,
-    /// reg, r/m, imm8 — the double-shift immediate form.
+    /// reg, r/m, imm8: the double-shift immediate form.
     RegRmImm8,
     /// reg, r/m, immediate of the operand size (three-operand `imul`).
     RegRmImmZ,
@@ -765,7 +765,7 @@ enum F {
     /// imm16 then imm8 (`enter`).
     Imm16Imm8,
     Rel8,
-    /// A relative branch as wide as the operand size — `imm16` under a `66`
+    /// A relative branch as wide as the operand size: `imm16` under a `66`
     /// prefix. Getting this wrong is a length error.
     RelZ,
     /// The accumulator, then an absolute `moffs` address.
@@ -783,7 +783,7 @@ enum F {
     SegRm,
     /// reg, then a ModRM memory operand holding a far pointer (`lds`, `les`).
     RegFarMem,
-    /// A lone ModRM operand that must be memory — the indirect far transfers,
+    /// A lone ModRM operand that must be memory: the indirect far transfers,
     /// which read their `m16:32` target rather than taking it in a register.
     RegFarMemOnly,
     /// An absolute `ptr16:32` operand (`9A`, `EA`).
@@ -809,7 +809,7 @@ enum Slot {
     Bad,
     /// A mnemonic and form at the current operand size.
     I(Mn, F),
-    /// The same, forced to byte width — the low opcode bit selects it.
+    /// The same, forced to byte width: the low opcode bit selects it.
     B(Mn, F),
     /// A `/digit` group, indexed by the ModRM `reg` field.
     G(&'static [Grp; 8]),
@@ -1012,8 +1012,8 @@ fn one_byte(op: u8) -> Slot {
         0x6a => I(Mn::Push, Imm8Sex),
         0x6b => I(Mn::Imul, RegRmImm8Sex),
         0x70..=0x7f => I(JCC[(op & 0xf) as usize], Rel8),
-        // `82` is an undocumented alias of `80` — same group, same byte-wide
-        // immediate — and real code does use it.
+        // `82` is an undocumented alias of `80` (same group, same byte-wide
+        // immediate), and real code does use it.
         0x80..=0x83 => G(&GRP1),
         0x84 => B(Mn::Test, RmReg),
         0x85 => I(Mn::Test, RmReg),
@@ -1109,8 +1109,8 @@ fn one_byte(op: u8) -> Slot {
 /// The `0F` encodings written by hand rather than taken from the generated
 /// table, because the rest of exav acts on their operands: branches need a
 /// resolved target, `setcc`/`cmovcc` a condition, `movzx`/`movsx` a source
-/// width. Everything else in the map — the SIMD region, the system and
-/// virtualisation space, the reserved no-ops — is generated, and `Bad` here
+/// width. Everything else in the map (the SIMD region, the system and
+/// virtualisation space, the reserved no-ops) is generated, and `Bad` here
 /// routes to it.
 fn two_byte(op: u8) -> Slot {
     match op {
@@ -1163,7 +1163,7 @@ fn two_byte(op: u8) -> Slot {
 /// different encodings of one mnemonic, and a caller sizing a read from the
 /// operand needs the right one.
 const X87_MEM: [[Option<(Mn, u8)>; 8]; 8] = [
-    // D8 — single-precision.
+    // D8: single-precision.
     [
         Some((Mn::Fadd, 4)),
         Some((Mn::Fmul, 4)),
@@ -1174,7 +1174,7 @@ const X87_MEM: [[Option<(Mn, u8)>; 8]; 8] = [
         Some((Mn::Fdiv, 4)),
         Some((Mn::Fdivr, 4)),
     ],
-    // D9 — load/store single, and the control-word / environment transfers.
+    // D9: load/store single, and the control-word / environment transfers.
     [
         Some((Mn::Fld, 4)),
         None,
@@ -1185,7 +1185,7 @@ const X87_MEM: [[Option<(Mn, u8)>; 8]; 8] = [
         Some((Mn::Fnstenv, 28)),
         Some((Mn::Fnstcw, 2)),
     ],
-    // DA — 32-bit integer.
+    // DA: 32-bit integer.
     [
         Some((Mn::Fiadd, 4)),
         Some((Mn::Fimul, 4)),
@@ -1196,7 +1196,7 @@ const X87_MEM: [[Option<(Mn, u8)>; 8]; 8] = [
         Some((Mn::Fidiv, 4)),
         Some((Mn::Fidivr, 4)),
     ],
-    // DB — 32-bit integer load/store, and extended-precision.
+    // DB: 32-bit integer load/store, and extended-precision.
     [
         Some((Mn::Fild, 4)),
         Some((Mn::Fisttp, 4)),
@@ -1207,7 +1207,7 @@ const X87_MEM: [[Option<(Mn, u8)>; 8]; 8] = [
         None,
         Some((Mn::Fstp, 10)),
     ],
-    // DC — double-precision.
+    // DC: double-precision.
     [
         Some((Mn::Fadd, 8)),
         Some((Mn::Fmul, 8)),
@@ -1218,7 +1218,7 @@ const X87_MEM: [[Option<(Mn, u8)>; 8]; 8] = [
         Some((Mn::Fdiv, 8)),
         Some((Mn::Fdivr, 8)),
     ],
-    // DD — double load/store, and the full-state transfers.
+    // DD: double load/store, and the full-state transfers.
     [
         Some((Mn::Fld, 8)),
         Some((Mn::Fisttp, 8)),
@@ -1229,7 +1229,7 @@ const X87_MEM: [[Option<(Mn, u8)>; 8]; 8] = [
         Some((Mn::Fnsave, 108)),
         Some((Mn::Fnstsw, 2)),
     ],
-    // DE — 16-bit integer.
+    // DE: 16-bit integer.
     [
         Some((Mn::Fiadd, 2)),
         Some((Mn::Fimul, 2)),
@@ -1240,7 +1240,7 @@ const X87_MEM: [[Option<(Mn, u8)>; 8]; 8] = [
         Some((Mn::Fidiv, 2)),
         Some((Mn::Fidivr, 2)),
     ],
-    // DF — 16-bit integer load/store, packed BCD, and 64-bit integer.
+    // DF: 16-bit integer load/store, packed BCD, and 64-bit integer.
     [
         Some((Mn::Fild, 2)),
         Some((Mn::Fisttp, 2)),
@@ -1400,7 +1400,7 @@ fn vex_index(map: u8, pp: u8, l: u8, w: u8, op: u8) -> usize {
 /// up the cell, honour its flags, then consume the ModRM and any immediate.
 ///
 /// Shared because the two prefixes differ only in which byte introduces them
-/// and which maps they select — a second copy of this would be a second place
+/// and which maps they select: a second copy of this would be a second place
 /// for an immediate width to go stale.
 #[allow(clippy::too_many_arguments)]
 fn vex_tail(
@@ -1414,8 +1414,8 @@ fn vex_tail(
     osize: Size,
 ) -> Option<Insn> {
     let mut cell = map[index];
-    // An opcode whose meaning varies by `/digit` or by `mod` — the shift
-    // groups, and the few whose register form is a different instruction —
+    // An opcode whose meaning varies by `/digit` or by `mod` (the shift
+    // groups, and the few whose register form is a different instruction)
     // stores a block of sixteen cells instead of one.
     if cell & VEX_SUB_BIT != 0 {
         let m = r.peek().unwrap_or(0);
@@ -1440,7 +1440,7 @@ fn vex_tail(
     } else {
         // A gather addresses memory through a vector index, and the only
         // encoding of one is a SIB byte. `rm != 100` names no SIB, so it is not
-        // a smaller form of the instruction — it is not the instruction, and
+        // a smaller form of the instruction: it is not the instruction, and
         // claiming it would put a length on bytes the CPU faults.
         if cell & VEX_VSIB != 0 && r.peek().is_some_and(|b| b & 7 != 4) {
             return None;
@@ -1459,7 +1459,7 @@ fn vex_tail(
             Op::None
         } else {
             // Same reason, one step further: for `mod == 3` the operand names a
-            // vector register, and `modrm` can only describe it as `Op::Reg` —
+            // vector register, and `modrm` can only describe it as `Op::Reg`,
             // which says `ecx` for `xmm1`. The `0F` map already collapses this
             // to nothing; consumers rely on that (exav-core's bytecode disasm
             // maps vector operands to no-arg precisely so a signature cannot
@@ -1567,11 +1567,11 @@ const EVEX_SUB_BIT: u32 = 1 << 2;
 const EVEX_STRICT_VVVV: u32 = 1 << 6;
 /// Set in an EVEX cell that requires a non-zero mask register.
 const EVEX_NEEDS_MASK: u32 = 1 << 7;
-/// Set in an EVEX cell that forbids one — it writes a mask rather than reads it.
+/// Set in an EVEX cell that forbids one: it writes a mask rather than reads it.
 const EVEX_FORBIDS_MASK: u32 = 1 << 8;
 /// Set in an EVEX cell that forbids zeroing-merge.
 const EVEX_FORBIDS_Z: u32 = 1 << 9;
-/// Set in an EVEX cell that indexes memory with a vector register — a gather or
+/// Set in an EVEX cell that indexes memory with a vector register: a gather or
 /// a scatter, which only a SIB byte can encode.
 const EVEX_VSIB: u32 = 1 << 10;
 /// How far an EVEX cell's mnemonic index (or block index) is shifted up.
@@ -1586,7 +1586,7 @@ fn evex_key(mm: u8, pp: u8, w: u8, ll: u8, b: u8, op: u8) -> u32 {
 /// Apply EVEX's compressed-displacement scaling.
 ///
 /// An eight-bit displacement in an EVEX encoding counts *elements*, not bytes,
-/// so it is multiplied by a factor the instruction chooses — which is why the
+/// so it is multiplied by a factor the instruction chooses, which is why the
 /// generated table has to carry it: nothing in the ModRM byte says what it is,
 /// and an unscaled displacement addresses the wrong memory by up to 63x.
 fn scale_disp(op: Op, shift: u32) -> Op {
@@ -1612,12 +1612,12 @@ fn scale_disp(op: Op, shift: u32) -> Op {
     }
 }
 
-/// Set in a VEX cell for an opcode that reads no ModRM byte — `vzeroupper` and
+/// Set in a VEX cell for an opcode that reads no ModRM byte: `vzeroupper` and
 /// `vzeroall`, where treating the next byte as one gets the length wrong.
 const VEX_NO_MODRM: u32 = 1 << 2;
 /// Set in a VEX cell that rejects a `vvvv` field other than `1111`.
 const VEX_STRICT_VVVV: u32 = 1 << 3;
-/// Set in a VEX cell whose SIB index names a vector register — the gathers and
+/// Set in a VEX cell whose SIB index names a vector register: the gathers and
 /// scatters. [`Op::Mem`] can only name a general-purpose index, so the operand
 /// of such an encoding is left unreported rather than named as the wrong
 /// register file. Its length is unaffected: a VSIB byte is a SIB byte.
@@ -1734,8 +1734,8 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
             return None;
         }
         let (p0, p1, p2) = (r.u8()?, r.u8()?, r.u8()?);
-        // `P0` bit 3 is reserved — the three below it are the opcode-map
-        // selector, which reaches 6 for the FP16 maps — `P1` bit 2 is fixed at
+        // `P0` bit 3 is reserved (the three below it are the opcode-map
+        // selector, which reaches 6 for the FP16 maps), `P1` bit 2 is fixed at
         // one, and `V'`, the fifth `vvvv` bit, names a register 32-bit mode
         // does not have, so it has to read as its inverted "absent" value.
         // Each is a hard reject: a processor raises #UD rather than ignoring
@@ -1774,11 +1774,11 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         // Every EVEX encoding reads a ModRM byte, and an eight-bit
         // displacement in one is *compressed*: it counts elements, not bytes,
         // so it has to be scaled by a factor the encoding chooses. Nothing in
-        // the ModRM byte says what that factor is — only the table does.
+        // the ModRM byte says what that factor is: only the table does.
         let disp8 = r.peek().is_some_and(|m| m >> 6 == 1);
         // A gather or scatter addresses memory through a vector index, and the
         // only encoding of one is a SIB byte. Without `rm == 100` there is no
-        // SIB and so no such instruction — `vscatterdps` with `rm = 001` is not
+        // SIB and so no such instruction: `vscatterdps` with `rm = 001` is not
         // a shorter form of it, and putting a length on it would step a linear
         // decode into the middle of whatever follows.
         if cell & EVEX_VSIB != 0 && r.peek().is_some_and(|m| m & 7 != 4) {
@@ -1807,7 +1807,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         // As in `vex_tail`: for `mod == 3` this names a vector register, and
         // reporting it as `Op::Reg` would say `ecx` where the encoding said
         // `xmm1`/`zmm1`. Not reporting it is the narrower, true claim. A vector
-        // INDEX is dropped for the same reason — the number in the SIB byte
+        // INDEX is dropped for the same reason: the number in the SIB byte
         // names a vector register, not the general-purpose one it would read as.
         let rm = match rm {
             _ if cell & EVEX_VSIB != 0 => Op::None,
@@ -1864,7 +1864,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
 
     if matches!(op, 0xc4 | 0xc5) && r.peek().is_some_and(|b| b >= 0xc0) {
         // A legacy operand-size, repeat or lock prefix in front of a VEX
-        // prefix is not a prefixed VEX instruction — it is not an instruction.
+        // prefix is not a prefixed VEX instruction: it is not an instruction.
         // The mandatory prefix VEX needs is the `pp` field inside itself.
         if osz16 || rep || repne || lock {
             return None;
@@ -1885,7 +1885,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
             (b1 & 0x1f, b2 >> 7, (b2 >> 2) & 1, b2 & 3, (b2 >> 3) & 0xf)
         };
         // Only three opcode maps are defined. The rest of the field is
-        // reserved, and `8F` — not `C4` — is what carries AMD's XOP maps.
+        // reserved, and `8F` (not `C4`) is what carries AMD's XOP maps.
         if !(1..=3).contains(&map) {
             return None;
         }
@@ -1965,8 +1965,8 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
     }
 
     // The `0F` map is handled two ways. Encodings whose *operands* the rest of
-    // exav acts on — conditional branches, `setcc`, `cmovcc`, `movzx`, the bit
-    // instructions — are hand-written above, so their operand shapes are real
+    // exav acts on (conditional branches, `setcc`, `cmovcc`, `movzx`, the bit
+    // instructions) are hand-written above, so their operand shapes are real
     // and independently tested. Everything else, which is the SIMD region and
     // the system space, comes from the generated table: it supplies the
     // mnemonic and the immediate size, and nothing else is needed to give the
@@ -1980,7 +1980,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         let op2 = r.u8()?;
         // Peeked, not consumed: the digit and `mod` select the table cell, and
         // `modrm()` reads the byte properly below. An opcode that takes no
-        // ModRM byte may legitimately have nothing here — its cells are
+        // ModRM byte may legitimately have nothing here: its cells are
         // uniform, so any digit selects the same instruction.
         let modrm_byte = r.peek().unwrap_or(0);
         // The table has a column per prefix *combination*, because `66` together
@@ -2069,8 +2069,8 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
                 (false, Op::Reg(..)) => (Op::None, Op::None),
                 // Left at the width `modrm` produced. `OF_SHAPE` carries one
                 // width per OPCODE, but the real access width varies per
-                // `/digit` — `0F 1C` is one byte at one digit and four at
-                // another, `F3 0F 38 D8` is 48 bytes at one and 64 at another —
+                // `/digit` (`0F 1C` is one byte at one digit and four at
+                // another, `F3 0F 38 D8` is 48 bytes at one and 64 at another),
                 // so applying the table's single value here would be wrong more
                 // often than the operand-size default it replaced. Carrying it
                 // per digit needs a table the size of `OF_MAP`.
@@ -2112,12 +2112,12 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
             });
         }
         // Where an opcode is keyed on the whole ModRM byte, a byte missing from
-        // the list is not an encoding — falling back to the digit-keyed map
+        // the list is not an encoding: falling back to the digit-keyed map
         // would name the group's instruction for something the CPU rejects.
         //
         // The table is sorted by `(prefix, opcode, modrm)`, so every entry for
         // one `(prefix, opcode)` is contiguous and the first of them is a
-        // partition point away — this runs on every `mod=3` `0F` decode, which
+        // partition point away: this runs on every `mod=3` `0F` decode, which
         // is most of them, and a scan of the whole table would be linear work
         // for a question with a logarithmic answer.
         let keyed_on_modrm = mod3 && {
@@ -2128,7 +2128,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
                 .is_some_and(|(p, o, _, _, _)| (*p, *o) == key)
         };
         // Whether the whole ModRM byte selected the instruction. For those the
-        // byte IS the opcode — `0F 01 C1` is `vmcall`, which takes nothing — so
+        // byte IS the opcode (`0F 01 C1` is `vmcall`, which takes nothing), so
         // reporting the `r/m` field as an operand invents one.
         let mut modrm_is_opcode = false;
         let (mn, imm) = match exact.flatten() {
@@ -2152,14 +2152,14 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
             }
         };
         // `0F 20`–`23` move to and from the control and debug registers. They
-        // read a ModRM byte but ignore its `mod` field — the operand is always
-        // a register — so the length probe behind `OF_HAS_MODRM` could not see
+        // read a ModRM byte but ignore its `mod` field (the operand is always
+        // a register), so the length probe behind `OF_HAS_MODRM` could not see
         // the byte, and the table counted it as an immediate instead. Consume
         // it here as the register it is, and drop the phantom immediate.
         let cr_dr = (0x20..=0x23).contains(&op2);
         let imm = if cr_dr { 0 } else { imm };
         // The shape says which register file each side of a SIMD encoding
-        // names and how wide its memory operand is — the facts an emulator
+        // names and how wide its memory operand is: the facts an emulator
         // needs and a length does not. `0` is "not modelled", and then only the
         // `rm` operand is reported, as before.
         let shape = generated::OF_SHAPE[pfx * 256 + op2 as usize];
@@ -2170,15 +2170,15 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
             match (shape & SHAPE_PRESENT != 0, rm) {
                 // A register operand of an encoding whose shape is unmodelled
                 // could name any file. Reporting it as general-purpose would be
-                // a plausible-looking lie — `movq mm0, mm1` read as `eax, ecx` —
+                // a plausible-looking lie (`movq mm0, mm1` read as `eax, ecx`),
                 // so it is not reported at all. Memory *is* reported: its base,
                 // index and displacement are the same whatever the access
                 // width, and the `lock` check needs to see it.
                 (false, Op::Reg(..)) => (Op::None, Op::None),
                 // Left at the width `modrm` produced. `OF_SHAPE` carries one
                 // width per OPCODE, but the real access width varies per
-                // `/digit` — `0F 1C` is one byte at one digit and four at
-                // another, `F3 0F 38 D8` is 48 bytes at one and 64 at another —
+                // `/digit` (`0F 1C` is one byte at one digit and four at
+                // another, `F3 0F 38 D8` is 48 bytes at one and 64 at another),
                 // so applying the table's single value here would be wrong more
                 // often than the operand-size default it replaced. Carrying it
                 // per digit needs a table the size of `OF_MAP`.
@@ -2224,9 +2224,9 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         }
         // `montmul` is encoded only for 32-bit addressing, so an address-size
         // prefix leaves it with no form to decode into and the processor
-        // faults. Its neighbours in the same opcode group do have both forms —
-        // `xsha1` and `xsha256` share `0F A6`, and the whole `0F A7` group
-        // takes the prefix without complaint — so this is one encoding, not a
+        // faults. Its neighbours in the same opcode group do have both forms
+        // (`xsha1` and `xsha256` share `0F A6`, and the whole `0F A7` group
+        // takes the prefix without complaint), so this is one encoding, not a
         // rule about the group.
         if asz16 && mn == Mn::Montmul {
             return None;
@@ -2292,7 +2292,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
             mn,
             // `Size::B4`, not `osize`. A `66` prefix shortens `xbegin`'s
             // displacement to sixteen bits but does not wrap the target within
-            // them the way a near branch does — the fallback address stays a
+            // them the way a near branch does: the fallback address stays a
             // full 32-bit one. Passing `osize` here truncates a target the
             // hardware does not.
             ops: resolve_rel(ops, ip, len, Size::B4),
@@ -2359,7 +2359,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         };
     }
 
-    // A few encodings are not "the same instruction with a repeat prefix" — the
+    // A few encodings are not "the same instruction with a repeat prefix": the
     // `F3` belongs to the opcode and names something else.
     if rep {
         match (op, two) {
@@ -2376,7 +2376,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
     let ops = decode_form(&mut r, form, size, osize, two.unwrap_or(op), seg, asz16)?;
 
     // `arpl` reads a 16-bit selector, but its register form names the full
-    // 32-bit registers — the one encoding where the register and memory widths
+    // 32-bit registers, the one encoding where the register and memory widths
     // differ, so `modrm`'s single size cannot express it.
     let ops = if mn == Mn::Arpl {
         [sized_mem(ops[0], 2), ops[1], ops[2]]
@@ -2385,15 +2385,15 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
     };
 
     // A segment-register move touches TWO bytes of memory whatever the operand
-    // size, and `bound` reads a PAIR of limits — eight bytes for the 32-bit
-    // form. `modrm` carries one width for both the register and memory shapes,
+    // size, and `bound` reads a PAIR of limits (eight bytes for the 32-bit
+    // form). `modrm` carries one width for both the register and memory shapes,
     // so like `arpl` these have to be corrected after the fact. An emulator
     // sizing its access from `Op::Mem.size` would otherwise write four bytes for
     // `mov [ecx], ds`, clobbering two it must not touch, and read four for
     // `mov ds, [ecx]`, faulting a page early at a page boundary.
     // Some instructions take an address, not a value: `lea` computes one, and
     // `bound` reads a pair of limits from memory. With `mod=3` they are not
-    // instructions at all — `62` with `mod=3` is where EVEX lives — and
+    // instructions at all (`62` with `mod=3` is where EVEX lives), and
     // claiming them would invent an encoding.
     //
     // This runs BEFORE the width fixup below, which can turn the operand into an
@@ -2469,7 +2469,7 @@ fn lockable(mn: Mn, two: Option<u8>, ops: &[Op; 3]) -> bool {
 /// Turn the raw displacements the form decoder produced into absolute targets.
 ///
 /// The sum is masked to the operand size, not just carried in 64 bits. Under a
-/// `66` prefix a near branch wraps within 16 bits — the hardware truncates the
+/// `66` prefix a near branch wraps within 16 bits: the hardware truncates the
 /// whole instruction pointer, so `66 e9 00 00` at `0x14000` goes to `0x4004`,
 /// not `0x14004`. A 16-bit near jump inside a 32-bit stub is a known
 /// anti-emulation move, chosen because decoders get exactly this wrong. Without
@@ -2494,7 +2494,7 @@ fn resolve_rel(mut ops: [Op; 3], ip: u64, len: usize, osize: Size) -> [Op; 3] {
 /// `vfmulcph` and its seven relatives treat a register pair as one complex
 /// number, reading both halves of each source while writing both halves of the
 /// destination. Overlap them and the result is undefined, so the processor
-/// refuses the encoding rather than producing one — which makes accepting it a
+/// refuses the encoding rather than producing one, which makes accepting it a
 /// decoder that hands an emulator an instruction no hardware will run.
 ///
 /// `vvvv` is stored inverted, and only its low three bits can name a register a
@@ -2519,8 +2519,8 @@ fn overlaps_a_source(mn: Mn, dest: u8, vvvv: u8, rm: Op) -> bool {
 
 /// Read the ModRM byte with its SIB and displacement.
 ///
-/// Returns the `reg` field — which is either a register number or a group digit,
-/// depending on the opcode — and the `r/m` operand it describes: a register when
+/// Returns the `reg` field (which is either a register number or a group digit,
+/// depending on the opcode) and the `r/m` operand it describes: a register when
 /// `mod == 3`, otherwise a memory reference already resolved to base, index,
 /// scale and displacement.
 fn modrm(r: &mut Reader, size: Size, seg: Option<Seg>, asz16: bool) -> Option<(u8, Op)> {
@@ -2813,7 +2813,7 @@ mod tests {
     ///
     /// A duplicate in `OF_NAMES` would give the second copy an index no `Mn::`
     /// constant can hold, and `mn == Mn::Whatever` would then be false for an
-    /// instruction that IS that mnemonic — a silently wrong answer, not a
+    /// instruction that IS that mnemonic: a silently wrong answer, not a
     /// failure. The generator emits a sorted set; this is what says so.
     #[test]
     fn name_indices_are_unique() {
@@ -2915,7 +2915,7 @@ mod tests {
             (Mn::Mov, "Mov"),
             (Mn::Bound, "Bound"),
             (Mn::Lea, "Lea"),
-            // In both tables — must resolve to the generated index, so that a
+            // In both tables: must resolve to the generated index, so that a
             // decode through the `0F` map compares equal to the constant.
             (Mn::Nop, "Nop"),
             (Mn::Pause, "Pause"),
@@ -3004,7 +3004,7 @@ mod tests {
                 ..
             }
         ));
-        // mov eax, [0x400000] — mod=0, rm=5 is a bare disp32, not [ebp]
+        // mov eax, [0x400000]: mod=0, rm=5 is a bare disp32, not [ebp]
         let i = one(&[0x8b, 0x05, 0x00, 0x00, 0x40, 0x00]);
         assert!(matches!(
             i.ops[1],

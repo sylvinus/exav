@@ -30,10 +30,13 @@ export const LISTS = {
     imports: [...BINDGEN, "glue.__wbg___wbindgen_string_get", "glue.__wbindgen_object_drop_ref"],
     why: "exav-render's IFC, STL and glTF meshes",
   },
-  exav_viewer_text_bg: { imports: BINDGEN, why: "exav-render's Markdown reader" },
+  exav_viewer_text_bg: { imports: BINDGEN, why: "exav-unpack's rule for reading a file as text, exav-render's Markdown reader and its JSON, XML and diff lines" },
   exav_viewer_sheets_bg: { imports: BINDGEN, why: "exav-render's XLS, ODS and Numbers converter" },
   exav_viewer_slides_bg: { imports: BINDGEN, why: "exav-render's PPT, ODP, Keynote and ODG converter" },
   exav_viewer_docs_bg: { imports: BINDGEN, why: "exav-render's DOC, ODT and RTF converter" },
+  exav_viewer_table_bg: { imports: BINDGEN, why: "exav-render's CSV reader and XLSX writer" },
+  // `names` and `contentTypes` hand an array of strings out, which wasm-bindgen builds in JS.
+  exav_viewer_sniff_bg: { imports: [...BINDGEN, "glue.__wbindgen_generic"], why: "exav's detection of what a file is, exav-unpack's ZIP reader for a ZIP's central directory" },
   exav_viewer_pdf_jpx_bg: { imports: BINDGEN, why: "the JPEG 2000 decoder given to pdf.js" },
   exav_viewer_pdf_jbig2_bg: { imports: BINDGEN, why: "the JBIG2 and CCITT decoder given to pdf.js" },
   exav_unpack_wasm_bg: {
@@ -87,6 +90,8 @@ export const MEMORY_CAPS = {
   exav_viewer_sheets_bg: 32768,
   exav_viewer_slides_bg: 32768,
   exav_viewer_docs_bg: 32768,
+  exav_viewer_table_bg: 4096,
+  exav_viewer_sniff_bg: 4096,
   exav_viewer_pdf_jpx_bg: 16384,
   exav_viewer_pdf_jbig2_bg: 16384,
 };

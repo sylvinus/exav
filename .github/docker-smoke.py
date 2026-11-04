@@ -3,7 +3,7 @@
 
 Exercises the wire protocol end-to-end against the built image: PING/PONG,
 VERSIONCOMMANDS, and an INSTREAM scan of the EICAR test string (which the
-built-in baseline database detects), so CI proves the image actually scans —
+built-in baseline database detects), so CI proves the image actually scans,
 not just that it starts. Usage: docker-smoke.py [host] [port].
 """
 import socket

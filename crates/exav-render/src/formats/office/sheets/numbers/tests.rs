@@ -89,8 +89,8 @@ fn entry(key: u64) -> W {
 }
 
 /// A document with two tables on one sheet: T1 (3 rows, 2 columns, one
-/// header row) and T2, which a formula of T1 refers to.
-fn document() -> Vec<u8> {
+/// header row) and T2, which a formula of T1 refers to: its objects.
+fn objects() -> Vec<(u64, u32, W)> {
     let num = |v: u64| cell(2, 0x1, &decimal(v));
     let text = |k: u32| cell(3, 0x8, &k.to_le_bytes());
     // B3 = A3 + T2::A1, as postfix: A3, T2::A1, +.
@@ -218,8 +218,11 @@ fn document() -> Vec<u8> {
         (40, 6002, t2_tile),
         (50, 4008, owner),
     ];
-    let doc = iwa(&objects);
-    zip(&[("Index/Document.iwa", &doc)])
+    objects
+}
+
+fn document() -> Vec<u8> {
+    zip(&[("Index/Document.iwa", &iwa(&objects()))])
 }
 
 fn read(bytes: &[u8]) -> Result<Workbook, Error> {
@@ -307,6 +310,23 @@ fn damaged_documents_do_not_panic() {
         d[i] ^= 0xA5;
         let _ = read(&zip(&[("Index/Document.iwa", &d)]));
     }
+}
+
+#[test]
+fn groups_that_hold_themselves_are_opened_once() {
+    let mut objects = objects();
+    // The sheet's drawable is a group holding itself many times, then the
+    // two tables.
+    objects[1].2 = W::default().bytes(1, b"Sheet 1").reference(2, 5);
+    let mut group = W::default();
+    for _ in 0..64 {
+        group = group.reference(2, 5);
+    }
+    objects.push((5, 3008, group.reference(2, 3).reference(2, 4)));
+    let t = std::time::Instant::now();
+    let wb = read(&zip(&[("Index/Document.iwa", &iwa(&objects))])).unwrap();
+    assert!(t.elapsed().as_secs() < 2, "took {:?}", t.elapsed());
+    assert_eq!(wb.sheets.len(), 2);
 }
 
 #[test]

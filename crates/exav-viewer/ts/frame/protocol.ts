@@ -7,16 +7,49 @@
  * the host treats every frame message as untrusted, since the frame runs the
  * parsers.
  */
-import { BUILTIN_ORDER } from "../core/formats.js";
+import { BUILTIN_ORDER, MATCHERS, WASM_IMAGES } from "../core/formats.js";
+import { shownName } from "../core/names.js";
 import { checkRasterOptions, checkRegion, isRasterErrorCode, MAX_PICTURE_EDGE, MAX_PICTURE_PIXELS, regionMatches, type RasterErrorCode } from "../core/pictures.js";
 import { checkTheme, isColor, type FrameTheme } from "../core/theme.js";
-import type { BuiltinFormat, LayerItem, LoadStep, MediaState, OutlineEntry, RasterOptions, RasterRegion, RegionSpace, Selection, StoreyItem, Viewport, Warning } from "../core/types.js";
+import { MAX_HIGHLIGHT_RECTS, MAX_HIGHLIGHT_TEXT, MAX_HIGHLIGHTS } from "../core/highlights.js";
+import type {
+  BuiltinFormat,
+  FormatMatcher,
+  Highlight,
+  LayerItem,
+  LoadStep,
+  MediaState,
+  OutlineEntry,
+  PlacedHighlight,
+  RasterOptions,
+  RasterRegion,
+  Region,
+  RegionSpace,
+  Selection,
+  StoreyItem,
+  Viewport,
+  Warning,
+} from "../core/types.js";
 import type { FramePolicy } from "./policy.js";
 
 export { isColor };
 
+/**
+ * How a format of the frame is told by name and type, on both sides: an image
+ * also by the types the frame decodes in WebAssembly, which browsers do not draw.
+ */
+export function frameMatcher(id: BuiltinFormat): FormatMatcher {
+  if (id !== "image") return MATCHERS[id];
+  const all = [MATCHERS.image, WASM_IMAGES];
+  return {
+    types: all.flatMap((m) => m.types ?? []),
+    extensions: all.flatMap((m) => m.extensions ?? []),
+    extensionOverrides: all.flatMap((m) => m.extensionOverrides ?? []),
+  };
+}
+
 /** Bumped on any change to the messages; both sides must agree. */
-export const PROTOCOL = 5;
+export const PROTOCOL = 7;
 
 /** The `type` of the one `window.postMessage`, which carries the port. */
 export const HELLO = "exav-frame/hello";
@@ -100,11 +133,22 @@ export interface FrameOptions {
   };
   ifc?: { ground?: "light" | "dark"; colors?: { light: string; dark: string }; highlight?: string; timeoutMs?: number; maxTriangles?: number };
   model?: { surface?: number; zUp?: boolean; timeoutMs?: number; maxTriangles?: number };
-  archive?: { maxExtractedBytes?: number; maxMembers?: number; maxCompressionRatio?: number };
+  archive?: { maxExtractedBytes?: number; maxMembers?: number };
   /** For the converted Office formats (`rtf()`, `doc()`...). */
   conversion?: { timeoutMs?: number; maxMemory?: number; converter?: "exav" | "external"; externalConverter?: string };
   /** "none": no player controls in the frame, for a host drawing its own (`MediaController`). */
   media?: { controls?: "native" | "none" };
+  /**
+   * The frame's detection of the files inside an archive: the host's
+   * `sniffTimeoutMs` and `sniffBytes`, which it sets here itself.
+   */
+  sniff?: { timeoutMs?: number; bytes?: number };
+  /**
+   * The limits on a ZIP's directory the frame applies before it opens an
+   * Office file or an archive: the host's `maxExtractedBytes`, `maxMembers` and
+   * `maxCompressionRatio`, which it sets here itself.
+   */
+  limits?: { maxExtractedBytes?: number; maxMembers?: number; maxCompressionRatio?: number };
 }
 
 /**
@@ -124,7 +168,13 @@ export interface OpenMessage {
   tree?: { path: string; paths: string[] };
   options: FrameOptions;
   theme: FrameTheme;
+  /** The file's highlights, each with its id, and the one to go to (`ViewerFile.focusHighlight`). */
+  highlights?: FrameHighlight[];
+  focusHighlight?: string;
 }
+
+/** A highlight as the frame is given it: its id always set. */
+export type FrameHighlight = Highlight & { id: string };
 
 /** The answer to a `read`: the bytes, exactly as many as asked (fewer only at the end of the file), or why not. */
 export type BytesMessage = { type: "bytes"; id: number; data: ArrayBuffer } | { type: "bytes"; id: number; error: "refused" | "failed" };
@@ -169,8 +219,24 @@ export interface ReplaceMessage {
   source: OpenSource;
 }
 
-export type CommandTarget = "pages" | "zoom" | "drag" | "outline" | "layers" | "storeys" | "layouts" | "ground" | "archive" | "media" | "sheets";
-const COMMAND_TARGETS: readonly CommandTarget[] = ["pages", "zoom", "drag", "outline", "layers", "storeys", "layouts", "ground", "archive", "media", "sheets"];
+/**
+ * What a file is, asked of the frame, which holds exav's detection module:
+ * its first bytes (at most `sniff.bytes` of them) and its size, or the
+ * address the frame is given the file at, whose first bytes it reads itself.
+ * Answered by a `sniffed` with the same call.
+ */
+export interface SniffMessage {
+  type: "sniff";
+  call: number;
+  /** The formats the host opens, in detection order. */
+  formats: readonly BuiltinFormat[];
+  file: { name: string; type: string; path: string };
+  source: { kind: "head"; head: ArrayBuffer; size: number } | { kind: "url"; url: string };
+  sniff: NonNullable<FrameOptions["sniff"]>;
+}
+
+export type CommandTarget = "pages" | "zoom" | "drag" | "outline" | "layers" | "storeys" | "layouts" | "ground" | "archive" | "media" | "sheets" | "highlights";
+const COMMAND_TARGETS: readonly CommandTarget[] = ["pages", "zoom", "drag", "outline", "layers", "storeys", "layouts", "ground", "archive", "media", "sheets", "highlights"];
 
 export interface CommandMessage {
   type: "command";
@@ -207,7 +273,7 @@ export type StatusSnapshot =
   | { phase: "empty" }
   | { phase: "error"; code: ErrorCode };
 
-export type ErrorCode = "pdf" | "image" | "image_no_preview" | "drawing" | "drawing_version" | "office" | "needs_converter" | "media" | "model" | "archive" | "text" | "text_binary" | "file";
+export type ErrorCode = "pdf" | "image" | "image_no_preview" | "drawing" | "drawing_version" | "office" | "needs_converter" | "media" | "model" | "archive" | "text" | "text_binary" | "damaged" | "wrong_type" | "too_large" | "too_compressed" | "too_many_entries" | "file";
 
 export interface ArchiveSnapshot {
   members: readonly { index: number; name: string; uncompressedSize: number; encrypted: boolean }[];
@@ -235,6 +301,8 @@ export interface Snapshots {
   sheets: { items: readonly { index: number; name: string }[]; current: number };
   pictures: { count: number; space: RegionSpace };
   viewport: Viewport | null;
+  /** Where each highlight is; its label, colour and text are the host's own. */
+  highlights: { items: readonly Pick<PlacedHighlight, "id" | "state" | "page" | "rects">[]; current: string | null };
 }
 
 export type ControllerKey = keyof Snapshots;
@@ -256,6 +324,7 @@ export const CONTROLLER_KEYS: readonly ControllerKey[] = [
   "sheets",
   "pictures",
   "viewport",
+  "highlights",
 ];
 
 /** What a controller has besides its store. */
@@ -291,7 +360,9 @@ export type FrameMessage =
   /** The answer to a `raster`: the picture and what it shows, or why there is none. */
   | { type: "rastered"; id: number; result: RasterResult }
   /** The answer to a `replace`: whether the document was replaced. False: nothing changed. */
-  | { type: "replaced"; call: number; ok: boolean };
+  | { type: "replaced"; call: number; ok: boolean }
+  /** The answer to a `sniff`: the format the file's bytes, name and type give, null for none. */
+  | { type: "sniffed"; call: number; format: BuiltinFormat | null };
 
 /** The picture of a `rastered`, as the frame sends it. */
 export type RasterResult =
@@ -326,7 +397,7 @@ function isPicture(v: unknown): v is ImageBitmap {
 
 const SPACES: readonly RegionSpace[] = ["page", "pixels", "drawing", "camera", "frame"];
 
-const ERROR_CODES: readonly ErrorCode[] = ["pdf", "image", "image_no_preview", "drawing", "drawing_version", "office", "needs_converter", "media", "model", "archive", "text", "text_binary", "file"];
+const ERROR_CODES: readonly ErrorCode[] = ["pdf", "image", "image_no_preview", "drawing", "drawing_version", "office", "needs_converter", "media", "model", "archive", "text", "text_binary", "damaged", "wrong_type", "too_large", "too_compressed", "too_many_entries", "file"];
 const REFUSALS = ["archive_no_reader", "archive_failed_member", "archive_member_encrypted", "archive_member_unsupported"] as const;
 
 const STEPS: readonly LoadStep[] = ["file", "engine", "start", "read", "convert", "render"];
@@ -359,7 +430,7 @@ export function checkStatus(v: unknown): StatusSnapshot | null {
 // A size of -1 is one the archive does not declare (a gzip or xz stream's).
 const checkMember = (m: unknown) =>
   isObject(m) && isInt(m.index) && isText(m.name, MAX_PATH) && isFinite(m.uncompressedSize) && m.uncompressedSize >= -1 && typeof m.encrypted === "boolean"
-    ? { index: m.index, name: m.name, uncompressedSize: m.uncompressedSize, encrypted: m.encrypted }
+    ? { index: m.index, name: shownName(m.name), uncompressedSize: m.uncompressedSize, encrypted: m.encrypted }
     : null;
 
 /** Each check returns a fresh copy of what it accepted, never the object it was given. */
@@ -383,7 +454,7 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
     for (const e of v) {
       if (!isObject(e) || !isText(e.title) || !isInt(e.page, 1) || !isInt(e.depth, 0, 64)) return undefined;
       if (e.offset !== null && !(isFinite(e.offset) && e.offset >= 0 && e.offset <= 1)) return undefined;
-      out.push({ title: e.title, page: e.page, depth: e.depth, offset: e.offset });
+      out.push({ title: shownName(e.title), page: e.page, depth: e.depth, offset: e.offset });
     }
     return out;
   },
@@ -392,7 +463,7 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
     const items: LayerItem[] = [];
     for (const i of v.items) {
       if (!isObject(i) || !isText(i.id) || !isText(i.name) || !isColor(i.color) || typeof i.visible !== "boolean") return undefined;
-      items.push({ id: i.id, name: i.name, color: i.color, visible: i.visible });
+      items.push({ id: i.id, name: shownName(i.name), color: i.color, visible: i.visible });
     }
     return { kind: v.kind, items };
   },
@@ -402,7 +473,7 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
     for (const i of v.items) {
       if (!isObject(i) || !isText(i.id) || !isText(i.name) || typeof i.visible !== "boolean") return undefined;
       if (i.elevation !== null && !isFinite(i.elevation)) return undefined;
-      items.push({ id: i.id, name: i.name, elevation: i.elevation, visible: i.visible });
+      items.push({ id: i.id, name: shownName(i.name), elevation: i.elevation, visible: i.visible });
     }
     return { items };
   },
@@ -411,7 +482,7 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
     const items: { id: string; name: string; isModel: boolean }[] = [];
     for (const i of v.items) {
       if (!isObject(i) || !isText(i.id) || !isText(i.name) || typeof i.isModel !== "boolean") return undefined;
-      items.push({ id: i.id, name: i.name, isModel: i.isModel });
+      items.push({ id: i.id, name: shownName(i.name), isModel: i.isModel });
     }
     return { items, current: v.current };
   },
@@ -419,7 +490,8 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
   selection(v) {
     if (v === null) return null;
     if (!isObject(v) || !isText(v.name) || !isText(v.category)) return undefined;
-    return isText(v.storey) ? { name: v.name, category: v.category, storey: v.storey } : { name: v.name, category: v.category };
+    const shown = { name: shownName(v.name), category: shownName(v.category) };
+    return isText(v.storey) ? { ...shown, storey: shownName(v.storey) } : shown;
   },
   info(v) {
     if (!isObject(v)) return undefined;
@@ -442,7 +514,7 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
         continue;
       }
       if (!isList(w.names, 16) || !w.names.every((n) => isText(n, 256))) return undefined;
-      out.push({ key: w.key, count: w.count, names: w.names as string[] });
+      out.push({ key: w.key, count: w.count, names: (w.names as string[]).map(shownName) });
     }
     return out;
   },
@@ -460,7 +532,7 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
       const o = v.opened;
       const member = isObject(o) ? checkMember(o.member) : null;
       if (!isObject(o) || !member || !isText(o.name, MAX_PATH) || !(o.format === null || isText(o.format, 64)) || !isInt(o.session, 1)) return undefined;
-      opened = { member, name: o.name, format: o.format, session: o.session };
+      opened = { member, name: shownName(o.name), format: o.format, session: o.session };
     }
     let refused: ArchiveSnapshot["refused"] = null;
     if (v.refused !== null) {
@@ -495,7 +567,7 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
     const items: { index: number; name: string }[] = [];
     for (const i of v.items) {
       if (!isObject(i) || !isInt(i.index) || !isText(i.name)) return undefined;
-      items.push({ index: i.index, name: i.name });
+      items.push({ index: i.index, name: shownName(i.name) });
     }
     return { items, current: v.current };
   },
@@ -509,7 +581,56 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
     if (!region) return undefined;
     return { space: v.space, page: v.page, ...(v.layout !== undefined && { layout: v.layout }), region };
   },
+  highlights(v) {
+    if (!isObject(v) || !isList(v.items, MAX_HIGHLIGHTS) || !(v.current === null || isText(v.current))) return undefined;
+    const items: Snapshots["highlights"]["items"][number][] = [];
+    for (const i of v.items) {
+      if (!isObject(i) || !isText(i.id) || !oneOf(i.state, ["pending", "shown", "missing"] as const)) return undefined;
+      if (!(i.page === null || isInt(i.page, 1, MAX_ITEMS)) || !isList(i.rects, MAX_HIGHLIGHT_RECTS)) return undefined;
+      const rects = checkRects(i.rects);
+      if (!rects) return undefined;
+      items.push({ id: i.id, state: i.state, page: i.page, rects });
+    }
+    return { items, current: v.current };
+  },
 };
+
+/** Boxes in fractions of a page, each within it, or null. */
+function checkRects(v: unknown[]): Region[] | null {
+  const out: Region[] = [];
+  for (const r of v) {
+    if (!isObject(r) || ![r.x, r.y, r.width, r.height].every((n) => isFinite(n) && n >= 0 && n <= 1)) return null;
+    out.push({ x: r.x as number, y: r.y as number, width: r.width as number, height: r.height as number });
+  }
+  return out;
+}
+
+/**
+ * The highlights the frame takes from `open`: each well formed, with an id;
+ * one that is not is left out. Boxes are clipped to the page where they are
+ * drawn (`createHighlights`).
+ */
+export function checkHighlights(v: unknown): FrameHighlight[] | undefined {
+  if (!isList(v, MAX_HIGHLIGHTS)) return undefined;
+  const out: FrameHighlight[] = [];
+  for (const h of v) {
+    if (!isObject(h) || !isText(h.id)) continue;
+    if (h.color !== undefined && !isColor(h.color)) continue;
+    if (h.label !== undefined && !isText(h.label)) continue;
+    if (h.page !== undefined && !isInt(h.page, 1, MAX_ITEMS)) continue;
+    const common = { id: h.id, ...(h.color !== undefined && { color: h.color as string }), ...(h.label !== undefined && { label: h.label as string }) };
+    if (typeof h.text === "string") {
+      if (!isText(h.text, MAX_HIGHLIGHT_TEXT)) continue;
+      out.push({ ...common, text: h.text, ...(h.page !== undefined && { page: h.page as number }) });
+      continue;
+    }
+    if (h.page === undefined || !isList(h.rects, MAX_HIGHLIGHT_RECTS)) continue;
+    const rects: Region[] = [];
+    for (const r of h.rects) if (isObject(r) && [r.x, r.y, r.width, r.height].every(isFinite)) rects.push({ x: r.x as number, y: r.y as number, width: r.width as number, height: r.height as number });
+    out.push({ ...common, page: h.page as number, rects });
+  }
+  return out;
+}
 
 /** The value of `key` if it has the shape that controller's store has, else undefined. */
 export function checkSnapshot<K extends ControllerKey>(key: K, v: unknown): Snapshots[K] | undefined {
@@ -586,6 +707,8 @@ export function checkFrameMessage(v: unknown): FrameMessage | null {
       return oneOf(v.key, NAV_KEYS) && typeof v.shift === "boolean" && typeof v.repeat === "boolean" ? { type: "key", key: v.key, shift: v.shift, repeat: v.repeat } : null;
     case "replaced":
       return isInt(v.call) && typeof v.ok === "boolean" ? { type: "replaced", call: v.call, ok: v.ok } : null;
+    case "sniffed":
+      return isInt(v.call) && (v.format === null || oneOf(v.format, BUILTIN_ORDER)) ? { type: "sniffed", call: v.call, format: v.format } : null;
     case "rastered":
       return isInt(v.id) ? { type: "rastered", id: v.id, result: checkRasterResult(v.result) } : (closeBitmap(isObject(v.result) ? v.result.bitmap : undefined), null);
     default:
@@ -643,12 +766,15 @@ function checkPolicy(v: unknown): FramePolicy | null {
 }
 
 /**
- * Whether the host may open `url` for the frame: an absolute http(s) URL.
- * Relative URLs are refused, as the frame has no base the host shares.
+ * Whether the host may open `url` for the frame: an absolute http(s) URL
+ * without credentials (`https://bank.example@evil.example` is refused, as
+ * `safeTarget` refuses it). Relative URLs are refused, as the frame has no
+ * base the host shares.
  */
 export function linkTarget(url: string): string | null {
   try {
     const parsed = new URL(url);
+    if (parsed.username || parsed.password) return null;
     return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : null;
   } catch {
     return null;
@@ -666,10 +792,17 @@ function defined<T extends Record<string, unknown>>(o: T): T {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as T;
 }
 
+function checkSniffOptions(sniff: Record<string, unknown>): NonNullable<FrameOptions["sniff"]> {
+  return defined({
+    timeoutMs: typeof sniff.timeoutMs === "number" && Number.isFinite(sniff.timeoutMs) && sniff.timeoutMs >= 0 ? sniff.timeoutMs : undefined,
+    bytes: typeof sniff.bytes === "number" && Number.isSafeInteger(sniff.bytes) && sniff.bytes >= 0 ? sniff.bytes : undefined,
+  });
+}
+
 /** The options the frame will use: known keys of the right type, the rest dropped. */
 export function checkOptions(v: unknown): FrameOptions {
   const out: FrameOptions = {};
-  const { pdf, image, cad, ifc, model, archive, conversion, media } = isObject(v) ? v : {};
+  const { pdf, image, cad, ifc, model, archive, conversion, media, sniff, limits } = isObject(v) ? v : {};
   if (isObject(pdf))
     out.pdf = defined({
       minZoom: num(pdf.minZoom),
@@ -720,7 +853,6 @@ export function checkOptions(v: unknown): FrameOptions {
     out.archive = defined({
       maxExtractedBytes: num(archive.maxExtractedBytes),
       maxMembers: num(archive.maxMembers),
-      maxCompressionRatio: num(archive.maxCompressionRatio),
     });
   if (isObject(conversion)) {
     const converter = oneOf(conversion.converter, ["exav", "external"] as const) ? conversion.converter : undefined;
@@ -734,6 +866,11 @@ export function checkOptions(v: unknown): FrameOptions {
     out.conversion = defined({ timeoutMs: num(conversion.timeoutMs), maxMemory: num(conversion.maxMemory), converter, externalConverter });
   }
   if (isObject(media)) out.media = defined({ controls: oneOf(media.controls, ["native", "none"] as const) ? media.controls : undefined });
+  if (isObject(sniff)) out.sniff = checkSniffOptions(sniff);
+  if (isObject(limits)) {
+    const whole = (n: unknown) => (typeof n === "number" && Number.isSafeInteger(n) && n >= 0 ? n : undefined);
+    out.limits = defined({ maxExtractedBytes: whole(limits.maxExtractedBytes), maxMembers: whole(limits.maxMembers), maxCompressionRatio: whole(limits.maxCompressionRatio) });
+  }
   return out;
 }
 
@@ -749,7 +886,18 @@ export function checkOpen(v: unknown, known: readonly BuiltinFormat[]): OpenMess
   if (format === undefined) return null;
   const tree = v.tree === undefined ? undefined : checkTree(v.tree);
   if (tree === null) return null;
-  return { type: "open", formats, file: { name: f.name, type: f.type, path: f.path, format }, source, ...(tree ? { tree } : {}), options: checkOptions(v.options), theme: checkTheme(v.theme) };
+  const highlights = checkHighlights(v.highlights);
+  return {
+    type: "open",
+    formats,
+    file: { name: f.name, type: f.type, path: f.path, format },
+    source,
+    ...(tree ? { tree } : {}),
+    options: checkOptions(v.options),
+    theme: checkTheme(v.theme),
+    ...(highlights && { highlights }),
+    ...(isText(v.focusHighlight) && { focusHighlight: v.focusHighlight }),
+  };
 }
 
 function checkTree(v: unknown): { path: string; paths: string[] } | null {
@@ -829,4 +977,18 @@ export function checkReplace(v: unknown, known: readonly BuiltinFormat[]): Repla
   const format = f.format === null ? null : oneOf(f.format, known) ? f.format : undefined;
   if (format === undefined) return null;
   return { type: "replace", call: v.call, generation: v.generation, file: { name: f.name, type: f.type, path: f.path, format }, source };
+}
+
+/** A `sniff`, checked, or null. */
+export function checkSniff(v: unknown, known: readonly BuiltinFormat[]): SniffMessage | null {
+  if (!isObject(v) || v.type !== "sniff" || !isInt(v.call) || !isList(v.formats, 64) || !isObject(v.file) || !isObject(v.source)) return null;
+  const f = v.file;
+  if (!isText(f.name, MAX_PATH) || !isText(f.type, 256) || !isText(f.path, MAX_PATH)) return null;
+  const s = v.source;
+  let source: SniffMessage["source"];
+  if (s.kind === "head" && s.head instanceof ArrayBuffer && isInt(s.size, s.head.byteLength)) source = { kind: "head", head: s.head, size: s.size };
+  else if (s.kind === "url" && isText(s.url, MAX_URL) && linkTarget(s.url)) source = { kind: "url", url: linkTarget(s.url)! };
+  else return null;
+  const formats = v.formats.filter((x): x is BuiltinFormat => oneOf(x, known));
+  return { type: "sniff", call: v.call, formats, file: { name: f.name, type: f.type, path: f.path }, source, sniff: isObject(v.sniff) ? checkSniffOptions(v.sniff) : {} };
 }

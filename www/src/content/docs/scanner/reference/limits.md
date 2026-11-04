@@ -18,31 +18,41 @@ column is for [library users](/subprojects/exav-core/) (`Limits` in exav-unpack,
 | CLI flag | Engine field | Default | What it stops |
 |---|---|---|---|
 | `--max-input-bytes` | `ScanOptions::max_scan_size` | no limit | A top-level input too big to take whole (its first bytes still get the whole scan) |
-| `--max-object-bytes` | `Limits::max_buffer_bytes` and `ScanOptions::deep_analysis_max` | 256 MiB | The largest single object held in memory; a larger file or member is read through a block cache or a temporary file |
+| `--max-object-bytes` | `Limits::max_buffer_bytes` (`ScanOptions::limits`) | 256 MiB | The largest single object held in memory; a larger file or member is read through a block cache or a temporary file. Also the PDF object table of bytecode and a GPT entry array |
 | `--max-matcher-bytes` | `Limits::max_scanned_bytes` | 10 GiB | Cumulative bytes fed to the matcher |
-| `--max-pcre-bytes` | `ScanOptions::max_pcre_bytes` | no limit (100 MiB under `--clamav-compat`) | PCRE subsignatures on an object larger than this, which then do not match |
+| `--max-hole-bytes` | `Limits::max_hole_bytes` | 64 GiB | Cumulative bytes of holes (the unwritten stretches of sparse files in a filesystem image) fed to the matcher as zeros; they count here and not toward `--max-matcher-bytes` |
+| `--max-pcre-bytes` | `ScanOptions::max_pcre_bytes` | no limit (100 MiB under `--clamav-compat`) | PCRE subsignatures on an object larger than this, which then do not match; the scan is reported incomplete, except under `--clamav-compat` |
+| `--max-regex-steps` | `ScanOptions::max_regex_steps` | 100,000,000 steps | The work one PCRE subsignature (lookaround or back reference) or one YARA regexp pattern may do on an object; a search that reaches it stops, and the scan is `LIMITS-EXCEEDED` unless something is found |
+| `--max-matcher-steps` | `ScanOptions::max_matcher_steps` | 2,000,000 steps per MiB, an object counting as at least 256 MiB | The verification of body signatures with wildcards and gaps in one object, and a 32nd of it for one group of signatures sharing an anchor; past either the search stops, and the scan is `LIMITS-EXCEEDED` unless something is found |
 | `--min-scan-bytes` | `ScanOptions::min_scan_bytes` | 6 bytes | Every check on an object smaller than this, which then counts as clean; `0` scans every object |
 | `--max-pe-emulation-steps` | `Limits::max_pe_emulation_steps` | 1,000,000,000 | Emulator instructions across all packed executables in one file |
 | `--max-unpack-depth` | `Limits::max_recursion` | 16 | Nesting depth, containers inside containers |
-| `--max-members` | `Limits::max_members` | 100000 | Member-count blowup |
-| `--max-extracted-bytes` (lowered by `--max-process-bytes`) | `Limits::max_extracted_bytes` | 1 GiB (400M under `--clamav-compat`) | What formats that decode a member whole have produced so far in one scan; never released. Members streamed to the matcher are not counted (ZIP, 7z, TAR, CAB and the stream codecs scan past it, bounded by `--max-matcher-bytes`) |
+| `--max-members` | `Limits::max_members` | 100000 | Member-count blowup; also MFT records, ISO and UDF directories and partition table entries |
+| `--max-extracted-bytes` (lowered by `--max-process-bytes`) | `Limits::max_extracted_bytes` | 1 GiB (400M under `--clamav-compat`) | What formats that decode a member into memory themselves have produced so far in one scan; never released. A member handed over as a stream is not counted (ZIP, 7z, TAR, CAB and the stream codecs): the scan holds it up to `--max-object-bytes` and reads a larger one in place or from a spill file, within `--max-matcher-bytes` |
 | `--max-bytecode-memory-bytes` (lowered by `--max-process-bytes`) | `Limits::max_bytecode_memory_bytes` | 256 MiB | What one run of a bytecode signature holds: its `malloc`s, its call frames and the globals it reads; past it the run stops as incomplete |
-| `--object-cache-bytes` (lowered by `--max-process-bytes`) | `ScanOptions::object_cache_bytes` | 8 MiB | Memory held by the block cache of each object read in place; not a limit on what is scanned, only on how often the source is read again |
+| `--object-cache-bytes` (lowered by `--max-process-bytes`) | `ScanOptions::object_cache_bytes` | 32 MiB | Memory held by the block cache of each object read in place; not a limit on what is scanned, only on how often the source is read again |
 | `--object-cache-block-bytes` | `ScanOptions::object_cache_block_bytes` | 1 MiB | The unit of that cache, and of a request that does not continue the previous one over HTTP |
 | `--http-request-bytes` (lowered by `--max-process-bytes`) | `ScanOptions::http_request_bytes` | 8 MiB | The most one HTTP range request fetches, and holds while it is read |
-| none | `Limits::max_compression_ratio` | 1000 | One stream that expands past the ratio |
-| none | none (fixed) | 16 of each kind | PE, ELF or Mach-O images [carved](/scanner/reference/formats/#found-inside-other-files) from one object |
-| none | none (fixed) | 32 | Archives carved from one object |
+| `--http-timeout-secs` | `ScanOptions::http_timeout_secs` | 120 s | The most one HTTP request takes, its body included |
+| `--http-max-redirects` | `ScanOptions::http_max_redirects` | 10 | Redirects followed to reach an HTTP object |
+| `--max-compression-ratio` | `Limits::max_compression_ratio` | 1000 | A member that decodes to more than this many times its size in its container, once it is past `--max-object-bytes`; it is left out and the other members are still scanned |
+| `--max-carved-executables` | `Limits::max_carved_executables` | 16 of each kind | PE, ELF or Mach-O images [carved](/scanner/reference/formats/#found-inside-other-files) from one object |
+| `--max-carved-archives` | `Limits::max_carved_archives` | 32 | Archives carved from one object |
+| `--max-base64-payloads` | `Limits::max_base64_payloads` | 8 | Executables or archives [decoded from the base64 runs](/scanner/reference/formats/#found-inside-other-files) of one text |
+| `--max-base64-runs` | `Limits::max_base64_runs` | 64 | Base64 runs of one text that start like an executable or an archive and are decoded to see |
+| `--max-page-assets` | `Limits::max_page_assets` | 16 | Base64 assets (`data:` URIs, inline images) decoded from one page of HTML or flat-XML Office |
 
 Each bound has one spelling; `clamscan`'s names (`--max-filesize`,
 `--max-scansize`, `--max-files`) are refused with an error naming the exav flag.
 See [the flag matrix](/scanner/reference/clamav-flag-matrix/).
 
 `--max-extracted-bytes` is the total a scan may decode whole. It counts the
-members that a format decodes into memory (RAR, OLE streams, PDF streams, RTF
-objects, installers and the like), added up over the scan; a member streamed to
-the matcher is not in it, so a ZIP, 7z, TAR or CAB that unpacks to several
-gigabytes is scanned, within `--max-matcher-bytes`. It is 1 GiB (400M under
+members that a format decodes into memory itself (OLE streams, PDF streams, RTF
+objects, installers, decrypted members and the like), added up over the scan; a
+member handed over as a stream is not in it: the scan holds one up to
+`--max-object-bytes` and reads a larger one in place or from a spill file, so a
+ZIP, 7z, TAR or CAB that unpacks to several gigabytes is scanned, within
+`--max-matcher-bytes`. It is 1 GiB (400M under
 `--clamav-compat`), `off` or `0` removes it, and `--max-process-bytes` lowers
 it, together with `--max-object-bytes` and `--max-bytecode-memory-bytes`, to what fits
 the memory a scan gets (see
@@ -54,26 +64,31 @@ lowercase one of at most 16 MiB. The
 default 2 G changes neither the default limits nor `--clamav-compat`'s.
 
 `--clamav-compat` sets `--max-input-bytes` to 100M, `--max-unpack-depth` to 17
-and `--max-members` to 10000, and holds 400M per file, both in total and as the
-largest top-level file held whole: ClamAV's scan size.
+and `--max-members` to 10000, and holds 400M per file in total: ClamAV's scan
+size. The largest object held whole stays at `--max-object-bytes`.
 
 ### `0` and `off`
 
 - On a limit (every `--max-` flag except `--max-unpack-depth`, which includes
-  `--max-jobs-per-worker`, plus `--icap-max-requests`), `0` and `off` both mean
-  no limit. An explicit `0` wins over the `--clamav-compat` default.
-  `--startup-wait-secs 0` and `off` both mean no wait.
+  `--max-jobs-per-worker`, plus `?request-secs=` and `?max-requests=` on a
+  listener's address), `0` and `off` both mean no limit. An explicit `0` wins
+  over the `--clamav-compat` default. `--startup-wait-secs 0` and `off` both
+  mean no wait.
 - Where no limit would be unsafe, there is no `off`: `--max-unpack-depth` (each
-  level costs stack), `--icap-idle-secs` and `--icap-max-header-bytes` (a client
-  could hold a connection forever). `0` is refused too.
+  level costs stack), `?idle-secs=` and `?max-header-bytes=` on a listener's
+  address (a client could hold a connection forever). `0` is refused too, but
+  for `--max-unpack-depth`, where it opens no container.
+- `?session-secs=` and `?reply-secs=` on a listener's address are off when the
+  key is absent, and refuse `0` and `off`: leaving the key out already says no
+  limit, and a `0` that elsewhere means none would here read as no time at all.
 - On a period (`--update-interval-secs`, `--metrics-secs`, `--slow-scan-secs`),
   `off` turns it off and `0` is refused, because a zero-second period reads as
   "always".
 - Where `0` is a value in its own right, `off` says something else:
   `--spill-threshold-bytes 0` spills every stream at once and has no `off`
-  (`--spill-dir off` keeps streams in RAM); `--icap-preview-bytes 0` previews
-  headers only and `off` leaves the header out; `--icap-options-ttl-secs 0`
-  expires at once and `off` never does. `--min-scan-bytes 0` scans every
+  (`--spill-dir off` keeps streams in RAM); on an ICAP address,
+  `?preview-bytes=0` previews headers only and `off` leaves the header out, and
+  `?options-ttl-secs=0` expires at once and `off` never does. `--min-scan-bytes 0` scans every
   object and has no `off`.
 - A threshold of findings (`--dlp-credit-cards`, `--dlp-ssns`) refuses `0`,
   which would alert on every file; leave the flag out instead.
@@ -84,11 +99,28 @@ Notes:
 - **`max_buffer_bytes` bounds one buffer, not their sum.** A container, its
   member and that member's member can each be mid-scan at once. The bound on
   total live memory is `max_extracted_bytes`.
+- **A member a format decodes whole that is past `--max-object-bytes` is left
+  out**, what was decoded of it counts toward `--max-extracted-bytes`, and the
+  other members of its container are still scanned; the container is then
+  `LIMITS-EXCEEDED` unless something is found. A member its container says is
+  larger than what is left of `--max-extracted-bytes` is left out before it is
+  decoded, unless the file ends inside it, and the walk goes on; one that
+  decodes past what is left ends the walk of its container there.
 - **`max_scanned_bytes` is a CPU bound.** It counts bytes fed to the matcher,
-  not bytes held in memory. Raising it costs only scan time.
+  not bytes held in memory. Raising it costs only scan time. The bytes hashed
+  for a PE's section hashes and read for their entropy count toward it too.
+- **What the YARA modules copy counts toward `--max-object-bytes`**: the names
+  an executable's imports, exports, sections, symbols and .NET tables refer
+  to, as they are copied for the `pe`, `elf` and `dotnet` modules and the
+  import hash.
 - **`max_compression_ratio` is the weak one.** The input size it divides by is a
   header field the attacker wrote, so it is a cheap early filter; the byte
-  budgets are what hold.
+  budgets are what hold. It is asked only of a member whose output passes
+  `--max-object-bytes`: below that a member is held in memory and the memory
+  limits bound it, and with `--max-object-bytes off` there is no output to pass
+  it. A member over the ratio is left out, what was decoded of it counts toward
+  `--max-matcher-bytes`, and the other members of its container are still
+  scanned; the container is then `LIMITS-EXCEEDED` unless something is found.
 
 One more bound is charged against the rules rather than the file: each buffer
 gets 20 million YARA condition-evaluation steps, shared by every rule in the set.
@@ -113,6 +145,20 @@ unless that finds something.
 
 See [Buffering a stream](/scanner/reference/cli/#buffering-a-stream-spill) for how they
 nest and what `--spill-dir off` changes.
+
+## QR codes
+
+With `--qr` (feature `qr`), the reading of the QR codes in one image is
+bounded. Past any bound the scan is `LIMITS-EXCEEDED`, unless something is
+found. `off` or `0` removes the bound.
+
+| Flag | Default | Bounds |
+|---|---|---|
+| `--max-qr-pixels` | 50000000 | Pixels an image may have to be read |
+| `--max-qr-millis` | 5000 | Milliseconds the reading of one image may take; the reader is stopped wherever it is |
+| `--max-qr-codes` | 64 | QR codes read in one image |
+| `--max-qr-finders` | 1000 | Finder patterns found in one image |
+| `--max-qr-grids` | 256 | Groups of three finder patterns tried as a QR code in one image |
 
 ## The kernel backstops
 

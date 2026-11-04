@@ -1,0 +1,24 @@
+---
+title: File formats
+description: "Every file format exav reads, in one table: whether the scanner checks it for malware, whether its members or parts can be extracted, whether the viewer shows it, with an example in the demo."
+tableOfContents: false
+---
+
+import FormatTable from '../../components/FormatTable.astro';
+
+What exav does with each format it knows, built from the project's format
+registry (`formats/registry.json`, which the tests check against the code):
+
+- **Malware scan.** Every file is scanned for signatures as bytes, whatever its
+  format. A container is opened and every member is scanned too, some documents
+  are also scanned through the text they show, and a format exav recognises but
+  does not open is reported as not examined, never as clean. The
+  [scanner's formats page](/scanner/reference/formats/) has the detail.
+- **Extract.** What `exav-unpack` takes out: the members of an archive, or the
+  parts of a document (the embedded files and streams of a PDF, the XML parts
+  of a DOCX). *Streamed* means decoded as it is read, at any size; *read whole*
+  means held in memory first. See the [extractor's formats](/unpack/formats/).
+- **View.** Whether the [viewer](/viewer/) draws it in the browser, and a file
+  of that format to open in the [demo](/viewer/demo/) when it has one.
+
+<FormatTable />

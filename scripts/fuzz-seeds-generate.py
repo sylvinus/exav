@@ -452,16 +452,20 @@ ODF_NS = ('xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
 
 
 def png_bytes(w, h, mode="RGB"):
-    from PIL import Image
-    im = Image.new(mode, (w, h))
-    px = im.load()
+    """A PNG of a small pattern, RGB or grey ("L"), written without Pillow."""
+    rgb = mode == "RGB"
+    rows = bytearray()
     for y in range(h):
+        rows.append(0)
         for x in range(w):
             v = (x * 7 % 256, y * 9 % 256, (x * y) % 256)
-            px[x, y] = v if mode == "RGB" else v[0]
-    b = io.BytesIO()
-    im.save(b, "PNG")
-    return b.getvalue()
+            rows.extend(v if rgb else v[:1])
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    head = struct.pack(">IIBBBBB", w, h, 8, 2 if rgb else 0, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", head) + chunk(b"IDAT", zlib.compress(bytes(rows), 9)) + chunk(b"IEND", b"")
 
 
 def fodt(variant):
