@@ -422,9 +422,9 @@ where
     while ap_count < 7 && info.apat[ap_count] != 0 {
         ap_count += 1
     }
-    for i in 1..(ap_count.saturating_sub(1)) {
-        score += fitness_apat(img, perspective, 6, info.apat[i] as i32);
-        score += fitness_apat(img, perspective, info.apat[i] as i32, 6);
+    for &a in info.apat.iter().take(ap_count.saturating_sub(1)).skip(1) {
+        score += fitness_apat(img, perspective, 6, a as i32);
+        score += fitness_apat(img, perspective, a as i32, 6);
     }
     for i in 1..ap_count {
         for j in 1..ap_count {

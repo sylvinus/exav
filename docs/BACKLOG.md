@@ -1032,7 +1032,11 @@ Open:
   `rustc-hash` 1.x, `bstr`...; 416 `unsafe` keywords) for a parser whose AST
   the in-tree engine then lowers. An in-tree YARA parser is the only way out
   and a large one.
-- **`paste` is the last `deny.toml` ignore**: it is unmaintained, build-time
+- **`chrono` is unmaintained (RUSTSEC-2026-0543, ignored in `deny.toml`).**
+  `delharc` 0.8.0 needs it for LHA timestamps, with no feature to leave it
+  out, and exav-unpack's CLI uses it for local times. Its maintainer points to
+  `jiff`; the CLI can move, `delharc` needs an upstream change or a fork.
+- **`paste` is a `deny.toml` ignore**: it is unmaintained, build-time
   only, and comes from `zenjxl-decoder-simd`'s `simd_function!`, which expands
   to `paste::paste!` in the decoder. Dropping it means copying that 9,000-line
   crate (and rewriting the macro) for no change in the module; not worth it

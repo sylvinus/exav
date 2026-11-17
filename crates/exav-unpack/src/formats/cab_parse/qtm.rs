@@ -227,13 +227,9 @@ impl<'a> Decoder<'a> {
         let target = ((self.code - self.low + 1) * total - 1) / range;
 
         let n = m.sym.len();
-        let mut slot = n - 1;
-        for i in 1..=n {
-            if m.cum[i] <= target {
-                slot = i - 1;
-                break;
-            }
-        }
+        let slot = (1..=n)
+            .find(|&i| m.cum[i] <= target)
+            .map_or(n - 1, |i| i - 1);
         let symbol = m.sym[slot];
 
         // Narrow the interval; both bounds use the OLD low.

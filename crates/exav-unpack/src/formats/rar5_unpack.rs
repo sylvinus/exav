@@ -211,13 +211,9 @@ fn decode_number(br: &mut BitReader, table: &DecodeTable, p: &[u8]) -> u16 {
         }
     }
 
-    let mut bits = 15usize;
-    for i in (table.quick_bits as usize + 1)..15 {
-        if bitfield < table.decode_len[i] {
-            bits = i;
-            break;
-        }
-    }
+    let bits = ((table.quick_bits as usize + 1)..15)
+        .find(|&i| bitfield < table.decode_len[i])
+        .unwrap_or(15);
     br.skip(bits as i32);
 
     let mut dist = bitfield - table.decode_len[bits - 1];

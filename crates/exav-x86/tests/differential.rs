@@ -260,11 +260,11 @@ fn register_mismatch(ours: &exav_x86::Insn, iced: &Instruction) -> Option<String
     if ours.op_count() != iced.op_count() as usize {
         return None;
     }
-    for i in 0..ours.op_count() {
+    for (i, op) in ours.ops.iter().enumerate().take(ours.op_count()) {
         // The register file and number this crate claims. A general-purpose
         // register is compared within its own width, since the encoding numbers
         // `al`, `ax` and `eax` alike.
-        let (file, num) = match ours.ops[i] {
+        let (file, num) = match *op {
             Op::Reg(n, Size::B1) => (GPR8, n),
             Op::Reg(n, Size::B2) => (GPR16, n),
             Op::Reg(n, Size::B4) => (GPR32, n),
@@ -280,7 +280,7 @@ fn register_mismatch(ours: &exav_x86::Insn, iced: &Instruction) -> Option<String
         }
         let r = iced.op_register(i as u32);
         if file.get(num as usize) != Some(&r) {
-            return Some(format!("operand {i}: {:?} vs iced {r:?}", ours.ops[i]));
+            return Some(format!("operand {i}: {op:?} vs iced {r:?}"));
         }
     }
     None

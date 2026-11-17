@@ -931,13 +931,11 @@ impl Parser<'_> {
         if self.fields.is_empty() {
             return;
         }
-        let n = self.fields.len();
         let mut out = vec![];
-        for i in 0..n {
-            if self.fields[i].broken {
+        for f in &mut self.fields {
+            if f.broken {
                 continue;
             }
-            let f = &mut self.fields[i];
             out.push(Inline::FieldChar(FieldCharKind::Begin));
             out.push(Inline::InstrText(f.instr.clone()));
             if f.in_result {

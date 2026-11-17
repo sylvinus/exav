@@ -38,15 +38,15 @@ mod tests {
     fn move_stuff() {
         let mut decoder = MoveToFrontDecoder::new();
 
-        for i in 0..=255 {
-            assert_eq!(i, usize::from(decoder.symbols[i]));
+        for (i, &s) in decoder.symbols.iter().enumerate() {
+            assert_eq!(i, usize::from(s));
         }
 
         let decode = decoder.decode(0);
         assert_eq!(decode, 0);
 
-        for i in 0..=255 {
-            assert_eq!(i, usize::from(decoder.symbols[i]));
+        for (i, &s) in decoder.symbols.iter().enumerate() {
+            assert_eq!(i, usize::from(s));
         }
 
         let decode = decoder.decode(5);
@@ -58,8 +58,8 @@ mod tests {
         assert_eq!(decoder.symbols[3], 2);
         assert_eq!(decoder.symbols[4], 3);
         assert_eq!(decoder.symbols[5], 4);
-        for i in 6..=255 {
-            assert_eq!(i, usize::from(decoder.symbols[i]));
+        for (i, &s) in decoder.symbols.iter().enumerate().skip(6) {
+            assert_eq!(i, usize::from(s));
         }
     }
 }

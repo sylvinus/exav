@@ -18,396 +18,226 @@ program that opens it.
 - **More formats, read where they lie.** Virtual disks (VHD, VHDX, QCOW2,
   VMDK), filesystems (exFAT, SquashFS, cramfs, romfs, EROFS, HFS+, APFS, with
   ext, FAT and NTFS), 7z, WIM, xar and tar are read from a seekable source
-  without holding them, and a file past `--max-object-bytes` inside one is
-  scanned in full. The registry lists 126 formats.
-- **Installers opened**: Inno Setup 5.1.5 to 6.4.0 (every compression Setup
-  uses), InstallShield InstallScript cabinets and the setup executables of
-  InstallShield 2009 to 2011 and 2015 and later (the MSI and the files beside
-  it), AppleSingle and AppleDouble, CryptFF. An encrypted file is
-  `PASSWORD-PROTECTED`, and a version or layout exav does not read is reported.
-- **Large objects in bounded memory.** RAR archives and volume sets of any
-  size are decoded as they are read, in their own dictionary; a stored member
-  (ZIP, tar, ISO and the like) is scanned where it lies, through the block
-  cache; compound files, email and mailboxes, CHM, 7z folders with BCJ2 or AES,
-  and the compressed files of NTFS, HFS+, APFS and EROFS are read a piece at a
-  time; a PE past `--max-object-bytes` is parsed from its image, so an
-  installer with a large overlay gets the checks that read a PE's structure.
-  They were refused or `LIMITS-EXCEEDED`. Over HTTP an object is checked for
-  change while it is read.
-- **A visible-text layer** (`visible-text`, on by default, off under
-  `--clamav-compat`): Markdown, HTML, Word, PowerPoint, Excel, OpenDocument,
-  AutoCAD and IFC files are also scanned as the text a reader sees, with the
-  hyperlinks of OOXML documents, PDFs and drawings, speaker notes and an
-  email's headers, for `Target:0` and `Target:7` signatures and
-  `--detect phishing`. PDF text and the text of legacy and flat office files
-  are opt-in (`visible-text-pdf`, `visible-text-office`). `exav-grep --text`
-  searches it.
-- **QR codes** (`--qr`, feature `qr`, off by default and under
-  `--clamav-compat`): the codes in images, in archives, documents and the
-  images of a PDF, are matched as text and their links judged by
-  `--detect phishing`. `exav-grep --qr` searches them and `exav-qr` prints them.
-- **Office documents converted in safe Rust, in `exav-render`** (features
-  `office-sheets`, `office-slides`, `office-docs`, `office`; none is a
-  default): XLS, ODS, FODS, Numbers, Excel 2003 XML, HTML tables and SYLK to
-  XLSX; PowerPoint 95 to 2003, ODP, FODP and Keynote to PPTX; DOC, ODT, FODT,
-  RTF, Word 2003 XML and Pages to DOCX; ODG, FODG and Visio (VSDX) to PPTX.
-  The viewer shows them through `xlsx()`, `pptx()` and `docx()`.
-- **One reader per format, one walk.** The scanner and `exav-render` share the
-  readers for OLE2, Excel decryption, RTF, BIFF and code pages; exav,
-  exav-grep, `exav-unpack -r` and the wasm share one typer and one walk of
-  nested containers (`exav_unpack::tree`).
-- **Smaller and faster binaries.** Each reader is compiled once and the release
-  profile uses fat LTO and one codegen unit: exav 25.2 MB to 16.7 MB, exav-grep
-  13.6 to 8.6 MB, exav-unpack 7.6 to 5.4 MB, a corpus scan about 8% faster.
-  `cargo install` now builds with this profile and its overflow checks (about
-  3 GiB of memory at its peak); `--profile fast-build` is the shorter build.
-- **The viewer** (`@exav/viewer`) opens many more files (RAW cameras, JPEG XL,
-  SVG, OBJ, PLY, glTF, more IFC, older Office, more archives), tells a file by
-  its bytes with exav's own detection, draws pages of documents, 3D models and
-  drawings, can be driven by the host's own UI, and speaks German, Spanish and
-  Dutch. A sandboxed frame can be published for some formats only (`formats`,
-  `--format`).
-- **Daemon**: `--listen-health ADDR`, a listener that answers while the
-  workers are busy, and a `STATS` that reports the whole pool.
+  without holding them. The registry lists 126 formats.
+- **Installers opened**: Inno Setup 5.1.5 to 6.4.0, InstallShield cabinets
+  and setup executables (2009 to 2011, 2015 and later), AppleSingle and
+  AppleDouble, CryptFF.
+- **Large files in bounded memory.** RAR archives of any size are decoded as
+  they are read, stored members are scanned where they lie, and a large PE is
+  parsed from its image. A file past `--max-object-bytes` inside a container
+  is scanned in full; it was refused or `LIMITS-EXCEEDED`.
+- **What a reader sees.** Markdown, HTML, Office, OpenDocument, AutoCAD and
+  IFC files are also scanned as their visible text, with their links
+  (`visible-text`, on by default). PDF and legacy Office text are opt-in.
+  `exav-grep --text` searches it.
+- **QR codes** (`--qr`, off by default): the codes in images, documents and
+  archives are matched as text and their links checked by
+  `--detect phishing`. `exav-qr` prints them.
+- **Read as the program that opens it.** ZIP, PDF, mail, PE, Office packages
+  and a dozen other formats were read differently by exav in some cases; they
+  now agree, and more of what exav cannot read is reported instead of
+  answered `OK`.
+- **Office documents converted in safe Rust** (`exav-render`, opt-in
+  features): legacy, OpenDocument and Apple spreadsheets, presentations and
+  documents to XLSX, PPTX and DOCX, which the viewer shows.
+- **Smaller, faster binaries**: exav 25.2 MB to 16.7 MB, a corpus scan about
+  8% faster. `cargo install` builds with the release profile (about 3 GiB of
+  memory at its peak); `--profile fast-build` is the shorter build.
+- **The viewer** opens many more files (camera RAW, JPEG XL, SVG, 3D models,
+  older Office, more archives), tells a file by its bytes with exav's own
+  detection, can be driven by the host's own UI, and speaks German, Spanish
+  and Dutch.
 
 ### Breaking changes
 
-- The minimum Rust version is 1.95 (it was 1.92) and every crate is edition
-  2024.
-- A `.cvd` whose header md5 does not match, or that is cut short, is refused.
-- A source with no end (`exav /dev/zero`) is an error, not `OK`.
-- A YARA rule nested more than 10 parentheses deep is refused (12 before): the
-  parser's time doubles with each level.
+- Rust 1.95 or later (it was 1.92); every crate is edition 2024.
+- Refused now: a `.cvd` whose header md5 does not match or that is cut short,
+  a source with no end (`exav /dev/zero`, it was `OK`), a YARA rule nested
+  more than 10 parentheses deep (12 before), and an HTTP answer whose
+  `Content-Range` is not the one asked for.
 - A one-shot scan that `--max-scan-secs` ends keeps the exit status of what it
-  found (`1`, then `2`) and otherwise follows `--partial-as`; it was always `3`.
-- The `Content-Range` of an HTTP answer is checked; a server that answers
-  with another range or object is an error.
-- The block cache is 32 MiB (it was 8 MiB), the library's default too (the
-  browser build keeps 8 MiB), in 1 MiB blocks (64 KiB, fixed).
-- `ScanOptions::deep_analysis_max` is removed: the largest object held in
-  memory is `limits.max_buffer_bytes` (`--max-object-bytes`), one setting
-  where there were two. `--clamav-compat` no longer holds objects up to
-  400 MiB: it uses the default 256 MiB, and a larger one is read through the
-  block cache.
-- **Import hashes**: the size of an `.imp` signature is the length of the
-  string hashed, as `clamscan --debug` prints it (exav compared the number of
-  imports), and the `imphash:` lines of a `.fdb` file are matched with the
-  usual import hash (`pe.imphash()`, pefile's). A signature written the old way
-  stops matching. The saved database is format version 5: one made by 0.0.2 is
-  rebuilt.
-- Viewer: the CSS prefix is `exav-viewer-` (it was `exv-`), the sandboxed
-  frame's protocol is version 7 (it was 3), and `controllers.viewport` is
-  computed only while used. `Detector.sniff` and `detectBytes` return promises;
-  `SIGNATURES`, `sniff`, `FormatMatcher.signatures`, `confirmSniff` and
-  `DetectionTable.signatures` are removed. `archive()` and `@exav/unpack-wasm`
-  no longer take `maxCompressionRatio`. It needs `@exav/unpack-wasm` 0.0.3 and
-  `pdfjs-dist` 6.4.299 or later.
-- exav-render's office features depend on `exav-unpack`. `exav-unpack`'s `ole`
-  feature no longer pulls the `cfb` crate, now a dev-dependency.
-- `exav-unpack` ext, FAT, HFS+ and APFS readers are in-tree: member names no
-  longer begin with `/`, and a damaged volume ends with an error after the
-  files before the damage.
-- Objects already scanned clean in the same place are scanned once per scan.
-- The seven `--icap-*` flags (and their variables) are removed: the ICAP
-  address takes `?idle-secs=`, `?max-requests=`, `?max-header-bytes=`,
-  `?preview-bytes=`, `?transfer-preview=`, `?options-ttl-secs=` and
-  `?infection-header=`, and the flag or the variable stops the run with a
-  message saying so. `?transfer-preview=` takes `*` or `off` only: exav sends no
-  other `Transfer-*` header, and RFC 3507 asks that one of them hold `*`.
+  found (`1`, then `2`), else follows `--partial-as`; it was always `3`.
+- One memory setting: `ScanOptions::deep_analysis_max` is removed, and the
+  largest object held is `--max-object-bytes` (`limits.max_buffer_bytes`).
+  `--clamav-compat` uses the default 256 MiB (it held 400 MiB). The block
+  cache is 32 MiB in 1 MiB blocks (8 MiB in 64 KiB).
+- **Import hashes**: an `.imp` signature's size is the length of the string
+  hashed, as `clamscan --debug` prints it, and `imphash:` lines use pefile's
+  hash. A signature written the old way stops matching. Saved databases are
+  format 5: rebuild one made by 0.0.2.
+- The seven `--icap-*` flags are options of the ICAP address now
+  (`?idle-secs=`, `?max-requests=`, `?max-header-bytes=`, `?preview-bytes=`,
+  `?transfer-preview=`, `?options-ttl-secs=`, `?infection-header=`); the old
+  flags stop the run with a message.
+- Libraries: exav-unpack reads ext, FAT, HFS+ and APFS itself (member names no
+  longer begin with `/`); exav-render's office features depend on
+  exav-unpack, whose `ole` feature no longer pulls `cfb`.
+- Viewer: CSS prefix `exav-viewer-` (it was `exv-`), frame protocol 7 (it
+  was 3), `controllers.viewport` computed only while used. `Detector.sniff`
+  and `detectBytes` return promises; `SIGNATURES`, `sniff`,
+  `FormatMatcher.signatures`, `confirmSniff` and `DetectionTable.signatures`
+  are removed, and `archive()` and `@exav/unpack-wasm` take no
+  `maxCompressionRatio`. It needs `@exav/unpack-wasm` 0.0.3 and `pdfjs-dist`
+  6.4.299 or later.
 
 ### Added
 
-- Settings, each with its `EXAV_*` variable and `off` (or `0`):
-  `--max-regex-steps` (100,000,000), one work budget for PCRE subsignatures
-  with lookaround or back references and for YARA regexps;
-  `--max-matcher-steps` (2,000,000 per MiB of an object, at least 256 MiB's
-  worth), the verification of body signatures with wildcards and gaps and a
-  32nd of it for one group sharing an anchor, which were fixed and left a
-  large executable incomplete whatever was set;
-  `--max-compression-ratio` (1000, also in exav-grep and exav-unpack);
-  `--max-carved-executables` (16 of each kind), `--max-carved-archives` (32),
-  `--max-base64-payloads` (8), `--max-base64-runs` (64) and
-  `--max-page-assets` (16), which were fixed; `--max-hole-bytes` (64G) for the
-  holes of sparse files in a filesystem image; the `--max-qr-*` bounds of
-  `--qr` (pixels, time, codes, finder patterns, grids), in exav-grep too;
-  `--max-extracted-bytes` (back) and `--max-bytecode-memory-bytes`. Also
-  `--object-cache-bytes`, `--object-cache-block-bytes` and
-  `--http-request-bytes`.
-- Daemon, on a listener's address: `?idle-secs=` (at least 1), the most one
-  read or one write waits for a clamd client (120, it was a fixed 60 seconds
-  for reads and none for writes) or an ICAP connection for its client (600),
-  and the time a `--listen-health` client has (5); `?request-secs=` (600, or
-  `off`), the most time one clamd command or ICAP request takes to arrive;
-  `?session-secs=` and `?reply-secs=`, off unless given: how long a
-  connection stays open (no new command or request after it), and the most
-  the writes of one reply wait for the client in all. A client cut for not
-  reading its reply is logged, on ICAP too. A `--listen-health` address
-  refuses the options it does not read (`?service=` was accepted and ignored).
-- HTTP: `--http-timeout-secs` (120), `--http-max-redirects` (10),
-  `--http-redirect-private` and `--http-spill`. A server that does not answer
+- Limits, each with its `EXAV_*` variable and `off`: `--max-regex-steps` (a
+  work budget for PCRE subsignatures and YARA regexps), `--max-matcher-steps`
+  (body signatures with wildcards and gaps), `--max-compression-ratio` (also
+  in exav-grep and exav-unpack), `--max-hole-bytes` (the holes of sparse
+  files), `--max-carved-executables`, `--max-carved-archives`,
+  `--max-base64-payloads`, `--max-base64-runs` and `--max-page-assets` (they
+  were fixed), the `--max-qr-*` bounds, `--max-extracted-bytes` (back),
+  `--max-bytecode-memory-bytes`, `--object-cache-bytes`,
+  `--object-cache-block-bytes` and `--http-request-bytes`.
+- Daemon: `--listen-health ADDR`, a listener that answers while the workers
+  are busy, and a `STATS` that reports the whole pool. Each listener's
+  address takes `?idle-secs=` (120; reads waited a fixed 60 seconds, writes
+  forever), `?request-secs=` (600), `?session-secs=` and `?reply-secs=`.
+- HTTP: `--http-timeout-secs`, `--http-max-redirects`,
+  `--http-redirect-private`, `--http-spill`. A server that does not answer
   range requests has the object downloaded whole, up to `--max-input-bytes`.
-- Scanning: `Target:3` and `Target:7` signatures also match the `script`
-  elements of an HTML page, normalised as script, where clamscan matched them
-  and exav did not; a message is read from inside a text or binary data when
-  two of its header lines are close together, as ClamAV reads one; an ARJ
-  archive stapled inside another file is carved;
+- Scanning: `Target:3` and `Target:7` signatures match the scripts of an HTML
+  page, as in clamscan; a mail message inside a text or binary file is read,
+  as ClamAV reads one; an ARJ archive inside another file is carved;
   `Heuristics.PDF.ObfuscatedNameObject` applies inside PDF object streams;
-  `--detect exav-heuristics` matches `tlsh:` lines against an installer's
-  executable and `-v` shows `pe-imphash`.
-- `exav-qr FILE...` (`cargo install exav-grep --features qr`): the payloads of
-  the QR codes in images and in what holds them, one per line with its
-  location. Exit 0 when a code is found, 1 when none, 2 on an error, 3 when
-  none was found but something could not be read.
-- exav-unpack: `-r` (`--recursive`) opens the archives inside the archive, to
-  `--max-unpack-depth` (16); exav-unpack and exav-grep take
-  `--object-cache-bytes` and `--object-cache-block-bytes` (32M and 1M, shared
-  by the parts of a split archive), open a container inside a member past
-  `--max-object-bytes` through a spill file (`--spill-dir`,
-  `--max-total-spill-bytes`, 2G), read exav's `EXAV_*` variables, and take
-  `off` or `0` for no limit. exav-grep takes `--max-extracted-bytes`.
-- Features `ishieldcab`, `applesingle` and `ishieldmsi` of exav-unpack,
-  forwarded by exav-core and exav. Formats: LZFSE, LZVN and InstallShield Z
-  in-tree, camera RAW, DDS, ICO and cursors, PLY, OBJ, glTF, TIFF variants, and
-  an external converter hook for the viewer.
+  `tlsh:` lines are matched against an installer's executable; `-v` shows
+  `pe-imphash`.
+- `exav-qr FILE...` (`cargo install exav-grep --features qr`) prints the QR
+  codes in images and in what holds them.
+- exav-unpack `-r` opens the archives inside an archive; exav-unpack and
+  exav-grep take exav's cache and spill settings, read its `EXAV_*`
+  variables and take `off` for no limit.
+- Formats: the `ishieldcab`, `applesingle` and `ishieldmsi` features; LZFSE,
+  LZVN and InstallShield Z in-tree; camera RAW, DDS, ICO, PLY, OBJ, glTF and
+  more TIFF variants.
 - Libraries: `exav_unpack::tree` (`Walker`, `Visitor`, `Typing`,
-  `type_object`), `MemberMeta::reason_kind`, `Budget::set_rasters`;
-  `@exav/unpack-wasm`'s `list()` marks the member of a single-stream format
-  `synthetic`.
-- Viewer: detection by exav in a worker (`sniffBytes`, 65,536;
-  `sniffTimeoutMs`, 30,000); `damaged` and `wrong_type` from exav's readers,
-  and `FormatMismatch`; a ZIP's directory checked before it is opened
-  (`maxExtractedBytes` 512 MiB, `maxMembers` 20,000, `maxCompressionRatio`
-  1000); `maxArchiveEntries` and `maxEntities`; a question about a link only
-  after a click or a key, and `linkQuietMs` (2000).
-- Viewer: highlights (`ViewerFile.highlights`, `focusHighlight`): boxes on a
-  PDF's pages, or a quote found in the text of a PDF, a text, Markdown, JSON
-  or XML file whatever its case, accents, spaces, punctuation and words cut
-  at the end of a line, `...` for text left out; `controllers.highlights` and
-  the `ref` of `ViewerBody` and `ViewerDialog` (`goToPage`, `goToHighlight`),
-  in the sandboxed frame too.
-- `scripts/bench-speed.sh`, a speed benchmark against `clamscan`, and 233
-  freely licensed example files for the viewer demo.
-- exav.org/formats/: every format exav reads in one table, built from the
-  format registry, with what the scanner, the extractor and the viewer do with
-  it and an example in the demo (it replaces the format matrix page).
+  `type_object`), the one walk of nested containers exav, exav-grep,
+  `exav-unpack -r` and the wasm share; `MemberMeta::reason_kind`,
+  `Budget::set_rasters`.
+- Viewer: detection by exav in a worker (`sniffBytes`, `sniffTimeoutMs`,
+  `FormatMismatch`); a ZIP's directory checked before it is opened
+  (`maxExtractedBytes`, `maxMembers`, `maxCompressionRatio`),
+  `maxArchiveEntries` and `maxEntities`; highlights on a PDF's pages and on a
+  quote found in a text (`ViewerFile.highlights`, `focusHighlight`,
+  `goToHighlight`); `linkQuietMs`; a sandboxed frame published for some
+  formats only (`formats`, `--format`); an external converter hook; 233
+  freely licensed example files for the demo.
+- exav.org/formats/: every format in one table, with what the scanner, the
+  extractor and the viewer do with it. `scripts/bench-speed.sh` compares
+  speed with `clamscan`.
 
 ### Changed
 
 - **Limits leave a part out and go on.** A member over the compression ratio
-  or over `--max-object-bytes` is left out, the members after it are scanned,
-  and the container is `LIMITS-EXCEEDED` unless something is found. The ratio
-  is asked only of a member that decodes past `--max-object-bytes` (it was
-  4 MiB). A member said to be larger than what is left of
-  `--max-extracted-bytes` is left out before it is decoded; one that decodes
-  past what it said is charged and ends the container. A limit reached in what
-  is found inside a file (a carved archive, an executable's payload, a message
-  in a text) is kept aside like a password, and what is found after it is
-  scanned. What the PDF reader parses again counts against
-  `--max-extracted-bytes`, not caps of its own.
-- `--max-unpack-depth 0` opens no container, in every CLI: exav scans each
-  file as it stands and reports an archive's members not scanned, exav-grep
-  and exav-qr search each file as it stands, and `exav-unpack -r` takes the
-  archive named as one file (exav refused 0; the others reported every
-  archive unreadable).
-- `--build-db` counts as unsupported the logical signatures with a PCRE
-  subsignature that neither regex engine builds. Loading the files directly
-  does not; a scan that reaches one is incomplete either way.
+  or `--max-object-bytes` is left out, the members after it are scanned, and
+  the container is `LIMITS-EXCEEDED` unless something is found. The ratio is
+  asked only of a member that decodes past `--max-object-bytes` (it was
+  4 MiB).
 - A member left out for its size is `LIMITS-EXCEEDED`, not `UNSCANNABLE`; a
   file a reader cannot parse is `UNSCANNABLE`, not `LIMITS-EXCEEDED`; a panic
-  while examining a member is reported at that member and the rest of its
-  container is scanned.
-- A file past `--max-object-bytes`, a spilled member or view and an HTTP input
-  are read once for detection, carving, the digests, the signatures, YARA and
-  the static model, where each needed a read of its own: 4.1x the
-  size down to 1.45x with YARA rules, 3.25x to 1.5x with 182,000 signatures,
-  211 HTTP requests down to 110. A pass over an object larger than the cache
-  streams through two blocks of its own.
-- `--clamav-compat` opens only what clamscan 1.4.3 opens: ZOO, StuffIt, ACE,
-  ARC, lz4, zstd, lrzip, WIM, InstallShield cabinets, AppleSingle and
-  AppleDouble, the filesystem images, `.lnk`, `.pyc`, Java classes, AI models,
-  KWAJ and the SZDD files it rejects stay unopened, as do gzip, bzip2 and xz
-  streams and ELF and Mach-O images stapled behind another file, and a PE
-  stapled behind anything but a PE. DMG is opened.
-- Typing as ClamAV types: a file that starts with a mail header is a message,
-  typed before HTML, and the files uuencoded in its body are decoded; an ARJ
-  archive at the start of a file is taken
-  by the shape of its main header; a Markdown file that is not UTF-8 is
-  windows-1252. For exav-grep and `exav-unpack -r` an executable is read as an
-  installer, a disk image or a packed program.
-- exav-grep walks with the scanner's engine (depth limit, members read where
-  they lie, partly decoded bytes searched with the reason, split files inside
-  an archive, appended ZIPs), holds a file up to `--max-object-bytes` where it
-  was a fixed 16 MiB, and stops at a closed pipe.
-- Names in verdict reasons and locations have control characters,
-  bidirectional controls and U+2028/9 replaced by `_` and are cut at 200
-  characters; exav-grep and exav-unpack print names and reasons the same way.
-- exav-unpack: `--max-memory` is `--max-object-bytes` and `--max-size` is
-  `--max-extracted-bytes` (the old names still work); the exit status of a
-  member that was not decoded follows the kind of its reason.
+  in a member is reported there and the rest of its container is scanned.
+- A large file, a spilled member and an HTTP input are read once for all the
+  checks, where each needed a read of its own: 4.1x the size down to 1.45x
+  with YARA rules, 211 HTTP requests down to 110. An object already scanned
+  clean in the same place is scanned once per scan.
+- `--clamav-compat` opens only what clamscan 1.4.3 opens (ZOO, StuffIt, ACE,
+  WIM, the filesystem images and others stay closed; DMG is opened).
+- Files are typed as ClamAV types them: one that starts with a mail header is
+  a message, before HTML; an ARJ archive is told by its main header; a
+  Markdown file that is not UTF-8 is windows-1252.
+- `--max-unpack-depth 0` opens no container, in every CLI (exav refused it;
+  the others reported every archive unreadable).
+- exav-grep walks as the scanner does (depth limit, members read where they
+  lie, split files, appended ZIPs) and holds a file up to `--max-object-bytes`
+  (it was 16 MiB). exav-unpack's `--max-memory` and `--max-size` are
+  `--max-object-bytes` and `--max-extracted-bytes`; the old names still work.
+- Names in reasons and locations have control and bidirectional characters
+  replaced by `_` and are cut at 200 characters, in every CLI.
+- `--build-db` counts as unsupported a logical signature whose PCRE neither
+  regex engine builds.
 - A daemon setting given only by its `EXAV_*` variable to a run without that
-  listener is ignored with a warning; on the command line it is still refused.
-- The Docker image names its user (65532), owns `/run/exav`, runs with
-  `--read-only`, `--cap-drop ALL` and `no-new-privileges`, and pins Alpine
-  3.23; the examples publish the clamd and ICAP ports on localhost only.
-- YARA: `pe.number_of_exports` counts the functions of the export address
-  table, those exported by ordinal alone included, as yara-x does; it counted
-  the named ones.
-- Dependencies are at their latest versions, except the image decoders pinned
-  to libclamav 1.5.4 and `zip`, required below 9.1 (from 9.1 it always brings
-  a random number crate). Fewer crates and less `unsafe`: `tar`, `filetime`,
-  `byteorder`, `salzweg`, `lru`, `foldhash` and `g2p` are gone, and the QR
-  reader is `exav-qr`, rqrr 0.11.0 vendored with `forbid(unsafe_code)`.
-  `fuzzy_img` JPEGs are decoded by zune-jpeg 0.5.15, not libclamav's 0.5.8:
-  the hashes differ only for baseline JPEGs with a scan for each component,
-  which 0.5.8 drew flat, and damaged files it panicked on.
+  listener is ignored with a warning.
+- The Docker image runs as a named user (65532), read-only, with every
+  capability dropped and `no-new-privileges`, on Alpine 3.23; the examples
+  publish the ports on localhost only.
+- YARA: `pe.number_of_exports` counts the exports by ordinal alone too, as
+  yara-x does.
+- Dependencies at their latest versions, except the image decoders pinned to
+  libclamav 1.5.4's and `zip` below 9.1. Seven crates fewer, and the QR reader
+  is rqrr 0.11.0 vendored as `exav-qr` with `forbid(unsafe_code)`.
+  `fuzzy_img` JPEGs are decoded by zune-jpeg 0.5.15: the hashes differ from
+  libclamav's 0.5.8 only for baseline JPEGs with a scan for each component.
 - Viewer: text, CSV, TSV and a ZIP's directory are read by exav's readers in
-  WebAssembly, in a worker, and the TypeScript readers are gone; IFC models
-  are framed by exav-render, off the main thread. A CSV past 16,384 columns or
-  1,048,576 rows is refused.
+  a worker; a CSV past 16,384 columns or 1,048,576 rows is refused.
 
 ### Fixed
 
-The ones that could change a verdict:
-
-- **Files that a reader opens differently from exav are read as that reader
-  reads them:** ZIP, PDF (with its object streams), mail (folded and long
-  boundaries, base64 without the URL-safe digits), ISO and UDF, `ar`, `cpio`,
-  bzip2, xz, CAB, NSIS and PowerPoint objects, NTFS compression units and data
-  attributes, MBR logical partitions, 7z coder graphs, an ARJ archive behind a
-  stub written on Unix, files holding a second archive. A message attached to
-  an email is now scanned, and a base64 part the mail parser cannot decode is
-  decoded in memory as it is streamed (pieces encoded apart and joined were
-  misread). A `.lzma` file cut short is reported as not fully examined.
-- **PE files are read as Windows, clamscan and libyara read them** (headers
-  inside the DOS header, names in the headers, an entry point in the headers,
-  rounded section pointers, imports by ordinal): the YARA `pe` module gives
-  libyara's values on all 952 PEs of a corpus (268 differed), and an `.imp`
-  signature made of clamscan's `hash:size` matches all 853 PE32 files with a
-  clamscan import hash (708 before), installers included. A PE whose other
-  directories do not parse keeps its import hash, YARA values and static
-  model; one whose import table does not parse is `UNSCANNABLE` when a check
-  needs it. exav's own PE readers (the packer check, the Inno Setup resource,
-  icons) read the headers through one reader and map an address the way the
-  loader does (a section to the end of its page, the headers below the
-  sections); the packer check read no data directory of a 64-bit image, and
-  YARA's `dotnet` module maps its addresses as yara-x does.
+- **Read as the program that opens it.** ZIP, PDF and its object streams,
+  mail (folded and long boundaries, attached messages, base64 parts), ISO and
+  UDF, `ar`, `cpio`, bzip2, xz, CAB, NSIS, PowerPoint, NTFS, MBR logical
+  partitions, 7z and ARJ are read as their own tools read them, where exav
+  differed in some cases.
+- **PE files are read as Windows, clamscan and libyara read them**: the YARA
+  `pe` module gives libyara's values on all 952 PEs of a corpus (268
+  differed), and an `.imp` signature from clamscan's import hash matches all
+  853 PE32 files that have one (708 before).
 - **An Office package is told by its ZIP directory, not its name**: a DOCX,
-  XLSX or PPTX named `.zip`, or with no name, has its text view and link
-  checks (from its local headers when its directory is lost), and the viewer
-  opens it in its document plugin. As a `Container:` type it is OOXML when its
-  directory says so, as clamscan types it: an XLSB too, and no longer a ZIP
-  that only quotes the part names, or one cut before its directory.
-- **A string a format is found by** (a PDF header, an XDP tag, the BinHex
-  line, the AutoIt and Script Encoder markers) no longer takes the type from
-  an object whose own header gives one; the format is read as well. A text
-  that names XDP's tags with no PDF in them is no longer `UNSCANNABLE`, and
-  the character references in an XDP's chunks are read.
-- **No clean answer for what was not read**: a PCRE subsignature or YARA
-  regexp stopped at `--max-regex-steps`, a PCRE subsignature on an object past
-  `--max-pcre-bytes` (outside `--clamav-compat`, where clamscan says nothing)
-  or one the backtracking engine cannot build, a RAR5 member of an unknown
-  compression version, a Numbers, Pages or Keynote stream past the memory
-  limit, a page at the depth limit with encoded
-  payloads, a split set inside an archive over the limit or cut, an input past
-  4 GiB on 32-bit targets, a DWG or CHM part that could not be read, an NTFS
-  sparse file whose runs end early, an email whose delimiter never comes, and
-  an Inno Setup installer before 5.1.5, told by its header and reported.
-- **A limit, not damage, and a cut the same at any size**: a 7z LZMA or LZMA2
-  folder and an SWF movie whose dictionary is over `--max-object-bytes` are a
-  limit reached, as in ZIP and RAR (they were decoded with a smaller window,
-  and a valid stream was reported damaged). A member cut by the end of its
-  archive is scanned as far as it goes whatever its size (one over
-  `--max-object-bytes` was UNSCANNABLE), and exav-unpack's `-t`, `-x` and `-p`
-  report it as an error, as tar and unzip do.
-- **A RAR member is its whole stream**: one whose header declares less is
-  scanned to the stream's end (RAR5 made it UNSCANNABLE, RAR4 cut it at the
-  declared size), one that ends first as far as it goes
-  (RAR4 made it UNSCANNABLE). Over the object limit, by its declared size or
-  its window, a member held in memory is that limit (it was reported as
-  undecodable or unsupported). A match that reaches before the start of the
-  stream is zeros, as unrar writes it (part of it was copied from the
-  stream's first bytes).
-- **What decoded before a cut or damage is scanned**: a member over
-  `--max-object-bytes` whose stream fails part way, a RAR member (stored or
-  compressed) cut by the end of the archive, an LZMA member of a ZIP or 7z
-  cut by the end of the file (to its last bytes), a 7z BCJ2 folder, a file of a
-  filesystem that breaks part way (reported with its cause), a CHM cut inside
-  a stored file. A RAR whose block header does not parse is reported damaged,
-  and a RAR volume set no longer joins the blocks after a volume's end.
-- **PCRE subsignatures with lookaround, back references or conditionals**:
-  seven wrong answers of the backtracking engine are fixed (`a+b?a+` and
-  `(?:a+b?a*)+` matched more than they should, a conditional whose true
-  branch is a group of alternatives took one of them as its false branch, a
-  lookahead backtracked into another capture, a failed condition ended an
-  atomic group early, a repeat with an empty body stopped below its minimum,
-  a back reference inside its own group panicked), and a lookbehind of
-  variable length reads byte classes as bytes.
-- **Resource bounds**: names an executable's tables refer to many times, an
-  import or export table of one long run of names (exports are read by exav's
-  own reader now, as imports are), the section names of a PE (each read
-  once, within the file's size) and the bytes hashed for its sections; YARA
-  ranges over many matches and regexps with long matches; Excel external
-  workbooks, XAR tables of contents, tar extended headers; a RAR5 dictionary
-  larger than what its run decodes to, and the RAR5 filters waiting for their
-  block (8,192, as RAR4's); a member held in memory, which took
-  twice the limit; Office conversion loops; nested documents, YARA rules,
-  Visio formulas, PPMd, zstd, JPEG XL, JBIG2, bytecode, 7z headers, RAR key
-  derivation and XML trees. Several recursive readers no longer overflow the
-  stack.
-- A logical signature subsignature with a nibble wildcard and `::i` counted
-  too many matches; ZOO LZD members past 4,096 table entries decode, a ZOO
-  archive whose last directory entry is short is read whole, and ZOO long
-  names and directory names are read (they were looked for one byte too
-  late, so a member took its 8.3 name); ARJ members
-  encrypted with GOST 40-bit open with the right password; a password-protected
-  DWG is `PASSWORD-PROTECTED`; a compound file with several documents has the
-  text of each read; InstallShield cabinets of version 4 and older are read.
-- A line of a hash, section hash, fuzzy, import hash, container, icon or file
-  type database that does not parse is counted with the unsupported
-  signatures, as the other formats' are. YARA: `pe.exports(ordinal)` matches
-  an export's ordinal, `math.abs` of the smallest integer is undefined, and
-  `--all-matches` and `ALLMATCHSCAN` give rules the file's `filename`,
-  `filepath` and `extension`, as a scan does.
-- A damaged executable carved from a file no longer turns a detection behind
-  it into `PARTIAL` or `OK`; a detection made before a read of the input
-  failed is reported (it was an error), and one inside a compressed member
-  when the member then passes `--max-matcher-bytes` (it was
-  `LIMITS-EXCEEDED`); base64 in scripts and pages decodes more archive types;
-  PDF strings `\b` and `\f` made encrypted PDFs that open with an empty
-  password report password-protected.
-  `--detect packed` names only the packers exav tells: an archive member
-  called `X-packed image` gave `Heuristics.Packed.X`.
-- Daemon: `FILDES` scans a descriptor from its start (one the client left at
-  its end was scanned as empty, `OK`); an `IDSESSION` is closed after a
-  stream it did not read to its end (more than 64 MiB past
-  `--max-input-bytes`, or an `EXINSTREAM MULTI` answered part-way), as clamd
-  closes; the clamd listener retries a transient
-  accept failure instead of ending; with `--auto-update` and the pool the
-  signature check runs in a child of its own; the Unix socket is bound in a
-  private directory, not under a
-  changed umask; `--listen-health` closes a client that is slow to send;
-  `VERSIONCOMMANDS` no longer lists `SHUTDOWN` and `QUIT` on a daemon that
-  refuses them. Large files over HTTP no longer cost a request per executable
-  candidate.
+  XLSX or PPTX named `.zip` gets its text view and link checks, and its
+  `Container:` type is OOXML, as clamscan types it.
+- **A string a format is found by** (a PDF header, an XDP tag, the BinHex,
+  AutoIt and Script Encoder markers) no longer takes the type of a file whose
+  own header gives one. A text that names XDP's tags is no longer
+  `UNSCANNABLE`, and an XDP's character references are read.
+- **No clean answer for what was not read**: a regexp stopped at
+  `--max-regex-steps`, a PCRE past `--max-pcre-bytes` or one the engine cannot
+  build, a RAR5 member of an unknown compression version, a split set inside
+  an archive over the limit or cut, an input past 4 GiB on 32-bit targets, an
+  unreadable DWG or CHM part, an email whose delimiter never comes, an Inno
+  Setup installer before 5.1.5, and more.
+- **A limit is not damage, and what decoded is scanned**: a 7z or SWF
+  dictionary over `--max-object-bytes` is a limit (it was decoded with a
+  smaller window and reported damaged); a member cut by the end of its
+  archive, a RAR member whose header declares less than its stream, and what
+  decoded before damage in RAR, ZIP, 7z, filesystems and CHM are scanned as
+  far as they go. exav-unpack reports a cut member as an error, as tar and
+  unzip do.
+- **PCRE**: seven wrong answers of the backtracking engine (lookaround, back
+  references, conditionals, atomic groups) are fixed.
+- **Resource bounds** on executables' tables, YARA ranges and regexps, Excel,
+  XAR, tar and RAR5 headers, Office conversion, nested documents, PPMd, zstd,
+  JPEG XL, JBIG2, bytecode, 7z headers and XML trees; recursive readers no
+  longer overflow the stack.
+- Detections kept: one made before a read of the input failed (it was an
+  error), one inside a compressed member that then passes
+  `--max-matcher-bytes` (it was `LIMITS-EXCEEDED`), and one behind a damaged
+  carved executable (it was `PARTIAL` or `OK`). `--all-matches` and
+  `ALLMATCHSCAN` give YARA rules the file's name, as a scan does.
+  `--detect packed` names only the packers exav tells.
+- Signatures: a nibble wildcard with `::i` counted too many matches; YARA's
+  `pe.exports(ordinal)` matches an export's ordinal and `math.abs` of the
+  smallest integer is undefined; database lines that do not parse are
+  counted as unsupported.
+- Formats: ZOO (large LZD tables, long names), ARJ GOST 40-bit passwords,
+  password-protected DWG, compound files with several documents, InstallShield
+  cabinets of version 4 and older, more archive types in the base64 of
+  scripts and pages; an encrypted PDF that opens with an empty password is
+  no longer password-protected for a `\b` or `\f` in its strings.
+- Daemon: `FILDES` scans a descriptor from its start (one left at its end was
+  scanned as empty, `OK`); an `IDSESSION` is closed after a stream it did not
+  read to its end, as clamd closes; the listener retries a transient accept
+  failure instead of ending; with `--auto-update` in the pool the signature
+  check runs in a child of its own; the Unix socket is bound in a private
+  directory; `VERSIONCOMMANDS` lists `SHUTDOWN` and `QUIT` only when allowed.
 - exav-unpack no longer makes symbolic links that lead out of the extraction
-  directory or panics on a closed pipe; `-t` no longer ends with "No errors
-  detected" after an error. `--build-db` makes the directory of its output.
-- Viewer: links with a user name or password are refused, names show control
-  and bidirectional characters as U+FFFD and are isolated from the text around
-  them, a module whose stack ran out is replaced rather than used again, an
-  encrypted ODP or Keynote part is said to be encrypted and a Pages file with
-  no document damaged, a web page with a picture of an enormous size converts,
-  the files a frame asks for are held
-  to `TREE.maxFileBytes`, and a formatter that fails shows plain text. Which
-  Office reader a file goes to is told by exav's readers from its directory
-  (a Word document named `.xls` went to the sheets converter, and a stream
-  name quoted inside another file could route it); a `resolve` source is
-  signed again on 401 or 403 for every request, not only range reads, and
-  every range answer is checked against what was asked. A read the frame asks
-  of a `ranges` source is answered with a copy: a buffer the host's `read`
-  returned whole was transferred, and emptied on the host's side.
-  Rendering and decoding fixes across TIFF, BMP, PNM, ICO, DWG, DXF, IFC, STL,
-  glTF, JPEG 2000, DDS, Word, Excel and PowerPoint files.
+  directory, and `-t` no longer says "No errors detected" after an error.
+- Viewer: links with a user name or password are refused; names show control
+  and bidirectional characters as U+FFFD; an Office file goes to the reader
+  its directory names, not its extension; a `resolve` source is signed again
+  on 401 or 403 for every request; a range read is answered with a copy (the
+  host's buffer was emptied); rendering fixes across TIFF, BMP, PNM, ICO, DWG,
+  DXF, IFC, STL, glTF, JPEG 2000, DDS and Office files.
 
 ## [0.0.2] - 2026-10-11
 

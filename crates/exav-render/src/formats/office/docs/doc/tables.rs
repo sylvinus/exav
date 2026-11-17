@@ -65,9 +65,9 @@ fn tc80(b: &[u8]) -> Tc {
         width: fts(((g >> 9) & 7) as u8, u16_at(b, 2)),
         ..Tc::default()
     };
-    for i in 0..4 {
+    for (i, border) in tc.borders.iter_mut().enumerate() {
         let v = b.get(4 + 4 * i..8 + 4 * i).unwrap_or(&[0; 4]);
-        tc.borders[i] = if v == [0, 0, 0, 0] {
+        *border = if v == [0, 0, 0, 0] {
             None
         } else if v == [0xFF; 4] {
             Some(None)
@@ -344,16 +344,16 @@ fn apply(t: &mut Tap, p: &Prl) {
         0x5624 => {
             if let [a, b, ..] = p.val {
                 let (a, b) = (usize::from(*a), usize::from(*b).min(t.tcs.len()));
-                for i in a..b {
-                    t.tcs[i].merge_h = if i == a { 2 } else { 1 };
+                for (i, tc) in t.tcs.iter_mut().enumerate().take(b).skip(a) {
+                    tc.merge_h = if i == a { 2 } else { 1 };
                 }
             }
         }
         0x5625 => {
             if let [a, b, ..] = p.val {
                 let (a, b) = (usize::from(*a), usize::from(*b).min(t.tcs.len()));
-                for i in a..b {
-                    t.tcs[i].merge_h = 0;
+                for tc in t.tcs.iter_mut().take(b).skip(a) {
+                    tc.merge_h = 0;
                 }
             }
         }
@@ -396,8 +396,7 @@ pub fn build(rows: Vec<(Tap, Vec<Vec<Block>>)>) -> Table {
         row.props.cant_split = tap.cant_split;
         let n = tap.tcs.len().min(tap.edges.len().saturating_sub(1));
         let mut contents = contents.into_iter();
-        for k in 0..n {
-            let tc = &tap.tcs[k];
+        for tc in &tap.tcs[..n] {
             let content = contents.next().unwrap_or_default();
             let mut cp = CellProps {
                 v_merge: match tc.merge_v {

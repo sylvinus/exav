@@ -810,10 +810,9 @@ fn decompress_encoded_header(
     // pack_sizes are attacker-controlled var-ints, so every add below must be
     // overflow-safe (a bare `+` panics under overflow-checks); a value that
     // overflows can only point past the file, which we reject anyway.
-    let mut pack_stream_offset = 0u64;
-    for i in 0..pack_idx {
-        pack_stream_offset = pack_stream_offset.saturating_add(streams_info.pack_sizes[i]);
-    }
+    let pack_stream_offset = streams_info.pack_sizes[..pack_idx]
+        .iter()
+        .fold(0u64, |sum, &size| sum.saturating_add(size));
 
     let pack_offset = SIGNATURE_HEADER_SIZE
         .checked_add(streams_info.pack_pos)

@@ -507,18 +507,13 @@ impl HuffmanDecoder {
             return Some(self.quicksym[i]);
         }
 
-        let mut found = false;
-        for i in (self.min as usize)..=(MAX_CODE_LENGTH as usize) {
-            if v < self.limit[i] {
+        match ((self.min as usize)..=(MAX_CODE_LENGTH as usize)).find(|&i| v < self.limit[i]) {
+            Some(i) => {
                 bits = i as u32;
                 br.unread_bits(MAX_CODE_LENGTH - bits);
-                found = true;
-                break;
             }
-        }
-        if !found {
             // No limit matched; consume all 15 bits (bits stays at max).
-            br.unread_bits(0);
+            None => br.unread_bits(0),
         }
 
         let mut dist = v - self.limit[(bits - 1) as usize];

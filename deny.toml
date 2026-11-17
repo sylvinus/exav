@@ -20,6 +20,11 @@ ignore = [
     # proc-macro crate that its author no longer maintains. Build time only,
     # and not a vulnerability. It goes with the decoder's own fix.
     "RUSTSEC-2026-0173", # proc-macro-error2, via zenjxl-decoder-macros
+    # chrono's maintainer is winding it down; the advisory is informational,
+    # not a vulnerability, and names no fixed release. `delharc` (LHA, ARJ
+    # and ZOO) needs it to read a header's timestamp, and exav-unpack's CLI
+    # for local times (`cli` feature). It goes when both move to another crate.
+    "RUSTSEC-2026-0543", # chrono, via delharc and exav-unpack's CLI
     # NOTE: RUSTSEC-2023-0071 (`rsa` "Marvin") is intentionally NOT listed. `rsa`
     # is not in the tree: the native YARA engine does `pe` via `goblin`
     # and needs no Authenticode RSA, so the advisory has nothing to apply to.
