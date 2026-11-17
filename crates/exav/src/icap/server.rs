@@ -1002,6 +1002,10 @@ mod tests {
     /// every write is within the socket's own timeout.
     #[test]
     fn an_answer_the_client_does_not_read_is_cut_by_the_reply_budget() {
+        // The body crosses the spill threshold: held until the server has
+        // given its share of the process-wide budget back.
+        let _budget = crate::spill::budget_guard();
+        let before = crate::spill::in_use();
         let mut client = connect_with(IcapConfig {
             reply: Some(Duration::from_secs(1)),
             ..IcapConfig::default()
@@ -1030,6 +1034,10 @@ mod tests {
         }
         assert!(got > 0, "no answer started");
         assert!(got < body.len(), "the whole answer was delivered: {got}");
+        let start = std::time::Instant::now();
+        while crate::spill::in_use() > before && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// With no limit a slow head is read to its end.
