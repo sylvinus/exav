@@ -612,7 +612,10 @@ scanner's, and are not part of this aim.
 - **Delete the viewer e2e diagnostics** (`screenshot: "only-on-failure"` in
   `crates/exav-viewer/playwright.config.ts` and the `viewer-e2e-results`
   upload step in `.github/workflows/ci.yml`) once the three PDF tests that
-  fail only on the GitHub runner are understood.
+  fail only on the GitHub runner are understood. The zoom test of
+  `demo.spec.ts` failed there twice: it measured the page before the sections
+  rail opened, when the outline came late, and waits for the rail now, as the
+  drag test does (both failed with the outline delayed 3 s, and pass).
 - **The release profiles in the binary packages' own manifests**, once cargo
   either stops warning about a profile in a workspace member or copies the
   workspace's profiles into the published package (cargo issue #8264).

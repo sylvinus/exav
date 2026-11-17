@@ -303,8 +303,15 @@ for (const mode of ["sandbox", "page"] as const) {
     });
 
     test.describe("documents", () => {
-      test("a PDF zoomed with the buttons is moved by dragging the page, and selects text once the toggle says so", async ({ page }) => {
+      /** report.pdf, once its sections rail is open and the page fits the width the rail leaves. */
+      async function openReport(page: Page) {
         await open(page, "report.pdf");
+        await expect(page.locator(".exav-viewer-outline-entry")).toHaveText(["Scope", "Findings", "Actions"]);
+        await settled(engine(page).locator(".exav-viewer-pdf-page").first());
+      }
+
+      test("a PDF zoomed with the buttons is moved by dragging the page, and selects text once the toggle says so", async ({ page }) => {
+        await openReport(page);
         const tools = page.locator(".demo-frame .exav-viewer-tools");
         const hand = tools.getByRole("button", { name: "Move the page" });
         const text = tools.getByRole("button", { name: "Select text" });
@@ -359,7 +366,7 @@ for (const mode of ["sandbox", "page"] as const) {
       });
 
       test("a PDF zooms out past the width to a whole page, where there is nothing to pan, and back", async ({ page }) => {
-        await open(page, "report.pdf");
+        await openReport(page);
         const tools = page.locator(".demo-frame .exav-viewer-tools");
         const scroller = engine(page).locator(".exav-viewer-pdf-scroller");
         const pageBox = engine(page).locator(".exav-viewer-pdf-page").first();
