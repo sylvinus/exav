@@ -37,6 +37,29 @@ struct SectionBuffer {
 /// can always take the fast 8-byte read path.
 const SECTION_PADDING: usize = 8;
 
+/// Grow `buf.data` so that bytes `[..readable]` can be received, without
+/// ever allocating the TOC-declared length up front. Reaching `readable ==
+/// buf.len` means the section will be complete, so the buffer takes its final
+/// padded size.
+fn grow_section_buffer(buf: &mut SectionBuffer, readable: usize) -> Result<()> {
+    debug_assert!(readable <= buf.len);
+    let target = if readable == buf.len {
+        buf.len + SECTION_PADDING
+    } else {
+        readable
+    };
+    if buf.data.len() < target {
+        let extra = target - buf.data.len();
+        if target == buf.len + SECTION_PADDING {
+            buf.data.try_reserve_exact(extra)?;
+        } else {
+            buf.data.try_reserve(extra)?;
+        }
+        buf.data.resize(target, 0);
+    }
+    Ok(())
+}
+
 pub(super) struct CodestreamParser {
     // TODO(veluca): this would probably be cleaner with some kind of state enum.
     pub(super) file_header: Option<FileHeader>,
@@ -226,44 +249,40 @@ impl CodestreamParser {
                 }
 
                 if !self.skip_sections {
-                    // This is just an estimate as there could be box bytes in the middle.
-                    let mut readable_section_data = (self.non_section_buf.len()
-                        + input.available_bytes()?
-                        + self.ready_section_data)
-                        .max(1);
-                    // Ensure enough section buffers are available for reading available data.
-                    for buf in self.sections.iter_mut() {
-                        if buf.data.is_empty() {
-                            // Allocate with SECTION_PADDING extra zero bytes so
-                            // BitReader::refill() always takes the fast 8-byte path.
-                            buf.data.resize(buf.len + SECTION_PADDING, 0);
-                        }
-                        readable_section_data = readable_section_data.saturating_sub(buf.len);
-                        if readable_section_data == 0 {
-                            break;
-                        }
-                    }
                     // Read sections up to the end of the current box.
                     let mut available_codestream = match box_parser.get_more_codestream(input) {
                         Err(Error::OutOfBounds(_)) => 0,
                         Ok(c) => c as usize,
                         Err(e) => return Err(e),
                     };
+                    // `get_more_codestream` reports the codestream bytes left in the
+                    // current box (u64::MAX for a bare codestream), not what the input
+                    // can deliver now. Bound it by the bytes actually obtainable in this
+                    // call so section buffers are only grown for data that exists.
+                    let obtainable = box_parser
+                        .box_buffer
+                        .len()
+                        .saturating_add(input.available_bytes()?);
+                    available_codestream = available_codestream.min(obtainable);
                     let mut section_buffers = vec![];
                     let mut ready = self.ready_section_data;
                     for buf in self.sections.iter_mut() {
-                        if buf.data.is_empty() {
+                        if available_codestream == 0 {
                             break;
                         }
                         let len = buf.len;
                         if len > ready {
                             let readable = (available_codestream + ready).min(len);
+                            // Section lengths come from the untrusted TOC (one entry can
+                            // claim ~1 GB), so grow each buffer only as far as the bytes
+                            // we are about to read, fallibly. Once the last byte of a
+                            // section is in sight the buffer takes its final size,
+                            // `len + SECTION_PADDING`: the zero padding lets
+                            // BitReader::refill() always use the fast 8-byte path and is
+                            // what BitReader::new_padded() checks for. (jxl-rs #856)
+                            grow_section_buffer(buf, readable)?;
                             section_buffers.push(IoSliceMut::new(&mut buf.data[ready..readable]));
-                            available_codestream =
-                                available_codestream.saturating_sub(readable - ready);
-                            if available_codestream == 0 {
-                                break;
-                            }
+                            available_codestream -= readable - ready;
                         }
                         ready = ready.saturating_sub(len);
                     }

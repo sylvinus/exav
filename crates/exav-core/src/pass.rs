@@ -1,16 +1,17 @@
 //! The one pass over an object read through a block cache.
 //!
 //! The searches that need every byte of such an object, in order, are fed
-//! from a single read of it: detection's markers, carving, the digests, the
-//! search for a message in a text file, the signature sweep and YARA's
-//! patterns. This module holds what they share:
+//! from a single read of it: carving, the digests, the search for a message
+//! in a text file, the signature sweep and YARA's patterns. Detection is not
+//! among them: it reads the object's start and the places its structure
+//! names. This module holds what they share:
 //! the [`Tap`] a search implements and the [`Fed`] that hands it each byte
 //! once, whichever reader drives the read.
 
 use crate::byte_source::{ByteSource, CHUNK};
 use crate::engine;
 use crate::filetype::FileType;
-use crate::{Facts, ScanOptions, Scanner, Shared, hashes, mail_inside, pe, profile, unpack};
+use crate::{Facts, ScanOptions, Scanner, Shared, hashes, mail_inside, pe, profile};
 
 /// A search fed the bytes of an object, in order, once.
 pub(crate) trait Tap {
@@ -156,36 +157,22 @@ struct Taps<'a> {
     end: usize,
     hashing: Option<hashes::Hashing>,
     carving: Option<pe::Carving>,
-    prescan: Option<unpack::Prescan>,
     /// How many times each byte occurs, for the static model.
     counts: Option<Box<[u64; 256]>>,
-    /// The search for a UPX pack header.
-    upx: Option<pe::UpxScan>,
     /// The search for a message inside a text file.
     mail: Option<mail_inside::Search>,
     #[cfg(feature = "yara")]
     yara: Option<crate::yara::YaraFeed<'a>>,
-    /// The window and what follows it, which carving and the marker search
-    /// see across the seam.
+    /// The window and what follows it, which carving sees across the seam.
     ahead: Vec<u8>,
 }
 
 impl Taps<'_> {
     /// Bytes each window runs into the next.
-    const OVERLAP: usize = {
-        let most = if unpack::Prescan::OVERLAP > pe::Carving::OVERLAP {
-            unpack::Prescan::OVERLAP
-        } else {
-            pe::Carving::OVERLAP
-        };
-        assert!(most >= pe::UpxScan::OVERLAP);
-        most
-    };
+    const OVERLAP: usize = pe::Carving::OVERLAP;
 
     fn searching(&self) -> bool {
-        self.prescan.as_ref().is_some_and(|p| !p.done())
-            || self.carving.as_ref().is_some_and(|c| !c.full())
-            || self.upx.as_ref().is_some_and(|u| !u.found())
+        self.carving.as_ref().is_some_and(|c| !c.full())
             || self.mail.as_ref().is_some_and(|m| !m.done())
     }
 
@@ -209,23 +196,14 @@ impl Tap for Taps<'_> {
         if let Some(m) = self.mail.as_mut().filter(|m| !m.done()) {
             m.feed(at, w, end >= self.len);
         }
-        if self.searching() {
-            let last = end >= self.len;
+        if let Some(c) = self.carving.as_mut().filter(|c| !c.full()) {
             self.ahead.clear();
             self.ahead.extend_from_slice(w);
-            if !last {
+            if end < self.len {
                 self.ahead
                     .extend_from_slice(&self.data.window(end, Self::OVERLAP));
             }
-            if let Some(c) = self.carving.as_mut().filter(|c| !c.full()) {
-                c.feed(self.data, at, &self.ahead, w.len());
-            }
-            if let Some(p) = self.prescan.as_mut().filter(|p| !p.done()) {
-                p.feed(at, &self.ahead, last);
-            }
-            if let Some(u) = self.upx.as_mut().filter(|u| !u.found()) {
-                u.feed(at, &self.ahead, w.len());
-            }
+            c.feed(self.data, at, &self.ahead, w.len());
         }
         #[cfg(feature = "yara")]
         if let Some(y) = &mut self.yara {
@@ -279,16 +257,9 @@ impl<'a> Facts<'a> {
     }
 
     /// Whether the object holds a UPX pack header, as
-    /// [`pe::upx_header_in`] says: found in the one read, or by a search of
-    /// its own.
+    /// [`pe::upx_header_in`] says: in its start.
     pub(crate) fn upx_header(&self) -> bool {
-        if self.shared.get().is_some_and(|s| s.upx) {
-            self.read_once(Why::Search);
-        }
-        match self.upx.get() {
-            Some(&found) => found,
-            None => pe::upx_header_in(self.data),
-        }
+        *self.upx.get_or_init(|| pe::upx_header_in(self.data))
     }
 
     /// The offset of the first line of the first pair of header lines that
@@ -335,7 +306,6 @@ impl<'a> Facts<'a> {
             want,
             carve,
             far,
-            upx,
             counts,
             mail,
             caps,
@@ -345,7 +315,6 @@ impl<'a> Facts<'a> {
         };
         let matching = self.matching.take();
         let (data, len) = (self.data, self.data.len());
-        let search = self.fmt.get().is_none() && unpack::Prescan::needed(len);
         let engine = matching.filter(|m| !m.db.engine.is_empty());
         #[cfg(feature = "yara")]
         let yara = matching.and_then(|m| m.db.yara.feed(data, &crate::whole_limits(m.opts)));
@@ -353,8 +322,6 @@ impl<'a> Facts<'a> {
         let yara = None::<()>;
         if want == hashes::Want::default()
             && !carve
-            && !search
-            && !upx
             && !counts
             && !mail
             && engine.is_none()
@@ -368,9 +335,7 @@ impl<'a> Facts<'a> {
             end: 0,
             hashing: (want != hashes::Want::default()).then(|| hashes::Hashing::new(want)),
             carving: carve.then(|| pe::Carving::new(far, caps)),
-            prescan: search.then(|| unpack::Prescan::new(&data.window(0, 8))),
             counts: counts.then(|| Box::new([0; 256])),
-            upx: upx.then(|| pe::UpxScan::new(len)),
             mail: mail.then(mail_inside::Search::new),
             #[cfg(feature = "yara")]
             yara,
@@ -400,11 +365,6 @@ impl<'a> Facts<'a> {
             c.settle(data);
             *self.embedded.borrow_mut() = Some(c.found);
         }
-        *self.prescan.borrow_mut() = taps.prescan.filter(|p| complete || p.done());
-        // A header found is there whatever else the read missed.
-        if let Some(u) = taps.upx.filter(|u| complete || u.found()) {
-            let _ = self.upx.set(u.found());
-        }
         if let Some(c) = taps.counts.filter(|_| complete) {
             let _ = self.counts.set(c);
         }
@@ -422,12 +382,7 @@ impl<'a> Facts<'a> {
     /// of icons is loaded, which the core matches against its image.
     fn run_engine(&self, m: Matching<'a>, fed: &mut Fed) -> Option<EngineRun> {
         let (db, opts, data) = (m.db, m.opts, self.data);
-        // The type before the search through the object has found anything:
-        // what the core takes it for, unless that search finds a marker that
-        // retypes the object. The answer is used only if no signature target
-        // can tell the two types apart (`same_view`, checked when the core
-        // asks).
-        let ft = m.core_type.unwrap_or_else(|| db.identify_head(self));
+        let ft = m.core_type.unwrap_or_else(|| db.identify_inner(self));
         if ft == FileType::Pe && !db.icons.is_empty() {
             return None;
         }

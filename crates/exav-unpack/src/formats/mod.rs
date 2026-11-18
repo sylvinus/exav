@@ -314,9 +314,7 @@ pub(crate) use aimodel::{extract_aimodel, is_aimodel};
 #[cfg(feature = "arj")]
 pub(crate) use arj::extract_arj;
 #[cfg(feature = "autoit")]
-pub(crate) use autoit::{
-    GUID_EA05, GUID_EA06, extract_autoit, is_autoit, starts_with_marker as autoit_marker_first,
-};
+pub(crate) use autoit::{extract_autoit, is_autoit, starts_with_marker as autoit_marker_first};
 #[cfg(feature = "binhex")]
 pub(crate) use binhex::{
     extract_binhex, looks_like_binhex, starts_with_marker as binhex_marker_first,
@@ -334,7 +332,7 @@ pub(crate) use lnk::extract_lnk;
 #[cfg(feature = "machofat")]
 pub(crate) use machofat::looks_like_machofat;
 #[cfg(feature = "nsis")]
-pub(crate) use nsis::{NSIS_SIG, extract_nsis, is_nsis};
+pub(crate) use nsis::{extract_nsis, is_nsis};
 #[cfg(feature = "ole")]
 pub(crate) use ole::extract_ole;
 #[cfg(feature = "onenote")]
@@ -360,7 +358,7 @@ pub(crate) use sfx::looks_like_sfx;
 #[cfg(feature = "szdd")]
 pub(crate) use szdd::{extract_szdd, is_szdd};
 #[cfg(feature = "upx")]
-pub(crate) use upx::{extract_upx, find_packheader, has_packheader_layout};
+pub(crate) use upx::{extract_upx, find_packheader_in, has_packheader_layout_in};
 #[cfg(feature = "uuencode")]
 pub(crate) use uuencode::{extract_uuencode, looks_like_uuencode};
 #[cfg(feature = "xdp")]

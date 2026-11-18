@@ -115,10 +115,18 @@ pub(crate) fn starts_with_marker(head: &[u8]) -> bool {
     head.starts_with(MARKER_EA05) || head.starts_with(MARKER_EA06)
 }
 
-/// A compiled script: the marker after the script GUID, anywhere in the
-/// object, or the marker at its start. A marker alone elsewhere is a string.
+/// A compiled script: the marker at the object's start, or after the script
+/// GUID in its start (a resource of the executable) or in the bytes after an
+/// executable's image (where a script of old is appended). A marker alone
+/// elsewhere is a string.
 pub(crate) fn is_autoit(p: &crate::Probe) -> bool {
-    starts_with_marker(p.head) || p.find(&GUID_EA05).is_some() || p.find(&GUID_EA06).is_some()
+    let holds = |hay: &[u8]| {
+        memchr::memmem::find(hay, &GUID_EA05).is_some()
+            || memchr::memmem::find(hay, &GUID_EA06).is_some()
+    };
+    starts_with_marker(p.head)
+        || holds(p.searched_start())
+        || p.after_image().is_some_and(|(_, after)| holds(&after))
 }
 
 /// Where the first marker of a compiled script is in `data`, and its version.

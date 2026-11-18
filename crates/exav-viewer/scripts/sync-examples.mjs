@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // Put the demo's example files in demo/public/examples/ (not committed): the
-// small ones are copied from demo/examples/files/, the others are downloaded
-// from the pinned URLs demo/examples/examples.json gives, and each is checked
-// against its size and SHA-256. The licence of every file is in that manifest
+// small ones are copied from demo/examples/files/, the others from the
+// examples/ folder of github.com/sylvinus/exav-samples, and each is checked
+// against its size and SHA-256 in demo/examples/examples.json. Where each one
+// was first downloaded from (`fetched`) and its licence are in that manifest
 // and in demo/examples/NOTICE.md.
 //
 //     npm run demo:examples               # copy and download
+//     EXAV_SAMPLES=/path/to/exav-samples npm run demo:examples   # copy from a local checkout
 //     npm run demo:examples -- --offline  # copy only; the files that need a download are left out of the list
 //
 // A file already in demo/public/examples/ with the right hash is not fetched again.
@@ -19,6 +21,8 @@ const from = path.join(pkg, "demo", "examples");
 const out = path.join(pkg, "demo", "public", "examples");
 const offline = process.argv.includes("--offline") || process.env.EXAV_EXAMPLES_OFFLINE === "1";
 const USER_AGENT = "exav-examples/1.0 (https://github.com/sylvinus/exav)";
+const MIRROR = "https://raw.githubusercontent.com/sylvinus/exav-samples/main/examples/";
+const samples = process.env.EXAV_SAMPLES ? path.join(process.env.EXAV_SAMPLES, "examples") : null;
 
 const sha256 = (data) => crypto.createHash("sha256").update(data).digest("hex");
 const { examples } = JSON.parse(fs.readFileSync(path.join(from, "examples.json"), "utf8"));
@@ -72,23 +76,23 @@ for (const e of examples) {
         continue;
       }
     }
-    if (offline) {
+    if (offline && !samples) {
       skipped++;
       continue;
     }
-    const url = e.fetched;
-    if (typeof url !== "string") {
+    if (typeof e.fetched !== "string") {
       bad.push(`${e.file}: neither committed nor fetched`);
       continue;
     }
+    const where = samples ? path.join(samples, e.file) : MIRROR + encodeURIComponent(e.file);
     let data;
     try {
-      data = await download(url);
+      data = samples ? fs.readFileSync(where) : await download(where);
     } catch (err) {
       bad.push(String(err.message ?? err));
       continue;
     }
-    if (!check(data, url)) continue;
+    if (!check(data, where)) continue;
     fs.writeFileSync(target, data);
     downloaded++;
   }
@@ -106,4 +110,4 @@ for (const f of fs.readdirSync(out)) {
   if (f !== "examples.json" && !names.has(f) && !f.startsWith(".fuse_hidden")) fs.rmSync(path.join(out, f), { recursive: true, force: true });
 }
 fs.writeFileSync(path.join(out, "examples.json"), `${JSON.stringify({ version: 1, examples: present })}\n`);
-console.log(`${present.length} examples in ${path.relative(process.cwd(), out) || "."}: ${copied} copied, ${downloaded} downloaded, ${kept} already there${skipped ? `, ${skipped} left out (offline)` : ""}`);
+console.log(`${present.length} examples in ${path.relative(process.cwd(), out) || "."}: ${copied} copied, ${downloaded} from exav-samples, ${kept} already there${skipped ? `, ${skipped} left out (offline)` : ""}`);

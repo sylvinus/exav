@@ -71,7 +71,9 @@ program that opens it.
   flags stop the run with a message.
 - Libraries: exav-unpack reads ext, FAT, HFS+ and APFS itself (member names no
   longer begin with `/`); exav-render's office features depend on
-  exav-unpack, whose `ole` feature no longer pulls `cfb`.
+  exav-unpack, whose `ole` feature no longer pulls `cfb`. exav-unpack's
+  `Prescan` and `detect_prescanned` are removed: detection no longer searches
+  a whole object, so it has no search to share with a caller's read.
 - Viewer: CSS prefix `exav-viewer-` (it was `exv-`), frame protocol 7 (it
   was 3), `controllers.viewport` computed only while used. `Detector.sniff`
   and `detectBytes` return promises; `SIGNATURES`, `sniff`,
@@ -125,8 +127,8 @@ program that opens it.
   formats only (`formats`, `--format`); an external converter hook; 233
   freely licensed example files for the demo.
 - exav.org/formats/: every format in one table, with what the scanner, the
-  extractor and the viewer do with it. `scripts/bench-speed.sh` compares
-  speed with `clamscan`.
+  extractor and the viewer do with it, and the extractor's module and crates
+  for it. `scripts/bench-speed.sh` compares speed with `clamscan`.
 
 ### Changed
 
@@ -190,6 +192,14 @@ program that opens it.
   AutoIt and Script Encoder markers) no longer takes the type of a file whose
   own header gives one. A text that names XDP's tags is no longer
   `UNSCANNABLE`, and an XDP's character references are read.
+- **Detection reads a file's start, its end and the places its structure
+  names, never all of it.** A Script Encoder marker, an NSIS, AutoIt or
+  self-extractor payload and a UPX header are looked for in the first 4 MiB,
+  or after an executable's image where the program keeps them. A large file
+  of any kind holds `#@~^` by chance and was typed an encoded script, then
+  `LIMITS-EXCEEDED` past `--max-object-bytes`; an archive's magic deep in an
+  executable's code made it a self-extractor; exav-unpack, exav-grep and the
+  viewer read all of a large file to type it.
 - **No clean answer for what was not read**: a regexp stopped at
   `--max-regex-steps`, a PCRE past `--max-pcre-bytes` or one the engine cannot
   build, a RAR5 member of an unknown compression version, a split set inside
@@ -219,6 +229,9 @@ program that opens it.
   `pe.exports(ordinal)` matches an export's ordinal and `math.abs` of the
   smallest integer is undefined; database lines that do not parse are
   counted as unsupported.
+- YARA: a pattern a rule uses at one offset only (`not $a at 0`) is looked
+  for there alone, as yara-x does. With a million matches elsewhere
+  (`{ 00 00 }` in a file of zeros) the scan was `LIMITS-EXCEEDED`.
 - Formats: ZOO (large LZD tables, long names), ARJ GOST 40-bit passwords,
   password-protected DWG, compound files with several documents, InstallShield
   cabinets of version 4 and older, more archive types in the base64 of

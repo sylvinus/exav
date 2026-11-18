@@ -116,8 +116,8 @@ until = "never pinned apart from the CLI: bump both together."
 [[patch]]
 crate = "zenjxl-decoder"
 where = "crates/exav-viewer/vendor/zenjxl-decoder"
-why = "Instant::now() panics on wasm32-unknown-unknown and the decoder calls it for every frame. crates/exav-viewer/vendor/zenjxl-decoder/EXAV.md lists the differences."
-until = "upstream reads its clock only when phase timing is asked for, or takes the patch. Its main branch does (commit 814994a, for the unreleased 0.4.0)."
+why = "Instant::now() panics on wasm32-unknown-unknown and the decoder calls it for every frame; and a section's buffer was sized by the length the file declares, about 1 GiB for a file of 34 bytes (upstream's fix ported). crates/exav-viewer/vendor/zenjxl-decoder/EXAV.md lists the differences."
+until = "a release reads its clock only when phase timing is asked for and sizes section buffers by the input. Upstream's main branch does both (commits 814994a and 5f1b834, for the unreleased 0.4.0)."
 
 [[patch]]
 crate = "zenjxl-decoder-macros"

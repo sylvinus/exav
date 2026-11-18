@@ -53,7 +53,7 @@ const notice = [
   "A file from a Zenodo or figshare record takes the licence that the record states for all of its files: those",
   "records name no licence per file.",
   "",
-  `${examples.length} files: ${committed.length} are committed under \`files/\` (${kb(total(committed))}); ${examples.length - committed.length} are downloaded by \`npm run demo:examples\` (${kb(total(examples.filter((e) => !e.committed)))}).`,
+  `${examples.length} files: ${committed.length} are committed under \`files/\` (${kb(total(committed))}); ${examples.length - committed.length} are in the \`examples/\` folder of github.com/sylvinus/exav-samples, from where \`npm run demo:examples\` takes them (${kb(total(examples.filter((e) => !e.committed)))}).`,
   "",
   "To rebuild: run the scripts of `generate/` (each lists what it needs; `python3 -I generate/make-images.py`, `make-cad.py`,",
   "`make-models.py`, `make-ifc.py`, `make-text.py`, `make-archives.py`, `make-media.py`, `make-pdf.py`, `make-office.py`), then",

@@ -568,3 +568,27 @@ fn a_detection_ends_the_walk_with_the_members_before_it_scanned_and_those_after_
         "{outcome:?}"
     );
 }
+
+/// Script Encoder's marker alone, four bytes a large file of any kind holds by
+/// chance, is no encoded script: past the object limit such a file is clean,
+/// as clamscan says. With a blob's header behind it, the file is read as one.
+#[test]
+fn a_script_encoder_marker_by_chance_is_no_encoded_script() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut blob: Vec<u8> = (0..3 << 20)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    blob[2 << 20..][..4].copy_from_slice(b"#@~^");
+    let mut opts = ScanOptions::default();
+    opts.limits.max_buffer_bytes = 1 << 20;
+    both(&blob, &opts, "a marker", |g| *g == Got::Clean);
+    blob[(2 << 20) + 4..][..8].copy_from_slice(b"AAAAAA==");
+    both(&blob, &opts, "a blob's header", |g| {
+        matches!(g, Got::Limits(_))
+    });
+}

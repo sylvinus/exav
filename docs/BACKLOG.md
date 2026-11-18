@@ -71,6 +71,15 @@ is on exav.org.
 
 ## Formats
 
+- **What bounded detection does not look at.** Detection reads the first
+  4 MiB, the end, and the 1 MiB after a PE's image (`after_image`); what it
+  searched for anywhere before is looked for there. Left: a compiled AutoIt
+  script whose resource lies past the first 4 MiB (the `SCRIPT` resource by
+  its name), a self-extractor's archive in a resource past them (IExpress
+  keeps its cabinet in `CABINET`), an ELF's appended archive past them, and an
+  encoded script past a page's first 4 MiB (the page reader could decode it,
+  as clamscan's HTML normaliser does). The self-extractor check takes
+  `PK\x03\x04` and `Rar!` without a header check.
 - **One reader per format**: the compound file, the encrypted workbook, RTF,
   BIFF (records, workbook tables, formulas) and HTML are read once for the
   scanner and the converters ([ARCHITECTURE.md](ARCHITECTURE.md)). Left to
@@ -197,11 +206,19 @@ scanner's, and are not part of this aim.
   whose image is past the limit; ELF and Mach-O (the UPX and packer check reads
   one whole); the readers that take a packed PE whole (NSIS, AutoIt, UPX, PE
   packers), which need a source from the end of the image in exav-unpack, as
-  the Inno reader has.
-- **One forward pass**: detection, carving, the digests, the signature sweep
-  with its verification, YARA's patterns, the UPX header search and the static
-  model's byte counts are fed from one read of an object read through the
-  cache. Left: the literals that signatures look for past an unbounded gap are
+  the Inno reader has. A PE that only looks packed, with no packer named, is
+  scanned as it is when it is held, and `LIMITS-EXCEEDED` past the limit: two
+  421 MB PEs of the corpus (a 300 KB image and a compressed overlay).
+- **A carved ZIP is read with the ZIPs after it**: an archive carved out of an
+  object runs to the object's end, and a ZIP whose directory is not its own
+  is read by its local headers. A PE with 45 ZIPs one after the other (an
+  IKVM bundle) gives about 2,400 members for each of the 32 it carves, so the
+  scan meets `--max-members` (`file count > 100000`), then the carving cap (45
+  ZIPs for 32 carved); clamscan says OK.
+- **One forward pass**: carving, the digests, the signature sweep with its
+  verification, YARA's patterns and the static model's byte counts are fed
+  from one read of an object read through the cache (detection reads only the
+  start, the end and the places the structure names). Left: the literals that signatures look for past an unbounded gap are
   searched in one walk after the sweep (0.9x of the object on a database of
   such signatures; those in a signature's forward part could be searched as the
   sweep goes by, a hook per window in `sweep_fed` with the verifier behind a
@@ -590,10 +607,6 @@ scanner's, and are not part of this aim.
 
 ## CI
 
-- **`metrics::tests::the_in_flight_gauge_is_released_even_when_a_scan_leaves_early`
-  reads a gauge the other tests move.** The slot is the process's, and the
-  daemon tests running beside it start scans: it failed once in a full
-  `make test-native`, and passes alone.
 - **Two native tests time a debug build.** `the_cpu_limit_is_per_job_not_per_worker`
   (`exav/tests/daemon_client.rs`) gives a scan of 8 MiB of random bytes
   `--max-scan-secs 1`, and its first job passed it once under a full
@@ -622,6 +635,9 @@ scanner's, and are not part of this aim.
   Until then `scripts/release.sh` adds them to the five packages with a
   binary at publish time, so those are published with `--allow-dirty` and
   their `.cargo_vcs_info.json` says `"dirty": true`.
+- **Two manifest warnings of cargo 1.100**: `workspace.package.categories` is
+  inherited by no package, and exav's `homepage` is the same URL as its
+  `documentation`.
 
 ## Robustness
 
@@ -727,14 +743,11 @@ scanner's, and are not part of this aim.
   is meant.
 - **Word's `{\rt` as RTF.** exav types RTF by `{\rtf` at offset 0 only; whether
   Word opens `{\rt` and what follows is untested.
-- **A JPEG XL file can still take a gigabyte for one section.** The vendored
-  decoder (`zenjxl-decoder`) sizes the buffer of each section of a frame from
-  the length its table of contents declares, and zero-fills it, before the data
-  is looked at. The pixel and channel limits set in `image::jxl` do not reach
-  it, so the saturation sweep leaves JPEG XL out. The fix is in the decoder:
-  read the section into a buffer that grows with what arrives, or check the
-  declared lengths against the bytes left in the file. The viewer decodes JPEG
-  XL in a tab that can be reloaded; the scanner does not decode it.
+- **The saturation sweep leaves JPEG XL out**: exav-render's tests build the
+  published zenjxl-decoder 0.3.10, which sizes a section's buffer by the length
+  the file declares (a gigabyte for one header). The viewer's copy has
+  upstream's fix (`vendor/zenjxl-decoder/EXAV.md`), as upstream's main branch
+  does; the sweep can take JPEG XL once the workspace builds a release with it.
 - **A Prometheus and HTTP metrics endpoint.** The daemon has no metrics
   endpoint, only the clamd `STATS` command. The counters behind it are shared
   by the processes of the pool since the health listener was added, so the
@@ -821,6 +834,14 @@ scanner's, and are not part of this aim.
   `hash.*` over a range, and string operators on module strings, are one step
   each. Digests are not cached per scan, so N rules with
   `hash.md5(0, filesize)` read the object N times.
+- **A YARA pattern past a million matches** makes the scan `LIMITS-EXCEEDED`
+  unless a rule matched, where yara-x keeps the first million and answers.
+  One a rule uses at one offset only is looked for there alone, as yara-x
+  does; one used at two offsets (`$a at 0 or $a at 2`), counted or
+  unanchored, still reaches it (`{ 00 00 }` in a file of zeros). The reason
+  does not name the rule or the pattern. Decided for the next cycle: the
+  verdict stays, and the reason names the rule and the pattern ("YARA rule R:
+  pattern $v1 has more than 1,000,000 matches").
 - **`--max-regex-steps` is a count of steps, not time**: on 6,921 corpus
   objects with the full ClamAV database its default moves none to `PARTIAL`
   (462 s against 535 s with `off`). Left: whether a signature whose prefilter

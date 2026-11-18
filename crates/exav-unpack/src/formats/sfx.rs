@@ -3,8 +3,9 @@
 //! Droppers commonly ship as an ordinary PE or ELF executable stub with a real
 //! archive appended after the program image (or embedded within it). The stub
 //! unpacks itself at runtime; a scanner must find and unpack that archive
-//! statically. We scan the executable for the first embedded archive magic past
-//! the stub and emit the slice from that magic to EOF as a single member, so the
+//! statically. The first archive magic past the stub's header is looked for in
+//! the executable's start, else in the bytes after its image ([`payload_at`]),
+//! and the slice from that magic to EOF is emitted as a single member, so the
 //! engine re-dispatches it to the matching extractor (7z, RAR, ZIP, CAB, ARJ).
 //! This complements exav's existing embedded-PE carving.
 //!
@@ -13,11 +14,10 @@
 //! **and** an archive magic appears well past the header. A bare archive
 //! (archive magic at offset 0) is left to normal format detection.
 //!
-//! The scan is a bounded substring search; the carve is a single `[off..]`
-//! slice, so hostile input can neither panic nor blow the budget.
+//! The carve is a single `[off..]` slice, so hostile input can neither panic
+//! nor blow the budget.
 
 use crate::*;
-use std::io::{Read, Seek};
 
 /// Archive magics we look for embedded in an executable stub, each paired with a
 /// short label for diagnostics. The 2-byte ARJ magic is the loosest and can
@@ -124,140 +124,54 @@ fn find_archive_from(data: &[u8], from: usize) -> Option<(usize, &'static str)> 
     best
 }
 
-/// True when `data` looks like a self-extracting archive: an executable stub
-/// with an archive magic embedded past [`MIN_SFX_OFFSET`] (used by `detect`).
-pub(crate) fn looks_like_sfx(p: &crate::Probe) -> bool {
-    if !starts_with_exe(p.head) {
-        return false;
-    }
-    let off = match p.source() {
-        None => find_embedded_archive(p.head).map(|(off, _)| off),
-        Some(_) => p.sfx_payload(),
+/// Where a self-extractor's archive starts, in an object of `len` bytes whose
+/// first [`crate::DETECT_HEAD`] bytes are `start`: the first archive magic
+/// past the stub's header in that start, else in the bytes after the
+/// executable's image, which `window` reads. Detection and the reader find it
+/// so, and nowhere else.
+pub(crate) fn payload_at(start: &[u8], window: &crate::pe::Window, len: usize) -> Option<usize> {
+    let off = match find_embedded_archive(start) {
+        Some((off, _)) => off,
+        None => {
+            let (end, after) = crate::after_image(window, len, start.len())?;
+            end + find_archive_from(&after, 0)?.0
+        }
     };
-    matches!(off, Some(off) if off > MIN_SFX_OFFSET)
+    (off > MIN_SFX_OFFSET).then_some(off)
 }
 
-/// The search [`payload_offset`] makes, fed a window at a time by a pass
-/// that reads the object for other searches too.
-pub(crate) struct PayloadSearch {
-    found: Option<Option<usize>>,
+/// True when the object looks like a self-extracting archive: an executable
+/// stub with an archive past its header ([`payload_at`]).
+pub(crate) fn looks_like_sfx(p: &crate::Probe) -> bool {
+    starts_with_exe(p.head)
+        && payload_at(p.searched_start(), &|o, n| p.window(o, n), p.len).is_some()
 }
 
-impl PayloadSearch {
-    /// Bytes each window must run into the next: the 7z start header, the
-    /// longest a candidate's check reads, so a match across the seam is seen
-    /// whole.
-    pub(crate) const OVERLAP: usize = 32;
-
-    pub(crate) fn new() -> Self {
-        PayloadSearch { found: None }
-    }
-
-    /// Search window `w`, at `base` in the object, the object's last or not.
-    pub(crate) fn feed(&mut self, base: usize, w: &[u8], last: bool) {
-        if self.found.is_some() {
-            return;
-        }
-        // Offset 0 is the executable's own magic, never its payload.
-        let from = if base == 0 { 1 } else { 0 };
-        if let Some((off, _)) = find_archive_from(w, from) {
-            // Near the end of a window a match may be cut short, and an ARJ or
-            // 7z candidate before it wrongly passed over; the next window sees
-            // both whole.
-            if last || off + Self::OVERLAP <= w.len() {
-                self.found = Some(Some(base + off));
-                return;
-            }
-        }
-        if last {
-            self.found = Some(None);
-        }
-    }
-
-    /// Whether the search has its answer.
-    pub(crate) fn done(&self) -> bool {
-        self.found.is_some()
-    }
-
-    /// Where the first embedded archive starts, if any.
-    pub(crate) fn offset(&self) -> Option<usize> {
-        self.found.flatten()
-    }
-}
-
-/// Offset of the archive [`find_embedded_archive`] finds in the first `limit`
-/// bytes of `source`, read a window at a time rather than held whole.
-pub(crate) fn payload_offset<R: Read + Seek>(
-    source: &mut R,
-    limit: u64,
-) -> Result<Option<u64>, LimitHit> {
-    /// Bytes read per window.
-    const WINDOW: usize = 1 << 20;
-    /// Kept from one window into the next, as [`PayloadSearch::OVERLAP`].
-    const OVERLAP: usize = PayloadSearch::OVERLAP;
-    source
-        .seek(std::io::SeekFrom::Start(0))
-        .map_err(|e| LimitHit::corrupt(format!("sfx: {e}")))?;
-    let mut buf: Vec<u8> = Vec::new();
-    // Offset of `buf[0]` in the source.
-    let mut base = 0u64;
-    let mut left = limit;
-    loop {
-        let want = (WINDOW as u64).min(left) as usize;
-        let kept = buf.len();
-        buf.resize(kept + want, 0);
-        let n = crate::read_full(source, &mut buf[kept..])?;
-        buf.truncate(kept + n);
-        left -= n as u64;
-        let last = n < want || left == 0;
-        // Offset 0 is the executable's own magic, never its payload.
-        let from = if base == 0 { 1 } else { 0 };
-        if let Some((off, _)) = find_archive_from(&buf, from) {
-            // Near the end of a window a match may be cut short, and an ARJ or
-            // 7z candidate before it wrongly passed over; the next window sees
-            // both whole.
-            if last || off + OVERLAP <= buf.len() {
-                return Ok(Some(base + off as u64));
-            }
-        }
-        if last {
-            return Ok(None);
-        }
-        let drop = buf.len() - OVERLAP.min(buf.len());
-        buf.drain(..drop);
-        base += drop as u64;
-    }
-}
-
-/// Walk a self-extractor: its appended archive, streamed from where it lies.
+/// Walk a self-extractor: its appended archive, streamed from where it lies,
+/// so a self-extracting installer with a multi-gigabyte payload is scanned
+/// without buffering it.
 pub(crate) fn walk(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
     visit: crate::stream::Visit<()>,
 ) -> Result<Option<()>, LimitHit> {
-    let mut source = crate::source::Reader::new(src);
-    let members = stream_offsets(&mut source)?;
-    crate::stream::stream_stored_ranges(src, budget, visit, crate::stream::Region::list(members))
+    crate::stream::stream_stored_ranges(
+        src,
+        budget,
+        visit,
+        crate::stream::Region::list(regions(src)),
+    )
 }
 
-/// Find the appended archive's offset, searching as far as detection does (a
-/// window at a time), then stream the payload `[off, EOF)` via seek+take, so a
-/// self-extracting installer with a multi-gigabyte payload is scanned without
-/// buffering it. A shorter search than detection's would type a file as an SFX
-/// and then find nothing in it.
-pub(crate) fn stream_offsets<R: Read + Seek>(
-    source: &mut R,
-) -> Result<Vec<(String, u64, u64)>, LimitHit> {
-    let len = source
-        .seek(std::io::SeekFrom::End(0))
-        .map_err(|e| LimitHit::corrupt(format!("sfx: {e}")))?;
-    let Some(off) = payload_offset(source, len)? else {
-        return Ok(Vec::new());
-    };
-    if off >= len {
-        return Ok(Vec::new());
+/// The payload `[off, end)` of the self-extractor `src`, where [`payload_at`]
+/// finds it, as detection does.
+fn regions(src: &dyn crate::source::ByteSource) -> Vec<(String, u64, u64)> {
+    let len = src.len();
+    let start = src.window(0, len.min(crate::DETECT_HEAD));
+    match payload_at(&start, &|o, n| src.window(o, n), len) {
+        Some(off) => vec![("sfx-payload".to_string(), off as u64, (len - off) as u64)],
+        None => Vec::new(),
     }
-    Ok(vec![("sfx-payload".to_string(), off, len - off)])
 }
 
 #[cfg(test)]
@@ -441,38 +355,43 @@ mod tests {
         assert!(plausible_cab_header(&odd, 0));
     }
 
-    /// The windowed search must answer what the whole-buffer one does, wherever
-    /// the archive sits relative to a window seam.
+    /// The payload is found in the executable's start, or in the bytes after
+    /// its image, and nowhere else: detection and the reader agree, held in
+    /// memory or read through a cache.
     #[test]
-    fn the_windowed_search_agrees_with_the_whole_buffer() {
-        const W: usize = 1 << 20;
-        let search = |blob: &[u8], limit: u64| {
-            payload_offset(&mut std::io::Cursor::new(blob), limit).unwrap()
+    fn a_payload_is_found_in_the_start_or_after_the_image() {
+        use crate::source::{BlockCache, ByteSource};
+        let zip = b"PK\x03\x04local-header::MALWARETEST::body";
+        let found = |blob: &[u8]| {
+            let held = looks_like_sfx(blob);
+            let cache =
+                BlockCache::with_sizes(std::io::Cursor::new(blob.to_vec()), 4093, 64 * 4093)
+                    .unwrap();
+            let via = crate::detect(&cache) == Some(Format::Sfx);
+            assert_eq!(held, via);
+            let reader = regions(&cache);
+            assert_eq!(held, !reader.is_empty());
+            let start = cache.window(0, crate::DETECT_HEAD);
+            payload_at(&start, &|o, n| cache.window(o, n), blob.len())
         };
-        let whole = |blob: &[u8]| find_embedded_archive(blob).map(|(o, _)| o as u64);
-        // An ARJ main header that passes `plausible_arj_header`.
-        let arj = [0x60, 0xEA, 40, 0, 30, 0, 0, 1, 0, 0, 0, 0];
-        // The same header with a ZIP magic inside it. Cut by the seam, the ARJ
-        // candidate fails its check while the ZIP fits, and a search taking
-        // that answer would miss the earlier archive.
-        let mut arj_zip = arj;
-        arj_zip[8..12].copy_from_slice(b"PK\x03\x04");
-        let seven = sevenz_header();
-        for at in (W - 40..W + 24).chain([100, 2 * W - 3]) {
-            for magic in [&b"PK\x03\x04"[..], &arj[..], &arj_zip[..], &seven[..]] {
-                let blob = mz_stub(magic, at);
-                assert_eq!(search(&blob, blob.len() as u64), whole(&blob), "{at}");
-            }
-            // A bare `60 EA` cut by the seam, then a real archive after it.
-            let mut blob = mz_stub(&[0x60, 0xEA], at);
-            blob.resize(at + 7, 0);
-            blob.extend_from_slice(b"PK\x03\x04");
-            assert_eq!(search(&blob, blob.len() as u64), whole(&blob), "{at}");
-        }
-        // The limit ends the search as the end of the prefix did.
-        let blob = mz_stub(b"PK\x03\x04", 1000);
-        assert_eq!(search(&blob, 1002), None);
-        assert_eq!(search(&blob, 1004), Some(1000));
+        // In the start.
+        assert_eq!(found(&mz_stub(zip, 4096)), Some(4096));
+        // After an image that ends past the start, and further on.
+        let image =
+            crate::pe_resource::tests::pe_with_resource(crate::DETECT_HEAD + 512, 10, 1, b"x");
+        let end = image.len();
+        let mut blob = image.clone();
+        blob.resize(end + 300, 0);
+        blob.extend_from_slice(zip);
+        assert_eq!(found(&blob), Some(end + 300));
+        let mut far = image.clone();
+        far.resize(end + AFTER_IMAGE + 10, 0);
+        far.extend_from_slice(zip);
+        assert_eq!(found(&far), None);
+        // Past the start of an executable with no image to place it after.
+        let mut bare = mz_stub(b"", crate::DETECT_HEAD + 100);
+        bare.extend_from_slice(zip);
+        assert_eq!(found(&bare), None);
     }
 
     #[test]

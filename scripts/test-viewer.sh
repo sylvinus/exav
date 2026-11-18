@@ -82,8 +82,8 @@ node scripts/check-package.mjs
 node scripts/size-tables.mjs --check
 
 echo "== the demo, and what it ships =="
-# Its sidebar's files, from github.com/sylvinus/exav-samples (HEAD), or from
-# the checkout EXAV_SAMPLES names.
+# Its sidebar's files, and in the build its example files, from
+# github.com/sylvinus/exav-samples, or from the checkout EXAV_SAMPLES names.
 npm run demo:showcase
 rm -rf demo/dist
 npm run demo:build

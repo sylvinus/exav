@@ -13,7 +13,7 @@
 use std::ops::Range;
 
 use base64::Engine;
-use regex_automata::{Input, meta, meta::Regex, util::syntax};
+use regex_automata::{Anchored, Input, meta, meta::Regex, util::syntax};
 use regex_syntax::ParserBuilder;
 use regex_syntax::hir::{self, Hir, HirKind};
 use serde::{Deserialize, Serialize};
@@ -314,6 +314,9 @@ pub(crate) struct Found {
 /// regexp searches that find them.
 struct Collector {
     out: Vec<Match>,
+    /// The offset the pattern is anchored at ([`crate::yara::ir::anchors`]):
+    /// matches elsewhere are not kept.
+    only: Option<usize>,
     full: bool,
     /// Bytes that the searches of the pattern may still read, `usize::MAX`
     /// for no limit.
@@ -328,6 +331,7 @@ impl Collector {
     fn new(steps: usize) -> Self {
         Collector {
             out: Vec::new(),
+            only: None,
             full: false,
             room: steps.saturating_mul(STEP_BYTES),
             spent: false,
@@ -363,7 +367,16 @@ impl Collector {
         }
     }
 
+    /// The collector of a pattern anchored at `only`, if it is.
+    fn only(mut self, only: Option<usize>) -> Self {
+        self.only = only;
+        self
+    }
+
     fn push(&mut self, offset: usize, len: usize) {
+        if self.only.is_some_and(|at| at != offset) {
+            return;
+        }
         if self.out.len() < MAX_MATCHES {
             self.out.push(Match { offset, len });
         } else {
@@ -453,9 +466,10 @@ pub(crate) struct WindowedTap {
 }
 
 impl WindowedTap {
-    pub(crate) fn new() -> Self {
+    /// The tap of a pattern anchored at `only`, if it is.
+    pub(crate) fn new(only: Option<usize>) -> Self {
         WindowedTap {
-            out: Collector::new(usize::MAX),
+            out: Collector::new(usize::MAX).only(only),
         }
     }
 
@@ -645,15 +659,16 @@ impl PatternMatcher {
     /// memory read; `materialize` is the largest such source read whole when
     /// they cannot follow it. The regexp searches of the pattern make at most
     /// `steps` steps: past that the matches found are kept and the result is
-    /// not complete.
+    /// not complete. A pattern anchored at `only` keeps its match there alone.
     pub(crate) fn find_all(
         &self,
         src: &dyn ByteSource,
         stream: RegexSource<'_>,
         materialize: usize,
         steps: usize,
+        only: Option<usize>,
     ) -> Found {
-        let mut out = Collector::new(steps);
+        let mut out = Collector::new(steps).only(only);
         let mut complete = true;
         match src.as_slice() {
             Some(data) => self.search(data, 0..data.len(), 0, stream, &mut out),
@@ -674,6 +689,15 @@ impl PatternMatcher {
         stream: RegexSource<'_>,
         out: &mut Collector,
     ) {
+        // Anchored at an offset: the one start there.
+        let (data, keep) = match out.only {
+            Some(at) if self.windowed() => {
+                let end = keep.end.min(at.saturating_add(1).saturating_sub(origin));
+                let start = keep.start.max(at.saturating_sub(origin)).min(end);
+                (&data[..data.len().min(end + self.reach().1)], start..end)
+            }
+            _ => (data, keep),
+        };
         match self {
             PatternMatcher::Literal {
                 needles,
@@ -839,10 +863,14 @@ impl PatternMatcher {
         match self {
             PatternMatcher::Literal { .. } | PatternMatcher::Base64 { .. } => {
                 // Chunks, each read with the bytes its matches need around them.
+                // Anchored at an offset, the one chunk from there.
                 let (before, after) = self.reach();
-                let mut base = 0;
-                while base < len && !out.full {
-                    let end = (base + CHUNK).min(len);
+                let (mut base, stop) = match out.only {
+                    Some(at) => (at.min(len), at.saturating_add(1).min(len)),
+                    None => (0, len),
+                };
+                while base < stop && !out.full {
+                    let end = (base + CHUNK).min(stop);
                     let from = base.saturating_sub(before);
                     let to = end.saturating_add(after).min(len);
                     let w = src.window(from, to - from);
@@ -871,7 +899,7 @@ impl PatternMatcher {
         fullword: bool,
         out: &mut Collector,
     ) -> bool {
-        let mut found = Collector::new(0);
+        let mut found = Collector::new(0).only(out.only);
         found.room = out.room;
         let streamed = stream().is_some_and(|regexes| {
             regexes
@@ -929,6 +957,18 @@ fn anchored_matches(
     wide: bool,
 ) {
     let len = data.len();
+    // Anchored at an offset: one search there, which reads what one search
+    // reads, so it is not charged.
+    if let Some(at) = out.only {
+        if at <= len
+            && let Some(m) = re.find(Input::new(data).span(at..len).anchored(Anchored::Yes))
+            && m.end() > m.start()
+            && (!fullword || verify_full_word(data, m.start(), m.end(), wide, 0))
+        {
+            out.push(m.start(), m.len());
+        }
+        return;
+    }
     let mut start = 0;
     let mut counter = None;
     while start <= len && !out.done() {
@@ -968,6 +1008,15 @@ fn stream_matches(
 ) -> std::result::Result<(), GaveUp> {
     let mut caches = sr.caches();
     let len = src.len();
+    if let Some(at) = out.only {
+        if let Some(end) = sr.find_at(&mut caches, src, at)?
+            && end > at
+            && (!fullword || full_word_in(src, at, end, wide))
+        {
+            out.push(at, end - at);
+        }
+        return Ok(());
+    }
     let mut start = 0;
     while start <= len && !out.done() {
         let found = sr.find(&mut caches, src, start)?;

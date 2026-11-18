@@ -65,10 +65,11 @@ are held. So are an HTTP source of that size, a spill file (below) and a stored
 archive member past the limit. Verifying a match can still look anywhere in the
 file: the cache bounds what is held at once, not how far a check may reach, and
 a block that was dropped is read again when it is needed. The scan is the same
-one, with the same results, only slower: the file is read once for format
-detection's search, carving, the digests, the signature sweep (every anchor at
-once), YARA's patterns, the UPX header search and the static model's byte
-counts, and again in the parts a check needs. A signature with an unbounded gap
+one, with the same results, only slower: the file is read once for carving,
+the digests, the signature sweep (every anchor at once), YARA's patterns and
+the static model's byte counts, and again in the parts a check needs. Format
+detection reads only the file's first 4 MiB, its end and the places its
+structure names, such as the bytes after an executable's image. A signature with an unbounded gap
 adds a walk over the rest of the object after the sweep, and a PE's image can
 add a read. [The block cache](#the-block-cache) below says how it works and
 what its three settings trade.

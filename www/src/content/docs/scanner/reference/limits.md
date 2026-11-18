@@ -126,7 +126,8 @@ One more bound is charged against the rules rather than the file: each buffer
 gets 20 million YARA condition-evaluation steps, shared by every rule in the set.
 A YARA range loop takes its size from the rule text, so
 `for any i in (0..200000000)` would otherwise stall every scan. A YARA string also
-keeps at most one million matches per buffer. A scan whose rules run out of steps,
+keeps at most one million matches per buffer; one a rule uses at one offset only
+(`$a at 0`) is looked for there alone. A scan whose rules run out of steps,
 or whose strings reach that count, is reported `LIMITS-EXCEEDED` unless a rule
 matched; real feeds use a few million steps for a whole scan.
 

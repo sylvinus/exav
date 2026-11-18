@@ -71,6 +71,12 @@ debug = 1
 [profile.release.package.exav-core]
 opt-level = 1
 
+# The JPEG XL decoder the viewer ships, not the published one: its copy sizes
+# a section's buffer by the input (crates/exav-viewer/vendor/zenjxl-decoder/EXAV.md).
+[patch.crates-io]
+zenjxl-decoder = { path = "../crates/exav-viewer/vendor/zenjxl-decoder" }
+zenjxl-decoder-macros = { path = "../crates/exav-viewer/vendor/zenjxl-decoder-macros" }
+
 [workspace]
 members = ["support", "exav-cli"]
 

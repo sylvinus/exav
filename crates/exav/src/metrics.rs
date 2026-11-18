@@ -123,8 +123,19 @@ static LOCAL: Counters = Counters::new();
 // bytes, page-aligned, zero-filled when made and never unmapped.
 static SHARED: AtomicPtr<Counters> = AtomicPtr::new(std::ptr::null_mut());
 
+// The counters of one test, apart from those the other tests of the binary
+// move from the threads of the same process.
+#[cfg(test)]
+thread_local! {
+    static OWN: std::cell::Cell<Option<&'static Counters>> = const { std::cell::Cell::new(None) };
+}
+
 /// The counters in use.
 fn c() -> &'static Counters {
+    #[cfg(test)]
+    if let Some(own) = OWN.with(std::cell::Cell::get) {
+        return own;
+    }
     let shared = SHARED.load(Ordering::Acquire);
     if shared.is_null() {
         &LOCAL
@@ -503,6 +514,12 @@ fn render(s: &Snapshot) -> String {
 mod tests {
     use super::*;
 
+    /// Gives this test's thread counters of its own: the other tests scan
+    /// beside it, and move the process's.
+    fn own_counters() {
+        OWN.with(|o| o.set(Some(Box::leak(Box::new(Counters::new())))));
+    }
+
     #[test]
     fn every_matcher_has_a_cell_and_a_home() {
         assert_eq!(c().cells.len(), CELLS);
@@ -567,7 +584,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_child_that_died_mid_scan_leaves_no_scan_in_flight() {
-        // A pid no test process has: its slot is nobody's but this test's.
+        own_counters();
         let pid = 4096 * 100 + 17;
         let slot = &c().in_flight[slot_of(pid)];
         let before = in_flight();
@@ -581,6 +598,7 @@ mod tests {
     fn the_in_flight_gauge_is_released_even_when_a_scan_leaves_early() {
         // A gauge that only decrements on the happy path reads as a permanently
         // busy server, which is the opposite of what someone polling it wants.
+        own_counters();
         let before = c().in_flight[my_slot()].load(Ordering::Relaxed);
         let t = ScanTimer::start();
         assert!(c().in_flight[my_slot()].load(Ordering::Relaxed) > before);

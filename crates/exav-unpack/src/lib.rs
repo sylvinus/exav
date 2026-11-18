@@ -1714,41 +1714,65 @@ fn base64_payloads_on<B: Bytes>(
     (out, capped)
 }
 
-/// What [`detect`] reads of an object: its start (all of it when it is held in
-/// memory), its length, and the rest of it for the checks that read its end or
-/// search it through.
+/// What [`detect`] reads of an object: its start, its length, and windows at
+/// the places past the start a check names: the end of the object, and
+/// where its structure says ([`Probe::after_image`]).
+///
+/// No check searches through all of an object: a search is made in the start
+/// alone, at most [`DETECT_HEAD`] bytes whether the object is held in memory
+/// or not, or in a window at such a place.
 pub(crate) struct Probe<'a> {
+    /// The object's first [`DETECT_HEAD`] bytes, or all of it when shorter.
     pub(crate) head: &'a [u8],
     pub(crate) len: usize,
     /// The object, when `head` is only its start.
-    src: Option<&'a dyn ByteSource>,
-    /// What the one read of `src` through [`search_through`] found.
-    #[cfg_attr(
-        not(any(
-            feature = "screnc",
-            feature = "autoit",
-            feature = "nsis",
-            feature = "sfx"
-        )),
-        allow(dead_code)
-    )]
-    found: std::cell::OnceCell<Searched>,
-    /// The caller's read that makes the search, in place of one of its own.
-    #[cfg_attr(
-        not(any(
-            feature = "screnc",
-            feature = "autoit",
-            feature = "nsis",
-            feature = "sfx"
-        )),
-        allow(dead_code)
-    )]
-    prescan: Option<&'a dyn Fn() -> Prescan>,
-    /// `head` is only the start of an object that cannot be read any further
-    /// (a stream): what a check asks of the rest is not there.
+    rest: Option<Rest<'a>>,
+    /// The object cannot be read past what `rest` holds (a stream): what a
+    /// check asks of the rest is not there.
     partial: bool,
-    /// Set when a check asked, of such an object, for what is past `head`.
+    /// Set when a check asked, of such an object, for what is past it.
     reached: std::cell::Cell<bool>,
+}
+
+/// The object whose start a [`Probe`] holds.
+#[derive(Clone, Copy)]
+enum Rest<'a> {
+    Held(&'a [u8]),
+    Source(&'a dyn ByteSource),
+}
+
+/// Bytes after an executable's image that a check reads, at most: where a
+/// self-extractor, an NSIS installer or an AutoIt script of old keeps its
+/// data, which the program reads from there.
+#[cfg_attr(
+    not(any(feature = "autoit", feature = "nsis", feature = "sfx")),
+    allow(dead_code)
+)]
+pub(crate) const AFTER_IMAGE: usize = 1 << 20;
+
+/// Where the image of the PE `window` shows ends (the end of its last
+/// section's data), and up to [`AFTER_IMAGE`] bytes from there, when they run
+/// past the first `searched` bytes, which a check has searched already.
+#[cfg_attr(
+    not(any(feature = "autoit", feature = "nsis", feature = "sfx")),
+    allow(dead_code)
+)]
+pub(crate) fn after_image<'w>(
+    window: &pe::Window<'w>,
+    len: usize,
+    searched: usize,
+) -> Option<(usize, std::borrow::Cow<'w, [u8]>)> {
+    let headers = pe::Headers::read(window)?;
+    let end = headers
+        .sections
+        .iter()
+        .map(|s| u64::from(s.raw_pointer) + u64::from(s.raw_size))
+        .max()?;
+    let end = usize::try_from(end).ok()?;
+    if end >= len || end.saturating_add(AFTER_IMAGE) <= searched {
+        return None;
+    }
+    Some((end, window(end, AFTER_IMAGE)))
 }
 
 /// What [`detect_head`] makes of the start of an object whose rest cannot be
@@ -1765,157 +1789,13 @@ pub enum Settled {
     Unsettled,
 }
 
-/// What [`detect`] searches a whole object for, found in one read of it the
-/// first time one is asked for, rather than in a read each: where each of
-/// [`searched`] first occurs, and for an executable, where the archive a
-/// self-extractor carries starts.
-#[derive(Default)]
-// Which field a build reads depends on its format features.
-#[allow(dead_code)]
-struct Searched {
-    markers: Vec<Option<usize>>,
-    sfx: Option<usize>,
-}
-
-/// The needles [`detect`] searches a whole object for.
-// Which pushes a build makes depends on its format features.
-#[allow(clippy::vec_init_then_push)]
-fn searched() -> Vec<&'static [u8]> {
-    #[allow(unused_mut)]
-    let mut needles: Vec<&'static [u8]> = Vec::new();
-    #[cfg(feature = "screnc")]
-    needles.push(formats::SCRENC_MARKER);
-    #[cfg(feature = "nsis")]
-    needles.push(&formats::NSIS_SIG);
-    #[cfg(feature = "autoit")]
-    needles.extend([&formats::GUID_EA05[..], &formats::GUID_EA06[..]]);
-    needles
-}
-
-/// What [`detect`] searches a whole object for, found as a caller reads the
-/// object: fed every window of it in order, each running [`Self::OVERLAP`]
-/// bytes into the next, and handed to [`detect_prescanned`] when it asks. One
-/// read of an object then serves detection and whatever else the caller looks
-/// for in it.
-pub struct Prescan {
-    finders: Vec<memchr::memmem::Finder<'static>>,
-    markers: Vec<Option<usize>>,
-    #[cfg(feature = "sfx")]
-    payload: Option<formats::sfx::PayloadSearch>,
-}
-
-impl Prescan {
-    /// Bytes each window must run into the next, so that what it looks for is
-    /// seen whole across the seam: the longest marker, and a self-extractor's
-    /// archive magic with the header check after it.
-    pub const OVERLAP: usize = 32;
-
-    /// Whether [`detect_prescanned`] can ask for the search on an object of
-    /// `len` bytes: not when the start it reads anyway is all of it.
-    pub fn needed(len: usize) -> bool {
-        len > DETECT_HEAD
-    }
-
-    /// The search for an object that starts with `head`: a self-extractor's
-    /// payload is looked for only in an executable.
-    pub fn new(head: &[u8]) -> Self {
-        let needles = searched();
-        #[cfg(not(feature = "sfx"))]
-        let _ = head;
-        Prescan {
-            finders: needles
-                .iter()
-                .map(|n| memchr::memmem::Finder::new(*n))
-                .collect(),
-            markers: vec![None; needles.len()],
-            #[cfg(feature = "sfx")]
-            payload: (head.starts_with(b"MZ") || head.starts_with(b"\x7fELF"))
-                .then(formats::sfx::PayloadSearch::new),
-        }
-    }
-
-    /// Search the window `w` at `base` in the object, its last or not.
-    pub fn feed(&mut self, base: usize, w: &[u8], last: bool) {
-        for (f, slot) in self.finders.iter().zip(&mut self.markers) {
-            if slot.is_none() {
-                *slot = f.find(w).map(|p| base + p);
-            }
-        }
-        #[cfg(feature = "sfx")]
-        if let Some(p) = &mut self.payload {
-            p.feed(base, w, last);
-        }
-        #[cfg(not(feature = "sfx"))]
-        let _ = last;
-    }
-
-    /// Whether every search has its answer, so the rest of the object has
-    /// nothing more to tell it.
-    pub fn done(&self) -> bool {
-        #[cfg(feature = "sfx")]
-        let payload = self.payload.as_ref().is_none_or(|p| p.done());
-        #[cfg(not(feature = "sfx"))]
-        let payload = true;
-        payload && self.markers.iter().all(Option::is_some)
-    }
-
-    #[cfg_attr(
-        not(any(
-            feature = "screnc",
-            feature = "autoit",
-            feature = "nsis",
-            feature = "sfx"
-        )),
-        allow(dead_code)
-    )]
-    fn searched(self) -> Searched {
-        #[cfg(feature = "sfx")]
-        const {
-            assert!(formats::sfx::PayloadSearch::OVERLAP <= Prescan::OVERLAP)
-        };
-        Searched {
-            markers: self.markers,
-            #[cfg(feature = "sfx")]
-            sfx: self.payload.and_then(|p| p.offset()),
-            #[cfg(not(feature = "sfx"))]
-            sfx: None,
-        }
-    }
-}
-
-/// [`Searched`] in the first `len` bytes of `src`, which starts with `head`,
-/// a window at a time.
-#[cfg(any(
-    feature = "screnc",
-    feature = "autoit",
-    feature = "nsis",
-    feature = "sfx"
-))]
-fn search_through(src: &dyn ByteSource, len: usize, head: &[u8]) -> Searched {
-    let mut pre = Prescan::new(head);
-    let overlap = Prescan::OVERLAP;
-    let mut at = 0;
-    while at < len && !pre.done() {
-        let w = src.window(at, (len - at).min(source::CHUNK.max(overlap + 1)));
-        let last = w.len() <= overlap || at + w.len() >= len;
-        pre.feed(at, &w, last);
-        if last {
-            break;
-        }
-        at += w.len() - overlap;
-    }
-    pre.searched()
-}
-
 impl<'a> Probe<'a> {
     /// An object held in memory.
     pub(crate) fn whole(data: &'a [u8]) -> Self {
         Probe {
-            head: data,
+            head: &data[..data.len().min(DETECT_HEAD)],
             len: data.len(),
-            src: None,
-            found: std::cell::OnceCell::new(),
-            prescan: None,
+            rest: (data.len() > DETECT_HEAD).then_some(Rest::Held(data)),
             partial: false,
             reached: std::cell::Cell::new(false),
         }
@@ -1927,6 +1807,7 @@ impl<'a> Probe<'a> {
             // As long as an object can be: the checks that read its end ask
             // for what is past `head`, and are told so.
             len: usize::MAX,
+            rest: Some(Rest::Held(head)),
             partial: true,
             ..Probe::whole(head)
         }
@@ -1934,63 +1815,46 @@ impl<'a> Probe<'a> {
 
     /// Up to `n` bytes of the object from `off`.
     pub(crate) fn window(&self, off: usize, n: usize) -> std::borrow::Cow<'a, [u8]> {
-        match self.src {
-            Some(src) => src.window(off, n),
-            None => {
-                if self.partial && off.saturating_add(n) > self.head.len() {
-                    self.reached.set(true);
-                }
-                ByteSource::window(self.head, off, n)
-            }
-        }
-    }
-
-    /// Where `needle` first occurs in the object.
-    #[cfg(any(feature = "screnc", feature = "autoit", feature = "nsis"))]
-    pub(crate) fn find(&self, needle: &[u8]) -> Option<usize> {
-        let Some(src) = self.src else {
-            self.reached.set(self.reached.get() || self.partial);
-            return memchr::memmem::find(self.head, needle);
+        let held = match self.rest {
+            Some(Rest::Source(src)) => return src.window(off, n),
+            Some(Rest::Held(data)) => data,
+            None => self.head,
         };
-        match searched().iter().position(|n| *n == needle) {
-            Some(i) => self.searched(src).markers[i],
-            None => src.find(needle, 0, self.len),
+        if self.partial && off.saturating_add(n) > held.len() {
+            self.reached.set(true);
         }
+        ByteSource::window(held, off, n)
     }
 
-    /// For an object not held in memory, where the archive a self-extractor
-    /// carries starts, as `sfx::payload_offset` finds it.
-    #[cfg(feature = "sfx")]
-    pub(crate) fn sfx_payload(&self) -> Option<usize> {
-        self.reached.set(self.reached.get() || self.partial);
-        self.searched(self.src?).sfx
-    }
-
+    /// [`Self::head`], for a check that searches it: of an object that cannot
+    /// be read further, a start shorter than [`DETECT_HEAD`] is not all that
+    /// such a search reads.
     #[cfg(any(
         feature = "screnc",
         feature = "autoit",
         feature = "nsis",
         feature = "sfx"
     ))]
-    fn searched(&self, src: &dyn ByteSource) -> &Searched {
-        self.found.get_or_init(|| match self.prescan {
-            Some(read) => read().searched(),
-            None => search_through(src, self.len, self.head),
-        })
+    pub(crate) fn searched_start(&self) -> &'a [u8] {
+        if self.partial && self.head.len() < DETECT_HEAD {
+            self.reached.set(true);
+        }
+        self.head
     }
 
-    /// The object, when it is not held whole in `head`.
-    #[cfg(any(feature = "uuencode", feature = "sfx"))]
-    pub(crate) fn source(&self) -> Option<&'a dyn ByteSource> {
-        self.reached.set(self.reached.get() || self.partial);
-        self.src
+    /// [`after_image`] of the object: the bytes after an executable's image,
+    /// and their offset, when they run past [`Self::head`].
+    #[cfg(any(feature = "autoit", feature = "nsis", feature = "sfx"))]
+    pub(crate) fn after_image(&self) -> Option<(usize, std::borrow::Cow<'_, [u8]>)> {
+        after_image(&|off, n| self.window(off, n), self.len, self.head.len())
     }
 }
 
-/// Bytes of an object's start the checks read, other than those that read its
-/// end, search it, or follow its structure (Inno Setup's loader table is found
-/// through the executable's resources). InstallShield's marker is looked for
-/// in the first 4 MiB, and its fixed record lies past the marker.
+/// Bytes of an object's start the checks read, and the most a check searches:
+/// past them a check reads only the end of the object and the places its
+/// structure names (Inno Setup's loader table through the executable's
+/// resources, [`after_image`]). InstallShield's marker is looked for in the
+/// first 4 MiB, and its fixed record lies past the marker.
 pub(crate) const DETECT_HEAD: usize = 4 * 1024 * 1024 + 1024;
 
 /// Best-effort recognition of a container by magic bytes. Detection is
@@ -1999,20 +1863,9 @@ pub(crate) const DETECT_HEAD: usize = 4 * 1024 * 1024 + 1024;
 /// disabled feature (CHM, FAT, ARC, among others) returns `None` rather than
 /// reaching extraction as `unsupported`.
 ///
-/// Reads the object's start, and whatever else a check needs when the object
-/// is not held in memory.
+/// Reads the object's start (its first 4 MiB), its end, and the places past
+/// its start that its structure names: never all of it, held in memory or not.
 pub fn detect(src: &dyn ByteSource) -> Option<Format> {
-    detect_with(src, None)
-}
-
-/// [`detect`], its search through `src` made by `read` when detection needs
-/// it: a [`Prescan`] fed all of `src` by a read of it that serves the caller's
-/// own searches too.
-pub fn detect_prescanned(src: &dyn ByteSource, read: &dyn Fn() -> Prescan) -> Option<Format> {
-    detect_with(src, Some(read))
-}
-
-fn detect_with(src: &dyn ByteSource, prescan: Option<&dyn Fn() -> Prescan>) -> Option<Format> {
     if let Some(data) = src.as_slice() {
         return detect_probe(&Probe::whole(data));
     }
@@ -2032,9 +1885,7 @@ fn detect_with(src: &dyn ByteSource, prescan: Option<&dyn Fn() -> Prescan>) -> O
     detect_probe(&Probe {
         head: &head,
         len: src.len(),
-        src: Some(src),
-        found: std::cell::OnceCell::new(),
-        prescan,
+        rest: Some(Rest::Source(src)),
         partial: false,
         reached: std::cell::Cell::new(false),
     })
@@ -2660,83 +2511,94 @@ mod detect_source_tests {
         }
     }
 
-    /// What one read of an object finds is where a search for each marker
-    /// finds it, and where a self-extractor's own search finds its payload,
-    /// whatever window seam they straddle, and nothing when absent.
-    #[cfg(all(
-        feature = "screnc",
-        feature = "autoit",
-        feature = "nsis",
-        feature = "sfx"
-    ))]
-    #[test]
-    fn markers_are_found_in_one_read() {
-        let needles = searched();
-        let payload = |data: &[u8]| {
-            let mut r = source::Reader::new(&data);
-            formats::sfx::payload_offset(&mut r, data.len() as u64)
-                .unwrap()
-                .map(|o| o as usize)
-        };
-        for shift in [0, 1, 7, 15, 16, 17] {
-            let mut data = vec![b'.'; 7 * source::CHUNK];
-            data[..2].copy_from_slice(b"MZ");
-            for (k, n) in needles.iter().enumerate() {
-                let at = (k + 1) * source::CHUNK - n.len() / 2 - shift;
-                data[at..at + n.len()].copy_from_slice(n);
-                // A second occurrence later, which must not be the one found.
-                let later = at + 3 * source::CHUNK / 2;
-                data[later..later + n.len()].copy_from_slice(n);
-            }
-            // An ARJ magic with no header behind it, then a ZIP, each across
-            // a seam.
-            let arj = 5 * source::CHUNK - 3 - shift;
-            data[arj..arj + 2].copy_from_slice(&[0x60, 0xEA]);
-            let zip = 6 * source::CHUNK - 2 - shift;
-            data[zip..zip + 4].copy_from_slice(b"PK\x03\x04");
-            let cache = BlockCache::with_sizes(Cursor::new(data.clone()), 4093, 64 * 4093).unwrap();
-            let want: Vec<_> = needles
-                .iter()
-                .map(|n| memchr::memmem::find(&data, n))
-                .collect();
-            let got = search_through(&cache, data.len(), &data[..2]);
-            assert_eq!(got.markers, want, "shift {shift}");
-            assert_eq!(got.sfx, payload(&data), "shift {shift}");
-            assert!(got.sfx.is_some());
-            // Fed by a caller's own read, in windows of its own size.
-            let got = prescanned(&data, 10007);
-            assert_eq!(got.markers, want, "shift {shift}");
-            assert_eq!(got.sfx, payload(&data), "shift {shift}");
-            // Not an executable: no payload to look for.
-            data[..2].copy_from_slice(b"..");
-            assert_eq!(search_through(&cache, data.len(), &data[..2]).sfx, None);
+    /// A source that notes the bytes read of it.
+    struct Noted {
+        data: Vec<u8>,
+        read: std::cell::RefCell<Vec<(usize, usize)>>,
+    }
+
+    impl ByteSource for Noted {
+        fn len(&self) -> usize {
+            self.data.len()
         }
-        let empty = vec![b'.'; 3 * source::CHUNK];
-        let cache = BlockCache::with_sizes(Cursor::new(empty.clone()), 4093, 64 * 4093).unwrap();
-        let got = search_through(&cache, empty.len(), b"MZ");
-        assert!(got.markers.iter().all(Option::is_none) && got.sfx.is_none());
-        for n in needles {
-            assert!(n.len() <= Prescan::OVERLAP + 1);
+
+        fn window(&self, off: usize, len: usize) -> std::borrow::Cow<'_, [u8]> {
+            let w = ByteSource::window(&self.data[..], off, len);
+            self.read.borrow_mut().push((off, off + w.len()));
+            w
+        }
+
+        fn identity(&self) -> (usize, usize) {
+            ByteSource::identity(&self.data[..])
         }
     }
 
-    #[cfg(all(
-        feature = "screnc",
-        feature = "autoit",
-        feature = "nsis",
-        feature = "sfx"
-    ))]
-    fn prescanned(data: &[u8], window: usize) -> Searched {
-        let mut pre = Prescan::new(data);
-        let mut at = 0;
-        loop {
-            let end = (at + window).min(data.len());
-            let last = end == data.len();
-            pre.feed(at, &data[at..end], last);
-            if last {
-                return pre.searched();
+    impl Noted {
+        /// How many bytes of it were read, each counted once.
+        fn bytes_read(&self) -> usize {
+            let mut ranges = self.read.borrow().clone();
+            ranges.sort();
+            let (mut total, mut end) = (0, 0);
+            for (from, to) in ranges {
+                let from = from.max(end);
+                if to > from {
+                    total += to - from;
+                    end = to;
+                }
             }
-            at = end - Prescan::OVERLAP;
+            total
+        }
+    }
+
+    /// Detection reads an object's start, its end, and the bytes after an
+    /// executable's image, never all of it: the bytes it reads do not grow
+    /// with the object, whatever markers lie past the start (each check
+    /// that searches looks for its own in the start alone).
+    #[test]
+    fn detection_reads_the_start_the_end_and_the_places_the_structure_names() {
+        const LEN: usize = 32 << 20;
+        // The start, the end the end checks read, the window after an image,
+        // and the headers and directories a structure names.
+        const MOST: usize = DETECT_HEAD + (64 << 10) + 64 + AFTER_IMAGE + (64 << 10);
+        let markers: [&[u8]; 6] = [
+            b"#@~^AAAAAA==",
+            b"\xEF\xBE\xAD\xDENullsoftInst",
+            b"PK\x03\x04local",
+            b"Rar!\x1a\x07\x00",
+            b"\0\0\0\0UPX!",
+            b"\n end \n",
+        ];
+        let plant = |data: &mut Vec<u8>, from: usize| {
+            for (k, m) in markers.iter().enumerate() {
+                let at = from + k * 4096;
+                data[at..at + m.len()].copy_from_slice(m);
+            }
+        };
+        let mut objects = Vec::new();
+        // A plain object, an executable of no image, and a text.
+        for start in [&b"...."[..], b"MZ\0\0", b"begin 644 x\n"] {
+            let mut data = vec![b'.'; LEN];
+            data[..start.len()].copy_from_slice(start);
+            plant(&mut data, DETECT_HEAD + 100);
+            plant(&mut data, LEN / 2);
+            objects.push(data);
+        }
+        // An executable whose image ends past the start, with markers past
+        // the window after it.
+        let mut pe = crate::pe_resource::tests::pe_with_resource(DETECT_HEAD + 512, 10, 1, b"x");
+        let end = pe.len();
+        pe.resize(LEN, b'.');
+        plant(&mut pe, end + AFTER_IMAGE + 100);
+        objects.push(pe);
+        for (i, data) in objects.into_iter().enumerate() {
+            let noted = Noted {
+                data,
+                read: Default::default(),
+            };
+            detect(&noted);
+            is_upx_source(&noted);
+            let read = noted.bytes_read();
+            assert!(read <= MOST, "object {i}: {read} bytes read of {LEN}");
         }
     }
 
@@ -2763,12 +2625,20 @@ mod detect_source_tests {
         // Fewer with fewer format features.
         assert!(typed.len() > 15, "{typed:?}");
 
-        // Markers only a search through the object finds, past its start.
+        // Markers past the start, which no check searches for there, and the
+        // checks of its end and of the bytes after an executable's image.
         let far = |head: &[u8], marker: &[u8], tail: &[u8]| {
             let mut v = head.to_vec();
             v.resize(BIG, b'.');
             v.extend_from_slice(marker);
             v.extend_from_slice(tail);
+            v
+        };
+        let after_image = |marker: &[u8]| {
+            let mut v = crate::pe_resource::tests::pe_with_resource(BIG, 10, 1, b"x");
+            v.resize(v.len() + 100, 0);
+            v.extend_from_slice(marker);
+            v.resize(v.len() + 200, 0);
             v
         };
         let nsis_sig = [
@@ -2779,25 +2649,22 @@ mod detect_source_tests {
         let koly = [b"koly".as_slice(), &[0, 0, 0, 4, 0, 0, 2, 0]].concat();
         // Each case needs its format's detection compiled in.
         let cases: Vec<(Vec<u8>, Option<Format>, bool)> = vec![
+            (far(b"", b"#@~^AAAAAA==", b""), None, true),
+            (far(b"", &autoit_marker(b"AU3!EA06"), b""), None, true),
+            (far(b"MZ", &nsis_sig, b""), None, true),
+            (far(b"MZ", b"PK\x03\x04", b""), None, true),
             (
-                far(b"", b"#@~^", b""),
-                Some(Format::Screnc),
-                cfg!(feature = "screnc"),
-            ),
-            (
-                far(b"", &autoit_marker(b"AU3!EA06"), b""),
+                after_image(&autoit_marker(b"AU3!EA05")),
                 Some(Format::Autoit),
                 cfg!(feature = "autoit"),
             ),
-            // The marker alone, past the start, is a string.
-            (far(b"", b"AU3!EA06", b""), None, true),
             (
-                far(b"MZ", &nsis_sig, b""),
+                after_image(&nsis_sig),
                 Some(Format::Nsis),
                 cfg!(feature = "nsis"),
             ),
             (
-                far(b"MZ", b"PK\x03\x04", b""),
+                after_image(b"PK\x03\x04"),
                 Some(Format::Sfx),
                 cfg!(feature = "sfx"),
             ),
@@ -3150,20 +3017,33 @@ pub fn join_cab_volumes(cabinets: &[&[u8]]) -> Result<Vec<u8>, String> {
 pub use formats::cab_join::Links as CabLinks;
 
 /// True if `data` looks like a UPX-packed executable (a valid `PackHeader` is
-/// present). Used by callers whose file-type classifier already recognises
-/// PE/ELF/Mach-O and wants to additionally unpack UPX.
+/// present in its start, where UPX writes it). Used by callers whose file-type
+/// classifier already recognises PE/ELF/Mach-O and wants to additionally
+/// unpack UPX.
 pub fn is_upx(data: &[u8]) -> bool {
+    is_upx_start(&data[..data.len().min(DETECT_HEAD)], data.len())
+}
+
+/// [`is_upx`] of the object `src`, from its start alone.
+pub fn is_upx_source(src: &dyn ByteSource) -> bool {
+    let len = src.len();
+    is_upx_start(&src.window(0, len.min(DETECT_HEAD)), len)
+}
+
+/// [`is_upx`] of an object of `len` bytes that starts with `start`.
+fn is_upx_start(start: &[u8], len: usize) -> bool {
     #[cfg(feature = "upx")]
     {
         // Both layouts the unpacker handles: the `l_info` chain, and a bare
         // PackHeader. Gating on `find_packheader` alone meant a PackHeader-only
         // image (a routine shape for packed malware) reached no unpacker at
         // all and scanned clean.
-        find_packheader(data).is_some() || formats::has_packheader_layout(data)
+        formats::find_packheader_in(start, len).is_some()
+            || formats::has_packheader_layout_in(start, len)
     }
     #[cfg(not(feature = "upx"))]
     {
-        let _ = data;
+        let _ = (start, len);
         false
     }
 }
@@ -4262,26 +4142,24 @@ mod tests {
         let whole = Probe::whole(&head);
         whole.window(90, 20);
         assert!(!whole.reached.get());
-        #[cfg(any(feature = "screnc", feature = "autoit", feature = "nsis"))]
+        #[cfg(any(
+            feature = "screnc",
+            feature = "autoit",
+            feature = "nsis",
+            feature = "sfx"
+        ))]
         {
+            // A search of the start reads all the start a check may search.
             let start = Probe::start(&head);
-            assert_eq!(start.find(b"no such marker"), None);
-            assert!(start.reached.get(), "a search through the object");
+            assert_eq!(start.searched_start().len(), 100);
+            assert!(start.reached.get(), "less than a search reads");
+            let long = vec![0u8; DETECT_HEAD + 10];
+            let start = Probe::start(&long);
+            assert_eq!(start.searched_start().len(), DETECT_HEAD);
+            assert!(!start.reached.get());
             let whole = Probe::whole(&head);
-            assert_eq!(whole.find(b"no such marker"), None);
+            whole.searched_start();
             assert!(!whole.reached.get());
-        }
-        #[cfg(any(feature = "uuencode", feature = "sfx"))]
-        {
-            let start = Probe::start(&head);
-            assert!(start.source().is_none());
-            assert!(start.reached.get(), "the object itself");
-        }
-        #[cfg(feature = "sfx")]
-        {
-            let start = Probe::start(&head);
-            assert_eq!(start.sfx_payload(), None);
-            assert!(start.reached.get(), "a search for a payload");
         }
     }
 

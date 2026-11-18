@@ -213,7 +213,7 @@ impl<'a> YaraFeed<'a> {
         let unslated = run.iter().filter(|&&r| !r).count();
         let mut lits: Vec<Option<WindowedTap>> = (0..n).map(|_| None).collect();
         for &pid in &plan.ungated_windowed {
-            lits[pid] = Some(WindowedTap::new());
+            lits[pid] = Some(WindowedTap::new(rules.anchored[pid]));
         }
         Some(YaraFeed {
             rules,
@@ -262,7 +262,7 @@ impl<'a> YaraFeed<'a> {
         }
         for (pid, first) in std::mem::take(&mut self.hits.slated) {
             if rules.patterns[pid].windowed() {
-                self.lits[pid] = Some(WindowedTap::new());
+                self.lits[pid] = Some(WindowedTap::new(rules.anchored[pid]));
             } else {
                 self.start_regex(pid, Some(first));
             }
@@ -322,10 +322,13 @@ impl<'a> YaraFeed<'a> {
     }
 
     /// Follow the object with regexp pattern `pid`, whose first atom was at
-    /// `hit` if it has one. A pattern that cannot be followed is left to the
-    /// search made after the read.
+    /// `hit` if it has one. A pattern that cannot be followed, or is anchored
+    /// at an offset, is left to the search made after the read.
     fn start_regex(&mut self, pid: usize, hit: Option<usize>) {
         let rules = self.rules;
+        if rules.anchored[pid].is_some() {
+            return;
+        }
         let Some(fullword) = rules.patterns[pid].regex_fullword() else {
             return;
         };

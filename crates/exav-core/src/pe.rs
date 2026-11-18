@@ -2641,111 +2641,15 @@ pub(crate) fn embedded_archive_offsets_in(data: &dyn ByteSource) -> Vec<usize> {
     embedded_in(data, CarveCaps::default()).archives
 }
 
-/// Whether `src` holds a UPX pack header, as [`crate::unpack::is_upx`] would
-/// find one in it held whole: the `UPX!` magic after a 4-byte checksum, and a
-/// first block that fits in what is left of the object. The check of a PE too
-/// large to hold is made on its image, which can say no to a block that runs
-/// on into the rest of the file. `false` where UPX is not compiled in.
+/// Whether `src` holds a UPX pack header, as [`crate::unpack::is_upx`] finds
+/// one: in its start, where UPX writes it. `false` where UPX is not compiled
+/// in.
 pub(crate) fn upx_header_in(src: &dyn ByteSource) -> bool {
-    if !upx_compiled_in() {
-        return false;
-    }
-    let len = src.len();
-    let mut scan = UpxScan::new(len);
-    let mut at = 0;
-    while at < len && !scan.found() {
-        let end = (at + crate::byte_source::CHUNK).min(len);
-        let w = src.window(at, end - at + UpxScan::OVERLAP);
-        if w.is_empty() {
-            return false;
-        }
-        scan.feed(at, &w, end - at);
-        at = end;
-    }
-    scan.found()
-}
-
-/// [`upx_header_in`] for an object that comes in windows, in order.
-pub(crate) struct UpxScan {
-    finder: memchr::memmem::Finder<'static>,
-    len: usize,
-    found: bool,
-    /// The last four bytes of the window before: the checksum before a magic
-    /// that begins the next.
-    behind: Vec<u8>,
-}
-
-impl UpxScan {
-    /// Bytes of the object past a window that the search reads.
-    pub(crate) const OVERLAP: usize = 32;
-
-    /// The search of an object of `len` bytes. Where UPX is not compiled in
-    /// it finds nothing.
-    pub(crate) fn new(len: usize) -> Self {
-        UpxScan {
-            finder: memchr::memmem::Finder::new(b"UPX!"),
-            len,
-            found: false,
-            behind: Vec::new(),
-        }
-    }
-
-    /// Whether a header was found.
-    pub(crate) fn found(&self) -> bool {
-        self.found
-    }
-
-    /// The window `w` at `at`, following the windows fed before. Its first
-    /// `owned` bytes are its own; the rest, up to [`Self::OVERLAP`] of them,
-    /// are the start of the next window.
-    pub(crate) fn feed(&mut self, at: usize, w: &[u8], owned: usize) {
-        if self.found || !upx_compiled_in() {
-            return;
-        }
-        let owned = owned.min(w.len());
-        // The four bytes before `at` come first: the checksum of a magic at `at`.
-        let mut buf = std::mem::take(&mut self.behind);
-        let base = at - buf.len();
-        buf.extend_from_slice(w);
-        for p in self.finder.find_iter(&buf) {
-            let m = base + p;
-            if p >= 4
-                && m >= at
-                && m < at + owned
-                && plausible_pack_header(&buf[p - 4..], self.len - (m - 4))
-            {
-                self.found = true;
-                return;
-            }
-        }
-        let next = at + owned - base;
-        self.behind = buf[next.saturating_sub(4)..next].to_vec();
-    }
-}
-
-/// Whether the 36 bytes at `h` (the checksum, `UPX!`, and the rest of the
-/// header), of which `left` bytes of the object remain, pass what
-/// [`crate::unpack::is_upx`] asks of a header: either of its two layouts.
-fn plausible_pack_header(h: &[u8], left: usize) -> bool {
-    let Some(h) = h.get(..36) else {
-        return false;
-    };
-    let word = |at: usize| u32::from_le_bytes([h[at], h[at + 1], h[at + 2], h[at + 3]]) as usize;
-    // The chain of `l_info`, `p_info` and `b_info`: the file's size and the
-    // first block's sizes.
-    let chain = word(16) != 0
-        && word(24) != 0
-        && word(24) <= 256 << 20
-        && word(28) != 0
-        && 36usize.saturating_add(word(28)) <= left;
-    // A bare header: the method, and the sizes unpacked and packed, of which
-    // the packed part must fit.
-    let bare =
-        matches!(h[10], 2 | 5 | 8) && word(20) != 0 && word(24) != 0 && word(24) <= left - 36;
-    chain || bare
+    crate::unpack::is_upx_source(src)
 }
 
 /// Whether `is_upx` can say yes in this build.
+#[cfg(test)]
 pub(crate) fn upx_compiled_in() -> bool {
     static YES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *YES.get_or_init(|| {
@@ -5042,21 +4946,9 @@ mod tests {
         assert_eq!(elf_image_in(&none, 1 << 20).map(|i| i.len()), Some(144));
     }
 
-    /// [`UpxScan`] over `buf` handed to it `piece` bytes at a time, each with
-    /// what follows it.
-    fn upx_scan_in_pieces(buf: &[u8], piece: usize) -> bool {
-        let mut scan = UpxScan::new(buf.len());
-        for (i, w) in buf.chunks(piece).enumerate() {
-            let at = i * piece;
-            let end = (at + w.len() + UpxScan::OVERLAP).min(buf.len());
-            scan.feed(at, &buf[at..end], w.len());
-        }
-        scan.found()
-    }
-
     /// A UPX header is found as `unpack::is_upx` finds one, in memory and
     /// through a cache, wherever the magic lies against the edges of the
-    /// blocks it is searched in, and when the object comes in pieces.
+    /// blocks of the cache; and only in the object's start.
     #[test]
     fn a_upx_header_is_found_as_is_upx_finds_it() {
         if !upx_compiled_in() {
@@ -5086,9 +4978,6 @@ mod tests {
             let want = crate::unpack::is_upx(&buf);
             assert_eq!(upx_header_in(&&buf[..]), want, "{k}");
             assert_eq!(upx_header_in(&cached(&buf)), want, "{k} through a cache");
-            for piece in [1, 3, 7, 64, seam] {
-                assert_eq!(upx_scan_in_pieces(&buf, piece), want, "{k}, pieces of {piece}");
-            }
             if want {
                 yes += 1;
             } else {
@@ -5099,21 +4988,24 @@ mod tests {
         // A magic in the first 4 bytes has no checksum before it.
         assert!(!upx_header_in(&&b"UPX!"[..]));
         // A lone magic in a long object is not a header, and a header is
-        // found past the first block.
-        let mut long = vec![b'.'; 5 * seam];
+        // found past the first block, in the start; past the start it is not
+        // looked for, as UPX writes it at the start.
+        let start = 4 * 1024 * 1024 + 1024;
+        let mut long = vec![b'.'; start + 5 * seam];
         long[3 * seam..3 * seam + 4].copy_from_slice(b"UPX!");
         assert!(!upx_header_in(&&long[..]));
-        let at = 4 * seam - 20;
-        long[at + 4..at + 8].copy_from_slice(b"UPX!");
-        long[at + 10] = 2;
-        set32(&mut long, at + 20, 100);
-        set32(&mut long, at + 24, 100);
+        let header = |long: &mut Vec<u8>, at: usize| {
+            long[at + 4..at + 8].copy_from_slice(b"UPX!");
+            long[at + 10] = 2;
+            set32(long, at + 20, 100);
+            set32(long, at + 24, 100);
+        };
+        let mut far = long.clone();
+        header(&mut long, 4 * seam - 20);
         assert!(upx_header_in(&&long[..]) && crate::unpack::is_upx(&long));
         assert!(upx_header_in(&cached(&long)));
-        for piece in [1, 5, 64, 1000, seam, 2 * seam] {
-            assert!(upx_scan_in_pieces(&long, piece), "pieces of {piece}");
-        }
-        long[at + 10] = 0;
-        assert!(!upx_scan_in_pieces(&long, 64));
+        header(&mut far, start + seam);
+        assert!(!upx_header_in(&&far[..]) && !crate::unpack::is_upx(&far));
+        assert!(!upx_header_in(&cached(&far)));
     }
 }

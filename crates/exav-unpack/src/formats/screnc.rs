@@ -241,9 +241,29 @@ fn decode_body(body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// True iff `data` contains the 4-byte `#@~^` Script Encoder marker.
+/// Whether `p` is an encoded script: the marker at its start, as clamscan
+/// 1.4.3 types one, or a blob's start ([`blob_starts`]) in its start.
 pub(crate) fn looks_like_screnc(p: &crate::Probe) -> bool {
-    p.find(MARKER).is_some()
+    if p.head.starts_with(MARKER) {
+        return true;
+    }
+    let head = p.searched_start();
+    memchr::memmem::find_iter(head, MARKER).any(|at| blob_starts(&head[at..]))
+}
+
+/// Bytes [`blob_starts`] reads.
+const BLOB_HEAD: usize = MARKER.len() + HEADER_EXTRA;
+
+/// Whether `at` starts with a blob: the marker, then the length in six base64
+/// characters and `==`, which every encoded script has. The marker alone is
+/// four bytes a large file of any kind holds by chance.
+fn blob_starts(at: &[u8]) -> bool {
+    at.len() >= BLOB_HEAD
+        && at.starts_with(MARKER)
+        && at[MARKER.len()..MARKER.len() + 6]
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+        && at[MARKER.len() + 6..BLOB_HEAD] == *b"=="
 }
 
 /// Find every `#@~^ … ^#~@` blob, decode each, and emit the recovered plaintext
@@ -331,10 +351,17 @@ mod tests {
         assert!(entries[0].data.windows(13).any(|w| w == b"CreateObject("));
     }
 
+    /// The marker counts at the start, or anywhere with a blob's header.
     #[test]
-    fn looks_like_screnc_detects_marker() {
+    fn the_marker_counts_at_the_start_or_with_its_header() {
         assert!(looks_like_screnc(REAL_VECTOR));
-        assert!(looks_like_screnc(b"junk#@~^stuff"));
+        assert!(looks_like_screnc(b"#@~^stuff"));
+        assert!(looks_like_screnc(b"<script>#@~^AAAAAA==x</script>"));
+        // A stray marker before a blob does not hide it.
+        assert!(looks_like_screnc(b"junk #@~^ then #@~^QQ+/9z==x"));
+        assert!(!looks_like_screnc(b"junk#@~^stuff"));
+        assert!(!looks_like_screnc(b"junk#@~^AAAAA-==x"));
+        assert!(!looks_like_screnc(b"junk#@~^AAAAAA="));
         assert!(!looks_like_screnc(b"MsgBox \"hello, world\"\r\n"));
         assert!(!looks_like_screnc(b""));
     }

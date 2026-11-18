@@ -47,10 +47,17 @@ fn find_firstheader(data: &[u8]) -> Option<usize> {
     memchr::memmem::find(data, &NSIS_SIG)?.checked_sub(4)
 }
 
-/// True if `data` is a PE stub carrying the NSIS firstheader signature.
+/// True if `p` is a PE stub carrying the NSIS firstheader signature: in its
+/// start, or in the bytes after its image, where the installer's data is.
 pub(crate) fn is_nsis(p: &crate::Probe) -> bool {
-    // As `find_firstheader` finds it.
-    p.head.starts_with(b"MZ") && p.find(&NSIS_SIG).and_then(|at| at.checked_sub(4)).is_some()
+    if !p.head.starts_with(b"MZ") {
+        return false;
+    }
+    // As `find_firstheader` finds it, past the 4 bytes of flags before it.
+    let in_start = memchr::memmem::find(p.searched_start(), &NSIS_SIG).is_some_and(|at| at >= 4);
+    in_start
+        || p.after_image()
+            .is_some_and(|(_, after)| memchr::memmem::find(&after, &NSIS_SIG).is_some())
 }
 
 pub(crate) fn extract_nsis(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {

@@ -167,16 +167,25 @@ pub(crate) fn looks_like_uuencode(p: &crate::Probe) -> bool {
     if !base64 && !head.starts_with(b"begin ") {
         return false;
     }
-    // Require a terminator so a stray "begin " prose line isn't claimed.
+    // Require a terminator so a stray "begin " prose line isn't claimed: in
+    // the start, or in the end, from a line's start.
     let mut scan = Terminator::new(base64);
-    match p.source() {
-        None => {
-            scan.feed(data);
-        }
-        Some(src) => src.chunks(0, src.len(), &mut |_, chunk| !scan.feed(chunk)),
+    if scan.feed(data) || p.len <= data.len() {
+        return scan.finish();
     }
+    let from = p.len.saturating_sub(TAIL).max(data.len());
+    let tail = p.window(from, p.len - from);
+    let Some(line) = memchr::memchr(b'\n', &tail) else {
+        return false;
+    };
+    let mut scan = Terminator::new(base64);
+    scan.feed(&tail[line + 1..]);
     scan.finish()
 }
+
+/// The bytes at the end of an object that [`looks_like_uuencode`] reads for
+/// the terminator, past its start.
+const TAIL: usize = 64 * 1024;
 
 /// Looks for a line that, trimmed of ASCII whitespace, is `end` (or starts
 /// with `====` for base64), over bytes fed a piece at a time.

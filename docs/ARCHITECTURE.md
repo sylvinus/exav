@@ -60,6 +60,15 @@ The readers sit behind the same Cargo features as the formats, and
 
 ## How a file is read
 
+**Detection.** A format is named from the file's first 4 MiB, its end, and
+the places its structure names (the bytes after an executable's image, a
+resource), never from a search through all of it: on a large file of any
+kind a short marker turns up by chance, and the read costs the whole file.
+The probe `detect` hands the checks holds only those places
+(`detection_reads_the_start_the_end_and_the_places_the_structure_names`
+checks the bytes read). Carving embedded executables and archives, which
+looks through all of a file, finds members and does not name its format.
+
 **Scan.** `exav-core` hands a file to `exav_unpack::walk`, which names the
 format and yields the members one at a time (decoded as they are read where the
 format allows). Each member is scanned as an object of its own, and the

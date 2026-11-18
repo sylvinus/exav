@@ -636,11 +636,11 @@ fn passes_over(db: &Scanner, file: &[u8], opts: ScanOptions) -> f64 {
 
 /// What a PE past the limit costs to read, the cache holding a few blocks of
 /// a file of 1 MiB: detection reads the start of the object, which is all of
-/// it up to 4 MiB; and the one read serves the signature sweep, carving, the
-/// prefilter, the search of the rest of the object for a UPX header, which
-/// the image alone cannot answer, and with `--detect exav-heuristics` the
-/// static model's byte counts. Each bound allows a fifth of a read more, for
-/// the headers and the image, read again by each check that needs them.
+/// it up to 4 MiB, and the search for a UPX header reads it again, which the
+/// cache cannot keep here; the one read serves the signature sweep, carving,
+/// the prefilter and with `--detect exav-heuristics` the static model's byte
+/// counts. Each bound allows a fifth of a read more, for the headers and the
+/// image, read again by each check that needs them.
 #[test]
 fn a_pe_with_an_overlay_is_read_a_few_times() {
     let mut f = small_pe(0x200);
@@ -648,8 +648,8 @@ fn a_pe_with_an_overlay_is_read_a_few_times() {
     let mut heuristics = ScanOptions::default();
     heuristics.heuristics = true;
     for (what, opts, bound) in [
-        ("default", ScanOptions::default(), 2.0),
-        ("heuristics", heuristics, 2.0),
+        ("default", ScanOptions::default(), 3.0),
+        ("heuristics", heuristics, 3.0),
     ] {
         let passes = passes_over(&near_misses(), &f, opts);
         assert!(
@@ -659,9 +659,9 @@ fn a_pe_with_an_overlay_is_read_a_few_times() {
     }
 }
 
-/// UPX's pack header can lie anywhere in an executable, and the check is made
-/// on the image of a PE too large to hold: so the rest of it is searched for
-/// one, and what the image cannot unpack is not OK.
+/// UPX's pack header is looked for in an executable's start, and the check is
+/// made on the image of a PE too large to hold: so the start past the image is
+/// searched for one, and what the image cannot unpack is not OK.
 #[cfg(feature = "all-formats")]
 #[test]
 fn a_upx_header_past_the_image_of_a_pe_is_not_ok() {
@@ -676,7 +676,7 @@ fn a_upx_header_past_the_image_of_a_pe_is_not_ok() {
     assert_ne!(
         mem,
         Verdict::Clean,
-        "held in memory, UPX is looked for in all of it"
+        "held in memory, UPX is looked for in its start"
     );
     match streamed(&db, &f, ScanOptions::default()) {
         Verdict::LimitsExceeded { .. } => {}

@@ -1,6 +1,6 @@
 ---
 title: File formats
-description: "Every file format exav reads, in one table: whether the scanner checks it for malware, whether its members or parts can be extracted, whether the viewer shows it, with an example in the demo."
+description: "Every file format exav reads, in one table: whether the scanner checks it for malware, whether its members or parts can be extracted and by which code, whether the viewer shows it, with an example in the demo."
 tableOfContents: false
 ---
 
@@ -18,6 +18,8 @@ registry (`formats/registry.json`, which the tests check against the code):
   parts of a document (the embedded files and streams of a PDF, the XML parts
   of a DOCX). *Streamed* means decoded as it is read, at any size; *read whole*
   means held in memory first. See the [extractor's formats](/unpack/formats/).
+- **Extractor code.** The module of `exav-unpack` that reads the format, and
+  the crates its Cargo feature brings in.
 - **View.** Whether the [viewer](/viewer/) draws it in the browser, and a file
   of that format to open in the [demo](/viewer/demo/) when it has one.
 

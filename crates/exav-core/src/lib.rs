@@ -222,8 +222,6 @@ pub(crate) struct Facts<'a> {
     /// For an object not held in memory, what the one read is for, until it
     /// is made.
     shared: std::cell::Cell<Option<Shared>>,
-    /// What that read found for detection, until detection asks.
-    prescan: std::cell::RefCell<Option<unpack::Prescan>>,
     /// What the matching core will run over the object, until the read that
     /// feeds the signature sweep and YARA's patterns is made.
     matching: std::cell::Cell<Option<pass::Matching<'a>>>,
@@ -232,23 +230,21 @@ pub(crate) struct Facts<'a> {
     /// What that read found of YARA's patterns: those slated to run, and
     /// their matches.
     yara_pass: std::cell::RefCell<Option<yara::YaraPass>>,
-    /// Whether the object holds a UPX pack header, when that read searched it.
+    /// Whether the object holds a UPX pack header, once asked.
     upx: std::cell::OnceCell<bool>,
     /// How often each byte occurs in it, when that read counted them.
     counts: std::cell::OnceCell<Box<[u64; 256]>>,
 }
 
 /// What the one read of an object not held in memory computes: the digests
-/// `want` names, detection's search, carving's when `carve`, and the search for
-/// a message inside it when `mail`.
+/// `want` names, carving's search when `carve`, and the search for a message
+/// inside it when `mail`.
 #[derive(Clone, Copy)]
 struct Shared {
     want: hashes::Want,
     carve: bool,
     /// Far candidates carving holds before it checks them.
     far: usize,
-    /// Search for a UPX pack header.
-    upx: bool,
     /// Count the bytes, for the static model.
     counts: bool,
     /// Search for a message inside it, as clamscan reads one from a text file.
@@ -268,7 +264,6 @@ impl<'a> Facts<'a> {
             caps: pe::CarveCaps::default(),
             mail: std::cell::RefCell::new(None),
             shared: std::cell::Cell::new(None),
-            prescan: std::cell::RefCell::new(None),
             matching: std::cell::Cell::new(None),
             engine_run: std::cell::RefCell::new(None),
             yara_pass: std::cell::RefCell::new(None),
@@ -283,14 +278,12 @@ impl<'a> Facts<'a> {
         let mut facts = Facts::new(data);
         facts.caps = pe::CarveCaps::of(&opts.limits);
         if data.as_slice().is_none() {
-            // Only an executable has its UPX header searched for and its bytes
-            // counted for the static model.
+            // Only an executable has its bytes counted for the static model.
             let executable = data.window(0, 2).as_ref() == b"MZ";
             facts.shared.set(Some(Shared {
                 want: digests_wanted_by(db, data.len() as u64),
                 carve,
                 far: opts.carve_pending(),
-                upx: executable && pe::upx_compiled_in(),
                 counts: executable && opts.heuristics,
                 mail: cfg!(feature = "email") && !executable,
                 caps: facts.caps,
@@ -300,18 +293,7 @@ impl<'a> Facts<'a> {
     }
 
     pub(crate) fn format(&self) -> Option<unpack::Format> {
-        *self.fmt.get_or_init(|| {
-            if self.shared.get().is_none() && self.prescan.borrow().is_none() {
-                return unpack::detect(self.data);
-            }
-            unpack::detect_prescanned(self.data, &|| {
-                self.read_once(pass::Why::Search);
-                // None only when the source gave nothing to read.
-                self.prescan
-                    .take()
-                    .unwrap_or_else(|| unpack::Prescan::new(b""))
-            })
-        })
+        *self.fmt.get_or_init(|| unpack::detect(self.data))
     }
 
     /// The digests the allowlist and the hash signatures of `db` can match at
@@ -1299,18 +1281,6 @@ impl Scanner {
 
     fn identify_inner(&self, facts: &Facts) -> FileType {
         self.identify_as(facts.data, &|| facts.format())
-    }
-
-    /// What [`Self::identify_facts`] says unless the search through all of
-    /// the object finds a marker: the type a read of it can assume while it
-    /// makes that search. Such a marker only types an object that no
-    /// signature's target can tell from it.
-    pub(crate) fn identify_head(&self, facts: &Facts) -> FileType {
-        let fmt = match facts.fmt.get() {
-            Some(fmt) => *fmt,
-            None => unpack::detect_prescanned(facts.data, &|| unpack::Prescan::new(b"")),
-        };
-        self.identify_as(facts.data, &|| fmt)
     }
 
     /// The type of `data`, `format` giving what detection makes of it.
@@ -5412,11 +5382,10 @@ mod tests {
     /// one a download, so a change that adds one fails here: raising a bound
     /// needs the maintainer's approval, not a new expectation.
     ///
-    /// One read serves detection's search for its markers (and for an
-    /// executable, a self-extractor's payload), carving, the digests when a
-    /// hash signature has the object's size, the search of a text file for a
-    /// message in it, the signature sweep and YARA's
-    /// patterns. A signature with an unbounded gap, whose literal after it is
+    /// One read serves carving, the digests when a hash signature has the
+    /// object's size, the search of a text file for a message in it, the
+    /// signature sweep and YARA's patterns; detection reads the object's
+    /// start and end. A signature with an unbounded gap, whose literal after it is
     /// searched through the rest of the object once the sweep is over, adds
     /// at most one more. The cache is smaller than the object, so a part it
     /// no longer holds that is read again is read from the source again: an
@@ -5682,30 +5651,36 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// The signature engine runs in the one read of a streamed object, as the
-    /// type the start of the object gives. A marker further in can type it
-    /// otherwise: the answer of the read is kept only when no signature
-    /// target tells the two types apart, else the engine runs again.
+    /// A marker in the start of an object types it, held or streamed. Past
+    /// the start, detection does not read it and the object keeps its type.
     #[cfg(feature = "all-formats")]
     #[test]
-    fn a_marker_past_the_start_that_retypes_an_object_discards_the_answer_of_the_read() {
+    fn a_marker_types_an_object_in_its_start_only() {
         let needle = b"needle in the mail";
         // A message told by its MIME headers: it does not start with one of the
         // headers that type a message by themselves.
         let mut mail =
             b"Content-Type: text/plain\r\nMIME-Version: 1.0\r\nSubject: hi\r\n\r\n".to_vec();
         mail.extend_from_slice(needle);
-        // Longer than the start that detection reads: the marker is found by
-        // the search through the rest of the object.
+        // Longer than the start that detection reads.
         mail.resize(5 << 20, b'.');
         // A compiled AutoIt script's marker after its GUID types such a
-        // message as AutoIt, as it does for clamscan.
-        let mut screnc = mail.clone();
-        screnc.extend_from_slice(&[
-            0xA3, 0x48, 0x4B, 0xBE, 0x98, 0x6C, 0x4A, 0xA9, 0x99, 0x4C, 0x53, 0x0A, 0x86, 0xD6,
-            0x48, 0x7D,
-        ]);
-        screnc.extend_from_slice(b"AU3!EA06");
+        // message as AutoIt.
+        let script = |at: usize| {
+            let mut m = mail.clone();
+            let marker = [
+                &[
+                    0xA3, 0x48, 0x4B, 0xBE, 0x98, 0x6C, 0x4A, 0xA9, 0x99, 0x4C, 0x53, 0x0A, 0x86,
+                    0xD6, 0x48, 0x7D,
+                ][..],
+                b"AU3!EA06",
+            ]
+            .concat();
+            m.splice(at..at, marker);
+            m
+        };
+        let near = script(1 << 20);
+        let far = script(mail.len());
         let mut l = loader::Builder::new();
         let sig = format!("Sig.Mail;Engine:51-255,Target:4;0;{}\n", hex_of(needle));
         l.add_named_bytes("a.ldb", sig.as_bytes(), true);
@@ -5721,15 +5696,18 @@ mod tests {
             Verdict::Infected { signature, .. } => Some(signature.clone()),
             _ => None,
         };
-        // A mail: its target applies, held or not.
-        assert_eq!(name(&held(&mail)).as_deref(), Some("Sig.Mail"));
-        assert_eq!(name(&streamed(&mail)).as_deref(), Some("Sig.Mail"));
-        // With the marker it is a compiled script, which no mail signature
-        // applies to. Streamed, its format is not read (it is over the limit),
-        // and the scan says so instead of naming the mail signature.
-        let want = held(&screnc);
+        // A mail, with the marker past its start too: its target applies,
+        // held or not.
+        for data in [&mail, &far] {
+            assert_eq!(name(&held(data)).as_deref(), Some("Sig.Mail"));
+            assert_eq!(name(&streamed(data)).as_deref(), Some("Sig.Mail"));
+        }
+        // With the marker in the start it is a compiled script, which no mail
+        // signature applies to. Streamed, its format is not read (it is over
+        // the limit), and the scan says so.
+        let want = held(&near);
         assert_eq!(name(&want), None, "{want:?}");
-        let got = streamed(&screnc);
+        let got = streamed(&near);
         assert!(matches!(got, Verdict::LimitsExceeded { .. }), "{got:?}");
     }
 
@@ -5872,9 +5850,8 @@ mod tests {
     #[test]
     fn one_read_serves_every_step() {
         use byte_source::CHUNK;
-        // Longer than the start detection reads, so it searches the rest.
+        // Longer than the start detection reads.
         let mut data = vec![b'.'; (5 << 20) + 77];
-        let end = data.len();
         let mut pe = b"MZ".to_vec();
         pe.resize(0x3c, 0);
         pe.extend_from_slice(&0x40u32.to_le_bytes());
@@ -5892,7 +5869,7 @@ mod tests {
         put(3 * CHUNK - 5, b"7z\xbc\xaf\x27\x1c");
         put(4 * CHUNK - 2, b"PK\x03\x04");
         put(
-            end - 3 * CHUNK - 19,
+            5 * CHUNK - 19,
             &[
                 0xA3, 0x48, 0x4B, 0xBE, 0x98, 0x6C, 0x4A, 0xA9, 0x99, 0x4C, 0x53, 0x0A, 0x86, 0xD6,
                 0x48, 0x7D, b'A', b'U', b'3', b'!', b'E', b'A', b'0', b'6',
@@ -5919,7 +5896,7 @@ mod tests {
         let want_fmt = unpack::detect(&slice);
         let want_embedded = pe::embedded_in(&slice, pe::CarveCaps::default());
         let want_digests = hashes::digests_wanted(&slice, digests_wanted_by(&db, size as u64));
-        // Found by the search past detection's start, in a build that has it.
+        // Found in the start, in a build that has it.
         #[cfg(feature = "all-formats")]
         assert_eq!(want_fmt, Some(unpack::Format::Autoit));
         assert!(!want_embedded.pe.is_empty() && !want_embedded.archives.is_empty());
@@ -6013,14 +5990,9 @@ mod tests {
             );
             facts.format();
             let passes = (read.load(Ordering::Relaxed) - before) as f64 / len as f64;
-            // Its start, and past that start a search through all of it.
-            let bound = if unpack::Prescan::needed(len) {
-                2.0
-            } else {
-                1.0
-            };
+            // Its start and its end: never all of it, and nothing twice.
             assert!(
-                passes <= bound + 0.1,
+                passes <= 1.1,
                 "{len}: detection read it {passes:.2} times over"
             );
         }

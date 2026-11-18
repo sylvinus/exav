@@ -13,9 +13,12 @@
 //   - the scanner's `FileType::as_str` (crates/exav-core/src/filetype.rs);
 //   - the viewer's `BUILTIN_ORDER` (the extensions and types of its matchers
 //     are generated from the registry, below);
-//   - the generated files: the summary sentences in the docs, and the viewer's
-//     ts/core/formats.generated.ts. The site's formats page reads the registry
-//     when the site is built.
+//   - every format the extractor reads has a reader module in
+//     crates/exav-unpack/src/formats;
+//   - the generated files: the summary sentences in the docs, the viewer's
+//     ts/core/formats.generated.ts, and formats/code.generated.json (each
+//     format's reader and the crates its feature pulls in). The site's formats
+//     page reads the registry and that file when the site is built.
 // The detection of the scanner is compared by a Rust test
 // (crates/exav-core/tests/suites/format_registry.rs). No dependencies.
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -75,6 +78,61 @@ export function viewerPlugins() {
   return [...text.slice(start, text.indexOf("];", start)).matchAll(/"([a-z0-9]+)"/g)].map((m) => m[1]);
 }
 
+const READERS = "crates/exav-unpack/src/formats";
+
+/** The module stream.rs walks each `Format` variant with. */
+function streamingModules() {
+  const text = read("crates/exav-unpack/src/stream.rs");
+  const body = block(text, text.indexOf("let walk: WalkFn = match fmt"));
+  return new Map([...body.matchAll(/Format::([A-Za-z0-9]+)\s*=>\s*f::([a-z0-9_]+)::/g)].map((m) => [m[1], m[2]]));
+}
+
+/** The extractor's reader of registry entry `f`: the module stream.rs walks it with, else the one its feature or its
+ * variant names. A file, or the directory of a module in parts; `null` when there is none. */
+function readerPath(f, walked) {
+  const { format, feature } = f.unpack;
+  const snake = format.replace(/(?<!^)(?=[A-Z])/g, "_").toLowerCase();
+  for (const name of [walked.get(format), feature, snake, format.toLowerCase()]) {
+    if (!name) continue;
+    if (existsSync(join(repo, READERS, `${name}.rs`))) return `${READERS}/${name}.rs`;
+    if (existsSync(join(repo, READERS, name, "mod.rs"))) return `${READERS}/${name}/`;
+  }
+  return null;
+}
+
+/** The `[name]` section of a Cargo manifest, comments removed. */
+function tomlSection(toml, name) {
+  const start = toml.indexOf(`\n[${name}]\n`);
+  if (start < 0) throw new Error(`no [${name}] in the manifest`);
+  const end = toml.indexOf("\n[", start + 1);
+  return toml.slice(start, end < 0 ? undefined : end).replace(/#.*$/gm, "");
+}
+
+/** For each of exav-unpack's features, the crates it pulls in, with the features it turns on: their package names. */
+function featureCrates() {
+  const toml = read("crates/exav-unpack/Cargo.toml");
+  const packages = new Map();
+  for (const m of tomlSection(toml, "dependencies").matchAll(/^([A-Za-z0-9_-]+)\s*=\s*(.*)$/gm)) {
+    packages.set(m[1], m[2].match(/package\s*=\s*"([^"]+)"/)?.[1] ?? m[1]);
+  }
+  const features = new Map();
+  for (const m of tomlSection(toml, "features").matchAll(/^([a-z0-9][a-z0-9-]*)\s*=\s*\[([^\]]*)\]/gm)) {
+    features.set(m[1], [...m[2].matchAll(/"([^"]+)"/g)].map((i) => i[1]));
+  }
+  const of = (name, out, seen) => {
+    if (seen.has(name)) return out;
+    seen.add(name);
+    for (const item of features.get(name) ?? []) {
+      const dep = item.startsWith("dep:") ? item.slice(4) : item.split("/")[0].replace(/\?$/, "");
+      if (features.has(dep) && !item.startsWith("dep:")) of(dep, out, seen);
+      else if (packages.has(dep)) out.add(packages.get(dep));
+      else throw new Error(`exav-unpack's feature ${name}: ${item} is neither a feature nor a dependency`);
+    }
+    return out;
+  };
+  return new Map([...features.keys()].map((name) => [name, [...of(name, new Set(), new Set())].sort()]));
+}
+
 export function problems() {
   const out = [];
   const add = (m) => out.push(m);
@@ -106,6 +164,7 @@ export function problems() {
   // The extractor.
   const variants = rustFormats();
   const stream = new Set(streamingFormats());
+  const walked = streamingModules();
   const features = unpackFeatures();
   const byFormat = new Map();
   for (const f of registry.formats) {
@@ -113,6 +172,9 @@ export function problems() {
     const { format, feature, read } = f.unpack;
     if (!variants.includes(format)) add(`format ${f.id}: no Format::${format} in exav-unpack`);
     if (feature !== null && !features.has(feature)) add(`format ${f.id}: exav-unpack has no feature ${feature}`);
+    if ((feature !== null || read !== "reported") && !readerPath(f, walked)) {
+      add(`format ${f.id}: no reader module for Format::${format} in ${READERS}`);
+    }
     const reads = byFormat.get(format) ?? new Set();
     reads.add(read);
     byFormat.set(format, reads);
@@ -158,7 +220,7 @@ export function problems() {
 
 // ── Generated files ──────────────────────────────────────────────────────────
 // The site's formats page reads the registry itself when it is built
-// (www/src/components/FormatTable.astro).
+// (www/src/components/FormatTable.astro), with formats/code.generated.json.
 
 const VIEWER_MODULE = "crates/exav-viewer/ts/core/formats.generated.ts";
 const WIDTH = 120;
@@ -210,6 +272,27 @@ function viewerModule() {
   return out.join("\n");
 }
 
+const CODE = "formats/code.generated.json";
+
+/** The site's table of where each format's code is: per registry entry the extractor reads, its reader module and
+ * the crates its feature pulls in. */
+function codeTable() {
+  const walked = streamingModules();
+  const crates = featureCrates();
+  const formats = {};
+  for (const f of registry.formats) {
+    if (!f.unpack) continue;
+    const reader = readerPath(f, walked);
+    const used = f.unpack.feature === null ? [] : (crates.get(f.unpack.feature) ?? []);
+    if (reader || used.length) formats[f.id] = { reader, crates: used };
+  }
+  const about =
+    "Generated by scripts/formats.mjs from formats/registry.json, exav-unpack's stream.rs and Cargo.toml: " +
+    "the reader of each format the extractor reads, and the crates its feature pulls in. Do not edit: " +
+    "run node scripts/formats.mjs generate.";
+  return `${JSON.stringify({ about, formats }, null, 2)}\n`;
+}
+
 /** `text` with what lies between the markers of `name` replaced. */
 export function withBlock(text, name, body) {
   const start = `<!-- formats:${name} -->`;
@@ -227,6 +310,7 @@ export function generated() {
     out[file] = withBlock(read(file), "viewer-summary", registry.summaries.viewer);
   }
   out[VIEWER_MODULE] = viewerModule();
+  out[CODE] = codeTable();
   return out;
 }
 

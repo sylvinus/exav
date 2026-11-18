@@ -142,7 +142,9 @@ impl StreamRegex {
     /// Whether the pattern matches anywhere in `src`.
     pub(crate) fn is_match(&self, src: &dyn ByteSource) -> Result<bool, GaveUp> {
         let mut caches = self.caches();
-        Ok(self.forward(&mut caches, src, 0, true)?.is_some())
+        Ok(self
+            .forward(&mut caches, src, 0, true, Anchored::No)?
+            .is_some())
     }
 
     /// The bytes that [`Self::find`] reads from `start` over `data`, which a
@@ -180,7 +182,7 @@ impl StreamRegex {
         src: &dyn ByteSource,
         start: usize,
     ) -> Result<Option<(usize, usize)>, GaveUp> {
-        let Some(end) = self.forward(caches, src, start, false)? else {
+        let Some(end) = self.forward(caches, src, start, false, Anchored::No)? else {
             return Ok(None);
         };
         if end == start || self.anchored {
@@ -188,6 +190,18 @@ impl StreamRegex {
         }
         let from = self.reverse(caches, src, start, end)?.ok_or(GaveUp)?;
         Ok(Some((from, end)))
+    }
+
+    /// The end of the leftmost-first match that starts at `start`, if one
+    /// does: what `meta::Regex::find` returns for that span, anchored.
+    #[cfg_attr(not(feature = "yara"), allow(dead_code))]
+    pub(crate) fn find_at(
+        &self,
+        caches: &mut Caches,
+        src: &dyn ByteSource,
+        start: usize,
+    ) -> Result<Option<usize>, GaveUp> {
+        self.forward(caches, src, start, false, Anchored::Yes)
     }
 
     /// The matches `meta::Regex::find_iter` yields over `src`, until `f`
@@ -228,16 +242,17 @@ impl StreamRegex {
     }
 
     /// End of the leftmost-first match starting at or after `start` (the first
-    /// match end at all when `earliest`).
+    /// match end at all when `earliest`), or at `start` when `anchored`.
     fn forward(
         &self,
         caches: &mut Caches,
         src: &dyn ByteSource,
         start: usize,
         earliest: bool,
+        anchored: Anchored,
     ) -> Result<Option<usize>, GaveUp> {
         let mut at = start;
-        let out = self.forward_to(&mut caches.fwd, src, start, earliest, &mut at);
+        let out = self.forward_to(&mut caches.fwd, src, start, earliest, anchored, &mut at);
         caches.read += at.saturating_sub(start);
         out
     }
@@ -249,6 +264,7 @@ impl StreamRegex {
         src: &dyn ByteSource,
         start: usize,
         earliest: bool,
+        anchored: Anchored,
         at: &mut usize,
     ) -> Result<Option<usize>, GaveUp> {
         let len = src.len();
@@ -256,7 +272,7 @@ impl StreamRegex {
             return Ok(None);
         }
         let behind = (start > 0).then(|| byte(src, start - 1));
-        let mut f = self.forward_begin(cache, start, behind)?;
+        let mut f = self.forward_begin(cache, start, behind, anchored)?;
         while f.at < len {
             let w = src.window(f.at, (len - f.at).min(STEP));
             if w.is_empty() {
@@ -277,10 +293,9 @@ impl StreamRegex {
         cache: &mut Cache,
         start: usize,
         behind: Option<u8>,
+        anchored: Anchored,
     ) -> Result<Forward, GaveUp> {
-        let config = start::Config::new()
-            .anchored(Anchored::No)
-            .look_behind(behind);
+        let config = start::Config::new().anchored(anchored).look_behind(behind);
         let sid = self.fwd.start_state(cache, &config).map_err(|_| GaveUp)?;
         Ok(Forward {
             sid,
@@ -429,7 +444,7 @@ impl<'a> Enumerator<'a> {
             None
         } else {
             let behind = (first > 0).then(|| byte(src, first - 1));
-            Some(sr.forward_begin(&mut caches.fwd, first, behind)?)
+            Some(sr.forward_begin(&mut caches.fwd, first, behind, Anchored::No)?)
         };
         Ok(Enumerator {
             sr,
@@ -542,7 +557,11 @@ impl<'a> Enumerator<'a> {
                 return Ok(false);
             }
             let behind = Some(byte(src, s));
-            self.search = Some(self.sr.forward_begin(&mut self.caches.fwd, next, behind)?);
+            self.search =
+                Some(
+                    self.sr
+                        .forward_begin(&mut self.caches.fwd, next, behind, Anchored::No)?,
+                );
         }
     }
 }

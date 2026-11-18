@@ -7,7 +7,7 @@ given to the public domain (CC0-1.0). This file is written by `generate/make-att
 A file from a Zenodo or figshare record takes the licence that the record states for all of its files: those
 records name no licence per file.
 
-233 files: 145 are committed under `files/` (5.6 MB); 88 are downloaded by `npm run demo:examples` (81.4 MB).
+233 files: 145 are committed under `files/` (5.6 MB); 88 are in the `examples/` folder of github.com/sylvinus/exav-samples, from where `npm run demo:examples` takes them (81.4 MB).
 
 To rebuild: run the scripts of `generate/` (each lists what it needs; `python3 -I generate/make-images.py`, `make-cad.py`,
 `make-models.py`, `make-ifc.py`, `make-text.py`, `make-archives.py`, `make-media.py`, `make-pdf.py`, `make-office.py`), then

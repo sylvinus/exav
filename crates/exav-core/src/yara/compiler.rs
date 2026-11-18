@@ -15,7 +15,7 @@ use crate::yara::base64::base64_patterns;
 use crate::yara::error::{Error, Result};
 use crate::yara::ir::{
     Access, Anchor, ArithOp, CmpOp, CompiledRegex, Cond, ExternalType, IntKind, Iter, OfItems,
-    Quant, StrOp, Value,
+    Quant, StrOp, Value, anchors,
 };
 use crate::yara::matcher::{
     Base64SubDef, Needle, PatternDef, PatternMatcher, build_regex, build_wide_regex, widen,
@@ -242,7 +242,9 @@ impl Compiler {
     /// Finalizes compilation.
     pub fn build(self) -> Rules {
         let gate = PatternGate::from_gates(&self.atom_gates);
+        let anchored = anchors(self.rules.iter().map(|r| &r.cond), self.patterns.len());
         Rules {
+            anchored,
             patterns: self.patterns,
             stream_regexes: self.defs.iter().map(|_| OnceLock::new()).collect(),
             defs: self.defs,

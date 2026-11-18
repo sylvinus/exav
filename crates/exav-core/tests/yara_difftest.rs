@@ -190,6 +190,77 @@ fn differential_matches_agree() {
     agree("phase-a", RULES, INPUTS);
 }
 
+/// Patterns used only at one offset, which both engines look for there
+/// alone, and patterns used at two offsets, which they do not.
+const ANCHORED_RULES: &str = r#"
+rule not_at_zero {
+    strings:
+        $v = { 00 00 }
+        $m = "hello"
+    condition:
+        $m and not $v at 0
+}
+
+rule of_at {
+    strings:
+        $a = "AB"
+        $b = "CD"
+    condition:
+        any of ($a, $b) at 2
+}
+
+rule two_offsets {
+    strings:
+        $a = "AB"
+    condition:
+        $a at 0 or $a at 2
+}
+
+rule regexp_at {
+    strings:
+        $r = /\bword[0-9]*/
+    condition:
+        $r at 1
+}
+
+rule wide_fullword_at {
+    strings:
+        $w = "word" wide ascii fullword
+    condition:
+        $w at 1
+}
+
+rule base64_at {
+    strings:
+        $b = "password" base64
+    condition:
+        $b at 1
+}
+"#;
+
+#[test]
+fn differential_anchored_patterns() {
+    // Past the most matches a pattern keeps.
+    let mut zeros = vec![0u8; 1_000_010];
+    zeros.extend_from_slice(b"hello");
+    let mut mz = zeros.clone();
+    mz[..2].copy_from_slice(b"MZ");
+    let inputs: [&[u8]; 11] = [
+        b"",
+        b"ABCDAB",
+        b"xxCDxx",
+        b"\x00\x00hello",
+        b"MZ\x00\x00hello",
+        b" word42 and more",
+        b"xword42",
+        b" w\0o\0r\0d\0 ",
+        b"xcGFzc3dvcmQ=",
+        &zeros,
+        &mz,
+    ];
+    agree("anchored", ANCHORED_RULES, &inputs);
+}
+
 /// The `elf` module, cross-checked against the real engine. Linux-focused
 /// rulesets lean on this module heavily, so every field exav exposes has to
 /// agree with yara-x, including the undefined-propagation behaviour on inputs

@@ -11,7 +11,7 @@ use crate::yara::atoms::PatternGate;
 use crate::yara::compiler::ExternalValue;
 use crate::yara::error::{Error, Result};
 use crate::yara::feed::{FeedPlan, YaraFeed, YaraPass};
-use crate::yara::ir::{Cond, EvalCtx, Value};
+use crate::yara::ir::{Cond, EvalCtx, Value, anchors};
 use crate::yara::matcher::{Match, PatternDef, PatternMatcher, StreamRegexes, find_all_windowed};
 use crate::yara::modules::{ModuleCtx, ModuleKind};
 
@@ -49,6 +49,9 @@ pub struct Rules {
     /// How the patterns are searched as an object is read, worked out on first
     /// use (see [`crate::yara::feed`]).
     pub(crate) feed_plan: OnceLock<FeedPlan>,
+    /// Per pattern, the offset it is anchored at, if it is
+    /// ([`crate::yara::ir::anchors`]): worked out from `rules`, not stored.
+    pub(crate) anchored: Vec<Option<usize>>,
 }
 
 /// The serialized form of a compiled [`Rules`] set. Everything here is cheap to
@@ -113,6 +116,7 @@ impl Rules {
         for def in &blob.defs {
             patterns.push(def.compile()?);
         }
+        let anchored = anchors(blob.rules.iter().map(|r| &r.cond), patterns.len());
         Ok(Rules {
             patterns,
             stream_regexes: blob.defs.iter().map(|_| OnceLock::new()).collect(),
@@ -123,6 +127,7 @@ impl Rules {
             uses_entrypoint: blob.uses_entrypoint,
             gate: blob.gate,
             feed_plan: OnceLock::new(),
+            anchored,
         })
     }
 
@@ -254,12 +259,18 @@ impl<'r> Scanner<'r> {
         fed.resize_with(rules.patterns.len(), || None);
         let mut complete = true;
         // Over an object not held in memory, the literal and base64 patterns
-        // the read did not search are searched in one read of it together.
+        // the read did not search are searched in one read of it together,
+        // but for those anchored at an offset, looked for there alone.
         let mut windowed = vec![Vec::new(); rules.patterns.len()];
         let together: Vec<usize> = match data.as_slice() {
             Some(_) => Vec::new(),
             None => (0..rules.patterns.len())
-                .filter(|&i| run[i] && fed[i].is_none() && rules.patterns[i].windowed())
+                .filter(|&i| {
+                    run[i]
+                        && fed[i].is_none()
+                        && rules.patterns[i].windowed()
+                        && rules.anchored[i].is_none()
+                })
                 .collect(),
         };
         let pats: Vec<&PatternMatcher> = together.iter().map(|&i| &rules.patterns[i]).collect();
@@ -287,7 +298,8 @@ impl<'r> Scanner<'r> {
                         .get_or_init(|| rules.defs[i].stream_regexes())
                         .as_ref()
                 };
-                let found = p.find_all(data, &stream, materialize, whole.regex_steps);
+                let only = rules.anchored[i];
+                let found = p.find_all(data, &stream, materialize, whole.regex_steps, only);
                 complete &= found.complete;
                 found.matches
             })
@@ -1188,7 +1200,7 @@ mod source_tests {
     /// The object read once and handed to the feed, as the pass hands it.
     fn read_once(
         rules: &Rules,
-        cache: &BlockCache<Cursor<Vec<u8>>>,
+        cache: &dyn crate::byte_source::ByteSource,
         whole: &WholeLimits,
     ) -> Option<YaraPass> {
         use crate::pass::{Fed, Tap};
@@ -1409,6 +1421,195 @@ mod source_tests {
         let e = evaluate(&rules, &h, usize::MAX);
         assert_eq!(e.matches[0].len(), super::super::matcher::MAX_MATCHES);
         assert!(!e.complete);
+    }
+
+    /// A pattern anchored at an offset, every use of it naming that one, is
+    /// looked for there alone, as yara-x does: its matches elsewhere, past
+    /// the match cap or not, leave the scan complete. Held, streamed, and
+    /// through the read.
+    #[test]
+    fn a_pattern_anchored_at_an_offset_is_looked_for_there_alone() {
+        use crate::yara::matcher::{MAX_MATCHES, Match};
+        let mut zeros = vec![0u8; MAX_MATCHES + 10];
+        zeros.extend_from_slice(b"hello");
+        let mut mz = zeros.clone();
+        mz[..2].copy_from_slice(b"MZ");
+        for v in [r"{ 00 00 }", r#""\x00\x00""#, r"/\x00\x00/"] {
+            let src = format!(
+                r#"rule r {{ strings: $v = {v} $m = "hello" condition: $m and not $v at 0 }}"#
+            );
+            let rules = rules(&src);
+            assert_eq!(rules.anchored, [Some(0), None], "{src}");
+            for (data, matching) in [(&zeros, false), (&mz, true)] {
+                let cache =
+                    BlockCache::with_sizes(Cursor::new(data.clone()), 1 << 16, 1 << 20).unwrap();
+                let whole = WholeLimits {
+                    materialize: 0,
+                    ..WholeLimits::NONE
+                };
+                let pass = read_once(&rules, &cache, &whole).expect("the object was read");
+                let at_zero = [Match { offset: 0, len: 2 }];
+                for e in [
+                    evaluate(&rules, data, usize::MAX),
+                    evaluate(&rules, &cache, 0),
+                    Scanner::new(&rules).evaluate(&cache, &whole, Some(pass)),
+                ] {
+                    assert!(e.complete, "{src}");
+                    assert_eq!(e.matching == [0], matching, "{src}");
+                    let want = if matching { &[][..] } else { &at_zero[..] };
+                    assert_eq!(e.matches[0], want, "{src}");
+                }
+            }
+            // One search, which no limit on the steps of a search for every
+            // match cuts.
+            let few = WholeLimits {
+                regex_steps: 1000,
+                ..WholeLimits::NONE
+            };
+            let e = Scanner::new(&rules).evaluate(&&zeros[..], &few, None);
+            assert!(e.complete && e.matching.is_empty(), "{src}");
+        }
+        // Streamed, an anchored pattern the read left is looked for in the
+        // start alone.
+        struct Counted(Cursor<Vec<u8>>, std::rc::Rc<std::cell::Cell<usize>>);
+        impl std::io::Read for Counted {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.read(b)?;
+                self.1.set(self.1.get() + n);
+                Ok(n)
+            }
+        }
+        impl std::io::Seek for Counted {
+            fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(p)
+            }
+        }
+        for v in [r"{ 00 00 }", r#""\x00\x00""#] {
+            let rules = rules(&format!(
+                "rule r {{ strings: $v = {v} condition: not $v at 0 }}"
+            ));
+            let read = std::rc::Rc::new(std::cell::Cell::new(0));
+            let src = Counted(Cursor::new(zeros.clone()), read.clone());
+            let cache = BlockCache::with_sizes(src, 1 << 12, 1 << 16).unwrap();
+            let whole = WholeLimits {
+                materialize: 0,
+                ..WholeLimits::NONE
+            };
+            let mut pass = read_once(&rules, &cache, &whole).expect("the object was read");
+            pass.found[0] = None;
+            read.set(0);
+            let e = Scanner::new(&rules).evaluate(&cache, &whole, Some(pass));
+            assert!(e.complete && e.matching.is_empty(), "{v}");
+            assert!(read.get() <= 1 << 17, "{v}: {} bytes read", read.get());
+        }
+        // Used otherwise too, or at two offsets, it is searched for whole.
+        for cond in ["$v at 0 and #v > 5", "$v at 0 or $v at 2"] {
+            let rules = rules(&format!(
+                "rule r {{ strings: $v = {{ 00 00 }} condition: {cond} }}"
+            ));
+            assert_eq!(rules.anchored, [None], "{cond}");
+            assert!(!evaluate(&rules, &zeros, usize::MAX).complete, "{cond}");
+        }
+    }
+
+    /// A pattern of each kind, anchored at an offset, has there the matches
+    /// it has there unanchored, and no other: held, streamed, and through the
+    /// read.
+    #[test]
+    fn an_anchored_pattern_matches_there_as_it_does_unanchored() {
+        let decls = [
+            r#""needle""#,
+            r#""NeEdLe" nocase"#,
+            r#""wide" wide ascii"#,
+            r#""word" fullword"#,
+            r#""wword" wide fullword"#,
+            r#""xored" xor(1-3)"#,
+            r#""xorword" xor(1-2) fullword"#,
+            r#""password123" base64"#,
+            r#""secret!" base64wide"#,
+            r"{ 4D 5A ?? ?? [2-40] 50 45 }",
+            r"{ 6E 65 ( 65 | 64 ) [-] 6C 65 }",
+            r"/ne+dle[0-9]*/",
+            r"/h.llo/is",
+            r"/c[a-z]+e/ wide ascii",
+            r"/word[0-9]?/ fullword",
+            r"/\bword/",
+            r"/x[^x]{1,300}y/s",
+        ];
+        let kinds = plants().len();
+        let spots: Vec<(usize, usize)> = (0..kinds).map(|k| (k * 41, k)).collect();
+        let h = haystack(kinds * 41 + 7, &spots, 3);
+        let cache = BlockCache::with_sizes(Cursor::new(h.clone()), 7, 56).unwrap();
+        let whole = WholeLimits {
+            materialize: 0,
+            ..WholeLimits::NONE
+        };
+        let rule = |decl: &str, cond: &str| {
+            rules(&format!(
+                "rule r {{ strings: $x = {decl} condition: {cond} }}"
+            ))
+        };
+        for decl in decls {
+            let all = evaluate(&rule(decl, "$x"), &h, usize::MAX).matches[0].clone();
+            assert!(!all.is_empty(), "{decl}");
+            let mut offsets: Vec<usize> =
+                all.iter().flat_map(|m| [m.offset, m.offset + 1]).collect();
+            offsets.extend([0, 1, h.len() - 1, h.len(), h.len() + 5]);
+            for at in offsets {
+                let rules = rule(decl, &format!("$x at {at}"));
+                assert_eq!(rules.anchored, [Some(at)], "{decl} at {at}");
+                let want: Vec<_> = all.iter().filter(|m| m.offset == at).cloned().collect();
+                let pass = read_once(&rules, &cache, &whole).expect("the object was read");
+                for (how, e) in [
+                    ("held", evaluate(&rules, &h, usize::MAX)),
+                    ("streamed", evaluate(&rules, &cache, 0)),
+                    (
+                        "read",
+                        Scanner::new(&rules).evaluate(&cache, &whole, Some(pass)),
+                    ),
+                ] {
+                    assert!(e.complete, "{decl} at {at}, {how}");
+                    assert_eq!(e.matches[0], want, "{decl} at {at}, {how}");
+                    assert_eq!(
+                        e.matching.is_empty(),
+                        want.is_empty(),
+                        "{decl} at {at}, {how}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Which uses of a pattern anchor it.
+    #[test]
+    fn a_pattern_is_anchored_when_every_use_names_one_offset() {
+        for (cond, want) in [
+            ("$a at 0", [Some(0), None]),
+            ("$a at 0x10 and not $a at 16", [Some(16), None]),
+            ("any of ($a, $b) at 4", [Some(4), Some(4)]),
+            ("$a at 0 and $b", [Some(0), None]),
+            ("$a at 0 or $a at 1", [None, None]),
+            ("$a at 0 and #a > 1", [None, None]),
+            ("$a at 0 and @a[1] == 0", [None, None]),
+            ("$a at 0 and !a[1] == 2", [None, None]),
+            ("$a in (0..10)", [None, None]),
+            ("$a at filesize - 2", [None, None]),
+            ("$a at -1", [None, None]),
+            ("any of them", [None, None]),
+            ("for any of ($a) : ($ at 0)", [None, None]),
+            ("for any i in (0..1) : ($a at i)", [None, None]),
+            ("$a at 0 and any of them", [None, None]),
+            ("true", [None, None]),
+        ] {
+            let src = format!(r#"rule r {{ strings: $a = "AB" $b = "CD" condition: {cond} }}"#);
+            assert_eq!(rules(&src).anchored, want, "{cond}");
+        }
+        // Each rule's patterns are its own.
+        let two = rules(
+            r#"rule p { strings: $a = "AB" condition: $a at 0 }
+               rule q { strings: $a = "AB" condition: $a at 4 }"#,
+        );
+        assert_eq!(two.anchored, [Some(0), Some(4)]);
     }
 }
 

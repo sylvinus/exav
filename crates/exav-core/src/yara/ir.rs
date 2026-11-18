@@ -356,6 +356,167 @@ pub(crate) enum Cond {
     LengthVar(usize, Option<Box<Cond>>),
 }
 
+/// Per pattern of the `n` there are, the offset it is anchored at: the one
+/// every use of it in `conds` names, `$a at <offset>` or `<n> of (…) at
+/// <offset>` with the offset a number, as yara-x anchors one. Its matches
+/// elsewhere decide nothing. `None` for a pattern used any other way, at two
+/// offsets, or not at all.
+pub(crate) fn anchors<'a>(
+    conds: impl IntoIterator<Item = &'a Cond>,
+    n: usize,
+) -> Vec<Option<usize>> {
+    let mut uses = vec![Use::Unseen; n];
+    for cond in conds {
+        cond.uses(&mut uses);
+    }
+    uses.into_iter()
+        .map(|u| match u {
+            Use::At(k) => Some(k),
+            Use::Unseen | Use::Other => None,
+        })
+        .collect()
+}
+
+/// What the conditions do with a pattern, so far.
+#[derive(Clone, Copy)]
+enum Use {
+    Unseen,
+    /// Matched at this offset alone.
+    At(usize),
+    Other,
+}
+
+/// Notes a use of pattern `p` (an id from a database is not trusted), at
+/// `anchor`.
+fn note(uses: &mut [Use], p: usize, anchor: Option<&Anchor>) {
+    let Some(u) = uses.get_mut(p) else {
+        return;
+    };
+    let at = match anchor {
+        Some(Anchor::At(e)) => match **e {
+            Cond::Int(k) => usize::try_from(k).ok(),
+            _ => None,
+        },
+        _ => None,
+    };
+    *u = match (*u, at) {
+        (Use::Unseen, Some(k)) => Use::At(k),
+        (Use::At(j), Some(k)) if j == k => Use::At(k),
+        _ => Use::Other,
+    };
+}
+
+impl Cond {
+    /// Notes every use of a pattern in the condition. Every variant is named,
+    /// so that a new one that holds patterns cannot be passed over.
+    fn uses(&self, u: &mut [Use]) {
+        let both = |a: &Cond, b: &Cond, u: &mut [Use]| {
+            a.uses(u);
+            b.uses(u);
+        };
+        match self {
+            Cond::Bool(_)
+            | Cond::Int(_)
+            | Cond::Float(_)
+            | Cond::Str(_)
+            | Cond::Filesize
+            | Cond::RuleRef(_)
+            | Cond::Entrypoint
+            | Cond::External(..)
+            | Cond::Var(_) => {}
+            Cond::Pattern(p, anchor) => {
+                note(u, *p, anchor.as_ref());
+                anchor_uses(anchor, u);
+            }
+            Cond::Count(p, range) => {
+                note(u, *p, None);
+                if let Some((a, b)) = range {
+                    both(a, b, u);
+                }
+            }
+            Cond::Offset(p, i) | Cond::Length(p, i) => {
+                note(u, *p, None);
+                if let Some(i) = i {
+                    i.uses(u);
+                }
+            }
+            Cond::Defined(c) | Cond::Not(c) | Cond::Neg(c) | Cond::BitNot(c) => c.uses(u),
+            Cond::IntRead(_, c) | Cond::Matches(c, _) => c.uses(u),
+            Cond::And(cs) | Cond::Or(cs) | Cond::ModCall(_, cs) => {
+                cs.iter().for_each(|c| c.uses(u));
+            }
+            Cond::Arith(_, a, b) | Cond::Cmp(_, a, b) | Cond::StrCmp(_, a, b) => both(a, b, u),
+            Cond::Of(quant, items, anchor) => {
+                quant.uses(u);
+                match items {
+                    OfItems::Patterns(ps) => ps.iter().for_each(|&p| note(u, p, anchor.as_ref())),
+                    OfItems::Exprs(cs) => cs.iter().for_each(|c| c.uses(u)),
+                }
+                anchor_uses(anchor, u);
+            }
+            Cond::ModAccess(_, chain) | Cond::VarAccess(_, chain) => {
+                for step in chain {
+                    match step {
+                        Access::Field(_) => {}
+                        Access::Index(c) => c.uses(u),
+                    }
+                }
+            }
+            Cond::ForIn(f) => {
+                f.quant.uses(u);
+                match &f.iter {
+                    Iter::Range(a, b) => both(a, b, u),
+                    Iter::Tuple(cs) => cs.iter().for_each(|c| c.uses(u)),
+                    Iter::Collection(c) => c.uses(u),
+                }
+                f.body.uses(u);
+            }
+            // The body reads its patterns through `$`, `#`, `@` and `!`.
+            Cond::ForOf(f) => {
+                f.quant.uses(u);
+                f.patterns.iter().for_each(|&p| note(u, p, None));
+                f.body.uses(u);
+            }
+            Cond::With(w) => {
+                w.decls.iter().for_each(|c| c.uses(u));
+                w.body.uses(u);
+            }
+            Cond::PatternVar(_, anchor) => anchor_uses(anchor, u),
+            Cond::CountVar(_, range) => {
+                if let Some((a, b)) = range {
+                    both(a, b, u);
+                }
+            }
+            Cond::OffsetVar(_, i) | Cond::LengthVar(_, i) => {
+                if let Some(i) = i {
+                    i.uses(u);
+                }
+            }
+        }
+    }
+}
+
+impl Quant {
+    fn uses(&self, u: &mut [Use]) {
+        match self {
+            Quant::All | Quant::Any | Quant::None => {}
+            Quant::Count(c) | Quant::Percent(c) => c.uses(u),
+        }
+    }
+}
+
+/// The uses of a pattern in the expressions of `anchor`.
+fn anchor_uses(anchor: &Option<Anchor>, u: &mut [Use]) {
+    match anchor {
+        None => {}
+        Some(Anchor::At(e)) => e.uses(u),
+        Some(Anchor::In(a, b)) => {
+            a.uses(u);
+            b.uses(u);
+        }
+    }
+}
+
 /// A value bound to an environment slot by a loop or `with` expression.
 pub(crate) enum Binding {
     /// A `for … in` / `with` variable value (`None` = undefined).
