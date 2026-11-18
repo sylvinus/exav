@@ -42,7 +42,8 @@ scan.
 - **A text view of documents** (`visible-text`): a document's words as a
   reader sees them, with each link followed by where it goes, are matched
   beside its bytes, through [exav-render](/subprojects/exav-render/#text). A
-  document whose text cannot be taken out marks the scan incomplete.
+  text cut short, a drawing past a limit, and an office document whose text
+  cannot be taken out (`visible-text-office`) mark the scan incomplete.
 - **Content-based file typing**, PE parsing, fuzzy and similarity scoring, the
   prebuilt-`.exavdb` builder, and an HTTP range-reader backend (`http`
   feature) that scans a large remote file through the block cache instead of

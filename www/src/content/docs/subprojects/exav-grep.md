@@ -162,10 +162,12 @@ A document that is also a container (a PDF, a drawing) is walked for its
 members as before. A compound file is read as an office document only by its
 extension, so that an installer is not read whole to find out.
 
-A document of those kinds whose text cannot be taken out (encrypted, past a
-limit, damaged) is reported unreadable, with the reason, and its bytes are
-searched instead. With no match the exit code is `3`, never `1`: finding
-nothing in a document it could not read is not a clean answer.
+A drawing past a limit, and a document of the `text-office` formats whose
+text cannot be taken out (encrypted, past a limit, damaged), are reported
+unreadable, with the reason, and their bytes are searched instead. A text cut
+short is searched as far as it goes and reported unreadable too. With no
+match the exit code is `3`, never `1`: finding nothing in a document it could
+not read is not a clean answer.
 
 ```bash
 cargo install exav-grep --features text-office

@@ -56,12 +56,15 @@ off under `--clamav-compat`.
 |---|---|
 | Markdown (`.md`, `.markdown`), HTML, the XML parts of Word, PowerPoint (speaker notes included), Excel and OpenDocument files, the hyperlinks of a DOCX, PPTX or XLSX (each label with the target its `.rels` part gives, Word's `HYPERLINK` fields too), an email's headers (From, Sender, Reply-To, To, Cc, Bcc, Subject, Date, with display names and RFC 2047 words decoded), the targets of a PDF's links and actions, IFC models and other STEP files (names, descriptions, property values), DXF and DWG drawings (a DWG's hyperlinks too) | PDF (`visible-text-pdf`); DOC, XLS, PPT, RTF, Word 2003 XML, SpreadsheetML 2003, SYLK, flat OpenDocument (FODT, FODS, FODP, FODG), Numbers, Pages and Keynote (`visible-text-office`) |
 
-A document of a kind that has such a text, whose text cannot be taken out
-(encrypted, past a limit, damaged), is still scanned as bytes, and the scan is
-`PARTIAL`, never `OK`. A compound file (`.doc`, `.xls`, `.ppt` and their
-templates) is read as an office document by its extension only, so that an
-installer is not read whole to find out; one that holds several documents (a
-Word document and a presentation, say) has the text of each read.
+A document whose text is not all read is still scanned as bytes, and the scan
+is `PARTIAL`, never `OK`: a text cut short, a drawing past a limit, and with
+`visible-text-office` an office document whose text cannot be taken out
+(encrypted, past a limit, damaged). Another document that does not parse has
+no text view, and its bytes are scanned as any file's. A compound file
+(`.doc`, `.xls`, `.ppt` and their templates) is read as an office document by
+its extension only, so that an installer is not read whole to find out; one
+that holds several documents (a Word document and a presentation, say) has the
+text of each read.
 
 A PDF's link targets are read from its objects, without their labels, so
 `--detect phishing` judges what a target says by itself (a host hidden behind

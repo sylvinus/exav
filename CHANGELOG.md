@@ -6,7 +6,7 @@ follow [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.0.3] - 2026-10-29
+## [0.0.3] - 2026-11-18
 
 Many more formats and installers read, in place and in bounded memory at any
 size; QR codes and a visible-text layer; a much larger viewer; and review

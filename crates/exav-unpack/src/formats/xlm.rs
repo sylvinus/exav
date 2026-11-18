@@ -12,9 +12,9 @@
 //! artifact: the macro-sheet names, the defined names with what they refer to,
 //! the text cells, and each formula as Excel shows it (`=EXEC("calc.exe")`),
 //! so the engine's `Target:2` and `Doc.*` signatures match the function calls
-//! and `--alert-macros` fires for XLM as it does for VBA. A formula the reader
-//! refuses still gives the calls and constants it read before the token it
-//! could not. Every read is bounds-checked; a malformed stream yields `None`,
+//! and `--detect macros` fires for XLM as it does for VBA. A formula the
+//! reader refuses still gives the calls and constants it read before the
+//! token it could not. Every read is bounds-checked; a malformed stream yields `None`,
 //! never a panic.
 
 use super::biff::{self, Book, formula};
