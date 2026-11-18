@@ -89,7 +89,7 @@ fn a_truncated_member_is_scanned_short_not_flagged() {
     // Declare 1 MiB, supply 5 bytes. Those bytes are ABSENT from the archive,
     // not hidden in it: the victim's extractor gets nothing either, so there is
     // no evasion to catch. Scanning what exists and returning clean is the
-    // honest answer — exav is not a file-integrity validator (docs/QUIRKS.md).
+    // honest answer: exav is not a file-integrity validator (docs/QUIRKS.md).
     let mut blob = newc("truncated.bin", 1024 * 1024);
     blob.extend_from_slice(b"hello");
 

@@ -4,8 +4,9 @@
 //! whose `SpcIndirectDataContent` embeds a digest of the file. We extract that
 //! digest and the signer certificate fields, and recompute the PE's Authenticode
 //! hash, using only:
-//!   * `goblin` (already a dependency) for the certificate table + the byte
-//!     ranges to hash ([`goblin::pe::PE::authenticode_ranges`]);
+//!   * `goblin` (already a dependency) for the headers, from which the byte
+//!     ranges to hash follow (as [`goblin::pe::PE::authenticode_ranges`] has
+//!     them), the certificate table being read from the file where they say;
 //!   * `sha1`/`sha2` (already dependencies) for the hash + thumbprint;
 //!   * a small **vendored** DER reader (the `der` module), so no `rsa`/`der`/`x509`/`nom`
 //!     crate enters the tree and everything stays `#![forbid(unsafe_code)]`.
@@ -24,6 +25,8 @@ mod der;
 
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+
+use crate::byte_source::ByteSource;
 
 // ---- OID content encodings (the bytes inside an OID TLV) --------------------
 const OID_SIGNED_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
@@ -56,7 +59,8 @@ pub struct CertInfo {
 #[derive(Clone, Debug)]
 pub struct PeSignature {
     /// The recomputed Authenticode hash equals the digest embedded in the
-    /// signature, i.e. the signature covers the current file bytes.
+    /// signature, i.e. the signature covers the current file bytes. `false`
+    /// when the scan did not ask for the hash.
     pub digest_matches: bool,
     /// The signer (leaf) certificate.
     pub signer: CertInfo,
@@ -356,64 +360,125 @@ fn parse_spc_digest(encap_content: &[u8]) -> Option<(DigestAlg, Vec<u8>)> {
 /// carries no PKCS#7 signature, or the signature can't be parsed. On `Some`, the
 /// caller can act on `digest_matches` / `signer`.
 pub fn analyze_pe(data: &[u8]) -> Option<PeSignature> {
-    // Cheap gate before the (heavier) full PE parse.
-    if data.len() < 2 || &data[..2] != b"MZ" {
-        return None;
+    inspect(&data, true, usize::MAX).ok().flatten()
+}
+
+/// [`analyze_pe`] of the PE in `src`, which need not be held in memory: its
+/// headers and certificate table are read, and the digest is made in one pass
+/// over it, so a PE of any size costs no more memory than those two.
+///
+/// `digest` asks for that pass. Without it `digest_matches` is `false`, and
+/// the signature's certificates are all that is read.
+///
+/// `Err` holds the size of the headers or the certificate table when it is
+/// over `limit` bytes: it was not read, and there is no answer.
+pub(crate) fn inspect(
+    src: &dyn ByteSource,
+    digest: bool,
+    limit: usize,
+) -> Result<Option<PeSignature>, usize> {
+    let Some(end) = crate::pe::headers_end(src) else {
+        return Ok(None);
+    };
+    if end > limit {
+        return Err(end);
     }
-    let pe = goblin::pe::PE::parse(data).ok()?;
-
-    // The first PKCS#7 SignedData attribute certificate.
-    let pkcs7 = pe.certificates.iter().find_map(|c| {
-        (c.certificate_type
-            == goblin::pe::certificate_table::AttributeCertificateType::PkcsSignedData)
-            .then_some(c.certificate)
-    })?;
-    let auth = parse_authenticode(pkcs7)?;
-
+    let head = src.window(0, end);
+    let Some(pe) = crate::pe::headers(&head) else {
+        return Ok(None);
+    };
+    let Some(&table) = pe
+        .header
+        .optional_header
+        .as_ref()
+        .and_then(|o| o.data_directories.get_certificate_table())
+    else {
+        return Ok(None);
+    };
+    // The table's address is a file offset, not an RVA. One that does not fit
+    // the file is not a signature.
+    let (at, size) = (table.virtual_address as usize, table.size as usize);
+    if at.checked_add(size).is_none_or(|end| end > src.len()) {
+        return Ok(None);
+    }
+    if size > limit {
+        return Err(size);
+    }
+    let table_bytes = src.window(at, size);
+    let Some(auth) = first_signed_data(&table_bytes).and_then(parse_authenticode) else {
+        return Ok(None);
+    };
+    let Some(signer) = auth.certs.first().cloned() else {
+        return Ok(None);
+    };
     // An image whose layout does not hold together has no hash to match: the
     // signature cannot cover it.
-    let computed = hashed_ranges(&pe, data).map(|ranges| match auth.digest_alg {
-        DigestAlg::Sha1 => {
-            let mut h = Sha1::new();
-            ranges.iter().for_each(|r| h.update(r));
-            h.finalize().to_vec()
-        }
-        DigestAlg::Sha256 => {
-            let mut h = Sha256::new();
-            ranges.iter().for_each(|r| h.update(r));
-            h.finalize().to_vec()
-        }
-    });
-
-    let signer = auth.certs.first().cloned()?;
-    Some(PeSignature {
-        digest_matches: computed.is_some_and(|c| c == auth.message_digest),
+    let digest_matches = digest
+        && hashed_ranges(&pe, src.len(), size).is_some_and(|(ranges, padding)| {
+            let computed = match auth.digest_alg {
+                DigestAlg::Sha1 => hash_ranges::<Sha1>(src, &ranges, padding),
+                DigestAlg::Sha256 => hash_ranges::<Sha256>(src, &ranges, padding),
+            };
+            computed.is_some_and(|c| c == auth.message_digest)
+        });
+    Ok(Some(PeSignature {
+        digest_matches,
         signer,
         certs: auth.certs,
-    })
+    }))
+}
+
+/// The first PKCS#7 `SignedData` in an attribute certificate table: entries
+/// of a `WIN_CERTIFICATE` header (length, revision, type) and their data, each
+/// padded to 8 bytes. Entries are read in order up to the first that does not
+/// fit or has no known revision and type, so a malformed entry cannot hide
+/// those before it.
+fn first_signed_data(table: &[u8]) -> Option<&[u8]> {
+    const REVISIONS: [u16; 2] = [0x0100, 0x0200];
+    const PKCS_SIGNED_DATA: u16 = 2;
+    let mut at = 0usize;
+    while let Some(header) = table.get(at..at.checked_add(8)?) {
+        let length = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let revision = u16::from_le_bytes([header[4], header[5]]);
+        let kind = u16::from_le_bytes([header[6], header[7]]);
+        let size = length.saturating_sub(8);
+        let data = table.get(at + 8..(at + 8).checked_add(size)?)?;
+        if !REVISIONS.contains(&revision) || !(1..=4).contains(&kind) {
+            return None;
+        }
+        if kind == PKCS_SIGNED_DATA {
+            return Some(data);
+        }
+        at = (at + 8 + size).checked_add(7)? & !7;
+    }
+    None
 }
 
 /// The byte ranges the Authenticode hash covers ("Calculating the PE Image
-/// Hash" in the PE/COFF specification), in the order goblin's
-/// `authenticode_ranges` yields them; `None` for an image whose headers,
-/// sections or certificate table do not fit the file. goblin indexes without
-/// checking, so a crafted image panics there.
-fn hashed_ranges<'a>(pe: &goblin::pe::PE<'_>, data: &'a [u8]) -> Option<Vec<&'a [u8]>> {
+/// Hash" in the PE/COFF specification) as file offsets `(start, end)`, in the
+/// order goblin's `authenticode_ranges` yields them, then the zero bytes that
+/// pad the whole to a multiple of 8. `None` for an image whose headers,
+/// sections or certificate table (of `cert_size` bytes) do not fit a file of
+/// `len` bytes, or whose ranges add up to more than that: each byte of an
+/// image that holds together is hashed once, and sections that name one region
+/// as many times over make the hash cost that much more.
+fn hashed_ranges(
+    pe: &crate::pe::Headers<'_>,
+    len: usize,
+    cert_size: usize,
+) -> Option<(Vec<(usize, usize)>, usize)> {
     let opt = pe.header.optional_header.as_ref()?;
     // Past the PE signature and the COFF header. The checksum field sits at
     // the same offset in PE32 and PE32+; the certificate table entry does not.
     let opt_off = (pe.header.dos_header.pe_pointer as usize).checked_add(4 + 20)?;
-    let checksum = opt_off + 64;
-    let cert_entry = opt_off + if pe.is_64 { 144 } else { 128 };
+    let checksum = opt_off.checked_add(64)?;
+    let wide = opt.standard_fields.magic == 0x20b;
+    let cert_entry = opt_off.checked_add(if wide { 144 } else { 128 })?;
     let headers = opt.windows_fields.size_of_headers as usize;
-    let cert_size = opt
-        .data_directories
-        .get_certificate_table()
-        .map_or(0, |t| t.size as usize);
     let mut out = vec![
-        data.get(..checksum)?,
-        data.get(checksum + 4..cert_entry)?,
-        data.get(cert_entry + 8..headers)?,
+        (0, checksum),
+        (checksum.checked_add(4)?, cert_entry),
+        (cert_entry.checked_add(8)?, headers),
     ];
     let mut sections: Vec<_> = pe
         .sections
@@ -425,17 +490,40 @@ fn hashed_ranges<'a>(pe: &goblin::pe::PE<'_>, data: &'a [u8]) -> Option<Vec<&'a 
     for s in sections {
         let start = s.pointer_to_raw_data as usize;
         let size = s.size_of_raw_data as usize;
-        out.push(data.get(start..start.checked_add(size)?)?);
+        out.push((start, start.checked_add(size)?));
         hashed = hashed.checked_add(size)?;
     }
-    // What follows the last section, less the certificate table, then padding
-    // to a multiple of 8.
-    if data.len() > hashed {
-        out.push(data.get(hashed..data.len().checked_sub(cert_size)?)?);
+    // What follows the last section, less the certificate table.
+    if len > hashed {
+        out.push((hashed, len.checked_sub(cert_size)?));
     }
-    const PADDING: [u8; 7] = [0; 7];
-    out.push(&PADDING[..(8 - data.len() % 8) % 8]);
-    Some(out)
+    let fits = out.iter().all(|&(start, end)| start <= end && end <= len);
+    // Summed once they are known to be in order, so no length is negative.
+    let total = |out: &[(usize, usize)]| out.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>();
+    (fits && total(&out) <= len as u64).then_some((out, (8 - len % 8) % 8))
+}
+
+/// The digest `D` of `ranges` of `src`, read a chunk at a time, then `padding`
+/// zero bytes. `None` if the source gave less than they hold.
+fn hash_ranges<D: Digest>(
+    src: &dyn ByteSource,
+    ranges: &[(usize, usize)],
+    padding: usize,
+) -> Option<Vec<u8>> {
+    let mut h = D::new();
+    for &(start, end) in ranges {
+        let mut got = 0;
+        src.chunks(start, end, &mut |_, chunk| {
+            h.update(chunk);
+            got += chunk.len();
+            true
+        });
+        if got != end - start {
+            return None;
+        }
+    }
+    h.update(&[0u8; 7][..padding]);
+    Some(h.finalize().to_vec())
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -602,7 +690,22 @@ mod tests {
         let pe = fixture("signed_mismatch.exe");
         let parsed = goblin::pe::PE::parse(&pe).unwrap();
         let want: Vec<u8> = parsed.authenticode_ranges().flatten().copied().collect();
-        assert_eq!(hashed_ranges(&parsed, &pe).unwrap().concat(), want);
+        let head = crate::pe::headers(&pe).unwrap();
+        let cert_size = parsed
+            .header
+            .optional_header
+            .unwrap()
+            .data_directories
+            .get_certificate_table()
+            .unwrap()
+            .size;
+        let (ranges, padding) = hashed_ranges(&head, pe.len(), cert_size as usize).unwrap();
+        let mut got: Vec<u8> = ranges
+            .iter()
+            .flat_map(|&(a, b)| pe[a..b].iter().copied())
+            .collect();
+        got.resize(got.len() + padding, 0);
+        assert_eq!(got, want);
 
         let mut bad = pe.clone();
         let at = u32::from_le_bytes(bad[0x3c..0x40].try_into().unwrap()) as usize;
@@ -617,5 +720,176 @@ mod tests {
         );
         let sig = analyze_pe(&bad).expect("the signature is still there");
         assert!(!sig.digest_matches);
+    }
+
+    /// The fixture with the digest its signature carries replaced by the one
+    /// of the file (the certificate table is not part of it).
+    fn covering(pe: &[u8]) -> Vec<u8> {
+        let parsed = goblin::pe::PE::parse(pe).unwrap();
+        let mut h = Sha256::new();
+        parsed.authenticode_ranges().for_each(|r| h.update(r));
+        let digest = h.finalize();
+        let mut out = pe.to_vec();
+        let was = Sha256::digest(b"hello authenticode");
+        let at = out
+            .windows(32)
+            .position(|w| w == was.as_slice())
+            .expect("the fixture's digest");
+        out[at..at + 32].copy_from_slice(&digest);
+        out
+    }
+
+    fn cached(data: &[u8]) -> crate::byte_source::BlockCache<std::io::Cursor<Vec<u8>>> {
+        crate::byte_source::BlockCache::with_sizes(
+            std::io::Cursor::new(data.to_vec()),
+            509,
+            8 * 509,
+        )
+        .unwrap()
+    }
+
+    /// A source is inspected as the bytes it holds are: the same signer, and
+    /// a digest that matches when it covers the file, hashed only when asked.
+    #[test]
+    fn a_source_is_inspected_as_the_bytes_it_holds() {
+        let mismatch = fixture("signed_mismatch.exe");
+        let covered = covering(&mismatch);
+        for (pe, matches) in [(&mismatch, false), (&covered, true)] {
+            let want = analyze_pe(pe).expect("signed");
+            assert_eq!(want.digest_matches, matches);
+            let got = inspect(&cached(pe), true, 1 << 20)
+                .unwrap()
+                .expect("signed");
+            assert_eq!(got.digest_matches, matches);
+            assert_eq!(got.signer.sha1_thumbprint, want.signer.sha1_thumbprint);
+            assert_eq!(got.certs.len(), want.certs.len());
+            // Not asked for, not made.
+            let none = inspect(&cached(pe), false, 1 << 20)
+                .unwrap()
+                .expect("signed");
+            assert!(!none.digest_matches);
+            assert_eq!(none.signer.sha1_thumbprint, want.signer.sha1_thumbprint);
+        }
+    }
+
+    /// The hash is of what the object holds: a byte changed anywhere, in the
+    /// headers, a section or after the sections, and it no longer matches.
+    #[test]
+    fn the_digest_is_of_the_whole_file() {
+        let covered = covering(&fixture("signed_mismatch.exe"));
+        // The checksum is not hashed.
+        for at in [0x58 + 64, 0x58 + 66] {
+            let mut same = covered.clone();
+            same[at] ^= 1;
+            assert!(
+                inspect(&cached(&same), true, 1 << 20)
+                    .unwrap()
+                    .unwrap()
+                    .digest_matches,
+                "{at:#x}"
+            );
+        }
+        // The DOS header, the optional header, the section table, and the
+        // first and the last byte of the section.
+        for at in [0x20, 0x58 + 20, 0x58 + 0xe0 + 8, 0x200, 0x3ff] {
+            let mut changed = covered.clone();
+            changed[at] ^= 1;
+            let sig = inspect(&cached(&changed), true, 1 << 20).unwrap().unwrap();
+            assert!(!sig.digest_matches, "{at:#x}");
+        }
+    }
+
+    /// Nothing is read of what is over the limit: the answer is its size.
+    #[test]
+    fn headers_and_a_table_over_the_limit_are_not_read() {
+        let pe = fixture("signed_mismatch.exe");
+        // Headers end at 0x160, the table is 952 bytes.
+        assert_eq!(inspect(&cached(&pe), true, 100).err(), Some(0x160));
+        assert_eq!(inspect(&cached(&pe), true, 400).err(), Some(952));
+        assert!(inspect(&cached(&pe), true, 952).unwrap().is_some());
+        // An object with no table, or that is not a PE, is not signed.
+        assert!(
+            inspect(&cached(b"MZ not a pe"), true, 100)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            inspect(&cached(&pe[..0x200]), true, 100_000)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A hash is of each byte of the image once, not of a region as many times
+    /// as sections name it: that costs a crafted file as much as it likes.
+    #[test]
+    fn sections_that_name_more_than_the_file_have_no_hash() {
+        let pe = fixture("signed_mismatch.exe");
+        let cert_size = 952;
+        // The section table has room before `SizeOfHeaders` for more entries:
+        // `n` copies of `.text`, each with a raw size of `size` at 0x200.
+        let with_sections = |n: u16, size: u32| {
+            let mut f = pe.clone();
+            let sh = 0x138;
+            f[sh + 16..sh + 20].copy_from_slice(&size.to_le_bytes());
+            for i in 1..usize::from(n) {
+                f.copy_within(sh..sh + 40, sh + 40 * i);
+            }
+            f[0x46..0x48].copy_from_slice(&n.to_le_bytes());
+            f
+        };
+        // One section of the file's, which the cert table follows; then two of
+        // 0x400 bytes, which each fit the file, and are 2 KiB over it.
+        for (n, size, hashed) in [(1, 0x200, true), (2, 0x400, false)] {
+            let f = with_sections(n, size);
+            let head = crate::pe::headers(&f).unwrap();
+            assert_eq!(
+                hashed_ranges(&head, f.len(), cert_size).is_some(),
+                hashed,
+                "{n} sections"
+            );
+        }
+    }
+
+    fn entry(kind: u16, revision: u16, body: &[u8]) -> Vec<u8> {
+        let mut e = ((8 + body.len()) as u32).to_le_bytes().to_vec();
+        e.extend(revision.to_le_bytes());
+        e.extend(kind.to_le_bytes());
+        e.extend(body);
+        e.resize(e.len().next_multiple_of(8), 0);
+        e
+    }
+
+    /// The signed data is the first PKCS entry of the table, and a malformed
+    /// entry hides the ones before it from no one.
+    #[test]
+    fn the_signed_data_is_the_first_pkcs_entry_before_a_malformed_one() {
+        let table = [
+            entry(1, 0x200, b"x509"),
+            entry(2, 0x200, b"first"),
+            entry(2, 0x200, b"second"),
+        ]
+        .concat();
+        assert_eq!(first_signed_data(&table), Some(&b"first"[..]));
+        let bad = entry(2, 0x300, b"a revision there is not");
+        assert_eq!(
+            first_signed_data(&[entry(2, 0x100, b"first"), bad.clone()].concat()),
+            Some(&b"first"[..])
+        );
+        assert_eq!(
+            first_signed_data(&[entry(1, 0x200, b"x"), bad, entry(2, 0x200, b"later")].concat()),
+            None
+        );
+        // A type there is not, a length past the table's end, and nothing at all.
+        assert_eq!(first_signed_data(&entry(9, 0x200, b"first")), None);
+        let mut cut = entry(2, 0x200, b"0123456789");
+        cut.truncate(12);
+        assert_eq!(first_signed_data(&cut), None);
+        assert_eq!(first_signed_data(&[]), None);
+        // An entry with no data is passed, and the walk goes on.
+        assert_eq!(
+            first_signed_data(&[entry(1, 0x200, b""), entry(2, 0x200, b"first")].concat()),
+            Some(&b"first"[..])
+        );
     }
 }

@@ -80,3 +80,87 @@ fn a_header_of_many_properties_over_many_files_is_read_in_linear_time() {
     let _ = extract(Format::SevenZip, &blob, &mut Budget::new(Limits::default()));
     assert!(start.elapsed().as_secs() < 3, "{:?}", start.elapsed());
 }
+
+/// A coder of a forged folder: method id, inputs, outputs.
+struct Coder(&'static [u8], u8, u8);
+
+const BCJ2: &[u8] = &[0x03, 0x03, 0x01, 0x1B];
+const COPY: &[u8] = &[0x00];
+
+/// An archive of one folder of `coders`, joined by `binds` (input, output),
+/// with the inputs `packed` fed by empty packed streams, and one file in it.
+fn forged_folder(coders: &[Coder], binds: &[(u8, u8)], packed: &[u8]) -> Vec<u8> {
+    let outs: u8 = coders.iter().map(|c| c.2).sum();
+    let ins: u8 = coders.iter().map(|c| c.1).sum();
+    assert_eq!(binds.len(), usize::from(outs - 1).min(coders.len()));
+    assert_eq!(packed.len(), usize::from(ins) - binds.len());
+    let mut h = vec![0x01, 0x04, 0x06, 0x00, packed.len() as u8, 0x09];
+    h.extend(vec![0u8; packed.len()]);
+    h.extend([0x00, 0x07, 0x0B, 0x01, 0x00, coders.len() as u8]);
+    for Coder(id, ins, outs) in coders {
+        h.push(0x10 | id.len() as u8);
+        h.extend(*id);
+        h.extend([*ins, *outs]);
+    }
+    for &(i, o) in binds {
+        h.extend([i, o]);
+    }
+    if packed.len() > 1 {
+        h.extend(packed);
+    }
+    h.push(0x0C);
+    h.extend(vec![16u8; usize::from(outs)]);
+    // The end of the unpack info, the folder's one stream, the end of the
+    // streams info; then one file, and the end of the header.
+    h.extend([0x00, 0x08, 0x00, 0x00, 0x05, 0x01, 0x00, 0x00]);
+    let mut start = Vec::new();
+    start.extend(0u64.to_le_bytes());
+    start.extend((h.len() as u64).to_le_bytes());
+    start.extend(crc32(&h).to_le_bytes());
+    let mut out = b"7z\xBC\xAF\x27\x1C\x00\x04".to_vec();
+    out.extend(crc32(&start).to_le_bytes());
+    out.extend(start);
+    out.extend(h);
+    out
+}
+
+/// Walked, the archive's end: the reason it stopped.
+fn stop(blob: &[u8]) -> String {
+    let mut budget = Budget::new(Limits::default());
+    match exav_unpack::walk(
+        Format::SevenZip,
+        &blob,
+        &mut budget,
+        &mut |_, _, _| None::<()>,
+    ) {
+        Err(e) => e.to_string(),
+        Ok(_) => String::new(),
+    }
+}
+
+/// 7-Zip refuses a folder in which a coder feeds several inputs. Built once
+/// for each, a coder under a few dozen bind pairs makes more readers than
+/// memory holds, each BCJ2 one with buffers of its own.
+#[test]
+fn a_folder_that_binds_one_output_to_several_inputs_is_refused() {
+    // Eight BCJ2 coders and a leaf: the four inputs of the first on the
+    // output of the second, the four of the second on the third's.
+    let mut coders: Vec<Coder> = (0..8).map(|_| Coder(BCJ2, 4, 1)).collect();
+    coders.push(Coder(COPY, 1, 1));
+    let binds: Vec<(u8, u8)> = (0..8).map(|i| (i, i / 4 + 1)).collect();
+    let packed: Vec<u8> = (8..=32).collect();
+    let why = stop(&forged_folder(&coders, &binds, &packed));
+    assert!(why.contains("two inputs"), "{why}");
+
+    // A coder of two outputs, each bound to an input of the one above it.
+    let coders = [Coder(BCJ2, 4, 1), Coder(COPY, 1, 2)];
+    let binds = [(0, 1), (1, 2)];
+    let why = stop(&forged_folder(&coders, &binds, &[2, 3, 4]));
+    assert!(why.contains("two inputs"), "{why}");
+
+    // One input bound to two outputs.
+    let coders = [Coder(BCJ2, 4, 1), Coder(COPY, 1, 1), Coder(COPY, 1, 1)];
+    let binds = [(0, 1), (0, 2)];
+    let why = stop(&forged_folder(&coders, &binds, &[1, 2, 3, 4]));
+    assert!(why.contains("two outputs"), "{why}");
+}

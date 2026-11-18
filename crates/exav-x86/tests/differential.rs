@@ -1,7 +1,7 @@
 //! Differential tests against `iced-x86`.
 //!
 //! WHY THIS SHAPE: a decoder cannot be checked against itself, and reading its
-//! tables proves nothing — a wrong immediate width or a missed prefix rule
+//! tables proves nothing: a wrong immediate width or a missed prefix rule
 //! looks exactly like a right one on the page. Only decoding the same bytes
 //! with an independent implementation and comparing settles it.
 //!
@@ -11,10 +11,10 @@
 //!
 //! THE THREE OUTCOMES are counted apart because they mean different things:
 //!
-//! * **agree** — same length, same mnemonic.
-//! * **declined** — this decoder returned `None` where iced decoded something.
+//! * **agree**: same length, same mnemonic.
+//! * **declined**: this decoder returned `None` where iced decoded something.
 //!   A gap in scope, not a defect: the caller reports rather than faults.
-//! * **disagree** — both decoded and they differ. The only failure, and the
+//! * **disagree**: both decoded and they differ. The only failure, and the
 //!   tests below assert it never happens.
 
 use exav_x86::{Mn, Op, Size, decode};
@@ -28,8 +28,8 @@ struct Tally {
     first: Vec<String>,
     /// What the declines were, by iced's mnemonic, with one example each. The
     /// corpus sweep prints this so the gap between "declines" and "covers" is a
-    /// number someone can act on rather than a percentage nobody can attribute
-    /// — and the example is what makes each one reproducible without a second
+    /// number someone can act on rather than a percentage nobody can attribute,
+    /// and the example is what makes each one reproducible without a second
     /// pass over 34 GB.
     declined_by: std::collections::HashMap<String, (u64, String)>,
 }
@@ -87,8 +87,8 @@ impl Tally {
         self.disagree += 1;
         if self.first.len() < 10 {
             // The whole window, not a prefix of it: a disagreement is often
-            // about a byte near the end — an immediate width, or a prefix run
-            // pushing the instruction past fifteen bytes — and a truncated
+            // about a byte near the end (an immediate width, or a prefix run
+            // pushing the instruction past fifteen bytes), and a truncated
             // report cannot be pasted back in to reproduce.
             self.first.push(format!("{bytes:02x?}: {why}"));
         }
@@ -113,7 +113,7 @@ impl Tally {
 
 /// Compare a resolved branch target.
 ///
-/// This is the operand an emulator acts on most, and it was compared nowhere —
+/// This is the operand an emulator acts on most, and it was compared nowhere,
 /// which is how a `66`-prefixed near branch went on adding into 64 bits instead
 /// of wrapping within the 16-bit instruction pointer, sending the emulator to an
 /// address the CPU would never reach.
@@ -136,7 +136,7 @@ fn branch_mismatch(ours: &exav_x86::Insn, iced: &Instruction) -> Option<String> 
 /// `rep`/`repne` are deliberately NOT compared. The two decoders report
 /// different facts under the same names: iced says whether `F2`/`F3` *acts* as a
 /// repeat prefix, and clears it when the byte was consumed as a mandatory prefix
-/// selecting the opcode — `f3 0f 11` is `movss`, `f3 90` is `pause`. This crate
+/// selecting the opcode: `f3 0f 11` is `movss`, `f3 90` is `pause`. This crate
 /// says whether the byte was *present*. Both are right about their own question,
 /// so an equality check between them tests nothing but the wording.
 ///
@@ -162,7 +162,7 @@ fn memory_mismatch(ours: &[Op; 3], iced: &Instruction) -> Option<String> {
     });
     // The ACCESS WIDTH, checked separately because `Op::MemWide` carries it in a
     // different field. An emulator sizes its read or write from this, so a wrong
-    // number writes bytes it must not touch — `mov [ecx], ds` is two bytes, not
+    // number writes bytes it must not touch: `mov [ecx], ds` is two bytes, not
     // four, and `bound` reads a pair of limits.
     let width = ours.iter().find_map(|o| match o {
         Op::Mem { size, .. } => Some(match size {
@@ -175,14 +175,14 @@ fn memory_mismatch(ours: &[Op; 3], iced: &Instruction) -> Option<String> {
     });
     // NOT compared, and the reason is worth stating: the access width this crate
     // reports comes from `OF_SHAPE`, which holds ONE value per opcode, while the
-    // real width varies per `/digit` — `0F 1C` is one byte at one digit and four
-    // at another, `F3 0F 38 D8` is 48 at one and 64 at another. Asserting on it
+    // real width varies per `/digit` (`0F 1C` is one byte at one digit and four
+    // at another, `F3 0F 38 D8` is 48 at one and 64 at another). Asserting on it
     // would be asserting on a value the table cannot express. Carrying it per
     // digit needs a table the size of `OF_MAP`, and until that exists an
     // assertion here would fail on ~460 encodings for a reason no fix in this
     // file addresses.
     //
-    // The widths that ARE pinned — `8C`/`8E` at two bytes, `bound` at eight —
+    // The widths that ARE pinned (`8C`/`8E` at two bytes, `bound` at eight)
     // have their own test, because those are set per instruction rather than
     // read from the table.
     let _ = width;
@@ -232,7 +232,7 @@ fn memory_mismatch(ours: &[Op; 3], iced: &Instruction) -> Option<String> {
     None
 }
 
-/// Compare register operands position by position — which register file each
+/// Compare register operands position by position: which register file each
 /// names, its number, and the order the two ModRM fields appear in.
 ///
 /// This is what an emulator reads, and getting it wrong is worse than getting a
@@ -241,7 +241,7 @@ fn memory_mismatch(ours: &[Op; 3], iced: &Instruction) -> Option<String> {
 ///
 /// Only encodings where both decoders report the same number of operands are
 /// compared. Where this crate models no operand shape it reports the `r/m`
-/// operand alone, which is one operand against iced's two — a different claim,
+/// operand alone, which is one operand against iced's two: a different claim,
 /// not a contradictory one, and [`Tally::declined`] is not the right name for
 /// it either. The count guard is what keeps those out.
 fn register_mismatch(ours: &exav_x86::Insn, iced: &Instruction) -> Option<String> {
@@ -255,16 +255,16 @@ fn register_mismatch(ours: &exav_x86::Insn, iced: &Instruction) -> Option<String
         ));
     }
     // Fewer is a narrower claim, not a contradictory one, but the positions no
-    // longer line up — ours may hold the `r/m` operand where iced holds `reg` —
+    // longer line up (ours may hold the `r/m` operand where iced holds `reg`),
     // so there is nothing to compare against.
     if ours.op_count() != iced.op_count() as usize {
         return None;
     }
-    for i in 0..ours.op_count() {
+    for (i, op) in ours.ops.iter().enumerate().take(ours.op_count()) {
         // The register file and number this crate claims. A general-purpose
         // register is compared within its own width, since the encoding numbers
         // `al`, `ax` and `eax` alike.
-        let (file, num) = match ours.ops[i] {
+        let (file, num) = match *op {
             Op::Reg(n, Size::B1) => (GPR8, n),
             Op::Reg(n, Size::B2) => (GPR16, n),
             Op::Reg(n, Size::B4) => (GPR32, n),
@@ -280,7 +280,7 @@ fn register_mismatch(ours: &exav_x86::Insn, iced: &Instruction) -> Option<String
         }
         let r = iced.op_register(i as u32);
         if file.get(num as usize) != Some(&r) {
-            return Some(format!("operand {i}: {:?} vs iced {r:?}", ours.ops[i]));
+            return Some(format!("operand {i}: {op:?} vs iced {r:?}"));
         }
     }
     None
@@ -339,7 +339,7 @@ const MMX: [Register; 8] = [
     Register::MM7,
 ];
 
-/// iced's 32-bit GPR numbering, back to the encoding's own — used for the
+/// iced's 32-bit GPR numbering, back to the encoding's own, used for the
 /// base and index of a memory operand, which are always 32-bit registers.
 fn reg_num(r: Register) -> Option<u8> {
     GPR32.iter().position(|x| *x == r).map(|i| i as u8)
@@ -417,7 +417,7 @@ fn exhaustive_two_byte_map() {
 ///
 /// The map sweeps above cannot reach EVEX at all: they emit
 /// `[.., op, modrm, 0x11, ..]`, so for `op = 0x62` the byte that lands in P1 is
-/// `0x11`, whose bit 2 is clear — every probe is rejected by both decoders
+/// `0x11`, whose bit 2 is clear: every probe is rejected by both decoders
 /// before a table is consulted. That left `EVEX_KEYS`/`EVEX_CELLS`/`EVEX_SUB`,
 /// about half this crate's generated table volume, covered by a handful of
 /// regression byte strings.
@@ -512,7 +512,7 @@ fn exhaustive_vex_and_xop() {
 ///
 /// `exhaustive_two_byte_map` sweeps the byte AFTER `0F`, so when that byte is
 /// `38` or `3A` the swept value is the third opcode byte and the real ModRM
-/// stays pinned at `0x11` — one of the sixteen slots each cell carries.
+/// stays pinned at `0x11`, one of the sixteen slots each cell carries.
 #[test]
 fn exhaustive_escape_maps() {
     let mut t = Tally::default();
@@ -701,7 +701,7 @@ fn fp16_complex_multiply_may_not_write_over_a_source() {
 /// The shape probe is what tells the decoder which operand is which. Probing a
 /// fixed `/digit` found nothing for the shift groups, which define no `/1`, and
 /// discarding a shape whose memory width is zero threw away the register-only
-/// encodings on top of that — so `psrlw mm0, imm8` came back with an immediate
+/// encodings on top of that, so `psrlw mm0, imm8` came back with an immediate
 /// and no destination, and `pmovmskb`, which real unpacker loops use, with no
 /// operands at all.
 ///
@@ -709,7 +709,7 @@ fn fp16_complex_multiply_may_not_write_over_a_source() {
 /// their register comparison on it: a wrong zero does not fail, it skips.
 #[test]
 fn a_register_only_encoding_reports_its_register() {
-    // 0F 71 /2 ib — psrlw mm0, 17.
+    // 0F 71 /2 ib: psrlw mm0, 17.
     let insn = decode(&[0x0f, 0x71, 0xd0, 0x11], 0).expect("psrlw decodes");
     assert!(
         matches!(insn.ops[0], Op::Mmx(_) | Op::Xmm(_) | Op::Reg(..)),
@@ -718,7 +718,7 @@ fn a_register_only_encoding_reports_its_register() {
     );
     assert_eq!(insn.op_count(), 2, "a destination and an immediate");
 
-    // 0F D7 — pmovmskb r32, mm. No memory form at all.
+    // 0F D7: pmovmskb r32, mm. No memory form at all.
     let insn = decode(&[0x0f, 0xd7, 0xc1], 0).expect("pmovmskb decodes");
     assert_eq!(
         insn.op_count(),
@@ -731,7 +731,7 @@ fn a_register_only_encoding_reports_its_register() {
 /// A vector register is never reported as a general-purpose one.
 ///
 /// `modrm` can only describe a `mod == 3` operand as `Op::Reg`, which names
-/// `ecx` for `xmm1` — the same number in the wrong register file. The `0F` map
+/// `ecx` for `xmm1`: the same number in the wrong register file. The `0F` map
 /// has always collapsed that to nothing, and consumers depend on it: exav-core's
 /// bytecode disassembler maps vector operands to no-arg so a signature cannot
 /// match `eax` where the instruction named `xmm0`. An `Op::Reg` arriving from
@@ -766,7 +766,7 @@ fn a_vector_register_is_not_reported_as_a_gpr() {
 ///
 /// The scale is read off the oracle at table-generation time, one probe per
 /// cell. Probing a fixed digit instead gives every `/digit` in a sub-block the
-/// same answer — and for a digit that is not an encoding at all the probe fails
+/// same answer, and for a digit that is not an encoding at all the probe fails
 /// and records "do not scale", which addresses memory up to 64x away from where
 /// the hardware would. Length and mnemonic still agree in that state, so nothing
 /// desynchronises and nothing looks wrong; only the address is silently off.
@@ -776,7 +776,7 @@ fn a_vector_register_is_not_reported_as_a_gpr() {
 #[test]
 fn evex_disp8_is_scaled_per_digit() {
     for (bytes, want) in [
-        // EVEX.128.66.0F.W0 71 /2 — vpsrlw xmm, [ecx+disp8], imm8. N=16.
+        // EVEX.128.66.0F.W0 71 /2: vpsrlw xmm, [ecx+disp8], imm8. N=16.
         (
             &[0x62, 0xf1, 0x7d, 0x08, 0x71, 0x51, 0x02, 0x05][..],
             0x20u64,
@@ -826,7 +826,7 @@ fn evex_disp8_is_scaled_per_digit() {
 ///
 /// Found by the fuzzer, not by the map sweeps: they hold the prefix run fixed,
 /// and this only appears once a `67` is placed in front of a specific encoding.
-/// The neighbours are the point of the test — the restriction belongs to this
+/// The neighbours are the point of the test: the restriction belongs to this
 /// one encoding, and a fix that took out the whole opcode group would lose
 /// three instructions the hardware accepts.
 #[test]
@@ -932,8 +932,8 @@ fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 /// default is wrong for both.
 #[test]
 fn segment_moves_and_bound_report_their_real_access_width() {
-    // `mov [eax], es`, `mov es, [eax]`, `bound eax, [eax]`, and `bound ax, [eax]`
-    // — the last under `66`, where the pair is four bytes rather than eight.
+    // `mov [eax], es`, `mov es, [eax]`, `bound eax, [eax]`, and `bound ax, [eax]`,
+    // the last under `66`, where the pair is four bytes rather than eight.
     for bytes in [
         &[0x8c, 0x00][..],
         &[0x8e, 0x00][..],
@@ -959,7 +959,7 @@ fn segment_moves_and_bound_report_their_real_access_width() {
 
 /// A gather addresses memory through a VECTOR index, which only a SIB byte can
 /// encode. Probing these with the usual `mod=00 rm=001` memory ModRM decodes
-/// nothing at all, so the whole family is easy to leave out of the map — and a
+/// nothing at all, so the whole family is easy to leave out of the map, and a
 /// decoder that leaves it out declines a real instruction and stops there.
 ///
 /// The `rm != 100` form is the other half: it is not a shorter encoding of the
@@ -967,7 +967,7 @@ fn segment_moves_and_bound_report_their_real_access_width() {
 /// decode into the middle of the next instruction.
 #[test]
 fn a_gather_decodes_only_through_a_vector_index() {
-    // `vpgatherdd xmm0, [eax + xmm2], xmm1` — VEX.128.66.0F38.W0 90 /r, with
+    // `vpgatherdd xmm0, [eax + xmm2], xmm1`: VEX.128.66.0F38.W0 90 /r, with
     // `mod=00 rm=100` and a SIB naming index 2. Destination, index and mask are
     // three different registers, which a gather requires.
     let with_sib = [0xc4, 0xe2, 0x71, 0x90, 0x04, 0x10];
@@ -1008,7 +1008,7 @@ fn a_gather_decodes_only_through_a_vector_index() {
 /// the map rather than merely one form of it.
 #[test]
 fn a_scatter_decodes_only_through_a_vector_index() {
-    // `vscatterdps [eax + xmm1] {k1}, xmm0` — EVEX.128.66.0F38.W0 A2 /vsib,
+    // `vscatterdps [eax + xmm1] {k1}, xmm0`: EVEX.128.66.0F38.W0 A2 /vsib,
     // with `mod=00 rm=100` and a SIB naming index 1. A scatter requires a mask,
     // which is why `aaa` is 1 rather than 0.
     let with_sib = [0x62, 0xf2, 0x7d, 0x09, 0xa2, 0x04, 0x08];

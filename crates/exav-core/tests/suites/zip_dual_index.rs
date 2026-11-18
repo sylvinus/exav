@@ -7,7 +7,7 @@
 //! the central directory doesn't cover.
 //!
 //! The verdict is the point. Finding the orphan and scanning it must yield
-//! `Infected`; failing to *decode* one must yield `Unscannable`, never `Clean` —
+//! `Infected`; failing to *decode* one must yield `Unscannable`, never `Clean`:
 //! a member exav could not read is content it did not examine, and reporting the
 //! containing file clean on that basis is exactly the silent-clean bug.
 
@@ -17,7 +17,7 @@ fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()
 }
 
-/// A bare local file header plus payload — no central directory, so every member
+/// A bare local file header plus payload, no central directory, so every member
 /// is reached through the orphan scan.
 fn lfh(name: &str, method: u16, flags: u16, payload: &[u8], declared_comp: Option<u32>) -> Vec<u8> {
     let mut v = Vec::new();
@@ -237,7 +237,7 @@ fn ordinary_file_with_chance_pk34_stays_clean() {
 #[test]
 fn damaged_jar_with_hundreds_of_orphans_is_fully_scanned() {
     // The shape this was found on: a real JAR whose End Of Central Directory
-    // record is gone, so no reader can enumerate it — 400+ members reachable
+    // record is gone, so no reader can enumerate it: 400+ members reachable
     // only as local headers. A few hundred members is ordinary for a JAR, so
     // capping the orphan scan below that would silently leave most of the
     // archive unscanned. EICAR sits in the 300th member, past any small cap.

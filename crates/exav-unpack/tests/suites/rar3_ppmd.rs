@@ -3,13 +3,13 @@
 //! Fixtures are libarchive's BSD-2-Clause RAR test files (the same upstream this
 //! crate ports for RAR3/RAR5 LZ):
 //!
-//! * `ppmd_lzss_conversion.rar` — a real RAR3 PPMd member that repeatedly
+//! * `ppmd_lzss_conversion.rar`: a real RAR3 PPMd member that repeatedly
 //!   switches between PPMd and LZSS mid-stream. Its stored FILE_CRC gives a
 //!   byte-exact oracle for the whole decoder (model + RAR range coder + framing
 //!   + escape handling + PPMd↔LZSS conversion + solid continuation). It unpacks
 //!     to ~241 MB, so the byte-exact check is `#[ignore]`d by default; run it with
 //!     `cargo test -p exav-unpack --no-default-features -- --ignored`.
-//! * `ppmd_use_after_free*.rar` — crafted malformed PPMd inputs (libarchive
+//! * `ppmd_use_after_free*.rar`: crafted malformed PPMd inputs (libarchive
 //!   crash-test corpus); they must fail gracefully without panicking.
 
 use exav_unpack::{Budget, Limits, unpack29};

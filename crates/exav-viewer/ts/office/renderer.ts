@@ -2,7 +2,6 @@ import { RasterError } from "../core/pictures.js";
 import { createPictures } from "../core/raster.js";
 import { onDemand, writable } from "../core/store.js";
 import type { Controllers, PagesController, RasterRect, Renderer, SheetsController, ViewportController, ZoomController } from "../core/types.js";
-import { readingOf } from "./delimited.js";
 import { docxExporter, pptxExporter, sheetExporter, type Current, type Exporter, type SheetExporter } from "./export.js";
 import { DEFAULT_MAX_ARCHIVE_ENTRIES, type OfficeOptions } from "./index.js";
 import { wantsProgressive } from "./progressive.js";
@@ -10,7 +9,7 @@ import { sheetView } from "./raster.js";
 import { textSelection } from "./selection.js";
 import { xlsxOfTable } from "./table.js";
 import { docxView, perFrame, slideView, viewportStore, type View } from "./viewport.js";
-import { trimZipTail } from "./zip-tail.js";
+import { trimZipTail, zipDirectory, type ZipDirectory } from "./zip.js";
 
 interface Engine {
   destroy(): void;
@@ -162,12 +161,23 @@ export function rendererFor(kind: "docx" | "xlsx" | "pptx" | "csv"): Renderer<Of
       // Whole bytes, never a URL: the source already holds them, and a ZIP
       // may need its trailing bytes cut first. Given a URL, the engines
       // fetch the whole file again.
+      // The ZIP's central directory, read once by exav's ZIP reader, in a
+      // worker of its own for this file. If the reader fails, the file goes
+      // to the engine as it came.
+      let directory: Promise<ZipDirectory | null> | undefined;
       const bytes = async () => {
+        const b = await ctx.source.bytes();
         // A ZIP with bytes after its end record is refused by the engines'
         // strict check, and read by everything else (see `trimZipTail`).
-        const b = kind === "csv" ? await ctx.source.bytes() : trimZipTail(await ctx.source.bytes());
-        return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer;
+        const kept = trimZipTail(b, await (directory ??= zipDirectory(b, ctx.signal).catch(() => null)));
+        return kept.buffer.slice(kept.byteOffset, kept.byteOffset + kept.byteLength) as ArrayBuffer;
       };
+      // A CSV or TSV is read by exav-render, which finds its encoding and
+      // separator, into an XLSX that the screen and the pictures' second copy
+      // both open. Made once; each user gets a copy, as the engines may take
+      // the buffer they are given.
+      let table: Promise<ArrayBuffer> | undefined;
+      const asWorkbook = async () => (await (table ??= xlsxOfTable(await ctx.source.bytes(), { signal: ctx.signal }))).slice(0);
       // A large deck or document is laid out progressively: `load` resolves
       // with the first slides or pages, the rest follows. If that layout
       // then fails, what is on screen stays.
@@ -179,8 +189,9 @@ export function rendererFor(kind: "docx" | "xlsx" | "pptx" | "csv"): Renderer<Of
         layoutFailed = true;
         if (mounted) ctx.status({ phase: "ready", partial: true });
       };
-      const progressive = (data: ArrayBuffer) =>
-        kind === "docx" || kind === "pptx" ? wantsProgressive(kind, new Uint8Array(data)) && { progressiveLayout: true, onLayoutComplete: laidOut } : {};
+      // After `bytes()`, which reads the directory.
+      const progressive = async () =>
+        kind === "docx" || kind === "pptx" ? wantsProgressive(kind, (await directory) ?? null) && { progressiveLayout: true, onLayoutComplete: laidOut } : {};
       const zoom =
         kind === "pptx"
           ? null
@@ -202,10 +213,11 @@ export function rendererFor(kind: "docx" | "xlsx" | "pptx" | "csv"): Renderer<Of
         if (kind === "docx") {
           const { DocxScrollViewer } = await import("@silurus/ooxml/docx");
           const data = await bytes();
+          const layout = await progressive();
           const v = new DocxScrollViewer(root, {
             ...common,
             ...range,
-            ...progressive(data),
+            ...layout,
             refitOnResize: true,
             // Each page's text as transparent runs over the canvas, to select
             // and copy; its hyperlinks are clicked on them.
@@ -228,7 +240,7 @@ export function rendererFor(kind: "docx" | "xlsx" | "pptx" | "csv"): Renderer<Of
         } else if (kind === "xlsx" || kind === "csv") {
           const { XlsxSheetViewer } = await import("@silurus/ooxml/xlsx");
           // The bare sheet: its tabs are the `sheets` controller's, drawn by
-          // the UI, and only it reads delimited text.
+          // the UI.
           const surface = canvas();
           const v = new XlsxSheetViewer(surface, {
             ...common,
@@ -247,10 +259,6 @@ export function rendererFor(kind: "docx" | "xlsx" | "pptx" | "csv"): Renderer<Of
           // A sheet's page is its used area, which only the document's model
           // says: the viewport is worked out (from the second copy) when
           // someone reads or follows it, and kept up to date while it is followed.
-          const asWorkbook = async () => {
-            const table = await bytes();
-            return xlsxOfTable(table, readingOf(table)).buffer as ArrayBuffer;
-          };
           const sheetPictures = sheetExporter(kind === "csv" ? asWorkbook : bytes, common);
           exporter = sheetPictures;
           sheetProbe = (page) => {
@@ -290,8 +298,7 @@ export function rendererFor(kind: "docx" | "xlsx" | "pptx" | "csv"): Renderer<Of
               });
           };
           if (kind === "csv") {
-            const table = await bytes();
-            await v.load(table, { format: "delimited-text", ...readingOf(table) });
+            await v.load(await asWorkbook());
           } else {
             await v.load(await bytes());
             sheetState.set({ items: v.sheetNames.map((name, index) => ({ index, name })), current: v.sheetIndex });
@@ -300,6 +307,7 @@ export function rendererFor(kind: "docx" | "xlsx" | "pptx" | "csv"): Renderer<Of
         } else {
           const { PptxViewer } = await import("@silurus/ooxml/pptx");
           const data = await bytes();
+          const layout = await progressive();
           // The slide is fitted into the stage and centred in it, the
           // surface around it (see the stylesheet).
           const stage = document.createElement("div");
@@ -307,7 +315,7 @@ export function rendererFor(kind: "docx" | "xlsx" | "pptx" | "csv"): Renderer<Of
           root.append(stage);
           const v = new PptxViewer(canvas(stage), {
             ...common,
-            ...progressive(data),
+            ...layout,
             // As for Word: the slide's text over it, its hyperlinks clicked on it.
             enableTextSelection: true,
             onSlideChange: (index: number, total: number) => {

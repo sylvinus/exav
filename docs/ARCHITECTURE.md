@@ -60,6 +60,15 @@ The readers sit behind the same Cargo features as the formats, and
 
 ## How a file is read
 
+**Detection.** A format is named from the file's first 4 MiB, its end, and
+the places its structure names (the bytes after an executable's image, a
+resource), never from a search through all of it: on a large file of any
+kind a short marker turns up by chance, and the read costs the whole file.
+The probe `detect` hands the checks holds only those places
+(`detection_reads_the_start_the_end_and_the_places_the_structure_names`
+checks the bytes read). Carving embedded executables and archives, which
+looks through all of a file, finds members and does not name its format.
+
 **Scan.** `exav-core` hands a file to `exav_unpack::walk`, which names the
 format and yields the members one at a time (decoded as they are read where the
 format allows). Each member is scanned as an object of its own, and the
@@ -67,11 +76,15 @@ members of members the same way, within the budget of the scan. A document that
 has a text view is scanned as its text too. A format that is recognised and not
 opened is reported, never passed as clean.
 
-**View.** The viewer sniffs the file in TypeScript (`ts/core/formats.ts`, kept
-equal to the registry by a test), picks the plugin, and hands the bytes to the
-WebAssembly module built from `exav-render` for that kind of file: pixels for
-an image, geometry for a drawing, a DOCX, XLSX or PPTX for an office document.
-The viewer draws those. Archives are listed through `exav-unpack-wasm`.
+**View.** The viewer picks the plugin by the file's name and type, and by its
+first bytes where it holds them: exav's own detection (`exav-unpack`'s
+`detect`, `exav-render`'s image detection and the models' readers, `is_ply`,
+`is_glb` and `is_ifc`) runs in `exav_viewer_sniff`, a WebAssembly module in a
+worker, and the registry test checks its answers against
+`formats/registry.json`. It then hands the bytes to the WebAssembly module
+built from `exav-render` for that kind of file: pixels for an image, geometry
+for a drawing, a DOCX, XLSX or PPTX for an office document. The viewer draws
+those. Archives are listed through `exav-unpack-wasm`.
 
 ## Budgets
 

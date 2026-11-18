@@ -76,6 +76,14 @@ on every restart. Turn on `signatures.persistence.enabled` for a
 PersistentVolumeClaim instead. With more than one replica, the PVC needs a
 `ReadWriteMany` access mode, or chart rendering fails.
 
+exav writes the signatures as uid 65532. The pod's `fsGroup` (65532) makes
+the volume writable by that group at each mount, so a claim that root or a
+ClamAV deployment filled works as it is (`signatures.persistence.existingClaim`).
+Some volume types ignore `fsGroup`, NFS among them: there, every update fails
+with `Permission denied` in the pod log until the files belong to 65532. The
+[chart README](https://github.com/sylvinus/exav/tree/main/deploy/helm/exav-chart#storage)
+shows a one-off pod that changes the owner.
+
 ## Memory and workers
 
 exav sizes each worker from the pod's cgroup memory limit. Without a memory
@@ -93,7 +101,19 @@ cpu limit but not a cpu request. Set `resources.limits.cpu`, or set
 
 The chart runs the pod under the Pod Security Standard `restricted`
 profile: non-root uid/gid/fsGroup 65532, all capabilities dropped,
+`allowPrivilegeEscalation: false`, the `RuntimeDefault` seccomp profile,
 `readOnlyRootFilesystem: true`, and no auto-mounted ServiceAccount token.
+The image runs as the same uid and needs neither root nor a capability. exav
+writes only to `/var/lib/exav` (an `emptyDir`, or the PVC) for the signatures
+and to `/tmp` (an `emptyDir`) for objects too large to hold in RAM while
+scanned.
+
+On OpenShift, the `restricted-v2` SCC assigns each namespace its own uid
+range and refuses a pod that asks for 65532. Set
+`podSecurityContext.runAsUser`, `podSecurityContext.runAsGroup`, and
+`podSecurityContext.fsGroup` to `null` in your values file so that the SCC
+fills them in.
+
 Neither the clamd port nor the ICAP port has authentication or TLS, so
 network reachability is the whole security boundary. Use a NetworkPolicy to
 restrict which namespaces can reach the Service.

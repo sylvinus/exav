@@ -86,7 +86,7 @@ fn repetitive_text_matches_reference() {
 fn many_distinct_strings_match_reference() {
     // Pushes the code width through 9, 10, 11, 12 bits. Each change pads the
     // code stream to a group boundary, measured from a base that moves to the
-    // previous padding point — get that wrong and the first few hundred bytes
+    // previous padding point: get that wrong and the first few hundred bytes
     // still decode correctly before it silently drifts.
     matches_reference("widths", "b16");
     matches_reference("widths", "b12");
@@ -95,7 +95,7 @@ fn many_distinct_strings_match_reference() {
 #[test]
 fn a_stream_with_table_resets_matches_reference() {
     // 300 KB of varied data fills the table and makes real `compress` emit CLEAR
-    // codes in block mode — which also pads the code stream to a whole group of
+    // codes in block mode, which also pads the code stream to a whole group of
     // eight codes at the current width. Getting that padding wrong misaligns
     // every code afterwards. This is precisely the case a decoder and its
     // hand-written twin encoder would agree on and both get wrong.
@@ -119,7 +119,7 @@ fn a_payload_inside_a_real_z_is_reachable() {
 #[test]
 fn a_truncated_stream_keeps_what_decoded() {
     // A sequential stream that runs out of input: everything decoded before the
-    // cut is returned, and that is honest — the missing tail is absent, not
+    // cut is returned, and that is honest: the missing tail is absent, not
     // hidden (docs/QUIRKS.md).
     let mut z = fixture("widths.b16.Z");
     let want = fixture("widths.txt");

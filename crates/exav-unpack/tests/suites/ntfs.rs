@@ -1,4 +1,4 @@
-//! NTFS — reading files out of the master file table.
+//! NTFS: reading files out of the master file table.
 //!
 //! VHD and VHDX are Windows-native, so a disk image aimed at a Windows victim
 //! holds NTFS. A raw carve of the volume finds a file only where its magic
@@ -7,7 +7,7 @@
 //!
 //! The fixture is a real volume built with `mkntfs` and filled with `ntfscp`,
 //! then edited so `payload.zip` occupies **two non-adjacent runs**. The edit is
-//! not taken on trust — `ntfscat` reads the edited volume back to the same
+//! not taken on trust: `ntfscat` reads the edited volume back to the same
 //! digest, so an independent NTFS implementation agrees it is a valid two-run
 //! file. The payload is a deflated ZIP, so EICAR appears nowhere in the volume's
 //! bytes and only reassembly reaches it.
@@ -22,7 +22,7 @@
 //! ```
 
 use super::extract_each;
-use super::fs_tree::{assert_streams_alike, came};
+use super::fs_tree::{assert_streams_alike, came, walked};
 use exav_unpack::{Budget, Entry, Format, Limits, detect};
 
 /// `sha256sum` of what `ntfscat` returns for each file.
@@ -100,7 +100,7 @@ fn a_fragmented_file_is_reassembled_from_its_data_runs() {
         sha256_hex(&p.data),
         PAYLOAD,
         "the file spans two non-adjacent runs, so anything short of following \
-         both returns fragments — and `ntfscat` returns this same digest"
+         both returns fragments, and `ntfscat` returns this same digest"
     );
 }
 
@@ -132,9 +132,9 @@ fn the_filesystems_own_metadata_is_not_emitted() {
 
 #[test]
 fn runs_that_do_not_cover_the_declared_size_are_reported_not_truncated() {
-    // The failure mode that matters most. If the runs come up short — because
+    // The failure mode that matters most. If the runs come up short (because
     // they were followed wrongly, or spill into an MFT record exav did not
-    // reach — emitting what was gathered would hand the scanner a *prefix* of
+    // reach), emitting what was gathered would hand the scanner a *prefix* of
     // the file and call it the file. A prefix that happens to exclude the
     // payload scans perfectly clean.
     //
@@ -430,6 +430,184 @@ fn a_list_naming_more_extents_than_exav_follows_is_reported() {
         "{:?}",
         start.elapsed()
     );
+}
+
+/// A volume of 2 KiB sectors and clusters and 1 MiB records (the format's
+/// largest; sectors of 2 KiB keep the update sequence array of such a record
+/// clear of the sector ends it replaces) whose record 16 is a file of `runs`
+/// clusters in `runs` runs of one hole each, so that its run list is 2 bytes a
+/// run, far more than a record of 1 KiB holds. 18 MB, made in memory.
+fn volume_with_runs(runs: usize) -> Vec<u8> {
+    const CLUSTER: usize = 2048;
+    const REC: usize = 1 << 20;
+    const USA: usize = 0x30;
+    let attr_off = (USA + 2 * (REC / CLUSTER + 1) + 7) & !7;
+    let mft_at = 5usize;
+    let mft_bytes = 17 * 1024 * 1024;
+    let mut vol = vec![0u8; (mft_at + mft_bytes / CLUSTER + 10) * CLUSTER];
+    vol[..3].copy_from_slice(&[0xEB, 0x52, 0x90]);
+    vol[3..11].copy_from_slice(b"NTFS    ");
+    vol[11..13].copy_from_slice(&(CLUSTER as u16).to_le_bytes());
+    vol[13] = 1;
+    vol[0x30..0x38].copy_from_slice(&(mft_at as u64).to_le_bytes());
+    vol[0x40] = 0xEC;
+    vol[510..512].copy_from_slice(&[0x55, 0xAA]);
+
+    // A run of one cluster that is a hole: a header of one byte for its
+    // length and none for its place, and the length.
+    let mut list = Vec::new();
+    for _ in 0..runs {
+        list.extend_from_slice(&[0x01, 0x01]);
+    }
+    list.push(0);
+    let mft_run = {
+        let mut r = vec![0x33];
+        r.extend_from_slice(&(mft_bytes / CLUSTER).to_le_bytes()[..3]);
+        r.extend_from_slice(&mft_at.to_le_bytes()[..3]);
+        r.push(0);
+        r
+    };
+
+    let mut record = |n: usize, size: usize, runs: &[u8]| {
+        let mut r = vec![0u8; REC];
+        r[..4].copy_from_slice(b"FILE");
+        r[0x14..0x16].copy_from_slice(&(attr_off as u16).to_le_bytes());
+        r[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
+        r[0x18..0x1C].copy_from_slice(&(REC as u32).to_le_bytes());
+        r[0x1C..0x20].copy_from_slice(&(REC as u32).to_le_bytes());
+        // The unnamed $DATA, non-resident, its run list after the header.
+        let off = attr_off;
+        let len = 64 + runs.len();
+        r[off..off + 4].copy_from_slice(&0x80u32.to_le_bytes());
+        r[off + 4..off + 8].copy_from_slice(&(len as u32).to_le_bytes());
+        r[off + 8] = 1;
+        r[off + 0x18..off + 0x20].copy_from_slice(&(size.div_ceil(CLUSTER) as u64).to_le_bytes());
+        r[off + 0x20..off + 0x22].copy_from_slice(&64u16.to_le_bytes());
+        for at in [0x28, 0x30, 0x38] {
+            r[off + at..off + at + 8].copy_from_slice(&(size as u64).to_le_bytes());
+        }
+        r[off + 64..off + len].copy_from_slice(runs);
+        r[off + len..off + len + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // The update sequence: its number at the start, the bytes it replaces
+        // kept in the array, and the number at the end of each sector.
+        let count = REC / CLUSTER + 1;
+        r[4..6].copy_from_slice(&(USA as u16).to_le_bytes());
+        r[6..8].copy_from_slice(&(count as u16).to_le_bytes());
+        r[USA..USA + 2].copy_from_slice(&[0xAA, 0xBB]);
+        for i in 1..count {
+            let end = i * CLUSTER;
+            let kept: [u8; 2] = r[end - 2..end].try_into().unwrap();
+            r[USA + 2 * i..USA + 2 * i + 2].copy_from_slice(&kept);
+            r[end - 2..end].copy_from_slice(&[0xAA, 0xBB]);
+        }
+        let at = mft_at * CLUSTER + n * REC;
+        vol[at..at + REC].copy_from_slice(&r);
+    };
+    record(0, mft_bytes, &mft_run);
+    record(16, runs * CLUSTER, &list);
+    vol
+}
+
+/// The most runs read from one run list: `MAX_RUNS` of the reader. A file
+/// whose list is longer is not given as if the list were all of it: it comes
+/// out as far as the runs read go, and is reported not to be whole.
+#[test]
+fn a_run_list_longer_than_the_most_runs_read_is_reported_short() {
+    const MOST: usize = 65_536;
+    // The report, when there is one, and how many bytes of the file came out
+    // (in one piece or as a stream read until it ends): the file is one
+    // member, or a report and then the member.
+    let file = |runs: usize| {
+        let img = volume_with_runs(runs);
+        let mut reported = None;
+        let mut bytes = 0usize;
+        let mut budget = Budget::new(Limits::default());
+        exav_unpack::walk(
+            Format::Ntfs,
+            &img.as_slice(),
+            &mut budget,
+            &mut |m, c, _| {
+                if m.name == "<mft-record-16>" {
+                    reported = reported.or(m.unsupported);
+                    match c {
+                        Some(exav_unpack::Member::Bytes(b)) => bytes += b.len(),
+                        Some(exav_unpack::Member::Stream(r)) => {
+                            let mut buf = vec![0u8; 1 << 16];
+                            while let Ok(n) = std::io::Read::read(r, &mut buf) {
+                                if n == 0 {
+                                    break;
+                                }
+                                bytes += n;
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                None::<()>
+            },
+        )
+        .unwrap();
+        (reported, bytes)
+    };
+    assert_eq!(file(MOST - 1), (None, (MOST - 1) * 2048));
+
+    let (reported, bytes) = file(MOST + 1000);
+    let why = reported.expect("a list cut short was not reported");
+    assert!(why.contains("did not cover its declared size"), "{why}");
+    assert_eq!(bytes, MOST * 2048, "what the runs read give");
+}
+
+/// The records of `img`'s master file table: the real size of the `$DATA` of
+/// record 0, over the size of a record.
+fn mft_records(img: &[u8]) -> usize {
+    let u16_at = |at: usize| usize::from(u16::from_le_bytes([img[at], img[at + 1]]));
+    let cluster = u16_at(11) * usize::from(img[13]);
+    let record = match img[0x40] as i8 {
+        n if n < 0 => 1usize << -n,
+        n => n as usize * cluster,
+    };
+    let mft = u64::from_le_bytes(img[0x30..0x38].try_into().unwrap()) as usize * cluster;
+    let mut off = mft + u16_at(mft + 20);
+    while off + 8 <= mft + record {
+        let ty = u32::from_le_bytes(img[off..off + 4].try_into().unwrap());
+        let len = u32::from_le_bytes(img[off + 4..off + 8].try_into().unwrap()) as usize;
+        if ty == 0xFFFF_FFFF || len < 16 {
+            break;
+        }
+        if ty == 0x80 && img[off + 8] != 0 {
+            let real = u64::from_le_bytes(img[off + 0x30..off + 0x38].try_into().unwrap());
+            return real as usize / record;
+        }
+        off += len;
+    }
+    panic!("record 0 has no non-resident $DATA");
+}
+
+/// Each record of the master file table, from the first of a user's, counts
+/// against `max_members` whether it is used or not, and the files it yields
+/// are not counted again: a table with more records than the limit allows ends
+/// the walk with the limit, however few files it holds.
+#[test]
+fn the_records_of_the_table_are_counted_against_the_member_limit() {
+    let img = fixture();
+    // The records from the first that is a user's (16), all of them.
+    let records = (mft_records(&img) - 16) as u64;
+    let files = members(&img).len() as u64;
+    assert!(records > files + 8, "{records} records, {files} files");
+    let with = |max_members: u64| {
+        let mut limits = Limits::default();
+        limits.max_members = max_members;
+        walked(Format::Ntfs, &img, limits)
+    };
+    let (_, end) = with(records);
+    end.unwrap();
+    let (_, end) = with(records - 1);
+    let hit = end.expect_err("a table of more records than the limit was walked");
+    assert_eq!(hit.kind, exav_unpack::LimitKind::MaxFiles, "{hit}");
+    // The limit lifted: every file, as with the default.
+    let (got, end) = with(u64::MAX);
+    end.unwrap();
+    assert_eq!(got.len() as u64, files);
 }
 
 #[test]

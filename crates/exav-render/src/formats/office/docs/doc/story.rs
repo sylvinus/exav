@@ -988,7 +988,7 @@ impl Reader<'_> {
                     }
                 }
                 0x05 if span.aux.spec => {
-                    if let Some(k) = self.atn_ref.iter().position(|r| r.0 == a.cp) {
+                    if let Some(&k) = self.atn_at.get(&a.cp) {
                         items.push(RunItem::CommentRef(k as u32));
                     }
                 }

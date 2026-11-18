@@ -37,7 +37,7 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::SeekFrom;
 
 use super::decmpfs;
 use super::vol::{
@@ -554,7 +554,7 @@ impl Volume<'_> {
     }
 
     /// The bytes of file `id`: held when they are at most `cap`, else read as
-    /// they go. A compressed file is unpacked, and is not read as it goes.
+    /// they go. A compressed file is read a block at a time.
     fn file<'x>(&self, fs: &'x mut Fs<'_, '_>, id: u64, cap: u64) -> Got<'x> {
         let Ok(inode) = self.inode(fs, id) else {
             return Got::Why("APFS file whose inode could not be read");
@@ -565,12 +565,16 @@ impl Volume<'_> {
                 let fork = decmpfs::header(&attr)
                     .filter(|h| decmpfs::in_fork(h.kind))
                     .and(attrs.fork)
-                    // A fork holds the bytes in blocks, a little over their number.
                     .and_then(|(stream, size)| {
-                        let bound = cap.saturating_add(cap / 32).saturating_add(4096);
-                        self.stream(fs, stream, size, bound).ok()
+                        let mut list = self.extents(fs, stream).ok()?;
+                        list.sort_by_key(|e| e.at);
+                        Some(ResourceFork {
+                            list,
+                            block: fs.block,
+                            size,
+                        })
                     });
-                return decmpfs::unpack(&attr, fork.as_deref(), cap);
+                return decmpfs::file(&mut *fs.v, &attr, fork, cap);
             }
             if inode.size == 0 {
                 return Got::Why("compressed file (decmpfs) without its attribute");
@@ -643,6 +647,68 @@ impl Plan for Spans {
                 },
             };
         }
+    }
+}
+
+/// The stream that is the resource fork of a compressed file, read where its
+/// table says: its extents in order of their place in it, a hole between them
+/// reading as zeros.
+struct ResourceFork {
+    list: Vec<Extent>,
+    block: u64,
+    size: u64,
+}
+
+impl decmpfs::Fork for ResourceFork {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read(&self, v: &mut Vol, off: u64, len: usize, out: &mut Vec<u8>) -> bool {
+        let Some(end) = off.checked_add(len as u64).filter(|&end| end <= self.size) else {
+            return false;
+        };
+        let zeros = |out: &mut Vec<u8>, n: u64| {
+            out.resize(out.len().saturating_add(crate::bytes::to_usize(n)), 0);
+        };
+        let mut pos = off;
+        // The last extent that starts at or before `off`: those before it end
+        // before it, as extents that do not overlap do.
+        let mut i = self.list.partition_point(|e| e.at <= pos).saturating_sub(1);
+        while pos < end {
+            let Some(e) = self.list.get(i) else {
+                zeros(out, end.saturating_sub(pos));
+                break;
+            };
+            if e.at > pos {
+                let gap = e.at.saturating_sub(pos).min(end.saturating_sub(pos));
+                zeros(out, gap);
+                pos = pos.saturating_add(gap);
+                continue;
+            }
+            let skip = pos.saturating_sub(e.at);
+            i = i.saturating_add(1);
+            if skip >= e.len {
+                continue;
+            }
+            let take = e.len.saturating_sub(skip).min(end.saturating_sub(pos));
+            match e.block {
+                0 => zeros(out, take),
+                block => {
+                    let Some(at) = block
+                        .checked_mul(self.block)
+                        .and_then(|b| b.checked_add(skip))
+                    else {
+                        return false;
+                    };
+                    if !v.append(at, crate::bytes::to_usize(take), out) {
+                        return false;
+                    }
+                }
+            }
+            pos = pos.saturating_add(take);
+        }
+        true
     }
 }
 
@@ -777,20 +843,16 @@ pub(crate) fn is_apfs(head: &[u8]) -> bool {
 
 /// Walk the APFS container `disk`, which starts at its first block, handing
 /// each file to `visit`.
-pub(crate) fn walk_volume<D: Read + Seek, R>(
-    mut disk: D,
+pub(crate) fn walk_volume(
+    disk: &mut dyn super::vol::Disk,
     budget: &mut Budget,
-    visit: Emit<R>,
-) -> Result<Option<R>, LimitHit> {
+    visit: Emit,
+) -> crate::Extracted {
     let len = disk
         .seek(SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("APFS container: {e}")))?;
     let max = crate::bytes::to_usize(budget.limits().max_buffer_bytes);
-    let mut v = Vol {
-        disk: &mut disk,
-        len,
-        max,
-    };
+    let mut v = Vol { disk, len, max };
     let mut fs = Fs {
         v: &mut v,
         block: 4096,
@@ -838,14 +900,14 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
 }
 
 /// Walk the volume whose superblock is `sb`.
-fn walk_one<R>(
+fn walk_one(
     fs: &mut Fs,
     sb: &[u8],
     multiple: bool,
     n: usize,
     budget: &mut Budget,
-    visit: Emit<R>,
-) -> Result<Option<R>, LimitHit> {
+    visit: Emit,
+) -> crate::Extracted {
     // The name is 256 bytes, ended by a NUL, 704 bytes in.
     let name = sb.get(704..960).unwrap_or_default();
     let name = name.split(|&b| b == 0).next().unwrap_or_default();
@@ -870,7 +932,7 @@ fn walk_one<R>(
     } else {
         String::new()
     };
-    let unreadable = |budget: &mut Budget, visit: Emit<R>| {
+    let unreadable = |budget: &mut Budget, visit: Emit| {
         budget.count_entry()?;
         let note = Entry::unsupported(
             format!("<apfs-volume:{name}>"),
@@ -963,7 +1025,7 @@ mod tests {
     use super::super::vol::collected;
     use super::*;
     use crate::Limits;
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Seek, Write};
 
     const BS: usize = 4096;
 
@@ -1211,9 +1273,9 @@ mod tests {
     fn run(img: &[u8], limits: Limits) -> (Vec<Entry>, Result<(), LimitHit>) {
         let mut budget = Budget::new(limits);
         let mut out = Vec::new();
-        let end = walk_volume(Cursor::new(img.to_vec()), &mut budget, &mut |e, _| {
+        let end = walk_volume(&mut Cursor::new(img.to_vec()), &mut budget, &mut |e, _| {
             out.push(e.whole());
-            None::<()>
+            None
         });
         (out, end.map(|_| ()))
     }
@@ -1326,6 +1388,104 @@ mod tests {
             ]
         );
         assert!(entries.iter().all(|e| e.unsupported.is_none()));
+    }
+
+    /// A container that records the longest read made of it.
+    struct Counting {
+        inner: Cursor<Vec<u8>>,
+        biggest: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.biggest.set(self.biggest.get().max(buf.len()));
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for Counting {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    /// A compressed file whose resource fork is long, in three extents with
+    /// other data between them: past the buffer limit it is read as it goes,
+    /// a block at a time, and no read of the container is longer than a block.
+    #[test]
+    fn a_compressed_file_is_read_a_block_at_a_time_from_its_fragmented_fork() {
+        const BLOCK: usize = 0x1_0000;
+        let text: Vec<u8> = (0..6 * BLOCK + 100)
+            .map(|i| (i * 7 % 251) as u8 ^ (i >> 12) as u8)
+            .collect();
+        // Type 10: the offsets of the blocks, then each behind a marker byte.
+        let blocks: Vec<Vec<u8>> = text
+            .chunks(BLOCK)
+            .map(|c| [&[0u8][..], c].concat())
+            .collect();
+        let mut fork = Vec::new();
+        let mut at = 4 * (blocks.len() + 1);
+        for b in &blocks {
+            fork.extend_from_slice(&(at as u32).to_le_bytes());
+            at += b.len();
+        }
+        fork.extend_from_slice(&(at as u32).to_le_bytes());
+        for b in &blocks {
+            fork.extend_from_slice(b);
+        }
+
+        let mut c = Cont::new();
+        let mut extents = Vec::new();
+        let cuts = [0, 40 * BS, 70 * BS, fork.len()];
+        for w in cuts.windows(2) {
+            let first = c.data(&fork[w[0]..w[1]]);
+            c.data(&[0x55; 100]);
+            let len = (w[1] - w[0]).div_ceil(BS) * BS;
+            extents.push(extent(900, w[0] as u64, len as u64, first));
+        }
+        let mut attr = b"fpmc".to_vec();
+        attr.extend_from_slice(&10u32.to_le_bytes());
+        attr.extend_from_slice(&(text.len() as u64).to_le_bytes());
+        let mut recs = vec![
+            drec(2, "big", 31, DT_REG),
+            inode(31, 2, 31, PACKED, 0),
+            xattr(31, "com.apple.decmpfs", &attr, None),
+            xattr(
+                31,
+                "com.apple.ResourceFork",
+                &[],
+                Some((900, fork.len() as u64)),
+            ),
+        ];
+        recs.extend(extents);
+        let v = c.volume("V", FS_UNENCRYPTED, &sorted(recs));
+        let img = c.finish(&[v]);
+
+        for (cap, streamed) in [(100, true), (u64::MAX, false)] {
+            let biggest = std::rc::Rc::new(std::cell::Cell::new(0));
+            let mut disk = Counting {
+                inner: Cursor::new(img.clone()),
+                biggest: std::rc::Rc::clone(&biggest),
+            };
+            let mut budget = Budget::new(Limits {
+                max_buffer_bytes: cap,
+                ..Limits::default()
+            });
+            let (e, end) = collected(|emit| walk_volume(&mut disk, &mut budget, emit));
+            end.unwrap();
+            assert_eq!(e.len(), 1);
+            let (big, was) = &e[0];
+            assert!(big.unsupported.is_none(), "{:?}", big.unsupported);
+            assert_eq!(*was, streamed, "cap {cap}");
+            assert!(big.data == text, "cap {cap}");
+            if streamed {
+                assert!(
+                    biggest.get() <= BLOCK + 1,
+                    "a read of {} bytes of the container",
+                    biggest.get()
+                );
+            }
+        }
     }
 
     #[test]
@@ -1458,7 +1618,8 @@ mod tests {
             max_buffer_bytes: 3,
             ..Limits::default()
         });
-        let (e, end) = collected(|emit| walk_volume(Cursor::new(img.to_vec()), &mut budget, emit));
+        let (e, end) =
+            collected(|emit| walk_volume(&mut Cursor::new(img.to_vec()), &mut budget, emit));
         end.unwrap();
         // The same bytes as held, holes included, and none of them held.
         let (held, end) = run(&img, Limits::default());
@@ -1569,9 +1730,9 @@ mod tests {
             let mut budget = Budget::new(Limits::default());
             budget.set_verify_checksums(true);
             let mut out = Vec::new();
-            let end = walk_volume(Cursor::new(img.to_vec()), &mut budget, &mut |e, _| {
+            let end = walk_volume(&mut Cursor::new(img.to_vec()), &mut budget, &mut |e, _| {
                 out.push(e.whole());
-                None::<()>
+                None
             });
             (out, end)
         };

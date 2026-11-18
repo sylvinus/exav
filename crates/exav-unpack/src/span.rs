@@ -1,4 +1,5 @@
-//! A ZIP split across files, read as one archive.
+//! Archives split across files, read as one: a ZIP here, and a RAR set as
+//! [`RarSpan`].
 //!
 //! `zip -s` (and PKZIP spanning) writes `x.z01`, `x.z02`, ..., `x.zip`: one
 //! ZIP stream cut into parts, the central directory in the last. Joined end to
@@ -9,7 +10,11 @@
 //! all on one part, which any ZIP reader then reads as a single archive.
 
 use crate::source::ByteSource;
+use crate::zip_end::end_records;
 use std::borrow::Cow;
+
+#[cfg(feature = "rar")]
+pub use crate::formats::rar::RarSpan;
 
 /// The parts of a split ZIP, read as one archive (see the module docs).
 pub struct ZipSpan {
@@ -21,7 +26,6 @@ pub struct ZipSpan {
     patches: Vec<(u64, Vec<u8>)>,
 }
 
-const EOCD: &[u8; 4] = b"PK\x05\x06";
 const EOCD64: &[u8; 4] = b"PK\x06\x06";
 const LOCATOR64: &[u8; 4] = b"PK\x06\x07";
 const CDFH: &[u8; 4] = b"PK\x01\x02";
@@ -56,6 +60,9 @@ impl ZipSpan {
         for p in &parts {
             bases.push(len);
             len += p.len() as u64;
+        }
+        if usize::try_from(len).is_err() {
+            return Err("the parts together are too long to be addressed".to_string());
         }
         let mut span = ZipSpan {
             parts,
@@ -93,11 +100,11 @@ impl ZipSpan {
         // The end record is in the last part's final 64 KiB and 22 bytes.
         let from = last.len().saturating_sub(22 + 0xffff);
         let tail = last.window(from, last.len() - from);
-        let at = tail
-            .windows(4)
-            .rposition(|w| w == EOCD)
-            .ok_or("no end of central directory in the last part")?;
-        let eocd_at = self.bases[self.parts.len() - 1] + (from + at) as u64;
+        let base = self.bases[self.parts.len() - 1] + from as u64;
+        let eocd_at = end_records(&tail, base)
+            .next()
+            .ok_or("no end of central directory in the last part")?
+            .at;
         let mut eocd = self.read(eocd_at, 22);
         let (mut cd_disk, mut entries, mut cd_size, mut cd_off) = (
             u64::from(u16_at(&eocd, 6).ok_or("short end record")?),
@@ -288,6 +295,8 @@ impl ByteSource for ZipSpan {
 mod tests {
     use super::*;
 
+    const EOCD: &[u8; 4] = b"PK\x05\x06";
+
     /// A ZIP of three members, and where its directory and end record are.
     fn archive() -> (Vec<u8>, usize, usize) {
         use std::io::Write;
@@ -381,6 +390,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Bytes after the last part's end record that hold a marker no record can
+    /// be (its comment would run past the file) are not taken for the record.
+    #[test]
+    fn a_marker_after_the_end_record_that_cannot_be_one_is_skipped() {
+        let (blob, cd, eocd) = archive();
+        let mut parts = split(&blob, cd, eocd, &[100, 4000]);
+        let mut junk = b"PK\x05\x06".to_vec();
+        junk.extend_from_slice(&[0; 16]);
+        junk.extend_from_slice(&u16::MAX.to_le_bytes());
+        parts.last_mut().unwrap().extend_from_slice(&junk);
+        let boxed = parts
+            .into_iter()
+            .map(|p| Box::new(p) as Box<dyn ByteSource>)
+            .collect();
+        let span = ZipSpan::new(boxed).unwrap();
+        assert_eq!(
+            span.window(0, blob.len()).into_owned(),
+            blob,
+            "the directory is rewritten as the archive's own"
+        );
+    }
+
+    /// A source that only has a length.
+    #[cfg(target_pointer_width = "32")]
+    struct Long(usize);
+
+    #[cfg(target_pointer_width = "32")]
+    impl ByteSource for Long {
+        fn len(&self) -> usize {
+            self.0
+        }
+
+        fn window(&self, _: usize, _: usize) -> Cow<'_, [u8]> {
+            Cow::Owned(Vec::new())
+        }
+
+        fn identity(&self) -> (usize, usize) {
+            (0, self.0)
+        }
+    }
+
+    /// Parts that together are longer than `usize` can address are refused,
+    /// not cut where the address space ends.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn parts_longer_than_the_address_space_are_refused() {
+        let parts = (0..2)
+            .map(|_| Box::new(Long(3 << 30)) as Box<dyn ByteSource>)
+            .collect();
+        let why = ZipSpan::new(parts).err().expect("the span was made");
+        assert!(why.contains("too long"), "{why}");
     }
 
     /// A directory naming a part the set does not have is refused.

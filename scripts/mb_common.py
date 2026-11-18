@@ -1,13 +1,13 @@
 """Shared helpers for the MalwareBazaar corpus fetchers.
 
 Reproducibility contract:
-  * The MalwareBazaar Auth-Key is read from $MALWAREBAZAAR_API_KEY (preferred —
+  * The MalwareBazaar Auth-Key is read from $MALWAREBAZAAR_API_KEY (preferred;
     matches .env.local and fuzz/fetch_mb_corpus.sh) or the legacy $MB_KEY, after
     loading a gitignored .env.local at the repo root if present. The key is NEVER
     hard-coded or committed. Get one at https://bazaar.abuse.ch/account/.
   * Samples are written under the gitignored corpus/ dir (LIVE MALWARE), never
     next to these scripts.
-  * Each sample's full MalwareBazaar metadata (the `get_info` record — family
+  * Each sample's full MalwareBazaar metadata (the `get_info` record: family
     `signature`, tags, `intelligence.clamav`, `yara_rules`, vendor verdicts, …)
     is saved as a sibling `<sha>.json` so the corpus is self-describing: a
     differential run can look up what each "clean" miss actually is.
@@ -72,7 +72,7 @@ def mb_post(fields, key=None, retries=3, timeout=90):
 
 def get_info(sha256, key=None):
     """Return the MalwareBazaar `get_info` metadata record (a dict) for a sample,
-    or None if the hash is unknown / the query failed. This is the full record —
+    or None if the hash is unknown / the query failed. This is the full record:
     family `signature`, tags, `intelligence.clamav`, `yara_rules`, `vendor_intel`,
     `delivery_method`, hashes, etc."""
     raw = mb_post({"query": "get_info", "hash": sha256}, key)

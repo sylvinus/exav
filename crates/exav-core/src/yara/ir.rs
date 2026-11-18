@@ -356,6 +356,167 @@ pub(crate) enum Cond {
     LengthVar(usize, Option<Box<Cond>>),
 }
 
+/// Per pattern of the `n` there are, the offset it is anchored at: the one
+/// every use of it in `conds` names, `$a at <offset>` or `<n> of (…) at
+/// <offset>` with the offset a number, as yara-x anchors one. Its matches
+/// elsewhere decide nothing. `None` for a pattern used any other way, at two
+/// offsets, or not at all.
+pub(crate) fn anchors<'a>(
+    conds: impl IntoIterator<Item = &'a Cond>,
+    n: usize,
+) -> Vec<Option<usize>> {
+    let mut uses = vec![Use::Unseen; n];
+    for cond in conds {
+        cond.uses(&mut uses);
+    }
+    uses.into_iter()
+        .map(|u| match u {
+            Use::At(k) => Some(k),
+            Use::Unseen | Use::Other => None,
+        })
+        .collect()
+}
+
+/// What the conditions do with a pattern, so far.
+#[derive(Clone, Copy)]
+enum Use {
+    Unseen,
+    /// Matched at this offset alone.
+    At(usize),
+    Other,
+}
+
+/// Notes a use of pattern `p` (an id from a database is not trusted), at
+/// `anchor`.
+fn note(uses: &mut [Use], p: usize, anchor: Option<&Anchor>) {
+    let Some(u) = uses.get_mut(p) else {
+        return;
+    };
+    let at = match anchor {
+        Some(Anchor::At(e)) => match **e {
+            Cond::Int(k) => usize::try_from(k).ok(),
+            _ => None,
+        },
+        _ => None,
+    };
+    *u = match (*u, at) {
+        (Use::Unseen, Some(k)) => Use::At(k),
+        (Use::At(j), Some(k)) if j == k => Use::At(k),
+        _ => Use::Other,
+    };
+}
+
+impl Cond {
+    /// Notes every use of a pattern in the condition. Every variant is named,
+    /// so that a new one that holds patterns cannot be passed over.
+    fn uses(&self, u: &mut [Use]) {
+        let both = |a: &Cond, b: &Cond, u: &mut [Use]| {
+            a.uses(u);
+            b.uses(u);
+        };
+        match self {
+            Cond::Bool(_)
+            | Cond::Int(_)
+            | Cond::Float(_)
+            | Cond::Str(_)
+            | Cond::Filesize
+            | Cond::RuleRef(_)
+            | Cond::Entrypoint
+            | Cond::External(..)
+            | Cond::Var(_) => {}
+            Cond::Pattern(p, anchor) => {
+                note(u, *p, anchor.as_ref());
+                anchor_uses(anchor, u);
+            }
+            Cond::Count(p, range) => {
+                note(u, *p, None);
+                if let Some((a, b)) = range {
+                    both(a, b, u);
+                }
+            }
+            Cond::Offset(p, i) | Cond::Length(p, i) => {
+                note(u, *p, None);
+                if let Some(i) = i {
+                    i.uses(u);
+                }
+            }
+            Cond::Defined(c) | Cond::Not(c) | Cond::Neg(c) | Cond::BitNot(c) => c.uses(u),
+            Cond::IntRead(_, c) | Cond::Matches(c, _) => c.uses(u),
+            Cond::And(cs) | Cond::Or(cs) | Cond::ModCall(_, cs) => {
+                cs.iter().for_each(|c| c.uses(u));
+            }
+            Cond::Arith(_, a, b) | Cond::Cmp(_, a, b) | Cond::StrCmp(_, a, b) => both(a, b, u),
+            Cond::Of(quant, items, anchor) => {
+                quant.uses(u);
+                match items {
+                    OfItems::Patterns(ps) => ps.iter().for_each(|&p| note(u, p, anchor.as_ref())),
+                    OfItems::Exprs(cs) => cs.iter().for_each(|c| c.uses(u)),
+                }
+                anchor_uses(anchor, u);
+            }
+            Cond::ModAccess(_, chain) | Cond::VarAccess(_, chain) => {
+                for step in chain {
+                    match step {
+                        Access::Field(_) => {}
+                        Access::Index(c) => c.uses(u),
+                    }
+                }
+            }
+            Cond::ForIn(f) => {
+                f.quant.uses(u);
+                match &f.iter {
+                    Iter::Range(a, b) => both(a, b, u),
+                    Iter::Tuple(cs) => cs.iter().for_each(|c| c.uses(u)),
+                    Iter::Collection(c) => c.uses(u),
+                }
+                f.body.uses(u);
+            }
+            // The body reads its patterns through `$`, `#`, `@` and `!`.
+            Cond::ForOf(f) => {
+                f.quant.uses(u);
+                f.patterns.iter().for_each(|&p| note(u, p, None));
+                f.body.uses(u);
+            }
+            Cond::With(w) => {
+                w.decls.iter().for_each(|c| c.uses(u));
+                w.body.uses(u);
+            }
+            Cond::PatternVar(_, anchor) => anchor_uses(anchor, u),
+            Cond::CountVar(_, range) => {
+                if let Some((a, b)) = range {
+                    both(a, b, u);
+                }
+            }
+            Cond::OffsetVar(_, i) | Cond::LengthVar(_, i) => {
+                if let Some(i) = i {
+                    i.uses(u);
+                }
+            }
+        }
+    }
+}
+
+impl Quant {
+    fn uses(&self, u: &mut [Use]) {
+        match self {
+            Quant::All | Quant::Any | Quant::None => {}
+            Quant::Count(c) | Quant::Percent(c) => c.uses(u),
+        }
+    }
+}
+
+/// The uses of a pattern in the expressions of `anchor`.
+fn anchor_uses(anchor: &Option<Anchor>, u: &mut [Use]) {
+    match anchor {
+        None => {}
+        Some(Anchor::At(e)) => e.uses(u),
+        Some(Anchor::In(a, b)) => {
+            a.uses(u);
+            b.uses(u);
+        }
+    }
+}
+
 /// A value bound to an environment slot by a loop or `with` expression.
 pub(crate) enum Binding {
     /// A `for … in` / `with` variable value (`None` = undefined).
@@ -395,9 +556,10 @@ pub(crate) struct EvalCtx<'a> {
 /// language caps that, and the scan has no other clock: without a step budget a
 /// single such rule stalls every scan for as long as it takes.
 ///
-/// The ceiling is far above what real rulesets reach — large community feeds
-/// evaluate in the low millions of steps for a whole scan — so it costs
-/// legitimate rules nothing and bounds a runaway one to a fraction of a second.
+/// The ceiling is far above what real rulesets reach (large community feeds
+/// evaluate in the low millions of steps for a whole scan), so it costs
+/// legitimate rules nothing. It counts nodes: one that reads a range of the
+/// object (a `math` or `hash` call, a string operator) costs by its range.
 pub(crate) const EVAL_STEP_BUDGET: u64 = 20_000_000;
 
 impl EvalCtx<'_> {
@@ -460,43 +622,9 @@ impl Cond {
             Cond::Str(s) => Some(Value::Str(s.clone())),
             Cond::Filesize => Some(Value::Int(ctx.data.len() as i64)),
 
-            Cond::Pattern(id, anchor) => {
-                let ms = &ctx.matches[*id];
-                let ok = match anchor {
-                    None => !ms.is_empty(),
-                    Some(Anchor::At(e)) => {
-                        let n = eval_int(e, ctx)?;
-                        n >= 0 && ms.iter().any(|m| m.offset as i64 == n)
-                    }
-                    Some(Anchor::In(lo, hi)) => {
-                        let lo = eval_int(lo, ctx)?;
-                        let hi = eval_int(hi, ctx)?;
-                        ms.iter().any(|m| {
-                            let o = m.offset as i64;
-                            o >= lo && o <= hi
-                        })
-                    }
-                };
-                Some(Value::Bool(ok))
-            }
+            Cond::Pattern(id, anchor) => Some(Value::Bool(pattern_present(*id, anchor, ctx)?)),
 
-            Cond::Count(id, range) => {
-                let ms = &ctx.matches[*id];
-                let c = match range {
-                    None => ms.len() as i64,
-                    Some((lo, hi)) => {
-                        let lo = eval_int(lo, ctx)?;
-                        let hi = eval_int(hi, ctx)?;
-                        ms.iter()
-                            .filter(|m| {
-                                let o = m.offset as i64;
-                                o >= lo && o <= hi
-                            })
-                            .count() as i64
-                    }
-                };
-                Some(Value::Int(c))
-            }
+            Cond::Count(id, range) => count_in_range(*id, range, ctx).map(Value::Int),
 
             Cond::Offset(id, idx) => {
                 let i = index_value(idx, ctx)?;
@@ -618,7 +746,14 @@ impl Cond {
     }
 }
 
-/// Counts a pattern's matches, optionally restricted to an offset range.
+/// How many of `ms`, sorted by offset, start before `bound`.
+fn starting_before(ms: &[Match], bound: i64) -> usize {
+    ms.partition_point(|m| (m.offset as i64) < bound)
+}
+
+/// Counts a pattern's matches, optionally restricted to an offset range. The
+/// matches are sorted by offset, so a range costs a search, not a pass over
+/// them: a loop over a pattern's matches asks for it once per iteration.
 fn count_in_range(id: usize, range: &Option<(Box<Cond>, Box<Cond>)>, ctx: &EvalCtx) -> Option<i64> {
     let ms = &ctx.matches[id];
     Some(match range {
@@ -626,12 +761,12 @@ fn count_in_range(id: usize, range: &Option<(Box<Cond>, Box<Cond>)>, ctx: &EvalC
         Some((lo, hi)) => {
             let lo = eval_int(lo, ctx)?;
             let hi = eval_int(hi, ctx)?;
-            ms.iter()
-                .filter(|m| {
-                    let o = m.offset as i64;
-                    o >= lo && o <= hi
-                })
-                .count() as i64
+            if hi < lo {
+                0
+            } else {
+                let upto = ms.partition_point(|m| (m.offset as i64) <= hi);
+                upto.saturating_sub(starting_before(ms, lo)) as i64
+            }
         }
     })
 }
@@ -902,17 +1037,19 @@ fn pattern_present(id: usize, anchor: &Option<Anchor>, ctx: &EvalCtx) -> Option<
     let ms = &ctx.matches[id];
     Some(match anchor {
         None => !ms.is_empty(),
+        // The matches are sorted by offset: see `count_in_range`.
         Some(Anchor::At(e)) => {
             let n = eval_int(e, ctx)?;
-            n >= 0 && ms.iter().any(|m| m.offset as i64 == n)
+            n >= 0
+                && ms
+                    .get(starting_before(ms, n))
+                    .is_some_and(|m| m.offset as i64 == n)
         }
         Some(Anchor::In(lo, hi)) => {
             let lo = eval_int(lo, ctx)?;
             let hi = eval_int(hi, ctx)?;
-            ms.iter().any(|m| {
-                let o = m.offset as i64;
-                o >= lo && o <= hi
-            })
+            ms.get(starting_before(ms, lo))
+                .is_some_and(|m| m.offset as i64 <= hi)
         }
     })
 }

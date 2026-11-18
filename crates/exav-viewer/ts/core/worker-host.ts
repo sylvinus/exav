@@ -80,8 +80,9 @@ export function createWorkerHost<Req, Res>(start: () => Worker): WorkerHost<Req,
 
 /**
  * The worker side: answers each request with `handle`. A `WebAssembly.RuntimeError`
- * is a trap, after which the instance is unusable: it is reported fatal, so
- * the host replaces the worker.
+ * is a trap, after which the instance is unusable, and so is a `RangeError`, which
+ * is how an exhausted stack surfaces: either is reported fatal, so the host
+ * replaces the worker.
  */
 export function serve<Req, Res>(handle: (request: Req) => Promise<{ value: Res; transfer?: Transferable[] }>): void {
   const scope = self as unknown as {
@@ -96,7 +97,8 @@ export function serve<Req, Res>(handle: (request: Req) => Promise<{ value: Res; 
         const { value, transfer } = await handle(request);
         scope.postMessage({ id, ok: true, value }, transfer ?? []);
       } catch (error) {
-        const fatal = typeof WebAssembly !== "undefined" && error instanceof WebAssembly.RuntimeError;
+        const fatal =
+          error instanceof RangeError || (typeof WebAssembly !== "undefined" && error instanceof WebAssembly.RuntimeError);
         scope.postMessage({ id, ok: false, error: error instanceof Error ? error.message : String(error), fatal });
       }
     });

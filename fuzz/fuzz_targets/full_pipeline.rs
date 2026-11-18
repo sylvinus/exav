@@ -22,7 +22,7 @@
 //!   `AllMatchOutcome`);
 //! * a stream and a buffer are one scan: `scan_seekable` over a reader that
 //!   returns what it is asked in pieces answers what `analyze` did, while the
-//!   object is within `deep_analysis_max` (`tests/suites/one_scan.rs`);
+//!   object is within `limits.max_buffer_bytes` (`tests/suites/one_scan.rs`);
 //! * a database written out and read back scans as the one it came from.
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
@@ -149,7 +149,7 @@ fuzz_target!(|data: &[u8]| {
 
     // One scan from any source, within the limit that decides how it is read.
     let len = scan.len() as u64;
-    if len <= opts.deep_analysis_max && opts.max_scan_size.is_none_or(|m| len <= m) {
+    if len <= opts.limits.max_buffer_bytes && opts.max_scan_size.is_none_or(|m| len <= m) {
         let reader = Pieces(Cursor::new(scan), 1 + scan.len() % 7);
         let streamed =
             scan_seekable(db, reader, len, &opts).expect("a memory reader does not fail");

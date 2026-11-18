@@ -1,4 +1,4 @@
-//! HWP3 — Hangul Word Processor v3 documents.
+//! HWP3: Hangul Word Processor v3 documents.
 //!
 //! exav had no code for it, which is the worst shape a gap can take: the body is
 //! deflate-compressed, so a raw pattern scan over the file matched nothing and it
@@ -13,7 +13,7 @@
 //! preamble offsets. Only v3 is handled here: HWP5 is an OLE2 compound file and
 //! reaches exav's existing OLE path instead.
 
-use crate::{Budget, Entry, Format, LimitHit, Sink};
+use crate::{Budget, Entry, Format, Sink};
 
 /// Byte offsets within the preamble, all fixed by the format.
 mod at {
@@ -29,16 +29,12 @@ mod at {
     pub const SUMMARY_LEN: usize = 1008;
 }
 
-pub(crate) fn extract_hwp3<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_hwp3(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     if !super::sniff::is(data, Format::Hwp3) {
         return Ok(None);
     }
 
-    let report = |reason: &'static str, encrypted: bool, budget: &mut Budget, visit: Sink<R>| {
+    let report = |reason: &'static str, encrypted: bool, budget: &mut Budget, visit: Sink| {
         budget.count_entry()?;
         Ok(visit(
             Entry::unsupported(
@@ -105,7 +101,6 @@ pub(crate) fn extract_hwp3<R>(
     let entry = if compressed {
         match inflate(body, cap) {
             Some(s) if !s.over_cap => {
-                crate::ratio_guard(body.len() as u64, s.data.len() as u64, budget)?;
                 budget.commit(s.data.len() as u64);
                 // The body runs to the end of the file, so a stream that runs
                 // out of input was cut there: only damage leaves bytes unread.
@@ -118,12 +113,14 @@ pub(crate) fn extract_hwp3<R>(
                     ..Entry::new("hwp3-body".to_string(), s.data)
                 }
             }
-            Some(_) => Entry::unsupported(
-                "hwp3-body".to_string(),
-                body.len() as u64,
-                false,
-                "HWP3 body exceeds the per-member decompression budget",
-            ),
+            Some(s) => {
+                budget.commit(s.data.len() as u64);
+                Entry::over_limit(
+                    "hwp3-body".to_string(),
+                    body.len() as u64,
+                    "HWP3 body exceeds the per-member decompression budget",
+                )
+            }
             None => Entry::unsupported(
                 "hwp3-body".to_string(),
                 body.len() as u64,
@@ -131,10 +128,13 @@ pub(crate) fn extract_hwp3<R>(
                 "HWP3 body would not decompress",
             ),
         }
+    } else if body.len() as u64 > cap {
+        Entry::over_limit(
+            "hwp3-body".to_string(),
+            body.len() as u64,
+            "HWP3 body exceeds the per-member size budget",
+        )
     } else {
-        if body.len() as u64 > cap {
-            return Err(LimitHit::new("hwp3 body exceeds budget".to_string()));
-        }
         budget.commit(body.len() as u64);
         Entry::new("hwp3-body".to_string(), body.to_vec())
     };
@@ -177,14 +177,14 @@ mod tests {
         let mut seen = Vec::new();
         let _ = extract_hwp3(blob, &mut b, &mut |e: Entry, _: &mut Budget| {
             seen.push(e);
-            None::<()>
+            None
         });
         seen
     }
 
     /// A document built to the documented preamble layout. This validates the
     /// offsets against themselves, so it proves the *parser* matches the layout
-    /// as recorded — not that the layout is right. The layout's authority is
+    /// as recorded, not that the layout is right. The layout's authority is
     /// `java-hwp`. A fixture this crate wrote can only prove the decoder is
     /// self-consistent, which is why the real-sample check matters.
     fn build(compressed: bool, password: u16, info_len: usize, body: &[u8]) -> Vec<u8> {
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn the_info_block_length_shifts_where_the_body_starts() {
         // Getting this wrong slices into the summary and yields garbage that
-        // still "decompresses" for some inputs — so it is pinned explicitly.
+        // still "decompresses" for some inputs, so it is pinned explicitly.
         let body = b"body after a long info block";
         let seen = members(&build(true, 0, 257, body));
         assert_eq!(seen.len(), 1, "{seen:?}");

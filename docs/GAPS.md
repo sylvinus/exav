@@ -3,7 +3,7 @@
 What exav does not do, recorded deliberately.
 
 Every gap here is **reported, never a silent `Clean`**. A file exav cannot fully
-process comes back `Unscannable`, `LimitsExceeded` or `PasswordProtected` — the
+process comes back `Unscannable`, `LimitsExceeded` or `PasswordProtected`: the
 one failure mode that would matter is an unrecognised container scanning clean,
 and that is what this list exists to prevent quietly happening.
 
@@ -12,7 +12,7 @@ and that is what this list exists to prevent quietly happening.
 exav does not ship a hand-written unpacker per packer family. Anything whose
 shape says a packer built it has its stub run under a bounded x86 interpreter,
 and the image the stub rebuilds is captured. Coverage is therefore not a list of
-families — but three packers in `corpus/packers` (23 packers, 276 samples)
+families, but three packers in `corpus/packers` (23 packers, 276 samples)
 still defend themselves on most samples, and little or nothing is recovered from
 them:
 
@@ -32,7 +32,7 @@ Each remaining gap is a separate investigation with no shared fix, which is
 why they are recorded rather than scheduled.
 
 Note the naming collision: **Yoda's *Cryptor* (`yC`) is a different product and
-is unpacked** — it is in `MUST_UNPACK` in
+is unpacked**: it is in `MUST_UNPACK` in
 `crates/exav-unpack/tests/suites/pe_emulation_corpus.rs`, so every one of its
 samples must yield a complete image or the test fails. Yoda's *Protector* is the
 one above. What exav does not implement is `BoundsCheck`, the heuristic ClamAV's
@@ -51,7 +51,7 @@ instructions before the stop.
 
 VMProtect, Themida/WinLicense and Enigma translate the protected functions into
 a private bytecode when the file is *built*. There is no moment at runtime when
-the original instructions exist in memory, so no emulator recovers them — there
+the original instructions exist in memory, so no emulator recovers them: there
 is nothing to recover. exav does not spend the budget trying, and reports them
 in wording that says what is true about them.
 
@@ -60,4 +60,4 @@ in wording that says what is true about them.
 See [the ClamAV comparison](../www/src/content/docs/scanner/reference/comparison-with-clamav.md)
 for the list and the reasoning: they are per-family detection content expressed
 as engine code rather than as signatures, so reproducing them means reproducing
-logic that exists only in GPL source — which exav's clean-room rule forbids.
+logic that exists only in GPL source, which exav's clean-room rule forbids.

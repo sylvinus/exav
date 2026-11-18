@@ -3,7 +3,8 @@ exav-render: notices
 
 exav-render is licensed under the MIT License (see LICENSE). This file
 covers the office converters (the `office-sheets`, `office-slides` and
-`office-docs` features, `src/formats/office/`). The vendored image decoders
+`office-docs` features, `src/formats/office/`) and the camera RAW previews
+(the `raw` feature, below). The vendored image decoders
 keep their licences in `src/image_codecs/` and the stroke font its
 dedication in `fonts/`; the notices of the rest of the workspace are in the
 repository's NOTICE.
@@ -122,6 +123,17 @@ Formats nobody published
   root style sheet's. The gradient patterns 25 to 40 are approximations of
   the pictures in [MS-VSDX]. Formats the reader leaves out: the binary .vsd
   and the Visio 2003 XML .vdx.
+
+Camera RAW previews (`raw`)
+---------------------------
+
+src/formats/image/raw.rs and raw/ are written from TIFF 6.0, the Adobe
+Digital Negative (DNG) Specification 1.7.1.0, Exif 2.32 (CIPA DC-008-2019),
+ITU-T T.81 and ISO/IEC 14496-12, and from CC0 sample files; the repository's
+NOTICE (section 1p) says more. The DNG Specification's patent licence asks
+for this notice:
+
+  This product includes DNG technology under license by Adobe.
 
 Data from other projects
 ------------------------

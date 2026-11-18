@@ -82,9 +82,11 @@ exit `0` for a file it could not fully scan; `--partial-as` maps `3` to any of
 the other codes, and `--clamav-compat` installs `--partial-as ok`. See
 [Migrating from ClamAV](/scanner/guides/migrating-from-clamav/).
 
-Two cases sit outside the ranking: `--ping` exits `0` if the daemon answered
-and `2` if it did not, and a one-shot run stopped by `--max-scan-secs` exits
-`3`.
+`--ping` sits outside the ranking: it exits `0` if the daemon answered and `2`
+if it did not. A one-shot run stopped by `--max-scan-secs` keeps the ranking:
+`1` if it had found something, then `2` if a file had failed, and otherwise
+the code `--partial-as` gives `LIMITS-EXCEEDED` (`3` by default, `0` under
+`--clamav-compat`).
 
 ## On the clamd wire
 

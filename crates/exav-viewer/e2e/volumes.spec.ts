@@ -38,6 +38,8 @@ for (const mode of ["page", "sandbox"] as const) {
         // In the order of the archive, whichever it is.
         await expect(members(page)).toHaveCount(listed.length);
         expect((await members(page).allInnerTexts()).sort()).toEqual([...listed].sort());
+        // A name cannot reorder the text around it.
+        await expect(members(page).first()).toHaveCSS("unicode-bidi", "isolate");
         await expect(page.locator(".demo-frame .exav-viewer-member", { hasText: member }).locator(".exav-viewer-member-size")).toHaveText(size);
       });
     }

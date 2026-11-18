@@ -108,7 +108,7 @@ fn check_archive(data: &[u8]) -> (u32, u32, u32, u32, u32) {
                     Err(_) => fail += 1,
                 }
             } else {
-                // older version (15/20/26) or PPMd-only — skipped
+                // older version (15/20/26) or PPMd-only: skipped
                 skip += 1;
             }
             pos = data_off + add_size as usize;

@@ -13,6 +13,7 @@
  */
 import { createDetector } from "../core/detect.js";
 import { MATCHERS } from "../core/formats.js";
+import { bodyChunks, createFetcher, declaredLength, requestRange, type Fetcher } from "../core/http.js";
 import { readWhole } from "../core/source.js";
 import type { BuiltinFormat, ByteRanges, FileSource, ViewerFile } from "../core/types.js";
 import { isOrigin, type FrameOrigins } from "./policy.js";
@@ -122,13 +123,48 @@ export interface PrepareOptions {
   progress?: (share: number) => void;
 }
 
+/** How a file of `kind` reaches the frame (`null`: every other kind of file, a Blob). */
+function modeOf(kind: Kind | null, d: Delivery): "url" | "auto" | "ranges" | "blob" {
+  return kind === null ? "blob" : (d[kind] ?? (kind === "pdf" || kind === "archive" ? "ranges" : "auto"));
+}
+
+/**
+ * Whether `prepare` refuses the address of a file shown as `format`: delivery
+ * "url" for it, and an origin the frame's policy does not name. It is an
+ * error before any request, so the host does not ask that address for its
+ * first bytes either.
+ */
+export function refusesAddress(address: { url: string; init?: RequestInit }, format: BuiltinFormat | null, file: Pick<ViewerFile, "name" | "type" | "path">, o: Pick<PrepareOptions, "delivery" | "origins">): boolean {
+  const kind = format ? kindOf(format, file) : null;
+  if (modeOf(kind, o.delivery ?? {}) !== "url") return false;
+  const origins = o.origins ?? {};
+  return urlRefusal(address.url, address.init, kind === "pdf" ? (origins.connect ?? []) : (origins.media ?? [])) !== null;
+}
+
+/**
+ * The address `prepare` gives the frame for a file shown as `format`, or
+ * null when this page reads the file itself; with whether the frame may
+ * fetch it (an origin of `origins.connect`), as it does a PDF's, rather than
+ * only show it in an element. Video and audio are never fetched by the frame.
+ */
+export function addressGiven(address: { url: string; init?: RequestInit }, format: BuiltinFormat | null, file: Pick<ViewerFile, "name" | "type" | "path">, o: Pick<PrepareOptions, "delivery" | "origins">): { url: string; fetchable: boolean } | null {
+  const kind = format ? kindOf(format, file) : null;
+  const mode = modeOf(kind, o.delivery ?? {});
+  if (mode !== "url" && mode !== "auto") return null;
+  const origins = o.origins ?? {};
+  if (urlRefusal(address.url, address.init, kind === "pdf" ? (origins.connect ?? []) : (origins.media ?? [])) !== null) return null;
+  const fetchable = kind !== "media" && urlRefusal(address.url, address.init, origins.connect ?? []) === null;
+  return { url: new URL(address.url, location.href).href, fetchable };
+}
+
 /** Reads `source` as `format`'s delivery says, and what the frame is given. */
 export async function prepare(source: FileSource, format: BuiltinFormat, file: Pick<ViewerFile, "name" | "type" | "path">, o: PrepareOptions): Promise<Prepared> {
   const kind = kindOf(format, file);
   const d = o.delivery ?? {};
   const origins = o.origins ?? {};
   const r = "resolve" in source ? resolved(await source.resolve(o.signal)) : source;
-  const mode = kind === null ? "blob" : (d[kind] ?? (kind === "pdf" || kind === "archive" ? "ranges" : "auto"));
+  const mode = modeOf(kind, d);
+  const http = "url" in r ? createFetcher(r, "resolve" in source ? (s) => source.resolve(s) : null, o.signal) : null;
 
   if (mode === "url" || mode === "auto") {
     if ("url" in r) {
@@ -138,60 +174,39 @@ export async function prepare(source: FileSource, format: BuiltinFormat, file: P
     }
     // A file the host holds has no address to give: it goes whole.
   } else if (mode === "ranges") {
-    const ranges = await openRanges(r, "resolve" in source ? source.resolve : null, o);
-    if (ranges instanceof Blob) return { kind: "blob", blob: ranges, readWhole: true };
-    if (ranges === WHOLE) return { kind: "blob", blob: await readBlob(r, o), readWhole: true };
+    const ranges = await openRanges(r, http, o);
+    if (ranges instanceof Response) return { kind: "blob", blob: await blobOf(ranges, o), readWhole: true };
+    if (ranges === WHOLE) return { kind: "blob", blob: await readBlob(r, http, o), readWhole: true };
     if (ranges) return { kind: "ranges", ranges };
   }
-  return { kind: "blob", blob: await readBlob(r, o) };
+  return { kind: "blob", blob: await readBlob(r, http, o) };
 }
 
-async function readBlob(r: Resolved, o: PrepareOptions): Promise<Blob> {
+/** `http`: the requests to `r`, when it is an address. */
+async function readBlob(r: Resolved, http: Fetcher | null, o: PrepareOptions): Promise<Blob> {
   if ("blob" in r) return r.blob;
   if ("bytes" in r) return new Blob([r.bytes as BlobPart]);
   if ("ranges" in r) return new Blob([(await readWhole(r.ranges, o.signal, (n) => o.progress?.(n / r.ranges.size))) as BlobPart]);
-  const response = await fetch(r.url, { ...r.init, signal: o.signal });
+  const response = await http!.get(null, o.signal);
   if (!response.ok) throw new Error(`HTTP ${response.status} for the file`);
-  return readBody(response, o);
+  return blobOf(response, o);
 }
 
-/** A response's body as a Blob, with progress when its length is known. */
-async function readBody(response: Response, o: PrepareOptions): Promise<Blob> {
-  const length = Number(response.headers.get("content-length"));
-  const total = Number.isFinite(length) && length > 0 ? length : null;
-  if (!response.body) return response.blob();
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let loaded = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    loaded += value.length;
-    if (total) o.progress?.(Math.min(1, loaded / total));
-  }
-  return new Blob(chunks as BlobPart[]);
-}
-
-/** `bytes start-end/total`, or null. */
-export function contentRange(header: string | null): { start: number; end: number; total: number | null } | null {
-  const m = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(header?.trim() ?? "");
-  if (!m) return null;
-  const start = Number(m[1]);
-  const end = Number(m[2]);
-  const total = m[3] === "*" ? null : Number(m[3]);
-  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end < start || (total !== null && (!Number.isSafeInteger(total) || end >= total))) return null;
-  return { start, end, total };
+/** The whole file `response` holds, its progress said as it is read. */
+async function blobOf(response: Response, o: PrepareOptions): Promise<Blob> {
+  const total = declaredLength(response);
+  const body = await bodyChunks(response, undefined, (loaded) => total && o.progress?.(Math.min(1, loaded / total)));
+  return new Blob(body.chunks as BlobPart[]);
 }
 
 const copy = (b: Uint8Array) => b.slice();
 
 /**
- * `r` read by ranges; or the whole file, from a server that answered the
- * first range request with all of it; `WHOLE` for a server whose answer to
- * it cannot be used; or null when it is to be read whole (an empty file).
+ * `r` read by ranges; the whole file's answer, unread, from a server that
+ * ignores ranges; `WHOLE` for one whose answer to the first range request
+ * cannot be used; or null when it is to be read whole (an empty file).
  */
-async function openRanges(r: Resolved, resolve: ((signal: AbortSignal) => Promise<string | Blob | Uint8Array>) | null, o: PrepareOptions): Promise<HostRanges | Blob | typeof WHOLE | null> {
+async function openRanges(r: Resolved, http: Fetcher | null, o: PrepareOptions): Promise<HostRanges | Response | typeof WHOLE | null> {
   const headOf = async (ranges: ByteRanges) => copy(await ranges.read(0, Math.min(ranges.size, READS.head), o.signal));
   if ("ranges" in r) return r.ranges.size > 0 ? { size: r.ranges.size, head: await headOf(r.ranges), read: (offset, length, signal) => r.ranges.read(offset, length, signal) } : null;
   if ("bytes" in r || "blob" in r) {
@@ -200,81 +215,31 @@ async function openRanges(r: Resolved, resolve: ((signal: AbortSignal) => Promis
     const ranges: ByteRanges = { size: blob.size, read: async (offset, length) => new Uint8Array(await blob.slice(offset, offset + length).arrayBuffer()) };
     return { ...ranges, head: await headOf(ranges) };
   }
-  return openUrlRanges(r, resolve, o);
+  return openUrlRanges(http!, o);
 }
 
-/**
- * A URL read by HTTP range requests, with the source's `init`. A source
- * signed on demand is resolved again, once per request, when the server
- * answers 401 or 403: its URL may have expired.
- */
-async function openUrlRanges(
-  first: { url: string; init?: RequestInit },
-  resolve: ((signal: AbortSignal) => Promise<string | Blob | Uint8Array>) | null,
-  o: PrepareOptions,
-): Promise<HostRanges | Blob | typeof WHOLE | null> {
-  let current: Promise<{ url: string; init?: RequestInit }> = Promise.resolve(first);
-  const resign = (stale: Promise<{ url: string; init?: RequestInit }>) => {
-    // Requests that failed together resolve the source once.
-    if (current === stale)
-      current = resolve!(o.signal).then((r) => {
-        if (typeof r !== "string") throw new Error("the source resolved again to bytes, not a URL");
-        return { url: r, init: first.init };
-      });
-    return current;
-  };
-  const request = async (from: number, to: number, signal: AbortSignal): Promise<Response> => {
-    let at = current;
-    for (let attempt = 0; ; attempt++) {
-      const { url, init } = await at;
-      const headers: Record<string, string> = Object.fromEntries(new Headers(init?.headers).entries());
-      headers.range = `bytes=${from}-${to}`;
-      const response = await fetch(url, { ...init, headers, signal });
-      if ((response.status === 401 || response.status === 403) && resolve && attempt === 0) {
-        void response.body?.cancel();
-        at = resign(at);
-        continue;
-      }
-      return response;
-    }
-  };
-
-  const probe = await request(0, READS.head - 1, o.signal);
-  if (probe.status === 206) {
-    const range = contentRange(probe.headers.get("content-range"));
-    if (range && range.start === 0 && range.total) {
-      const size = range.total;
-      const head = new Uint8Array(await probe.arrayBuffer());
-      if (head.length !== Math.min(size, READS.head)) throw new Error(`the server sent ${head.length} bytes for the first ${Math.min(size, READS.head)}`);
-      return {
-        size,
-        head,
-        async read(offset, length, signal) {
-          const end = Math.min(size, offset + length) - 1;
-          const response = await request(offset, end, signal);
-          const got = contentRange(response.headers.get("content-range"));
-          if (response.status !== 206 || !got || got.start !== offset || got.end !== end || got.total !== size) {
-            void response.body?.cancel();
-            throw new Error(`HTTP ${response.status} for bytes ${offset}-${end}`);
-          }
-          const bytes = new Uint8Array(await response.arrayBuffer());
-          if (bytes.length !== end - offset + 1) throw new Error(`the server sent ${bytes.length} bytes for ${end - offset + 1}`);
-          return bytes;
-        },
-      };
-    }
-    void probe.body?.cancel();
-    console.warn("exav viewer: the server answered a range request without a readable Content-Range (cross-origin, it must be exposed): the whole file is downloaded");
+/** A URL read by HTTP range requests. */
+async function openUrlRanges(http: Fetcher, o: PrepareOptions): Promise<HostRanges | Response | typeof WHOLE | null> {
+  const probe = await requestRange(http, { from: 0, to: READS.head - 1 }, o.signal, true);
+  if (probe.kind === "empty") return null;
+  if (probe.kind === "refused" && probe.status !== 206) throw new Error(`HTTP ${probe.status} for the file`);
+  if (probe.kind === "whole") {
+    console.warn("exav viewer: the server does not answer range requests: the whole file is downloaded");
+    return probe.response;
+  }
+  if (probe.kind !== "part" || probe.total === null) {
+    console.warn("exav viewer: the server's answer to a range request is not the bytes asked for, or has no readable Content-Range (cross-origin, it must be exposed): the whole file is downloaded");
     return WHOLE;
   }
-  if (probe.status === 200) {
-    console.warn("exav viewer: the server does not answer range requests: the whole file is downloaded");
-    return readBody(probe, o);
-  }
-  if (probe.status !== 416) {
-    void probe.body?.cancel();
-    throw new Error(`HTTP ${probe.status} for the file`);
-  }
-  // 416: an empty file, read whole.
-  return null;
+  const size = probe.total;
+  return {
+    size,
+    head: probe.bytes,
+    async read(offset, length, signal) {
+      const to = Math.min(size, offset + length) - 1;
+      const a = await requestRange(http, { from: offset, to, total: size }, signal);
+      if (a.kind === "part") return a.bytes;
+      throw new Error(a.kind === "refused" ? a.why : `no usable answer for bytes ${offset}-${to}`);
+    },
+  };
 }

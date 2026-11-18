@@ -46,6 +46,8 @@ fn limits() -> Limits {
     l.max_buffer_bytes = BUFFER;
     l.max_extracted_bytes = 1024 * 1024;
     l.max_scanned_bytes = 4 * 1024 * 1024;
+    // The holes of a sparse file are zeros handed over, not decoded.
+    l.max_hole_bytes = 4 * 1024 * 1024;
     l.max_members = 400;
     l.max_recursion = 2;
     l

@@ -10,6 +10,7 @@
 //! [`Entry`]. Bounds are clamped and the decoders never index past the input, so
 //! hostile/truncated data cannot panic.
 
+use crate::tree::quoted;
 use crate::*;
 use base64::Engine;
 
@@ -68,7 +69,7 @@ fn parse_begin_name(rest: &[u8]) -> String {
     let name = name
         .trim()
         .trim_matches(|c| c == '/' || c == '\\' || c == '\0');
-    // Basename only — an attacker-supplied path must not escape.
+    // Basename only: an attacker-supplied path must not escape.
     let base = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
     if base.is_empty() {
         "uudecoded.bin".to_string()
@@ -83,13 +84,11 @@ fn lines(data: &[u8]) -> impl Iterator<Item = &[u8]> {
         .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
 }
 
-pub(crate) fn extract_uuencode<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_uuencode(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     let mut it = lines(data).peekable();
-    while let Some(line) = it.next() {
+    // A member past the object limit is left out; the lines of its body
+    // start no member, so the search goes on from where it stopped.
+    'members: while let Some(line) = it.next() {
         let trimmed = trim_ascii_start(line);
         let (base64, rest) = if let Some(r) = trimmed.strip_prefix(b"begin-base64 ") {
             (true, r)
@@ -115,18 +114,18 @@ pub(crate) fn extract_uuencode<R>(
                 }
                 b64.extend(t.iter().filter(|b| !b.is_ascii_whitespace()));
                 if b64.len() as u64 > cap.saturating_mul(2).saturating_add(64) {
-                    return Err(LimitHit::new(format!(
-                        "uuencode member '{name}' exceeds budget"
-                    )));
+                    let shown = quoted(&name);
+                    budget.over_cap(cap, 0, format_args!("uuencode member '{shown}'"))?;
+                    continue 'members;
                 }
             }
             out = base64::engine::general_purpose::STANDARD
                 .decode(&b64)
                 .map_err(|e| LimitHit::corrupt(format!("uuencode base64: {e}")))?;
             if out.len() as u64 > cap {
-                return Err(LimitHit::new(format!(
-                    "uuencode member '{name}' exceeds budget"
-                )));
+                let (spent, shown) = (out.len() as u64, quoted(&name));
+                budget.over_cap(cap, spent, format_args!("uuencode member '{shown}'"))?;
+                continue;
             }
         } else {
             // Classic body: decode each line until `end`, a blank/zero-length
@@ -143,9 +142,9 @@ pub(crate) fn extract_uuencode<R>(
                 }
                 decode_uu_line(t, &mut out);
                 if out.len() as u64 > cap {
-                    return Err(LimitHit::new(format!(
-                        "uuencode member '{name}' exceeds budget"
-                    )));
+                    let (spent, shown) = (out.len() as u64, quoted(&name));
+                    budget.over_cap(cap, spent, format_args!("uuencode member '{shown}'"))?;
+                    continue 'members;
                 }
             }
         }
@@ -160,7 +159,7 @@ pub(crate) fn extract_uuencode<R>(
 
 /// True if `data` (leading whitespace skipped) opens a uuencode stream: a
 /// `begin `/`begin-base64 ` line with a matching `end`/`====` terminator later.
-/// Conservative — used by [`crate::detect`], which is the single source of truth.
+/// Conservative: used by [`crate::detect`], which is the single source of truth.
 pub(crate) fn looks_like_uuencode(p: &crate::Probe) -> bool {
     let data = p.head;
     let head = trim_ascii_start(&data[..data.len().min(4096)]);
@@ -168,16 +167,32 @@ pub(crate) fn looks_like_uuencode(p: &crate::Probe) -> bool {
     if !base64 && !head.starts_with(b"begin ") {
         return false;
     }
-    // Require a terminator so a stray "begin " prose line isn't claimed.
+    // Require a terminator so a stray "begin " prose line isn't claimed: in
+    // the start, or in the end, from a line's start.
     let mut scan = Terminator::new(base64);
-    match p.source() {
-        None => {
-            scan.feed(data);
-        }
-        Some(src) => src.chunks(0, src.len(), &mut |_, chunk| !scan.feed(chunk)),
+    if scan.feed(data) || p.len <= data.len() {
+        return scan.finish();
     }
+    let from = p.len.saturating_sub(TAIL).max(data.len());
+    if from == data.len() {
+        // The end follows the start: the line the start ends in goes on.
+        scan.feed(&p.window(from, p.len - from));
+        return scan.finish();
+    }
+    // From the byte before the end read, so that a line starting at its first
+    // byte is whole.
+    let tail = p.window(from - 1, p.len - from + 1);
+    let Some(line) = memchr::memchr(b'\n', &tail) else {
+        return false;
+    };
+    let mut scan = Terminator::new(base64);
+    scan.feed(&tail[line + 1..]);
     scan.finish()
 }
+
+/// The bytes at the end of an object that [`looks_like_uuencode`] reads for
+/// the terminator, past its start.
+const TAIL: usize = 64 * 1024;
 
 /// Looks for a line that, trimmed of ASCII whitespace, is `end` (or starts
 /// with `====` for base64), over bytes fed a piece at a time.
@@ -326,6 +341,51 @@ mod tests {
                     assert_eq!(found || bytes.finish(), want);
                 }
             }
+        }
+    }
+
+    /// The `end` line counts wherever it lies in the start or the end read:
+    /// across the start's last byte, right after it, ended by a newline past
+    /// it, and at the first byte of the end read when a gap lies between.
+    #[test]
+    fn the_terminator_counts_across_the_start_and_at_the_end() {
+        let head = crate::DETECT_HEAD;
+        // `begin`, one long line, then `last` starting at `at`, then `after`.
+        let text = |at: usize, last: &[u8], after: usize| {
+            let mut d = b"begin 644 f\n".to_vec();
+            d.resize(at - 1, b'x');
+            d.push(b'\n');
+            d.extend_from_slice(last);
+            d.resize(d.len() + after, b'y');
+            d
+        };
+        let cases: [(&str, Vec<u8>, bool); 6] = [
+            ("across the start's end", text(head - 2, b"end\n", 0), true),
+            ("right after the start", text(head, b"end\n", 0), true),
+            (
+                "its newline past the start",
+                text(head - 3, b"end\n", 0),
+                true,
+            ),
+            (
+                "the first line of the end read",
+                text(head + 4096, b"end\n", TAIL - 4),
+                true,
+            ),
+            (
+                "not a terminator",
+                text(head + 4096, b"enx\n", TAIL - 4),
+                false,
+            ),
+            ("in the start", text(1000, b"end\n", head), true),
+        ];
+        for (what, data, want) in cases {
+            assert_eq!(looks_like_uuencode(&data), want, "{what}");
+            assert_eq!(
+                crate::detect(&&data[..]) == Some(crate::Format::Uuencode),
+                want,
+                "{what}"
+            );
         }
     }
 

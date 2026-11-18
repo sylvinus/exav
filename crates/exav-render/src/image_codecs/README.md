@@ -90,7 +90,8 @@ or orientation accessors, which `ImageReader::decode` does not call), turn
   last bytes of a tile whose end code is still to be read: the padding of a
   tile that overhangs the image reads past them) and asks again when only
   input was taken; upstream panics in both cases, and in a build that aborts
-  on panic, such as WebAssembly, that ends the decoder. Inside
+  on panic, such as WebAssembly, that ends the decoder. A read into an empty
+  buffer reads nothing (0.10.3 asserts there; 0.11 removed the assert). Inside
   `with_viewer_codecs` it also decodes a block of 64 KiB at a time and hands
   that out: asked for a row's data and then its padding, a few bytes each,
   `weezl` (0.1.10 as well as 0.1.12) can end a valid stream short, and the

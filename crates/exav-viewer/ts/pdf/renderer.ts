@@ -1,9 +1,29 @@
+import { createHighlights } from "../core/highlights.js";
 import { planRect } from "../core/pictures.js";
 import { createPictures } from "../core/raster.js";
-import type { FileSource, RasterRect, Renderer, SourceReader } from "../core/types.js";
+import type { FileSource, RasterRect, Region, Renderer, SourceReader } from "../core/types.js";
 import { createPdfEngine, type LoadedPdf } from "./engine.js";
 import type { PdfOptions } from "./index.js";
 import { createReader, READER_DEFAULTS } from "./reader.js";
+
+/** The pages a quote is looked for on: `page` first, then the nearest ones; from the first without one. */
+export function searchOrder(page: number | undefined, total: number): number[] {
+  const start = Number.isSafeInteger(page) && page! >= 1 && page! <= total ? page! : 1;
+  const out = [start];
+  for (let d = 1; out.length < total; d++) {
+    if (start + d <= total) out.push(start + d);
+    if (start - d >= 1) out.push(start - d);
+  }
+  return out;
+}
+
+/** The box around `rects`, or null when there are none. */
+function union(rects: readonly Region[]): Region | null {
+  if (rects.length === 0) return null;
+  const x = Math.min(...rects.map((r) => r.x));
+  const y = Math.min(...rects.map((r) => r.y));
+  return { x, y, width: Math.max(...rects.map((r) => r.x + r.width)) - x, height: Math.max(...rects.map((r) => r.y + r.height)) - y };
+}
 
 export const renderer: Renderer<PdfOptions> = {
   async mount(host, ctx) {
@@ -85,9 +105,32 @@ export const renderer: Renderer<PdfOptions> = {
         }
       },
     });
+    const highlights = createHighlights(
+      {
+        pageCount: () => current.doc.numPages,
+        async locate(h, signal) {
+          const { doc } = current;
+          for (const page of searchOrder(h.page, doc.numPages)) {
+            if (signal.aborted) return null;
+            try {
+              const rects = await doc.findText(page, h.text);
+              if (rects) return { page, rects };
+            } catch (error) {
+              if (doc !== current.doc) return null;
+              console.warn("pdf: the text of a page could not be read", error);
+            }
+          }
+          return null;
+        },
+        draw: (items, at) => reader.highlight(items, at),
+        reveal: (item, smooth) => item.page !== null && reader.reveal(item.page, union(item.rects), smooth),
+      },
+      ctx.file.highlights,
+      ctx.file.focusHighlight,
+    );
     ctx.status({ phase: "ready" });
     return {
-      controllers: { pages: reader.pages, zoom: reader.zoom, drag: reader.drag, outline: reader.outline, pictures, viewport: reader.viewport },
+      controllers: { pages: reader.pages, zoom: reader.zoom, drag: reader.drag, outline: reader.outline, pictures, viewport: reader.viewport, highlights: highlights.controller },
       resize: reader.resize,
       // The same document with other bytes (a report's preview after an
       // option changed): the zoom and scroll position stay.
@@ -98,8 +141,12 @@ export const renderer: Renderer<PdfOptions> = {
         reader.replace(incoming.shown, incoming.sizes);
         count.set({ count: incoming.doc.numPages, space: "page" });
         old.doc.destroy();
+        // Looked for again in the new text; the view stays where it is.
+        if (next.file.highlights) highlights.controller.set(next.file.highlights);
+        else highlights.relocate();
       },
       destroy() {
+        highlights.destroy();
         reader.destroy();
         current.doc.destroy();
       },

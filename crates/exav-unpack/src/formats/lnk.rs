@@ -13,11 +13,11 @@
 //! ShellLinkHeader (fixed 0x4C bytes):
 //!   u32  HeaderSize = 0x0000004C
 //!   u8[16] LinkCLSID = 01 14 02 00 00 00 00 00 C0 00 00 00 00 00 00 46
-//!   u32  LinkFlags        (bit flags, LSB-first — see below)
+//!   u32  LinkFlags        (bit flags, LSB-first; see below)
 //!   … FileAttributes, timestamps, size, icon index, show cmd, hotkey, reserved …
 //! [ if HasLinkTargetIDList ] u16 IDListSize, then IDListSize bytes (skipped)
 //! [ if HasLinkInfo ]         u32 LinkInfoSize, then LinkInfoSize-4 bytes (skipped)
-//! StringData — for each present flag, in this order:
+//! StringData, for each present flag, in this order:
 //!   HasName, HasRelativePath, HasWorkingDir, HasArguments, HasIconLocation:
 //!     u16  CountCharacters
 //!     char[CountCharacters]   (2 bytes each if IsUnicode, else 1)
@@ -25,7 +25,7 @@
 //!
 //! Every field read is bounds-checked and every declared size is clamped to the
 //! bytes actually present, so a truncated or hostile shortcut (extremely common)
-//! can never panic or read out of bounds — parsing simply stops at EOF.
+//! can never panic or read out of bounds: parsing simply stops at EOF.
 
 use crate::*;
 
@@ -52,14 +52,10 @@ const HAS_ARGUMENTS: u32 = 1 << 5;
 const HAS_ICON_LOCATION: u32 = 1 << 6;
 const IS_UNICODE: u32 = 1 << 7;
 
-pub(crate) fn extract_lnk<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_lnk(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     let len = data.len();
     // The whole 0x4C header (which contains LinkFlags at offset 20) must be
-    // present. A shorter buffer is a truncated shortcut — yield nothing.
+    // present. A shorter buffer is a truncated shortcut: yield nothing.
     if len < HEADER_SIZE || !data.starts_with(&LNK_MAGIC) {
         return Ok(None);
     }
@@ -73,7 +69,7 @@ pub(crate) fn extract_lnk<R>(
     // IDListSize counts only the IDList that follows, not the size field itself.
     if flags & HAS_LINK_TARGET_ID_LIST != 0 {
         if pos + 2 > len {
-            return Ok(None); // truncated before the size field — nothing to read
+            return Ok(None); // truncated before the size field: nothing to read
         }
         let id_list_size = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
         pos = pos.saturating_add(2).saturating_add(id_list_size).min(len);
@@ -106,7 +102,7 @@ pub(crate) fn extract_lnk<R>(
             continue;
         }
         if pos + 2 > len {
-            break; // truncated before this string's count — stop
+            break; // truncated before this string's count: stop
         }
         let count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
@@ -134,7 +130,7 @@ pub(crate) fn extract_lnk<R>(
         strings.push(s);
         pos = pos.saturating_add(take).min(len);
         if take < needed {
-            break; // string ran past EOF — clamp and stop
+            break; // string ran past EOF: clamp and stop
         }
     }
 
@@ -241,7 +237,7 @@ mod tests {
 
     #[test]
     fn truncated_header_does_not_panic() {
-        // Only the 20-byte magic is present — the full 0x4C header is missing.
+        // Only the 20-byte magic is present: the full 0x4C header is missing.
         // Detection matches on the magic, but extraction must clamp and yield
         // nothing rather than read past the buffer.
         let mut budget = Budget::new(Limits::default());

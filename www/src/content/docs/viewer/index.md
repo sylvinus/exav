@@ -18,9 +18,11 @@ file you open in it stays in your browser.
 
 - **A hostile file reaches nothing.** In the sandboxed mode each file opens
   in an `<iframe sandbox="allow-scripts">` of its own, in an opaque origin,
-  under a policy that lets nothing out: an engine a file manages to run
-  code in finds no cookie, no storage, no page to read and no way to send
-  anything. The host checks every message the frame sends.
+  under a policy that lets nothing in, and, when the host page's own policy
+  has `frame-src` and `child-src` naming the frame's origin alone, nothing
+  out: an engine a file manages to run code in finds no cookie, no storage,
+  no page to read and no way to send anything. The host checks every message
+  the frame sends.
   [Security](/viewer/security/) gives the guarantees, per
   browser, and the checks that keep them.
 - **exav's own decoders in WebAssembly.** The image formats browsers do not
@@ -53,12 +55,12 @@ file you open in it stays in your browser.
 
 | Format | Plugin | Engine | Install beside the package |
 |---|---|---|---|
-| PDF | `pdf()`, `@exav/viewer/pdf` | pdf.js, in a worker | `pdfjs-dist` 5 or 6 |
+| PDF | `pdf()`, `@exav/viewer/pdf` | pdf.js, in a worker | `pdfjs-dist` 6.4.299 or later 6 |
 | PNG, JPEG, GIF, WebP, SVG | `image()`, `@exav/viewer/image` | the browser | |
 | TIFF, BMP, ICO, PNM, QOI, DDS, farbfeld, HDR, JPEG 2000 (.jp2, .jpf, .j2k), JBIG2 (.jb2), JPEG XL (.jxl) | `image({ wasmDecoders: true })` | exav-render, in a worker | |
 | Camera RAW: DNG, CR2, CR3, CRW, NEF, NRW, ARW, SR2, SRF, ORF, RW2, RAW, RWL, RAF, PEF, SRW, 3FR, IIQ, X3F, MRW, DCR, KDC, ERF, MEF, MOS | `image({ wasmDecoders: true })` | exav-render, in a worker: the largest JPEG or RGB preview the file embeds, turned by its Exif orientation; the sensor data is not decoded, so a file with no preview shows an error | |
 | DWG (R13 to 2018), DXF | `dwg()`, `dxf()`, `@exav/viewer/cad` | exav-render, in a worker; WebGL2 | |
-| Word, Excel, PowerPoint | `docx()`, `xlsx()`, `pptx()`, `@exav/viewer/office` | @silurus/ooxml | `@silurus/ooxml` |
+| Word, Excel, PowerPoint | `docx()`, `xlsx()`, `pptx()`, `@exav/viewer/office` | @silurus/ooxml; the ZIP's central directory (where it ends, how large a deck or a document is) read first by exav-unpack's ZIP reader (`exav_viewer_sniff`) | `@silurus/ooxml` |
 | CSV, TSV | `csv()` | the separator and encoding read off the bytes | `@silurus/ooxml` |
 | XLS (.xls, .xlt; Excel 2.1 to 2003); ODS (.ods, .ots, .fods); Numbers (.numbers); an XML Spreadsheet 2003, HTML table or SYLK file saved as .xls | `xls()`, `ods()`, `numbers()`, `@exav/viewer/office`, with `xlsx()` | exav-render's `sheets`, in a worker: converted to XLSX, shown by `xlsx()` | `@silurus/ooxml` |
 | PPT (.ppt, .pps, .pot; PowerPoint 95 and 97 to 2003); ODP (.odp, .otp, .fodp); Keynote (.key, every version); ODG (.odg, .otg, .fodg); Visio 2013 and later (.vsdx, .vsdm, .vstx, .vstm) | `ppt()`, `odp()`, `keynote()`, `odg()`, `visio()`, `@exav/viewer/office`, with `pptx()` | exav-render's `slides`, in a worker: converted to PPTX, shown by `pptx()`; a page of a drawing is a slide | `@silurus/ooxml` |
@@ -273,8 +275,8 @@ import { SandboxedViewerProvider } from "@exav/viewer/react/sandbox";
   what remains.
 - [Example files](/viewer/examples/): the files of the [demo](/viewer/demo/),
   one or more for each format, with their authors, sources and licences.
-- [Format matrix](/project/formats/): every format, with what the scanner,
-  the extractor and the viewer do with it.
+- [File formats](/formats/): every format, with what the scanner, the
+  extractor and the viewer do with it, and an example in the demo.
 
 The Rust decoders behind the wasm modules, and what they do not draw
 faithfully yet, are documented under [exav-render](/subprojects/exav-render/).

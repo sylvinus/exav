@@ -15,6 +15,7 @@ static PEAK: AtomicUsize = AtomicUsize::new(0);
 // SAFETY: every call is the system allocator's, with the sizes counted around it.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's contract for `alloc` is `System.alloc`'s.
         let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
             let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
@@ -25,6 +26,8 @@ unsafe impl GlobalAlloc for Counting {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        // SAFETY: the caller passes a block of this allocator, that is of
+        // `System`, with its layout: `System.dealloc`'s contract.
         unsafe { System.dealloc(ptr, layout) }
     }
 }

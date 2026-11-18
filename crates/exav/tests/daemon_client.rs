@@ -656,7 +656,7 @@ fn cpu_secs(pid: u32) -> f64 {
         .split_whitespace()
         .collect();
     let ticks: u64 = rest[11].parse::<u64>().unwrap() + rest[12].parse::<u64>().unwrap();
-    // SAFETY: sysconf reads a constant.
+    // SAFETY: `sysconf` has no memory precondition.
     ticks as f64 / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64
 }
 

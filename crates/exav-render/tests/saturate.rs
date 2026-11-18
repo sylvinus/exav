@@ -66,10 +66,11 @@ type Reader = fn(&[u8]);
 fn reader_for(name: &str) -> Option<Reader> {
     let ext = name.rsplit('.').next()?.to_ascii_lowercase();
     Some(match ext.as_str() {
-        // Not JPEG XL: zenjxl-decoder sizes the buffer of each section of a frame
-        // from the length its table of contents declares, and zero-fills it
-        // before the data is looked at, so one header can take a gigabyte. The
-        // pixel and channel limits set in `image::jxl` do not reach it.
+        // Not JPEG XL: the published zenjxl-decoder 0.3.10, which this workspace
+        // builds, sizes the buffer of each section of a frame from the length
+        // its table of contents declares, and zero-fills it before the data is
+        // looked at, so one header can take a gigabyte. The viewer's copy, which
+        // the viewer ships and `raw_preview` fuzzes, has upstream's fix.
         #[cfg(feature = "image")]
         "png" | "jpg" | "jpeg" | "gif" | "tif" | "tiff" | "bmp" | "webp" | "ico" | "ppm"
         | "pgm" | "pbm" | "pam" | "qoi" | "dds" | "ff" | "hdr" | "j2k" | "jp2" | "jb2" | "raf"

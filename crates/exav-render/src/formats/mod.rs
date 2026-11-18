@@ -30,12 +30,16 @@ pub mod office;
 pub mod pdf_image;
 #[cfg(feature = "ply")]
 pub mod ply;
+#[cfg(feature = "qr")]
+pub mod qr;
 #[cfg(any(feature = "obj", feature = "ply", feature = "gltf"))]
 mod soup;
 #[cfg(feature = "stl")]
 pub mod stl;
 #[cfg(feature = "text")]
 pub mod text;
+#[cfg(feature = "text-view")]
+pub mod text_view;
 
 /// Most bytes a decoded image may take: the `image` crate's default, which
 /// ClamAV decodes with.

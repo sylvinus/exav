@@ -1,31 +1,49 @@
 //! Spreadsheets to XLSX: XLS (BIFF2 to BIFF8), ODS, FODS, OTS, Apple
 //! Numbers, and the text formats Excel opens from a .xls file (XML
 //! Spreadsheet, HTML tables, SYLK), converted for an XLSX renderer to draw, or
-//! read as text ([`text()`]) for a scanner or a search.
+//! read as text ([`text()`]). CSV and TSV ([`convert_csv`], feature
+//! `office-csv`) are read into the same model and written by the same XLSX
+//! writer; with that feature alone, none of the workbook readers is compiled.
+// Without `office-sheets` the readers are compiled for the presentations'
+// charts only (`office-slides`), and most of them is unused.
+#![cfg_attr(not(feature = "office-sheets"), allow(dead_code))]
 
 mod charts;
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 pub(crate) mod css;
+#[cfg(feature = "office-csv")]
+mod csv;
 mod error;
 mod fonts;
 mod geom;
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 pub(crate) mod html;
 mod limits;
 mod model;
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 mod numbers;
 mod numtext;
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 mod ods;
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 mod r1c1;
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 mod sylk;
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 mod text;
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 pub(crate) mod textenc;
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 mod xls;
 mod xlsx;
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 mod xmlss;
 
 pub use error::Error;
 pub use limits::Limits;
 
 /// The formats this module converts.
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Format {
@@ -46,6 +64,7 @@ pub enum Format {
     Sylk,
 }
 
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 impl Format {
     /// The format of a file extension (without its dot, any case).
     pub fn from_extension(ext: &str) -> Option<Format> {
@@ -84,6 +103,7 @@ pub struct Converted {
 }
 
 /// Converts `input`, a document of `format`, to XLSX.
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 pub fn convert(input: &[u8], format: Format, limits: &Limits) -> Result<Converted, Error> {
     let (wb, used) = read(input, format, limits)?;
     finish(wb, limits, used)
@@ -93,6 +113,7 @@ pub fn convert(input: &[u8], format: Format, limits: &Limits) -> Result<Converte
 /// sheet's name and cells, its comments and its drawings' text, taken from
 /// what the reader parsed, within the same [`Limits`] and with the same
 /// refusals as [`convert`]. No XLSX is written.
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 pub fn text(
     input: &[u8],
     format: Format,
@@ -104,6 +125,7 @@ pub fn text(
 
 /// Reads `input` into the model, within `limits`, and says how much of the
 /// memory limit the model took.
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 fn read(input: &[u8], format: Format, limits: &Limits) -> Result<(model::Workbook, u64), Error> {
     if input.len() as u64 > limits.max_input {
         return Err(Error::TooLarge("input"));
@@ -123,6 +145,7 @@ fn read(input: &[u8], format: Format, limits: &Limits) -> Result<(model::Workboo
 
 /// Converts an Apple Numbers document saved as a package directory, given
 /// as its files: paths relative to the package and contents.
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 pub fn convert_numbers_package(
     files: &[(&str, &[u8])],
     limits: &Limits,
@@ -139,6 +162,7 @@ pub fn convert_numbers_package(
 /// An ODF chart object's content (an office:chart holding its own data
 /// table, as presentations and drawings embed them) as a DrawingML chart
 /// part, its values written as literals. `None` when it is not a chart.
+#[cfg(any(feature = "office-sheets", feature = "office-slides"))]
 pub fn odf_chart_part(content: &[u8]) -> Option<String> {
     let anchor = model::Anchor {
         from: (0, 0, 0, 0),
@@ -152,6 +176,22 @@ pub fn odf_chart_part(content: &[u8]) -> Option<String> {
         s.size_ref = None;
     }
     Some(xlsx::chart::chart_xml(&chart))
+}
+
+/// Converts `input`, a CSV or TSV, to an XLSX of one sheet, "Sheet1", whose
+/// cells are all text. The encoding is read as exav-unpack reads a text file
+/// (a UTF-16 byte-order mark, else UTF-8 when valid, else windows-1252) and
+/// the separator is the comma, semicolon or tab that cuts the first rows into
+/// the same number of fields. `limits.max_cells` counts every field, empty
+/// ones included.
+#[cfg(feature = "office-csv")]
+pub fn convert_csv(input: &[u8], limits: &Limits) -> Result<Converted, Error> {
+    if input.len() as u64 > limits.max_input {
+        return Err(Error::TooLarge("input"));
+    }
+    let mut budget = limits::Budget::new(*limits);
+    let wb = csv::read(input, &mut budget)?;
+    finish(wb, limits, budget.used())
 }
 
 /// Writes the workbook, in what the model left of the memory limit: the

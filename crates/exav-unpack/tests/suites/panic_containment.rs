@@ -17,7 +17,7 @@ fn malformed_cab_does_not_panic() {
 }
 
 /// Regression for fuzz-found crash (2026-06-30): 122-byte CAB with zero-length
-/// folder data — same `folder.rs:134` OOB but different input shape.
+/// folder data: same `folder.rs:134` OOB but different input shape.
 #[test]
 fn malformed_cab_zero_folder_does_not_panic() {
     let data = include_bytes!("../fixtures/cab_folder_panic2.cab");
@@ -26,7 +26,7 @@ fn malformed_cab_zero_folder_does_not_panic() {
 }
 
 /// Regression for fuzz-found crash (2026-06-30): CAB triggering underflow in
-/// `FolderReader::read()` (`folder.rs:239`) — `current_offset_within_block`
+/// `FolderReader::read()` (`folder.rs:239`): `current_offset_within_block`
 /// exceeds `current_block_data.len()`. The vendored reader returns 0.
 #[test]
 fn malformed_cab_read_underflow_does_not_panic() {
@@ -44,7 +44,7 @@ fn malformed_cab_read_underflow_does_not_panic() {
 fn malformed_cpio_does_not_panic() {
     let data = include_bytes!("../fixtures/cpio_bin_oob.cpio");
     let mut budget = Budget::new(Limits::default());
-    // Must return (Ok or Err) — never unwind.
+    // Must return (Ok or Err), never unwind.
     let _ = extract(Format::Cpio, data, &mut budget);
 }
 
@@ -78,7 +78,7 @@ fn malformed_upx_nrv_gamma_does_not_panic() {
 
 /// Regression for fuzz-found crash (2026-07-01): a truncated CAB with LZX
 /// compressed data triggers an index-out-of-bounds in `lzxd`'s bitstream
-/// reader (`bitstream.rs:37` — `self.buffer[1]` when buffer has 1 byte).
+/// reader (`bitstream.rs:37`, `self.buffer[1]` when buffer has 1 byte).
 /// Must not panic; the `catch_unwind` boundary in `walk` turns it
 /// into a clean `LimitHit`.
 #[test]
@@ -141,7 +141,7 @@ fn an_arbitrary_decoder_panic_becomes_a_reported_limit() {
         "the limit does not say a panic caused it: {err}"
     );
     // Twice, because containment that survives one panic and not the next has
-    // contained nothing — a scanner meets hostile input repeatedly, in one
+    // contained nothing: a scanner meets hostile input repeatedly, in one
     // process, and has to keep answering.
     let mut budget = Budget::new(Limits::default());
     assert!(

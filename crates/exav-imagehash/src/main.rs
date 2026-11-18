@@ -1,5 +1,7 @@
 //! `exav-imagehash`: perceptual hashes of image files.
 
+#![forbid(unsafe_code)]
+
 use std::process::ExitCode;
 
 use exav_imagehash::{

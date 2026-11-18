@@ -46,7 +46,7 @@ bytemuck = { version = "1", optional = true }
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"], optional = true }
 # LZMA strips and tiles of a TIFF (libtiff's `LZMA`, written by GDAL), for the
 # viewer's `decode_any` only; the LZMA2 decoder that exav-unpack uses, same version.
-lzma-rust2 = { version = "0.23", default-features = false, features = ["std"], optional = true }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std"], optional = true }
 # JPEG 2000, JBIG2 and CCITT fax, which libclamav does not decode.
 # `forbid(unsafe_code)` crates, built without `simd` (fearless_simd, whose
 # intrinsics are `unsafe`) and `image` (the `image` and moxcms integration).
@@ -62,22 +62,28 @@ hayro-ccitt = { version = "=0.4.0", optional = true }
 # limits on pixels and memory. Built without its SIMD (the default
 # `all-simd`) and without `threads`; no CMS, no JPEG reconstruction.
 zenjxl-decoder = { version = "=0.3.10", default-features = false, optional = true }
-# DXF's pairs, records and code pages, and DWG's bit codes, sections and
-# objects, which the drawing model (`cad`) is read from; those formats
-# alone, none of the scanner's others.
-exav-unpack = { path = "../exav-unpack", version = "0.0.3", default-features = false, features = ["dxf", "dwg"], optional = true }
+# Its readers, each feature asking for the formats it needs and none of the
+# scanner's others: DXF's pairs, records and code pages and DWG's bit codes,
+# sections and objects, which the drawing model (`cad`) is read from (`dwg`);
+# the office converters' (`_office`); and, with no format at all, the
+# description of a PDF image's samples (`raster`).
+exav-unpack = { path = "../exav-unpack", version = "0.0.3", default-features = false, optional = true }
 # Markdown: CommonMark with tables and strikethrough, read as events. Without
 # its `html` and `simd` features: no markup is made, and its only `unsafe`
 # (the SIMD scanners) is off.
 pulldown-cmark = { version = "=0.13.6", default-features = false, optional = true }
 # The office converters (`office-*`): packages are read, and the XLSX, PPTX
-# and DOCX written, as ZIP.
-zip = { version = "9", default-features = false, features = ["deflate-flate2"], optional = true }
+# and DOCX written, as ZIP. Below 9.1 as in exav-unpack.
+zip = { version = ">=9.0.5, <9.1", default-features = false, features = ["deflate-flate2"], optional = true }
 # ODF's XML. 0.41 bounds namespace declarations per element and checks
 # duplicate attributes in linear time (RUSTSEC-2026-0194, -0195).
 quick-xml = { version = "0.42", optional = true }
 # Text in Windows and Mac code pages; the DOS ones are tables of our own.
-encoding_rs = { version = "0.8.42", default-features = false, features = ["alloc"], optional = true }
+encoding_rs = { version = "0.8.44", default-features = false, features = ["alloc"], optional = true }
+# QR codes in images (`qr`): rqrr vendored without `unsafe` and without its
+# dependencies. Without its `img` integration: the search holds a grey image of
+# its own, and stops at a deadline, a memory budget and caps by itself.
+exav-qr = { path = "../exav-qr", version = "0.0.3", default-features = false, optional = true }
 
 [features]
 default = ["image", "webp", "ico", "pnm", "qoi", "dds", "ff", "hdr", "jp2", "jbig2", "ccitt", "raw"]
@@ -115,7 +121,7 @@ raw = ["image"]
 jxl = ["image", "dep:zenjxl-decoder"]
 # DXF (R12 to 2018) and DWG (R13 to 2018) into the drawing model
 # (`cad`), tessellated for a GPU.
-dwg = ["dep:exav-unpack"]
+dwg = ["dep:exav-unpack", "exav-unpack/dxf", "exav-unpack/dwg"]
 # Print what each layout viewport emitted and what it clipped against.
 vp-debug = ["dwg"]
 # IFC (IFC2X3, IFC4, IFC4X3) models into triangle meshes (`ifc`, `mesh`).
@@ -130,24 +136,38 @@ gltf = []
 # Markdown into a tree of blocks and inlines (`markdown`), as data: no HTML
 # is ever made.
 markdown = ["dep:pulldown-cmark"]
+# JSON and XML indented and a diff's lines marked, as data (`text_view`), for
+# the viewer's text pages. No dependency.
+text-view = []
 # The text of a document as a reader sees it, one entry for every kind that has
-# some (`text`): Markdown, HTML, Office and OpenDocument XML parts, PDF (hayro)
-# and drawings. For a scanner or a search; the viewer does not use it.
-text = ["markdown", "dwg", "exav-unpack/text"]
+# some (`text`): Markdown, HTML, Office and OpenDocument XML parts and the
+# hyperlinks of their packages, an email's headers, PDF (hayro), drawings and
+# IFC models. For a scanner or a search; the viewer does not use it.
+text = ["markdown", "dwg", "ifc", "exav-unpack/text", "exav-unpack/zip", "exav-unpack/email"]
 # And PDF's, read by hayro: the largest part of `text`.
 text-pdf = ["text", "exav-unpack/text-pdf"]
+# Grey pixels from the raw samples of a PDF image that exav-unpack describes
+# (`image::from_raster`). Not a default.
+raster = ["image", "dep:exav-unpack"]
+# The payloads of the QR codes in an image (`qr`), read by exav-qr from the
+# pixels `image` decodes, or `raster` builds (the CCITT and JBIG2 images of a
+# PDF through `ccitt` and `jbig2`). Not a default.
+qr = ["image", "raster", "ccitt", "jbig2", "dep:exav-qr"]
 # And the office formats' the XML parts do not reach, from what `office`
 # reads: DOC, XLS, PPT, RTF, Word 2003 XML, SpreadsheetML 2003, SYLK, flat
 # OpenDocument, Numbers, Pages, Keynote.
 text-office = ["text", "office"]
 # What every office converter shares (`formats::office::common`): ZIP
 # packages, ODF's XML, style sheets, and the readers of exav-unpack (compound
-# files, BIFF, code pages, HTML). Not a feature to ask for.
-_office = ["dep:zip", "dep:flate2", "dep:quick-xml", "dep:encoding_rs", "dep:exav-unpack", "exav-unpack/ole", "exav-unpack/html"]
+# files, BIFF, code pages, HTML, BinHex). Not a feature to ask for.
+_office = ["dep:zip", "dep:flate2", "dep:quick-xml", "dep:encoding_rs", "dep:exav-unpack", "exav-unpack/ole", "exav-unpack/binhex", "exav-unpack/html"]
 # Spreadsheets into XLSX (`sheets`): Excel 2 to 2003, ODS, FODS, OTS, Apple
 # Numbers, XML Spreadsheet 2003, HTML tables and SYLK. Also the chart writer
 # the presentations use for ODF charts.
 office-sheets = ["_office", "exav-unpack/offcrypto"]
+# CSV and TSV into a one-sheet XLSX (`sheets::convert_csv`): the XLSX writer and
+# the text rule of exav-unpack, none of the workbook readers.
+office-csv = ["_office", "exav-unpack/text"]
 # Presentations into PPTX (`slides`): PowerPoint 95 and 97 to 2003, ODP, FODP,
 # OTP and Apple Keynote; drawings: ODG, OTG, FODG and Visio (VSDX). It
 # compiles the spreadsheet reader (an embedded workbook's chart), which opens
@@ -158,7 +178,7 @@ office-slides = ["_office", "exav-unpack/offcrypto"]
 # are read with the HTML reader of `exav-unpack`.
 office-docs = ["_office", "exav-unpack/rtf"]
 # Every office converter.
-office = ["office-sheets", "office-slides", "office-docs"]
+office = ["office-sheets", "office-csv", "office-slides", "office-docs"]
 # Writers of compound files, protobuf messages and Snappy blocks, for the
 # tests that build the documents they read. Not a feature to ask for.
 office-test-util = ["_office", "exav-unpack/test-util"]
@@ -172,6 +192,10 @@ exav-unpack = { path = "../exav-unpack", default-features = false, features = ["
 flate2 = "1.1.10"
 # The DWG oracle test names local corpus files by hash.
 sha2 = "0.11"
+# The packages the text tests read.
+zip = { version = ">=9.0.5, <9.1", default-features = false, features = ["deflate-flate2"] }
+# Draws the QR codes the `qr` tests read.
+qrcode = { version = "0.14", default-features = false }
 
 [[test]]
 name = "dwg"
@@ -252,6 +276,10 @@ required-features = ["markdown"]
 [[test]]
 name = "text"
 required-features = ["text"]
+
+[[test]]
+name = "qr"
+required-features = ["qr", "image"]
 
 [[test]]
 name = "office_sheets"

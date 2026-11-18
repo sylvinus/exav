@@ -1,4 +1,4 @@
-//! VHD disk images — fixed and dynamic reconstruction, and the cases exav
+//! VHD disk images: fixed and dynamic reconstruction, and the cases exav
 //! cannot assemble.
 //!
 //! Windows mounts a `.vhd` by double-click, so a payload inside one reaches the
@@ -107,7 +107,7 @@ fn a_dynamic_vhd_is_reassembled_from_its_block_table() {
 #[test]
 fn a_differencing_vhd_is_reported_not_passed_over() {
     // Its payload lives in a parent image that is not in this file, so the disk
-    // cannot be assembled — but saying nothing would report clean on a container
+    // cannot be assembled, but saying nothing would report clean on a container
     // whose contents were never seen.
     let mut blob = vec![0u8; SECTOR * 2];
     blob.extend_from_slice(&footer(4, FOOTER as u64, 1024 * 1024));
@@ -141,7 +141,7 @@ fn a_dynamic_vhd_with_an_unreadable_block_table_is_reported() {
 
 #[test]
 fn a_dynamic_vhd_declaring_an_enormous_disk_is_bounded_not_allocated() {
-    // A small file can declare a huge virtual disk — a decompression bomb by
+    // A small file can declare a huge virtual disk: a decompression bomb by
     // another name. It must be refused by the budget and reported, never
     // allocated.
     let mut blob = footer(3, FOOTER as u64, u64::MAX / 2);

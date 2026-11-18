@@ -1,23 +1,23 @@
-//! ZIP compression method 9 — Deflate64 ("enhanced deflate").
+//! ZIP compression method 9: Deflate64 ("enhanced deflate").
 //!
 //! ClamAV decodes method 9, so under the drop-in-replacement rule exav must too:
 //! before this, a Deflate64 member fell through `decode_zip_raw` and surfaced as
 //! `UNSCANNABLE`, i.e. a payload behind it was never scanned. It is not an exotic
-//! codec either — 7-Zip writes it with `-mm=Deflate64` and Windows' own
+//! codec either: 7-Zip writes it with `-mm=Deflate64` and Windows' own
 //! compressed-folder writer emits it, so a victim opens the archive normally
 //! while a scanner that skips the codec sees nothing.
 //!
 //! Deflate64 differs from deflate in exactly three places, and a decoder that
-//! gets any of them wrong emits *plausible bytes, not errors* — so the fixtures
+//! gets any of them wrong emits *plausible bytes, not errors*, so the fixtures
 //! are chosen to force each one:
 //!
 //! * **64 KiB window / distance codes 30 and 31** (14 extra bits, distances up to
-//!   64 KiB) — `eicar_deflate64.zip`. Its source repeats an ~11 KB section only
+//!   64 KiB): `eicar_deflate64.zip`. Its source repeats an ~11 KB section only
 //!   after >32 KiB of filler, so the encoder can only compress the repeat with a
 //!   back-reference plain deflate cannot express: the stream uses distance codes
 //!   30/31 43 times, at distances up to 60028. Confirmed out-of-band by feeding
 //!   the raw member to zlib's *plain* inflate, which rejects it.
-//! * **Length code 285 redefined** — 16 extra bits, lengths 3..65538, instead of
+//! * **Length code 285 redefined**: 16 extra bits, lengths 3..65538, instead of
 //!   deflate's fixed 258. `deflate64_len285.zip` covers this, and it had to be
 //!   hand-built: 7-Zip's Deflate64 *encoder* never emits code 285, so no
 //!   7z-produced archive exercises it. The stream carries a 65538-byte match (the
@@ -64,7 +64,7 @@ fn only_member(blob: &[u8]) -> exav_unpack::Entry {
     let e = entries.remove(0);
     assert!(
         e.unsupported.is_none(),
-        "member {} reported unsupported ({:?}) — method 9 was not decoded",
+        "member {} reported unsupported ({:?}): method 9 was not decoded",
         e.name,
         e.unsupported
     );
@@ -91,7 +91,7 @@ fn deflate64_extended_window_member_is_decoded() {
 
 /// Length code 285 with its 16 extra bits (a 65538-byte match) and a 50000-byte
 /// distance decode byte-exactly. Reading 285 as deflate's fixed length 258 would
-/// still produce output — just the wrong output — so this is checked against the
+/// still produce output (just the wrong output), so this is checked against the
 /// bytes 7-Zip's decoder produced from the same archive, not against exav.
 #[test]
 fn deflate64_long_length_code_285_is_decoded() {

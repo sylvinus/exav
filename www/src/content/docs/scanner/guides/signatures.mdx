@@ -56,7 +56,7 @@ From `.cvd`/`.cld` containers or loose files in the directory:
 | `.mdb` / `.msb` | PE section hashes |
 | `.fdb` | exav's own fuzzy hashes, [see below](#exavs-fdb-format) |
 | `.cdb` | container-metadata signatures |
-| `.imp` | PE import hashes (imphash) |
+| `.imp` | PE import hashes (`HASH:SIZE:NAME`; SIZE is the length of the hashed string, as `clamscan --debug` prints it, or `*`) |
 | `.idb` | PE icon signatures |
 | `.ftm` | file-type magic, used when content typing is inconclusive |
 | `.crb` | Authenticode certificate block list |
@@ -86,6 +86,12 @@ tlsh:<TLSH digest>:<name>[:<max distance>]
 
 The distance defaults to 100. `imphash` lines match PE files by default; `tlsh`
 lines match only with `--detect exav-heuristics`.
+
+An `imphash` line carries the usual import hash: the value of `pe.imphash()`,
+which pefile's `get_imphash()` and VirusTotal give for most PEs. It is not the
+hash of an `.imp` signature (the `IMP:` line of `clamscan --debug`), which
+differs for C++ names and for a library such as `lua5.1.dll`. A PE with no
+import matches no line, and a PE32+ matches one under `--clamav-compat`.
 
 ## Unofficial and third-party feeds
 

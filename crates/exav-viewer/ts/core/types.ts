@@ -117,10 +117,76 @@ export interface ViewerFile<Meta = unknown> extends FileInfo {
    * replaces the default message.
    */
   placeholder?: { state: "pending" | "unavailable"; label?: string };
-  /** A format to use instead of detecting one. */
+  /** A format to use instead of detecting one: neither the name, the type nor the bytes are looked at. */
   format?: FormatId;
   /** Free data for plugin options resolved per file (markers, detail source...). */
   meta?: Meta;
+  /**
+   * Passages drawn marked over the document, where the format has the
+   * `highlights` capability (PDF, text). On open the view goes to
+   * `focusHighlight`, or to the first of them.
+   */
+  highlights?: readonly Highlight[];
+  /** The `id` of the highlight to go to on open. */
+  focusHighlight?: string;
+}
+
+// ── Highlights ───────────────────────────────────────────────────────────────
+
+interface HighlightCommon {
+  /** What `focusHighlight` and `HighlightsController.goTo` name it by. Default: its index in the list, as a string. */
+  id?: string;
+  /** A CSS colour for its boxes. Default: `--exav-viewer-highlight`. */
+  color?: string;
+  /** Its accessible name, and the boxes' tooltip. */
+  label?: string;
+}
+
+/** Boxes on a page, placed by the host. */
+export interface HighlightRects extends HighlightCommon {
+  /** 1-based. */
+  page: number;
+  /** Fractions of the page as shown (0..1, origin at the top left). */
+  rects: readonly Region[];
+}
+
+/**
+ * A passage the viewer finds in the document's text. Case, accents, spaces,
+ * punctuation and words cut by a hyphen at the end of a line are ignored;
+ * "..." or "…" stands for text left out of the quote.
+ */
+export interface HighlightText extends HighlightCommon {
+  /** 1-based: the page searched first, then the others. */
+  page?: number;
+  text: string;
+}
+
+export type Highlight = HighlightRects | HighlightText;
+
+/** A highlight as the view has it: where it was found, or that it was not. */
+export interface PlacedHighlight {
+  id: string;
+  /**
+   * "pending": a text still being looked for. "missing": not found (or a
+   * page that does not exist, or boxes in a format without pages).
+   */
+  state: "pending" | "shown" | "missing";
+  /** 1-based; null while pending or missing, and for a format without pages (text). */
+  page: number | null;
+  /** Fractions of `page`, a box for each line; none for a format without pages. */
+  rects: readonly Region[];
+  color?: string;
+  label?: string;
+  /** The text looked for, for a `HighlightText`. */
+  text?: string;
+}
+
+/** `current`: the id last gone to. */
+export interface HighlightsController extends Store<{ items: readonly PlacedHighlight[]; current: string | null }> {
+  /** Replaces the highlights shown. Does not move the view. */
+  set(highlights: readonly Highlight[]): void;
+  /** Brings the highlight into view, once found for a text still pending; to its page if it was not found. */
+  goTo(id: string): void;
 }
 
 /** Reads the source once per session; cancelled and revoked when the session ends. */
@@ -136,16 +202,6 @@ export interface SourceReader {
 
 // ── Detection ────────────────────────────────────────────────────────────────
 
-/** One magic-byte signature. */
-export interface Signature {
-  /** The content type these bytes prove. */
-  type: string;
-  prefix: readonly number[];
-  offset?: number;
-  also?: readonly number[];
-  alsoOffset?: number;
-}
-
 /**
  * How a plugin claims files. Detection is data, so the table can be exported
  * for a server-side copy (`Detector.table`).
@@ -153,13 +209,15 @@ export interface Signature {
  *   0. `kind === "link"`: none.
  *   1. the type, exactly, against every plugin's `types`;
  *   2. the extension, against `extensions`, when the type is unknown, or is
- *      some plugin's container type and this plugin lists "container" in
- *      `extensionOverrides` (every .docx is a zip), or is one of the types
- *      this plugin lists there (a .csv typed `text/plain`);
+ *      a container type (a zip, a compound file) and this plugin lists
+ *      "container" in `extensionOverrides` (every .docx is a zip), or is one
+ *      of the types this plugin lists there (a .csv typed `text/plain`);
  *   3. the type, exactly, against `containerTypes` (a zip is an archive);
  *   4. none.
  *
- * Plugins are tried in registration order within each step.
+ * Plugins are tried in registration order within each step. The first bytes
+ * of a file, when there are some (`Detector.detectFile`), give a type of
+ * their own, which replaces the one the host trusts where the two disagree.
  */
 export interface FormatMatcher {
   types?: readonly string[];
@@ -169,31 +227,106 @@ export interface FormatMatcher {
   extensions?: readonly string[];
   /** Known types the extension may still answer over: "container", or types. */
   extensionOverrides?: readonly ("container" | (string & {}))[];
-  /** Magic bytes, for files with no trusted type (archive members). */
-  signatures?: readonly Signature[];
-  /**
-   * Rejects a sniffed type the bytes do not really back: a STEP file is an
-   * IFC model only when its schema says so or its name ends in .ifc.
-   */
-  confirmSniff?(head: Uint8Array, name: string): boolean;
 }
 
 export interface Detector {
-  /** From the host's metadata alone. Synchronous, to decide "viewer or new tab". */
+  /**
+   * From the host's metadata alone (a type, a name). Synchronous, to decide
+   * "viewer or new tab". The first bytes of the file can overrule it: see
+   * `detectFile`.
+   */
   detect(info: Pick<FileInfo, "type" | "path" | "name" | "kind">): FormatId | null;
-  /** From a name and the first bytes (`HEAD_BYTES` are enough). For archive members. */
-  detectBytes(name: string, head: Uint8Array): FormatId | null;
-  /** The content type the first bytes prove, or "". */
-  sniff(head: Uint8Array): string;
+  /**
+   * From what `detect` knows and the start of the file, which exav's own
+   * detection (the scanner's, in WebAssembly, in a worker) reads: the type
+   * it gives replaces the host's, unless the format the host's metadata
+   * names is one the bytes can be (a .docx is a zip). When the bytes say
+   * nothing the viewer opens, `detect`'s answer stands, and so it does when
+   * the engine fails (a warning is logged). `head` is the first `headBytes`
+   * of the file, or all of it when it is shorter; `size` is the file's, when
+   * `head` is not all of it. Rejects only when `signal` aborts.
+   *
+   * A ZIP that no name claims for another format (no name, or one an archive
+   * has) is told by its directory when `tail` reads the end of the file (null:
+   * it cannot): one that is an Office or OpenDocument package, and only one
+   * of them, is that format, not an archive.
+   */
+  detectFile(
+    info: Pick<FileInfo, "type" | "path" | "name" | "kind">,
+    head: Uint8Array,
+    size?: number,
+    signal?: AbortSignal,
+    tail?: (length: number) => Promise<{ bytes: Uint8Array; size: number } | null>,
+  ): Promise<FormatId | null>;
+  /** `detectFile` for a file known by its name alone: an archive member. */
+  detectBytes(name: string, head: Uint8Array, size?: number, signal?: AbortSignal): Promise<FormatId | null>;
+  /**
+   * The content type exav's detection gives the start of a file, or "" when
+   * it proves none the viewer opens (a text file, a format it has no viewer
+   * for). Where there is no engine (a page without workers), "".
+   */
+  sniff(head: Uint8Array, size?: number, signal?: AbortSignal): Promise<string>;
+  /**
+   * How many bytes from the start of a file `sniff` and `detectFile` take
+   * (`sniffBytes`); 0: no file is told by its bytes.
+   */
+  readonly headBytes: number;
+  /**
+   * What exav's readers find wrong with a file of `size` bytes that failed to
+   * open as format `kind`, from its `head` and, where its format keeps its
+   * directory at the end, its last bytes (`tail` reads them; null: it
+   * cannot). Never rejects but when `signal` aborts: a file it cannot judge is
+   * "not-inspected", which is not "valid".
+   */
+  inspect(
+    kind: FormatId,
+    head: Uint8Array,
+    size: number,
+    tail: (length: number) => Promise<{ bytes: Uint8Array; size: number } | null>,
+    signal?: AbortSignal,
+  ): Promise<Inspection>;
+  /** The limits on a ZIP's directory the viewer was given (`maxExtractedBytes`, `maxMembers`, `maxCompressionRatio`; 0: none). */
+  readonly limits: PackageLimits;
+  /**
+   * The limit that the directory of a file of `size` bytes named as format
+   * `kind` goes past, with exav-unpack's reason, or null: within them all, a
+   * format with no ZIP directory (a ZIP is looked at for the Office formats
+   * and `archive`), or a file it cannot judge (no end of it to read).
+   * Arguments as `inspect`. Never rejects but when `signal` aborts.
+   */
+  exceeds(
+    kind: FormatId,
+    head: Uint8Array,
+    size: number,
+    tail: (length: number) => Promise<{ bytes: Uint8Array; size: number } | null>,
+    signal?: AbortSignal,
+  ): Promise<{ code: "too_large" | "too_compressed" | "too_many_entries"; reason: string } | null>;
   /** The whole table as JSON, for a server-side copy and its parity test. */
   table(): DetectionTable;
 }
 
+/**
+ * What `Detector.inspect` found. "valid": examined, and the package is sound.
+ * "not-inspected": nothing was examined (a format it does not check, a server
+ * that gives no end of the file). "signature-mismatch": the first bytes are
+ * not those of the format the name gives. "invalid-package": a ZIP package
+ * with no readable directory. "missing-part": a package without a part its
+ * format requires.
+ */
+export type Inspection = "valid" | "not-inspected" | "signature-mismatch" | "invalid-package" | "missing-part";
+
+/** The limits on a ZIP's directory, 0 for none (`ViewerConfig.maxExtractedBytes`, `maxMembers`, `maxCompressionRatio`). */
+export interface PackageLimits {
+  maxExtractedBytes: number;
+  maxMembers: number;
+  maxCompressionRatio: number;
+}
+
 export interface DetectionTable {
-  formats: { id: FormatId; matcher: Omit<FormatMatcher, "confirmSniff"> }[];
-  /** The signatures `sniff` reads, in order, first match wins. */
-  signatures: readonly Signature[];
+  formats: { id: FormatId; matcher: FormatMatcher }[];
   unknownTypes: readonly string[];
+  /** The types of files that hold other files, which "container" stands for. */
+  containerTypes: readonly string[];
 }
 
 // ── Plugins ──────────────────────────────────────────────────────────────────
@@ -214,7 +347,8 @@ export type Capability =
   | "media"
   | "sheets"
   | "pictures"
-  | "viewport";
+  | "viewport"
+  | "highlights";
 
 export interface FormatPlugin<Options = unknown> {
   id: FormatId;
@@ -232,6 +366,10 @@ export interface FormatPlugin<Options = unknown> {
 }
 
 export interface Renderer<Options = unknown> {
+  /**
+   * Rejects with a `FormatMismatch` when the bytes are another format (see
+   * `mismatchOf`): the session shows the file as that format, once.
+   */
   mount(host: HTMLElement, ctx: RenderContext<Options>): RendererHandle | Promise<RendererHandle>;
 }
 
@@ -327,7 +465,7 @@ export type Status =
   | { phase: "error"; error: ViewerError };
 
 /** The codes the built-in plugins report; a plugin of the host may use its own. */
-export type BuiltinErrorCode = "pdf" | "image" | "image_no_preview" | "drawing" | "drawing_version" | "office" | "needs_converter" | "media" | "model" | "archive" | "text" | "text_binary" | "file";
+export type BuiltinErrorCode = "pdf" | "image" | "image_no_preview" | "drawing" | "drawing_version" | "office" | "needs_converter" | "media" | "model" | "archive" | "text" | "text_binary" | "damaged" | "wrong_type" | "too_large" | "too_compressed" | "too_many_entries" | "file";
 
 export interface ViewerError {
   /**
@@ -338,7 +476,15 @@ export interface ViewerError {
    * and older). `image_no_preview`: a camera RAW file that embeds no
    * preview. `needs_converter`: a format only an external converter reads,
    * and none is set (the cause is a `NeedsConverterError`, `kind`
-   * "needs-converter", with the format's name).
+   * "needs-converter", with the format's name). `damaged` and `wrong_type`:
+   * a file of a format whose package or signature exav's readers check
+   * (PDF, DOCX, XLSX, PPTX, ODT, ODS, ODP) that failed to open, when they
+   * found the package unreadable or a part missing (`damaged`), or the first
+   * bytes not those of the format (`wrong_type`); the cause is the failure.
+   * `too_large`, `too_compressed` and `too_many_entries`: a ZIP-based file
+   * (Office, archive) refused before it was opened because its directory goes
+   * past `maxExtractedBytes`, `maxCompressionRatio` or `maxMembers`; the cause
+   * is an `Error` with exav-unpack's reason.
    */
   code: BuiltinErrorCode | (string & {});
   /** Worded for the user in the host's language, shown instead of the stock message for `code`. */
@@ -365,6 +511,8 @@ export interface Controllers {
   sheets?: SheetsController;
   pictures?: PicturesController;
   viewport?: ViewportController;
+  /** The file's `highlights`, where the format draws them. */
+  highlights?: HighlightsController;
   /**
    * What the user should know about what is shown, as message keys
    * (`warning_<key>`) and counts: what is left out of the picture (a
@@ -786,6 +934,37 @@ export interface ViewerConfig {
   plugins: readonly FormatPlugin<any>[];
   /** Where `@exav/viewer/vite` published the copied assets. Default "/exav-viewer/". */
   assetBase?: string;
+  /**
+   * How long the detection of a file's first bytes may take, in milliseconds,
+   * before its worker is stopped and the file's name and type decide.
+   * Default 30,000; 0: no timeout.
+   */
+  sniffTimeoutMs?: number;
+  /**
+   * How many bytes from the start of a file are read to tell what it is.
+   * Default 65,536. A file given by an address is asked for them with a range
+   * request (a server that ignores it is not read past them). 0: files are
+   * told by their name and type alone, and no request is made for it.
+   */
+  sniffBytes?: number;
+  /**
+   * The most bytes all the members of a ZIP (an Office file, an archive) may
+   * come to once inflated, read off its directory before the file reaches its
+   * engine; past it the file is refused as `too_large`. Default 536,870,912
+   * (512 MiB); 0: no limit. The limit of exav-unpack of the same name.
+   */
+  maxExtractedBytes?: number;
+  /**
+   * The most members a ZIP may have, directories included; past it the file
+   * is refused as `too_many_entries`. Default 20,000; 0: no limit.
+   */
+  maxMembers?: number;
+  /**
+   * The most a member of a ZIP may inflate to, as a multiple of its
+   * compressed size, once past 256 MiB (exav-unpack's rule for a stream); past
+   * it the file is refused as `too_compressed`. Default 1000; 0: no limit.
+   */
+  maxCompressionRatio?: number;
 }
 
 export interface Viewer extends Detector {
@@ -800,6 +979,11 @@ export interface Viewer extends Detector {
 export interface Session {
   /** The file on screen: the last one `replace` took. */
   readonly file: ViewerFile;
+  /**
+   * What the file is shown as. Where the first bytes of the file are read to
+   * tell (`ViewerFile.format` not given, and `sniffBytes` not 0), it is the
+   * format the name and type give until they are.
+   */
   readonly format: FormatId | null;
   readonly status: Store<Status>;
   readonly controllers: Store<Controllers>;

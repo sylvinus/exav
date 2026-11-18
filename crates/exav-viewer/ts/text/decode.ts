@@ -1,7 +1,8 @@
 /**
- * Bytes to text that is safe to show: the encoding is read off the bytes, a
- * file that is not text is refused, and what could make the text lie about
- * itself (control characters, bidirectional overrides) is made visible.
+ * Decoded text made safe to show: what could make it lie about itself
+ * (control characters, bidirectional overrides) is made visible, and it is cut
+ * into lines. What the bytes are as text (their encoding, whether they are
+ * text at all) is decided by the text module, `engine.ts`.
  */
 
 /** Bytes of a file that are read. */
@@ -10,66 +11,6 @@ export const MAX_BYTES = 2 * 1024 * 1024;
 export const MAX_LINES = 50_000;
 /** Characters shown of one line. */
 export const MAX_LINE = 10_000;
-
-/** How much of the head the binary check looks at. */
-const SNIFF = 64 * 1024;
-
-export interface Decoded {
-  text: string;
-  encoding: "utf-8" | "utf-16le" | "utf-16be" | "windows-1252";
-}
-
-/** One decode, `null` when the bytes are not valid in that encoding. */
-function strict(bytes: Uint8Array, encoding: string, partial: boolean): string | null {
-  try {
-    // `stream`: a character cut in half by the end of the bytes is held back, not an error.
-    return new TextDecoder(encoding, { fatal: true }).decode(bytes, { stream: partial });
-  } catch {
-    return null;
-  }
-}
-
-/**
- * The text of `bytes`, or `null` when they are not text. `partial`: the bytes
- * are the start of a longer file.
- *
- * A byte-order mark settles the encoding (UTF-32 is refused). Otherwise a NUL
- * in the head means binary, then UTF-8 if the bytes are valid in it, else
- * windows-1252, which cannot fail and so comes last. A head where control
- * characters or replacement characters are one in ten is binary too.
- */
-export function decodeText(bytes: Uint8Array, partial = false): Decoded | null {
-  const [a = 0, b = 0, c = 0, d = 0] = bytes;
-  if ((a === 0xff && b === 0xfe && c === 0 && d === 0) || (a === 0 && b === 0 && c === 0xfe && d === 0xff)) return null;
-  let text: string | null;
-  let encoding: Decoded["encoding"];
-  if (a === 0xff && b === 0xfe) {
-    encoding = "utf-16le";
-    text = new TextDecoder(encoding).decode(bytes, { stream: partial });
-  } else if (a === 0xfe && b === 0xff) {
-    encoding = "utf-16be";
-    text = new TextDecoder(encoding).decode(bytes, { stream: partial });
-  } else {
-    const head = Math.min(bytes.length, SNIFF);
-    for (let i = 0; i < head; i++) if (bytes[i] === 0) return null;
-    text = strict(bytes, "utf-8", partial);
-    encoding = "utf-8";
-    if (text === null) {
-      text = new TextDecoder("windows-1252").decode(bytes);
-      encoding = "windows-1252";
-    }
-  }
-  return looksBinary(text.slice(0, SNIFF)) ? null : { text, encoding };
-}
-
-/** C0 controls but tab, line feed and carriage return, DEL, C1 controls, and U+FFFD. */
-const isOdd = (c: number) => (c < 0x20 && c !== 9 && c !== 10 && c !== 13) || (c >= 0x7f && c <= 0x9f) || c === 0xfffd;
-
-function looksBinary(sample: string): boolean {
-  let odd = 0;
-  for (let i = 0; i < sample.length; i++) if (isOdd(sample.charCodeAt(i))) odd++;
-  return odd * 10 > sample.length;
-}
 
 /**
  * What is not shown as itself: C0 controls but tab, line feed and carriage

@@ -60,9 +60,10 @@ Differences to know before swapping a socket (see
 ClamAV reads a file over about 2 GB, scans none of it, and reports `OK`.
 
 exav gives every file the full engine. One up to `--max-object-bytes` (256 MiB
-by default) is held in memory; a larger one is read through an 8 MiB block
-cache. The few checks that parse a file whole, such as a PE's structure, do not
-run past that limit, and a file they applied to is reported `LIMITS-EXCEEDED`
+by default) is held in memory; a larger one is read through a block cache
+(`--object-cache-bytes`, 32 MiB by default). The few checks that parse a file
+whole, such as a PE's structure when its image is past that limit, do not run,
+and a file they applied to is reported `LIMITS-EXCEEDED`
 unless something is found, never `OK`. See
 [Streaming & memory](/scanner/concepts/streaming-memory/).
 
@@ -131,7 +132,7 @@ each axis. (For the catalogue see [Supported formats](/scanner/reference/formats
 | **Bytecode (`.cbc`)** | Part of ClamAV's host API is implemented; the rest are stubs returning fail-safe values, so a program depending on one could diverge from ClamAV. Every shipped program runs to completion, stub use is rare, and each use is recorded. | Runs on an interpreter with no JIT, removing the code-execution class that has affected a C/JIT bytecode VM. The unpackers ClamAV ships as bytecode, such as MPRESS, run too. |
 | **Signature scope (`Target:`, TDB)** | Most `Target:` values ([details](#targets)), and every TDB attribute any engine implements. A signature with a constraint exav cannot evaluate is refused and counted ([details](#signature-metadata-tdb-attributes)). | none |
 | **YARA** | none | Seven modules work (`pe`, `elf`, `dotnet`, `math`, `hash`, `string`, `time`); rules importing another (such as `macho`, `dex` or `cuckoo`) are rejected per rule and counted, so one unsupported rule cannot drop a feed. Matching is cross-checked against `yara-x`. No wasmtime or Cranelift behind it. In ClamAV no module works; even `pe` fails to load. |
-| **Archive codecs** | none | ZIP members compressed with LZMA, bzip2, zstd, XZ or PPMd are decoded. Members whose sizes are deferred to a trailing data descriptor are carved and scanned. |
+| **Archive codecs** | none | ZIP members compressed with LZMA, zstd, XZ, PPMd, Shrink or Reduce are decoded (ClamAV reads stored, Deflate, Deflate64, bzip2 and Implode). Members whose sizes are deferred to a trailing data descriptor are carved and scanned. |
 | **Container formats** | none | Virtual disks ClamAV does not open: VHD, VHDX, QCOW2 (compressed clusters included) and VMDK (sparse and streamOptimized, as inside an OVA), reconstructed to the guest disk and rescanned, with the filesystems inside them (NTFS, FAT, exFAT, ext2/3/4, HFS+, APFS). Also SquashFS, cramfs, romfs, EROFS, UDF, WIM, KWAJ, LZ4, ARC and Unix `compress` (`.Z`). |
 | **Decryption** | none | ZIP, 7z and RAR3/RAR5 (encrypted headers included), encrypted DMG, PDF and Office are decrypted with the password pool and the built-in passwords ([details](/scanner/reference/formats/#encryption-and-passwords)). What stays encrypted, PKWARE Strong Encryption included, is reported `PASSWORD-PROTECTED`; ClamAV returns `OK` for an encrypted archive unless `--alert-encrypted-archive` is passed. |
 | **PE unpacking** | none | UPX and the aPLib family are unpacked by decoders, and the result is rebuilt in ClamAV's layout so ClamAV hash signatures over its rebuilt image match. Everything else that looks packed has its stub run under a bounded x86 interpreter ([how](/scanner/concepts/pe-emulation/)); ClamAV ships a hand-written unpacker per family. |
@@ -242,7 +243,7 @@ members went unexamined.
 |---|---|---|
 | ACE | No support: 200 members of a real ACE went unextracted | `UNSCANNABLE` |
 | StuffIt / StuffIt X | No support: real `.sit` and `.sitx` unextracted | `UNSCANNABLE` |
-| Inno Setup | No support: stops at "Recognized MS-EXE/DLL", 71 members unreached | `UNSCANNABLE` |
+| Inno Setup | No support: stops at "Recognized MS-EXE/DLL", 71 members unreached | Decoded from 5.1.5 to 6.4; other versions `UNSCANNABLE` |
 | ZIP method 10 (DCL Implode) | Enumerates the entry, then `unsupported method (10)` | `UNSCANNABLE` |
 | ZIP methods 94 / 96 / 97 (MP3, JPEG, WavPack) | No support | `UNSCANNABLE` |
 | PKWARE Strong Encryption | No support | `PASSWORD-PROTECTED` |
@@ -258,12 +259,12 @@ default.
 
 | Format | ClamAV | exav |
 |---|---|---|
-| **EGG** (ESTsoft, Korean) | Decodes; `Heuristics.Encrypted.EGG` shows members are parsed deeply enough to detect encryption | Decodes (store/deflate/bzip2/LZMA/AZO) |
+| **EGG** (ESTsoft, Korean) | Decodes store, deflate and bzip2 blocks; LZMA, AZO, solid archives and encrypted members are not read (`LZMA decompression not yet supported`); `Heuristics.Encrypted.EGG` shows members are parsed deeply enough to detect encryption | Decodes (store/deflate/bzip2/LZMA/AZO) |
 | **ALZ** (ESTsoft, Korean) | Decodes; magic added at flevel 210 | Decodes (store/bzip2/deflate) |
 | **HWP3** (Hangul Word Processor) | Decodes, with its own scan-option bit, `MAX_RECHWP3` and `--max-rechwp3` | Decodes (deflate body) |
 | CAB Quantum | Decodes | Decodes |
-| **InstallShield MSI** | `CL_TYPE_ISHIELD_MSI`, types and handles | Recognised, reported `UNSCANNABLE` |
-| **CRYPTFF** | `CL_TYPE_CRYPTFF`, types and handles | Recognised, reported `PASSWORD-PROTECTED` |
+| **InstallShield MSI** | `CL_TYPE_ISHIELD_MSI`, types and handles | Opened: the MSI and the files beside it are scanned. The 2015 layout, which clamscan does not open, is opened too, except under `--clamav-compat` |
+| **CRYPTFF** | `CL_TYPE_CRYPTFF`, types and handles | Decodes (16-byte header, content flipped) |
 
 EGG and ALZ matter for Korean-language targets, where ALZip is common; HWP3 is
 the Korean government's standard document format and a recurring spear-phishing
@@ -282,9 +283,13 @@ reached, and the scan can come back clean.
 | ext2/3/4, exFAT, SquashFS, cramfs, romfs, EROFS | No support | Decoded |
 | ZOO | No support | Decoded |
 | VHD, VHDX, QCOW2, VMDK, NTFS, FAT, HFS+, APFS | No support | Decoded |
-| InstallShield InstallScript cabinet | No support | Recognised, reported `UNSCANNABLE` |
-| AppleSingle / AppleDouble | No support | Recognised, reported `UNSCANNABLE` |
+| InstallShield InstallScript cabinet | No support | Decoded (files in other cabinets of a set reported `UNSCANNABLE`) |
+| AppleSingle / AppleDouble | No support | Decoded |
 | lrzip | No support | Recognised, reported `UNSCANNABLE` |
+| lz4, zstd, ARC | No support | Decoded |
+| `.lnk`, `.pyc`, Java class, pickle and safetensors members | Typed, nothing extracted | Strings or body scanned |
+| 7z BZip2, Deflate and Delta | `cli_7unz: unsupported` | Decoded |
+| ZIP methods 1, 2, 14, 95, 98 | `unsupported method` | Decoded |
 
 [Evidence for what ClamAV does not open](#evidence-for-what-clamav-does-not-open)
 has the disk image measurements.
@@ -442,7 +447,9 @@ unsupported and counted: `\X`, `\G`, subroutine calls and recursion, `(*ACCEPT)`
 and the other backtracking verbs but `(*FAIL)`, branch reset `(?|`, callouts,
 `(*UTF)`, `(*UCP)` and newline conventions, `\p` other than a general category,
 and a condition other than on a group or an assertion. No PCRE subsignature in
-the official databases uses one.
+the official databases uses one. A pattern that translates but that neither
+engine builds is found when `--build-db` writes a database, and counted with the
+unsupported signatures there; a scan that reaches one is reported incomplete.
 
 Two more are TDB rather than syntax: `HandlerType:CL_TYPE_GRAPHICS` needs a
 graphics type to re-type to, and `Container:CL_TYPE_MHTML` needs MHTML told apart
@@ -474,7 +481,7 @@ only a handful of signatures are named `Heuristics.*`. ClamAV routes `PUA.`,
 
 | exav | ClamAV | Status |
 |---|---|---|
-| `Heuristics.PDF.ObfuscatedNameObject` | same | exact parity, on by default |
+| `Heuristics.PDF.ObfuscatedNameObject` | same | exact parity, on by default; exav also reads the objects inside object streams (not under `--clamav-compat`) |
 | `Heuristics.Zip.OverlappingFiles` | same | exact parity, on by default |
 | `Heuristics.XZ.DicSizeLimit` | same | exact parity, always on (ClamAV has no flag for it either) |
 | `Heuristics.Limits.Exceeded.{MaxScanSize,MaxFileSize,MaxFiles,MaxRecursion,MaxScanTime}` | same | parity, via `--partial-as limits-exceeded=found` |
@@ -549,8 +556,12 @@ recognition rather than extraction.
 * **Updating:** see the Updating row [above](#signature--format-support-whats-missing-whats-added).
 * **Quarantine actions, `VirusEvent` and on-access scanning** are
   [out of scope](#out-of-scope-for-now).
-* **RAR volume sets** are not joined by either engine. exav reports the split
-  member and scans the part present in the volume it was given.
+* **Volume sets**: ClamAV scans each volume alone. exav joins RAR, ZIP and
+  CAB volume sets whose volumes sit next to each other on disk or arrive
+  together at the daemon (see
+  [split archives](/scanner/guides/daemon/#split-archives)). A volume met
+  alone, or as a member of another archive, is scanned on its own and the
+  member continued in another volume is reported.
 
 ## Out of scope for now
 

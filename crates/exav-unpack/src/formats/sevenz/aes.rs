@@ -7,19 +7,20 @@
 //! times, then finalised. The IV and salt travel in the coder properties. This
 //! is the decrypt half only: no key wrapping, no RNG.
 //!
-//! Only the *data* layer is handled here (the common `7z a -p…` case, plaintext
-//! header). Archives with an AES-encrypted *header* (`-mhe=on`) fail to parse
-//! and are still reported encrypted/unsupported by the caller.
-//!
-//! `#![forbid(unsafe_code)]`: property parsing is bounds-checked, the KDF round
-//! count is capped to reject a DoS, and a wrong passphrase simply yields bytes
-//! the downstream codec rejects (never a panic, never emitted as data).
+//! The reader decrypts a folder's packed stream as it is read, so a folder of
+//! any size takes the memory of one chunk. It does not tell a wrong passphrase
+//! from the right one: the bytes it gives are garbage the next coder rejects,
+//! or that fail the CRC the caller checks. Property parsing is bounds-checked
+//! and the KDF round count is capped.
 
 use crate::LimitHit;
 use crate::kdf::Pass;
 use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::NoPadding};
 use sha2::{Digest, Sha256};
-use std::io::{self, Cursor, Read};
+use std::io::{self, Read};
+
+/// Ciphertext decrypted at a time.
+const CHUNK: usize = 64 * 1024;
 
 /// The special `numCyclesPower` meaning "use the passphrase (with salt) verbatim
 /// as the key", with no hashing.
@@ -120,15 +121,26 @@ fn utf16le(password: &str) -> Vec<u8> {
     out
 }
 
-/// A `Read` adapter that decrypts a 7zAES folder stream. It reads the whole
-/// ciphertext on first read (folder streams are bounded by the archive/budget),
-/// AES-256-CBC-decrypts it with no padding (7z streams are block-aligned; the
-/// exact unpacked length is enforced by the caller), and serves the plaintext.
+/// A `Read` adapter that decrypts a 7zAES folder stream: AES-256-CBC with no
+/// padding, a chunk of ciphertext at a time. The stream is a whole number of
+/// blocks, and a partial block at its end is dropped; the plaintext is as long
+/// as the ciphertext, and the coder after this one stops at its own size.
 pub(super) struct Aes7zReader<'a> {
-    inner: Option<Box<dyn Read + 'a>>,
+    inner: Box<dyn Read + 'a>,
     key: [u8; 32],
+    /// What the next chunk chains from: the IV, then the last ciphertext block
+    /// of the chunk before.
     iv: [u8; 16],
-    plain: Cursor<Vec<u8>>,
+    buf: Box<[u8]>,
+    /// `buf[pos..end]` is decrypted and not yet read. `buf[end..filled]` is
+    /// the start of a block whose rest has not been read.
+    pos: usize,
+    end: usize,
+    filled: usize,
+    eof: bool,
+    /// An error of `inner`, met after ciphertext was read: returned once the
+    /// plaintext of that ciphertext has been.
+    failed: Option<io::Error>,
 }
 
 impl<'a> Aes7zReader<'a> {
@@ -160,37 +172,77 @@ impl<'a> Aes7zReader<'a> {
         }
         .ok_or_else(|| LimitHit::corrupt("7z: AES KDF cost too high".into()))?;
         Ok(Aes7zReader {
-            inner: Some(inner),
+            inner,
             key,
             iv: props.iv,
-            plain: Cursor::new(Vec::new()),
+            buf: vec![0; CHUNK].into_boxed_slice(),
+            pos: 0,
+            end: 0,
+            filled: 0,
+            eof: false,
+            failed: None,
         })
     }
 
-    fn fill(&mut self) -> io::Result<()> {
-        let Some(mut inner) = self.inner.take() else {
+    /// Read the next chunk of ciphertext and decrypt its whole blocks. Leaves
+    /// `pos == end` when there is no more.
+    fn refill(&mut self) -> io::Result<()> {
+        if let Some(e) = self.failed.take() {
+            return Err(e);
+        }
+        if self.eof {
             return Ok(());
-        };
-        let mut ct = Vec::new();
-        inner.read_to_end(&mut ct)?;
-        // CBC operates on whole blocks; drop any trailing partial block.
-        let full = ct.len() - (ct.len() % 16);
-        ct.truncate(full);
-        let pt = cbc::Decryptor::<aes::Aes256>::new(&self.key.into(), &self.iv.into())
-            .decrypt_padded::<NoPadding>(&mut ct)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "7z AES decrypt"))?
-            .to_vec();
-        self.plain = Cursor::new(pt);
+        }
+        // The start of a block the last chunk ended in goes to the front.
+        self.buf.copy_within(self.end..self.filled, 0);
+        self.filled -= self.end;
+        self.pos = 0;
+        self.end = 0;
+        while self.filled < self.buf.len() {
+            match self.inner.read(&mut self.buf[self.filled..]) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(n) => self.filled += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if self.filled < 16 => return Err(e),
+                Err(e) => {
+                    self.failed = Some(e);
+                    break;
+                }
+            }
+        }
+        let full = self.filled - self.filled % 16;
+        if full == 0 {
+            return Ok(());
+        }
+        let mut next_iv = [0u8; 16];
+        next_iv.copy_from_slice(&self.buf[full - 16..full]);
+        cbc::Decryptor::<aes::Aes256>::new(&self.key.into(), &self.iv.into())
+            .decrypt_padded::<NoPadding>(&mut self.buf[..full])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "7z AES decrypt"))?;
+        self.iv = next_iv;
+        self.end = full;
         Ok(())
     }
 }
 
 impl Read for Aes7zReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.inner.is_some() {
-            self.fill()?;
+        if out.is_empty() {
+            return Ok(0);
         }
-        self.plain.read(out)
+        while self.pos == self.end {
+            self.refill()?;
+            if self.pos == self.end && self.eof {
+                return Ok(0);
+            }
+        }
+        let n = out.len().min(self.end - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
     }
 }
 
@@ -198,6 +250,7 @@ impl Read for Aes7zReader<'_> {
 mod tests {
     use super::*;
     use cbc::cipher::BlockModeEncrypt;
+    use std::io::Cursor;
 
     /// AES-256-CBC encrypt with NoPadding (test-only, mirrors the decrypt path)
     /// to build a ciphertext the reader must recover.
@@ -243,12 +296,135 @@ mod tests {
         let mut reader = Aes7zReader::new(Box::new(Cursor::new(ct)), &props, Some(pass)).unwrap();
         let mut got = Vec::new();
         reader.read_to_end(&mut got).unwrap();
-        // Decryption yields the block-padded plaintext; the real caller truncates
-        // to the known unpacked size. Compare the meaningful prefix.
+        // Decryption yields the block-padded plaintext. Compare the meaningful
+        // prefix.
         assert!(
             got.starts_with(&plain),
             "decrypted prefix must match plaintext"
         );
+    }
+
+    /// `data`, at most `step` bytes at a time, and then the end of the stream
+    /// or, with `fails`, an error. `read` counts the bytes given.
+    struct Trickle {
+        data: Vec<u8>,
+        at: usize,
+        step: usize,
+        fails: bool,
+        read: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Trickle {
+        fn new(data: Vec<u8>, step: usize) -> Self {
+            Trickle {
+                data,
+                at: 0,
+                step,
+                fails: false,
+                read: Default::default(),
+            }
+        }
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.at == self.data.len() {
+                return if self.fails {
+                    Err(io::Error::other("damaged"))
+                } else {
+                    Ok(0)
+                };
+            }
+            let n = buf.len().min(self.step).min(self.data.len() - self.at);
+            buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+            self.at += n;
+            self.read.set(self.read.get() + n);
+            Ok(n)
+        }
+    }
+
+    /// The ciphertext of `plain`, a whole number of blocks, with `tail` after
+    /// it, and the properties the reader is built from (the password is `pw`).
+    fn ciphertext(plain: &[u8], tail: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        assert_eq!(plain.len() % 16, 0);
+        let props = build_props(8, b"\x01\x02\x03\x04", &[7u8; 16]);
+        let parsed = parse_props(&props).unwrap();
+        let key = derive_key(&utf16le("pw"), &parsed.salt, parsed.num_cycles_power).unwrap();
+        let mut ct = encrypt(&key, &parsed.iv, plain.to_vec());
+        ct.extend(tail);
+        (ct, props)
+    }
+
+    fn reader_of(stream: Trickle, props: &[u8]) -> Aes7zReader<'static> {
+        let kdf = crate::kdf::Kdf::default();
+        let pass = Pass {
+            word: "pw",
+            kdf: &kdf,
+        };
+        Aes7zReader::new(Box::new(stream), props, Some(pass)).unwrap()
+    }
+
+    /// Across the seams of its chunks, and of the reads it is given and gives,
+    /// the stream decrypts as one: the chain from one chunk to the next is the
+    /// last block of ciphertext, and a partial block at the end is dropped.
+    #[test]
+    fn a_stream_decrypts_as_one_in_reads_of_any_size() {
+        let plain: Vec<u8> = (0..3 * CHUNK as u32 + 1000)
+            .map(|i| (i * 31 % 251) as u8)
+            .collect();
+        let plain = &plain[..plain.len() - plain.len() % 16];
+        let (ct, props) = ciphertext(plain, &[0xAB; 7]);
+        for step in [1, 7, 16, 100, 4096, CHUNK, 1 << 20] {
+            for out in [1, 15, 17, 4096, 1 << 20] {
+                let mut reader = reader_of(Trickle::new(ct.clone(), step), &props);
+                let mut got = Vec::new();
+                let mut buf = vec![0u8; out];
+                loop {
+                    match reader.read(&mut buf).unwrap() {
+                        0 => break,
+                        n => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                assert!(got == plain, "ciphertext in {step}s, read in {out}s");
+            }
+        }
+    }
+
+    /// A megabyte of ciphertext is not read to give its first bytes.
+    #[test]
+    fn the_ciphertext_is_read_a_chunk_at_a_time() {
+        let (ct, props) = ciphertext(&vec![0x41u8; 1 << 20], &[]);
+        let stream = Trickle::new(ct, 1 << 20);
+        let read = stream.read.clone();
+        let mut reader = reader_of(stream, &props);
+        let mut first = [0u8; 100];
+        reader.read_exact(&mut first).unwrap();
+        assert_eq!(first, [0x41u8; 100]);
+        assert!(read.get() <= 64 * 1024, "{} bytes read", read.get());
+    }
+
+    /// An error of the stream after some ciphertext comes after the plaintext
+    /// of that ciphertext, whole blocks of it.
+    #[test]
+    fn an_error_of_the_stream_comes_after_the_plaintext_before_it() {
+        let plain: Vec<u8> = (0..160u32).map(|i| i as u8).collect();
+        let (ct, props) = ciphertext(&plain, &[0xAB; 5]);
+        for size in [1, 16, 4096] {
+            let mut stream = Trickle::new(ct.clone(), 40);
+            stream.fails = true;
+            let mut reader = reader_of(stream, &props);
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; size];
+            let err = loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => panic!("ended without the error"),
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(e) => break e,
+                }
+            };
+            assert_eq!(got, plain, "reads of {size}");
+            assert_eq!(err.to_string(), "damaged");
+        }
     }
 
     #[test]

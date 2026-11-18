@@ -3,8 +3,8 @@
 //!
 //! Container-aware scanning needs to *seek*: a ZIP's directory is at its end, so
 //! an archive that can only be read forward cannot be opened at all. Every
-//! streaming surface — `INSTREAM`/`EXINSTREAM`, the CLI's stdin, an ICAP
-//! encapsulated body — therefore has to materialise what it receives before it
+//! streaming surface (`INSTREAM`/`EXINSTREAM`, the CLI's stdin, an ICAP
+//! encapsulated body) therefore has to materialise what it receives before it
 //! can scan it. Small objects sit in RAM; past a threshold they go to a temp
 //! file, which is what keeps a listener's memory bounded by the threshold rather
 //! than by whatever a client chooses to send.
@@ -12,15 +12,15 @@
 //! That trade moves the exposure from RAM to disk, so the disk side is bounded
 //! too, at three levels:
 //!
-//! * [`SpillConfig::threshold`] — how much stays in RAM before any file exists.
-//! * [`SpillConfig::max_object`] — the largest single object that may be spilled.
-//! * [`SpillConfig::max_total`] — how much every in-flight object *together* may
+//! * [`SpillConfig::threshold`]: how much stays in RAM before any file exists.
+//! * [`SpillConfig::max_object`]: the largest single object that may be spilled.
+//! * [`SpillConfig::max_total`]: how much every in-flight object *together* may
 //!   occupy within one process. Under the prefork pool that is per worker and
 //!   per ICAP child, not across the pool.
 //!
 //! The third is the one a per-object limit cannot replace. A listener serving a
 //! hundred connections with a 2 GiB per-object cap has a 200 GiB worst case, and
-//! filling the temp filesystem is a denial of service against the host — one
+//! filling the temp filesystem is a denial of service against the host, one
 //! that outlives the connection that caused it and takes down everything else
 //! sharing that filesystem.
 //!
@@ -120,7 +120,7 @@ pub(crate) fn in_use() -> u64 {
 /// Serialises the tests that assert on [`IN_USE`] against the tests that move
 /// it.
 ///
-/// The counter is process-wide, which is the point of it — and `cargo test`
+/// The counter is process-wide, which is the point of it, and `cargo test`
 /// runs this binary's tests on threads inside one process. So a test reading
 /// `in_use()` around a payload it owns is also reading every other test's
 /// spilling, and asserting on an absolute value races them. It showed up as
@@ -148,7 +148,7 @@ pub(crate) enum SpillError {
     /// A configured budget refused it. The object is unscannable; the connection
     /// is fine and owes the client a verdict.
     Budget(String),
-    /// The temp filesystem failed — full, read-only, or absent.
+    /// The temp filesystem failed: full, read-only, or absent.
     Io(io::Error),
 }
 
@@ -173,7 +173,7 @@ impl From<io::Error> for SpillError {
 /// budget.
 ///
 /// The share is released by `Drop`, so it is tied to the payload's lifetime
-/// rather than to any code path remembering to give it back — including the
+/// rather than to any code path remembering to give it back, including the
 /// paths that leave early because a scan failed or a client vanished.
 pub(crate) struct SpillFile {
     file: TempFile,
@@ -357,7 +357,7 @@ mod tests {
     }
 
     /// The budget is released when the payload is, not when some code path
-    /// remembers to give it back — including the paths that leave early.
+    /// remembers to give it back, including the paths that leave early.
     #[test]
     fn a_dropped_payload_returns_its_share_of_the_budget() {
         let _budget = budget_guard();

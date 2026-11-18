@@ -121,6 +121,26 @@ pub(crate) const OPTION_LEFTMOST_LONGEST: u32 = 1 << 3;
 // TODO: make configurable
 const MAX_STACK: usize = 1_000_000;
 
+/// The repetition count to go on with after an iteration matched empty, or `None` to
+/// leave the loop. Below the minimum, a body that reads its own captures runs every
+/// required iteration. Any other body skips to the last one, but only after the first
+/// iteration, as doing so later makes failing searches much slower.
+fn count_after_empty_iteration(
+    repcount: usize,
+    lo: usize,
+    reads_own_captures: bool,
+) -> Option<usize> {
+    if repcount >= lo {
+        None
+    } else if reads_own_captures {
+        Some(repcount)
+    } else if repcount == 1 {
+        Some(lo - 1)
+    } else {
+        None
+    }
+}
+
 /// Represents a range of capture groups by storing the first and last group numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureGroupRange(pub usize, pub usize);
@@ -312,6 +332,75 @@ fn range_contains<T: Ord + Copy>(ranges: &[(T, T)], needle: T) -> bool {
         .is_ok()
 }
 
+/// What a backtrack costs in the work a search is limited to, counted in
+/// bytes: the bytes a delegated search or a back reference reads cost one
+/// each. About the time a backtrack takes against the time of a lazy DFA to
+/// read that many bytes.
+pub const STEP_BYTES: usize = 32;
+
+/// A lazy DFA of a delegated pattern, run only to see how many bytes a search
+/// of the delegate reads: the regex crate does not say.
+#[derive(Clone)]
+pub struct Extent {
+    dfa: Arc<regex_automata::hybrid::dfa::DFA>,
+    cache_pool: Arc<Pool<regex_automata::hybrid::dfa::Cache, CachePoolFn>>,
+}
+
+impl Extent {
+    /// The extent of forward searches for `pattern`, with the syntax the
+    /// delegate itself is built with; `None` when the DFA cannot be built.
+    pub(crate) fn new(pattern: &str, utf8: bool, unicode: bool) -> Option<Self> {
+        use regex_automata::hybrid::dfa;
+        use regex_automata::nfa::thompson;
+        use regex_automata::util::syntax;
+        let dfa = Arc::new(
+            dfa::DFA::builder()
+                .configure(dfa::Config::new().unicode_word_boundary(true))
+                .syntax(syntax::Config::new().utf8(utf8).unicode(unicode))
+                .thompson(thompson::Config::new().utf8(utf8))
+                .build(pattern)
+                .ok()?,
+        );
+        let for_pool = Arc::clone(&dfa);
+        let create: CachePoolFn = Box::new(move || for_pool.create_cache());
+        Some(Extent {
+            dfa,
+            cache_pool: Arc::new(Pool::new(create)),
+        })
+    }
+}
+
+/// The bytes a search of a delegate from `at` in `hay` reads, at most `room`
+/// + 1: a search that goes on past `room` is cut there. When the DFA is
+/// missing, or cannot tell (it gave up, or its cache was cleared, which
+/// resets its count), it is all of what follows `at`.
+fn delegate_read(extent: Option<&Extent>, hay: &[u8], at: usize, room: usize) -> usize {
+    let rest = hay.len() - at;
+    let Some(extent) = extent else {
+        return rest;
+    };
+    let end = hay.len().min(at.saturating_add(room).saturating_add(1));
+    let input = Input::new(hay).span(at..end).anchored(Anchored::Yes);
+    let mut cache = extent.cache_pool.get();
+    let before = cache.search_total_len();
+    let clears = cache.clear_count();
+    let searched = extent.dfa.try_search_fwd(&mut cache, &input);
+    if searched.is_ok() && cache.clear_count() == clears {
+        cache.search_total_len().saturating_sub(before)
+    } else {
+        rest
+    }
+}
+
+/// Charge `n` to `work`, failing when that is more than `limit`.
+fn spend(work: &mut usize, limit: usize, n: usize) -> Result<()> {
+    *work = work.saturating_add(n);
+    if *work > limit {
+        return Err(Error::RuntimeError(RuntimeError::BacktrackLimitExceeded));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 /// Delegate matching to the regex crate
 pub struct Delegate {
@@ -321,6 +410,8 @@ pub struct Delegate {
     pub pattern: String,
     /// The range of capture groups. None if there are no capture groups.
     pub capture_groups: Option<CaptureGroupRange>,
+    /// How far a search reads
+    pub(crate) extent: Option<Extent>,
 }
 
 impl core::fmt::Debug for Delegate {
@@ -330,6 +421,7 @@ impl core::fmt::Debug for Delegate {
             inner: _,
             pattern,
             capture_groups,
+            extent: _,
         } = self;
 
         f.debug_struct("Delegate")
@@ -444,6 +536,15 @@ pub enum Insn {
     /// Save the current string index into the specified capture group start slot if the capture group is empty
     /// or has already completed.
     SaveCaptureGroupStart(usize),
+    /// Like `SaveCaptureGroupStart`, but first copy the group's previous capture to
+    /// `previous` and `previous + 1`, for backrefs inside the group to read, and clear
+    /// the end slot, so the group counts as open until it ends
+    SaveCaptureGroupStartKeepPrevious {
+        /// The capture group
+        group: usize,
+        /// The first of the two slots for the previous capture
+        previous: usize,
+    },
     /// Set the string index to the value that was saved in the specified slot
     Restore(usize),
     /// Repeat greedily (match as much as possible)
@@ -478,6 +579,8 @@ pub enum Insn {
         repeat: usize,
         /// The slot for saving the previous IX to check if we had an empty match
         check: usize,
+        /// Whether the body reads a capture group it sets itself
+        reads_own_captures: bool,
     },
     /// Repeat non-greedily and prevent infinite loops from empty matches
     RepeatEpsilonNg {
@@ -489,6 +592,8 @@ pub enum Insn {
         repeat: usize,
         /// The slot for saving the previous IX to check if we had an empty match
         check: usize,
+        /// Whether the body reads a capture group it sets itself
+        reads_own_captures: bool,
     },
     /// Negative look-around failed
     FailNegativeLookAround,
@@ -514,7 +619,8 @@ pub enum Insn {
         /// Whether this is at the start of the pattern (allowing early exit on failure)
         at_start: bool,
     },
-    /// Continue only if the specified capture group has already been populated as part of the match
+    /// Continue only if the capture group whose start is in the specified slot has already been
+    /// populated as part of the match
     BackrefExistsCondition(usize),
     /// Immediately fail the current match attempt and trigger backtracking.
     /// This is used for backtracking control verbs like `(*FAIL)`.
@@ -714,6 +820,26 @@ impl State {
         if self.options & OPTION_TRACE != 0 {
             println!("saves: {:?}", self.saves);
         }
+    }
+
+    /// Starts the next iteration of a repeat that checks for empty iterations, and
+    /// returns how many ran before it, or `None` if the loop ends here.
+    fn start_epsilon_iteration(
+        &mut self,
+        ix: usize,
+        lo: usize,
+        repeat: usize,
+        check: usize,
+        reads_own_captures: bool,
+    ) -> Option<usize> {
+        let mut repcount = self.get(repeat);
+        // `check` holds where the previous iteration of this run started
+        if repcount > 0 && self.get(check) == ix {
+            repcount = count_after_empty_iteration(repcount, lo, reads_own_captures)?;
+        }
+        self.save(repeat, repcount + 1);
+        self.save(check, ix);
+        Some(repcount)
     }
 
     fn get(&self, slot: usize) -> usize {
@@ -1017,13 +1143,39 @@ pub(crate) fn run_spans<S: HaystackInput + ?Sized>(
 
 /// Run the program with options; `extract` pulls the result out of the final
 /// state before the scratch returns to the pool.
-#[allow(clippy::cognitive_complexity)]
+///
+/// The work of the run is limited: [`STEP_BYTES`] for a backtrack, a byte for
+/// each one a delegated search or a back reference reads. The limit is the
+/// room in the input's cell when it has one, which the run leaves what it
+/// did not use in, and the options' backtrack limit otherwise.
 fn run_with<S: HaystackInput + ?Sized, T>(
     prog: &Prog,
     input: &RegexInput<'_, S>,
     option_flags: u32,
     options: &HardRegexRuntimeOptions,
     extract: impl FnOnce(&State) -> T,
+) -> Result<Option<T>> {
+    let limit = match input.work_cell() {
+        Some(cell) => cell.get(),
+        None => options.backtrack_limit.saturating_mul(STEP_BYTES),
+    };
+    let mut work = 0;
+    let out = run_loop(prog, input, option_flags, options, extract, limit, &mut work);
+    if let Some(cell) = input.work_cell() {
+        cell.set(limit.saturating_sub(work));
+    }
+    out
+}
+
+#[allow(clippy::cognitive_complexity)]
+fn run_loop<S: HaystackInput + ?Sized, T>(
+    prog: &Prog,
+    input: &RegexInput<'_, S>,
+    option_flags: u32,
+    options: &HardRegexRuntimeOptions,
+    extract: impl FnOnce(&State) -> T,
+    limit: usize,
+    work: &mut usize,
 ) -> Result<Option<T>> {
     if input.is_done() {
         return Ok(None);
@@ -1041,7 +1193,6 @@ fn run_with<S: HaystackInput + ?Sized, T>(
     if option_flags & OPTION_TRACE != 0 {
         println!("pos\tinstruction");
     }
-    let mut backtrack_count = 0;
     let mut pc = 0;
     let mut ix = pos;
     let mut slash_z_matched = false;
@@ -1284,6 +1435,16 @@ fn run_with<S: HaystackInput + ?Sized, T>(
                         state.save(start_slot, ix);
                     }
                 }
+                Insn::SaveCaptureGroupStartKeepPrevious { group, previous } => {
+                    let start_slot = group * 2;
+                    let (start, end) = (state.get(start_slot), state.get(start_slot + 1));
+                    if start == usize::MAX || end != usize::MAX {
+                        state.save(previous, start);
+                        state.save(previous + 1, end);
+                        state.save(start_slot, ix);
+                        state.save(start_slot + 1, usize::MAX);
+                    }
+                }
                 Insn::Restore(slot) => ix = state.get(slot),
                 Insn::RepeatGr {
                     lo,
@@ -1324,16 +1485,15 @@ fn run_with<S: HaystackInput + ?Sized, T>(
                     next,
                     repeat,
                     check,
+                    reads_own_captures,
                 } => {
-                    let repcount = state.get(repeat);
-                    if repcount > 0 && state.get(check) == ix {
-                        // zero-length match on repeat, then move to next instruction
+                    let Some(repcount) =
+                        state.start_epsilon_iteration(ix, lo, repeat, check, reads_own_captures)
+                    else {
                         pc = next;
                         continue;
-                    }
-                    state.save(repeat, repcount + 1);
+                    };
                     if repcount >= lo {
-                        state.save(check, ix);
                         state.push(next, ix)?;
                     }
                 }
@@ -1342,16 +1502,15 @@ fn run_with<S: HaystackInput + ?Sized, T>(
                     next,
                     repeat,
                     check,
+                    reads_own_captures,
                 } => {
-                    let repcount = state.get(repeat);
-                    if repcount > 0 && state.get(check) == ix {
-                        // zero-length match on repeat, then move to next instruction
+                    let Some(repcount) =
+                        state.start_epsilon_iteration(ix, lo, repeat, check, reads_own_captures)
+                    else {
                         pc = next;
                         continue;
-                    }
-                    state.save(repeat, repcount + 1);
+                    };
                     if repcount >= lo {
-                        state.save(check, ix);
                         state.push(pc + 1, ix)?;
                         pc = next;
                         continue;
@@ -1400,6 +1559,7 @@ fn run_with<S: HaystackInput + ?Sized, T>(
                     }
                     let ref_text = &haystack.as_bytes()[lo..hi];
                     let ix_end = ix + ref_text.len();
+                    spend(work, limit, ref_text.len())?;
                     if casei {
                         if !matches_literal_casei(haystack, ix, ix_end, ref_text, unicode) {
                             break 'fail;
@@ -1409,8 +1569,8 @@ fn run_with<S: HaystackInput + ?Sized, T>(
                     }
                     ix = ix_end;
                 }
-                Insn::BackrefExistsCondition(group) => {
-                    let lo = state.get(group * 2);
+                Insn::BackrefExistsCondition(slot) => {
+                    let lo = state.get(slot);
                     if lo == usize::MAX {
                         // Referenced group hasn't matched, so the backref doesn't match either
                         break 'fail;
@@ -1430,11 +1590,25 @@ fn run_with<S: HaystackInput + ?Sized, T>(
                 }) => {
                     // Use regex-automata to search backwards from current position
                     let mut cache_guard = cache_pool.get();
+                    // The search reads back from `ix` until the DFA is dead.
+                    // The range is cut one byte past the room left, so a
+                    // search that would read further stops there, is charged
+                    // more than the room, and ends the run.
+                    let room = limit.saturating_sub(*work);
                     let input = Input::new(haystack.as_bytes())
                         .anchored(Anchored::Yes)
-                        .range(0..ix);
+                        .range(ix.saturating_sub(room.saturating_add(1))..ix);
+                    let before = cache_guard.search_total_len();
+                    let clears = cache_guard.clear_count();
+                    let found = dfa.try_search_rev(&mut cache_guard, &input);
+                    let read = if cache_guard.clear_count() == clears {
+                        cache_guard.search_total_len().saturating_sub(before)
+                    } else {
+                        ix
+                    };
+                    spend(work, limit, read.max(1))?;
 
-                    match dfa.try_search_rev(&mut cache_guard, &input) {
+                    match found {
                         Ok(Some(match_result)) => {
                             // Update ix to the start position of the match
                             let match_start = match_result.offset();
@@ -1477,7 +1651,11 @@ fn run_with<S: HaystackInput + ?Sized, T>(
                     ref inner,
                     pattern: _,
                     capture_groups,
+                    ref extent,
                 }) => {
+                    let room = limit.saturating_sub(*work);
+                    let read = delegate_read(extent.as_ref(), haystack.as_bytes(), ix, room);
+                    spend(work, limit, read.max(1))?;
                     let input = Input::new(haystack.as_bytes())
                         .span(ix..haystack.len())
                         .anchored(Anchored::Yes);
@@ -1506,6 +1684,9 @@ fn run_with<S: HaystackInput + ?Sized, T>(
                     // If we reach end of string without delegate matching, we also continue
 
                     // Check if delegate matches at current position
+                    let room = limit.saturating_sub(*work);
+                    let read = delegate_read(delegate.extent.as_ref(), haystack.as_bytes(), ix, room);
+                    spend(work, limit, read.max(1))?;
                     let input = Input::new(haystack.as_bytes())
                         .span(ix..haystack.len())
                         .anchored(Anchored::Yes);
@@ -1633,10 +1814,7 @@ fn run_with<S: HaystackInput + ?Sized, T>(
             return Ok(Some(extract(state)));
         }
 
-        backtrack_count += 1;
-        if backtrack_count > options.backtrack_limit {
-            return Err(Error::RuntimeError(RuntimeError::BacktrackLimitExceeded));
-        }
+        spend(work, limit, STEP_BYTES)?;
 
         let (newpc, newix) = state.pop();
         pc = newpc;
@@ -1858,5 +2036,115 @@ mod tests {
         fn state_save_quickcheck(operations: Vec<Operation>) -> bool {
             check_saves_for_operations(operations)
         }
+    }
+
+    fn bytes_regex(pattern: &str) -> crate::fancy_regex::Regex {
+        crate::fancy_regex::RegexBuilder::new(pattern)
+            .bytes_mode(BytesMode::Ascii)
+            .build()
+            .unwrap()
+    }
+
+    const ROOM: usize = usize::MAX / 2;
+
+    /// The work, in bytes, of the search of `hay` for `pattern`, which finds
+    /// nothing.
+    fn work_of(pattern: &str, hay: &[u8]) -> usize {
+        let work = core::cell::Cell::new(ROOM);
+        let found = bytes_regex(pattern).find_input(RegexInput::new(hay).work(&work));
+        assert!(matches!(found, Ok(None)), "{found:?}");
+        ROOM - work.get()
+    }
+
+    /// A search with `room` to work with, and whether it ran out.
+    fn runs_out(pattern: &str, hay: &[u8], room: usize) -> bool {
+        let work = core::cell::Cell::new(room);
+        let found = bytes_regex(pattern).find_input(RegexInput::new(hay).work(&work));
+        match found {
+            Err(Error::RuntimeError(RuntimeError::BacktrackLimitExceeded)) => {
+                assert_eq!(work.get(), 0);
+                true
+            }
+            other => {
+                assert!(matches!(other, Ok(None)), "{other:?}");
+                false
+            }
+        }
+    }
+
+    /// `x`, a run of `n` `a`, and a byte the pattern does not want after it.
+    fn run_of(n: usize) -> Vec<u8> {
+        let mut hay = vec![b'x'];
+        hay.extend(vec![b'a'; n]);
+        hay.push(b'e');
+        hay
+    }
+
+    #[test]
+    fn a_backtrack_costs_a_step() {
+        // `b` after a lone `a` fails at each of the offsets: one backtrack each.
+        let hay = vec![b'a'; 100];
+        let work = work_of("(?<=z)a+b", &hay);
+        assert!(work >= 100 * STEP_BYTES, "{work}");
+        assert!(work < 120 * STEP_BYTES, "{work}");
+    }
+
+    /// The run is read from each offset of it that passes the lookbehind, up to
+    /// the byte that ends it: the bytes read grow with the square of the run,
+    /// the backtracks with the run.
+    #[test]
+    fn the_bytes_a_delegated_search_reads_are_work() {
+        let one = work_of("(?<=[xa])a+d", &run_of(1000));
+        let two = work_of("(?<=[xa])a+d", &run_of(2000));
+        assert!(two > 3 * one, "{one} then {two}");
+        assert!(one > 1000 * 1000 / 2, "{one}");
+    }
+
+    #[test]
+    fn a_delegated_search_that_reads_past_the_room_ends_the_search() {
+        // 2,000 backtracks are 64,000 bytes of room; the reads are some 2,000,000.
+        assert!(runs_out("(?<=[xa])a+d", &run_of(2000), 500_000));
+        assert!(!runs_out("(?<=[xa])a+d", &run_of(2000), 5_000_000));
+        assert!(!runs_out("(?<=[xa])a+d", &run_of(10), 10_000));
+    }
+
+    /// A lookbehind of no fixed length runs a DFA back from the offset.
+    #[test]
+    fn the_bytes_a_search_reads_back_are_work() {
+        let hay = |n: usize| {
+            let mut hay = vec![b'a'];
+            hay.extend(vec![b'b'; n]);
+            hay
+        };
+        let one = work_of("(?<=ab+)d", &hay(1000));
+        let two = work_of("(?<=ab+)d", &hay(2000));
+        assert!(two > 3 * one, "{one} then {two}");
+        assert!(runs_out("(?<=ab+)d", &hay(100_000), 10_000));
+    }
+
+    #[test]
+    fn the_bytes_a_back_reference_compares_are_work() {
+        // Anchored, so that the backtracks are the group giving back one
+        // byte at a time, and the bytes compared the square of the run.
+        let one = work_of(r"\A(a+)\1b", &vec![b'a'; 1000]);
+        let two = work_of(r"\A(a+)\1b", &vec![b'a'; 2000]);
+        assert!(two > 3 * one, "{one} then {two}");
+    }
+
+    #[test]
+    fn searches_that_share_a_cell_share_the_room() {
+        let re = bytes_regex("(?<=[xa])a+d");
+        let hay = run_of(100);
+        let work = core::cell::Cell::new(ROOM);
+        assert!(re.find_input(RegexInput::new(&hay[..]).work(&work)).is_ok());
+        let after_one = work.get();
+        assert!(after_one < ROOM);
+        assert!(re.find_input(RegexInput::new(&hay[..]).work(&work)).is_ok());
+        assert_eq!(ROOM - work.get(), 2 * (ROOM - after_one));
+        // What is left is what a search has to work with.
+        work.set(10);
+        assert!(re.find_input(RegexInput::new(&hay[..]).work(&work)).is_err());
+        assert_eq!(work.get(), 0);
+        assert!(re.find_input(RegexInput::new(&hay[..]).work(&work)).is_err());
     }
 }

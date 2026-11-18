@@ -1,0 +1,345 @@
+---
+// Every format of formats/registry.json in one table, built when the site is:
+// what the scanner, the extractor and the viewer do with it, the extractor's
+// code for it (formats/code.generated.json), and an example of it in the
+// viewer demo when the demo has one (crates/exav-viewer/demo/examples/
+// examples.json, matched by extension).
+import registry from '../../../formats/registry.json';
+import code from '../../../formats/code.generated.json';
+import demo from '../../../crates/exav-viewer/demo/examples/examples.json';
+
+type Format = (typeof registry.formats)[number] & { note?: string };
+type Code = { reader: string | null; crates: string[] };
+
+const REPO = 'https://github.com/sylvinus/exav';
+const codeOf = (f: Format): Code | undefined => (code.formats as Record<string, Code>)[f.id];
+/** A file, or the directory of a module in parts (its path ends with `/`). */
+const readerLink = (path: string) => `${REPO}/${path.endsWith('/') ? 'tree' : 'blob'}/main/${path}`;
+const readerName = (path: string) => path.split('/').filter(Boolean).pop();
+
+const scan: Record<string, [string, 'yes' | 'some']> = {
+  container: ['Opened, every member scanned', 'yes'],
+  view: ['Scanned with its text', 'yes'],
+  type: ['Typed, signatures applied', 'yes'],
+  none: ['Scanned as bytes', 'yes'],
+  reported: ['Recognised, reported as not examined', 'some'],
+};
+
+/** Members of an archive, parts of a document. */
+const holds = (f: Format) =>
+  ['document', 'drawing', 'image', 'media', 'text'].includes(f.kind) ? 'Its parts' : 'Its members';
+
+function extract(f: Format): [string, 'yes' | 'some' | 'no'] {
+  const read = f.unpack?.read;
+  if (!read) return ['No', 'no'];
+  if (read === 'reported') return ['Recognised, reported', 'some'];
+  const how = { stream: 'streamed', members: 'read whole, then streamed', whole: 'read whole' }[read];
+  return [`${holds(f)}, ${how}`, 'yes'];
+}
+
+function example(f: Format): string | undefined {
+  if (!f.viewer) return undefined;
+  const hit = demo.examples.find((e) => f.ext.some((x) => e.file.toLowerCase().endsWith(x)));
+  return hit && `/viewer/demo/?file=${encodeURIComponent(`example:${hit.file}`)}`;
+}
+
+for (const mode of Object.keys(registry.scanModes)) {
+  if (!scan[mode]) throw new Error(`FormatTable: no wording for the scan mode ${mode}`);
+}
+
+const kinds = Object.entries(registry.kinds).map(([kind, title]) => ({
+  kind,
+  title,
+  rows: (registry.formats as Format[]).filter((f) => f.kind === kind),
+}));
+---
+
+<div class="formats not-content">
+  <div class="filter">
+    <label for="format-filter">Find a format</label>
+    <input id="format-filter" type="search" placeholder="Name or extension, such as docx or .7z" autocomplete="off" />
+    <span class="count" aria-live="polite">{registry.formats.length} formats</span>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Format</th>
+        <th scope="col">Extensions</th>
+        <th scope="col">Malware scan</th>
+        <th scope="col">Extract</th>
+        <th scope="col">Extractor code</th>
+        <th scope="col">View</th>
+        <th scope="col">Demo</th>
+        <th scope="col">Comment</th>
+      </tr>
+    </thead>
+    {
+      kinds.map(({ title, rows }) => (
+        <tbody>
+          <tr class="kind">
+            <th colspan="8" scope="colgroup">
+              {title}
+            </th>
+          </tr>
+          {rows.map((f) => {
+            const [scanText, scanState] = scan[f.scan.mode];
+            const [unpackText, unpackState] = extract(f);
+            const link = example(f);
+            const c = codeOf(f);
+            return (
+              <tr data-find={[f.name, f.id, ...f.ext].join(' ').toLowerCase()}>
+                <th scope="row">{f.name}</th>
+                <td data-label="Extensions">
+                  <span class="ext">{f.ext.map((e) => <code>{e}</code>)}</span>
+                </td>
+                <td data-label="Malware scan" class={scanState}>{scanText}</td>
+                <td data-label="Extract" class={unpackState}>{unpackText}</td>
+                <td data-label="Extractor code">
+                  {c && (
+                    <span class="code">
+                      {c.reader && (
+                        <a href={readerLink(c.reader)}>
+                          <code>{readerName(c.reader)}</code>
+                        </a>
+                      )}
+                      {c.crates.map((n) => (
+                        <a href={`https://crates.io/crates/${n}`}>{n}</a>
+                      ))}
+                    </span>
+                  )}
+                </td>
+                <td data-label="View" class={f.viewer ? 'yes' : 'no'}>{f.viewer ? 'Yes' : 'No'}</td>
+                <td data-label="Demo">{link && <a href={link}>Open</a>}</td>
+                <td data-label="Comment" class="note">{f.note}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      ))
+    }
+  </table>
+</div>
+
+<script>
+  // Without it every row stays shown.
+  const root = document.querySelector('.formats');
+  const input = root?.querySelector<HTMLInputElement>('#format-filter');
+  const count = root?.querySelector('.count');
+  input?.addEventListener('input', () => {
+    const words = input.value.toLowerCase().split(/\s+/).filter(Boolean);
+    let shown = 0;
+    for (const body of root!.querySelectorAll('tbody')) {
+      let any = false;
+      for (const row of body.querySelectorAll<HTMLTableRowElement>('tr[data-find]')) {
+        const hit = words.every((w) => row.dataset.find!.includes(w));
+        row.hidden = !hit;
+        if (hit) any = true;
+        if (hit) shown++;
+      }
+      body.hidden = !any;
+    }
+    if (count) count.textContent = words.length ? `${shown} of ${root!.querySelectorAll('tr[data-find]').length} formats` : `${shown} formats`;
+  });
+</script>
+
+<style>
+  /* The table wants the page's whole width, not the column of prose. */
+  :global(.sl-container:has(.formats)) {
+    max-width: none;
+  }
+
+  .filter {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1rem;
+    margin-block: 1.5rem 1rem;
+  }
+
+  .filter label {
+    font-weight: 600;
+  }
+
+  .filter input {
+    flex: 1 1 16rem;
+    max-width: 28rem;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.25rem;
+    background: var(--sl-color-black);
+    color: var(--sl-color-white);
+    font: inherit;
+  }
+
+  .filter input:focus-visible {
+    outline: 2px solid var(--sl-color-text-accent);
+    outline-offset: 1px;
+  }
+
+  .count {
+    color: var(--sl-color-gray-3);
+    font-size: var(--sl-text-sm);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* The table is part of the page and its header sticks under the site's: a
+     box that scrolls would hold the header instead. Where eight columns do
+     not fit, each format is a card (below). */
+  .formats {
+    container: formats / inline-size;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--sl-text-sm);
+  }
+
+  thead th {
+    position: sticky;
+    top: var(--sl-nav-height);
+    z-index: 1;
+    background: var(--sl-color-gray-6);
+    box-shadow: inset 0 -1px 0 var(--sl-color-gray-5);
+    text-align: start;
+    white-space: nowrap;
+  }
+
+  th,
+  td {
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid var(--sl-color-gray-5);
+    text-align: start;
+    vertical-align: top;
+  }
+
+  td.yes,
+  td.some,
+  td.no {
+    min-width: 8.5rem;
+  }
+
+  tbody th[scope='row'] {
+    font-weight: 600;
+  }
+
+  tr.kind th {
+    padding-top: 1.25rem;
+    color: var(--sl-color-text-accent);
+    font-size: var(--sl-text-base);
+    text-align: start;
+  }
+
+  .ext,
+  .code {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    max-width: 16rem;
+  }
+
+  .code {
+    gap: 0.25rem 0.5rem;
+    max-width: 14rem;
+  }
+
+  .ext code,
+  .code code {
+    padding: 0.05rem 0.3rem;
+    border-radius: 0.2rem;
+    background: var(--sl-color-gray-6);
+    font-family: var(--__sl-font-mono);
+    white-space: nowrap;
+  }
+
+  a {
+    color: var(--sl-color-text-accent);
+  }
+
+  @container formats (width < 64rem) {
+    thead {
+      display: none;
+    }
+
+    table,
+    tbody,
+    tr,
+    th,
+    td {
+      display: block;
+    }
+
+    tr[data-find] {
+      display: grid;
+      grid-template-columns: 7rem 1fr;
+      padding-block: 0.6rem;
+      border-bottom: 1px solid var(--sl-color-gray-5);
+    }
+
+    tr[data-find] > * {
+      padding: 0.15rem 0;
+      border: 0;
+    }
+
+    tbody th[scope='row'] {
+      grid-column: 1 / -1;
+    }
+
+    tr.kind th {
+      padding-inline: 0;
+    }
+
+    td {
+      display: contents;
+    }
+
+    /* The label takes the place of the status dot. */
+    tr td[data-label]::before {
+      content: attr(data-label);
+      width: auto;
+      height: auto;
+      margin: 0;
+      border: 0;
+      border-radius: 0;
+      background: none;
+      color: var(--sl-color-gray-3);
+    }
+
+    td[data-label]:empty {
+      display: none;
+    }
+  }
+
+  td.yes::before,
+  td.some::before,
+  td.no::before {
+    content: '';
+    display: inline-block;
+    width: 0.5rem;
+    height: 0.5rem;
+    margin-inline-end: 0.4rem;
+    border-radius: 50%;
+    vertical-align: 0.05rem;
+  }
+
+  td.yes::before {
+    background: var(--sl-color-green);
+  }
+
+  td.some::before {
+    background: var(--sl-color-orange);
+  }
+
+  td.no {
+    color: var(--sl-color-gray-3);
+  }
+
+  td.no::before {
+    border: 1px solid var(--sl-color-gray-4);
+  }
+
+  .note {
+    min-width: 14rem;
+    color: var(--sl-color-gray-2);
+  }
+</style>

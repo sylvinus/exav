@@ -36,8 +36,19 @@ impl Drop for Parsed<'_> {
     }
 }
 
+/// Why a multipart that was not taken apart is reported.
+pub const MULTIPART_NOT_FOUND: &str =
+    "email: multipart whose parts were not found, its body read as one part";
+
 /// A leaf of a message: its name, its part, and its bytes.
 type Leaf<'a> = (String, &'a MessagePart<'a>, &'a [u8]);
+
+/// Whether a leaf calls itself a multipart: the parser found no delimiter of
+/// its boundary, or no boundary, and left its body as one part.
+fn is_lost_multipart(part: &MessagePart<'_>) -> bool {
+    part.content_type()
+        .is_some_and(|ct| ct.ctype().eq_ignore_ascii_case("multipart"))
+}
 
 /// The leaves of `msg` and of the messages attached to it, in order, named by
 /// where they are: `email-part-3` and, in the message that is part 3,
@@ -71,13 +82,16 @@ fn leaves<'a>(msg: &'a Message<'_>) -> Result<Vec<Leaf<'a>>, LimitHit> {
 }
 
 /// The boundaries of the multiparts in `msg` and in the messages attached to
-/// it, outer first.
+/// it, outer first. A multipart the parser found no delimiter of is a leaf,
+/// not one of them: closing it would give it a delimiter and no parts.
 fn boundaries(msg: &Message<'_>) -> Vec<String> {
     let mut out = Vec::new();
     let mut pending: Vec<&Message<'_>> = vec![msg];
     while let Some(m) = pending.pop() {
         for part in &m.parts {
-            if let Some(b) = part.content_type().and_then(|ct| ct.attribute("boundary")) {
+            if matches!(part.body, PartType::Multipart(_))
+                && let Some(b) = part.content_type().and_then(|ct| ct.attribute("boundary"))
+            {
                 out.push(b.to_string());
             }
             if let PartType::Message(inner) = &part.body {
@@ -116,9 +130,9 @@ fn missing_closings(msg: &Message<'_>, data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The text of a base64 or quoted-printable part the parser could not decode,
-/// decoded as far as it goes: every byte outside the alphabet is skipped, as the
-/// mail readers that show such a part do.
+/// The bytes of a base64 part the parser could not decode, decoded as the
+/// streamed reader decodes a body (`LenientBase64`), as the mail readers that
+/// show such a part do.
 fn lenient_decode(part: &MessagePart<'_>) -> Option<Vec<u8>> {
     if !part.is_encoding_problem {
         return None;
@@ -144,24 +158,56 @@ fn lenient_decode(part: &MessagePart<'_>) -> Option<Vec<u8>> {
         _ => return None,
     };
     let mut out = Vec::with_capacity(raw.len() / 4 * 3);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for &c in raw {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            _ => continue,
-        };
-        acc = (acc << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
+    super::email_stream::LenientBase64::default().feed(raw, &mut out);
+    Some(out)
+}
+
+/// `data` with the line breaks removed that fold a `Content-Type` or
+/// `Content-Disposition` header next to the `=` of a parameter (`boundary=`,
+/// a break, then `"x"`). The parser reads no value after such a fold, and a
+/// multipart with no boundary is not taken apart. `None` when there is no such
+/// fold. A line of a body that looks like such a header is changed the same
+/// way.
+fn unfold_parameters(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out: Option<Vec<u8>> = None;
+    let mut copied = 0;
+    // The line being read is, or continues, one of those headers.
+    let mut structured = false;
+    // The last line: where it starts, and where its break does.
+    let (mut prev_start, mut prev_break) = (0, 0);
+    let mut at = 0;
+    while at < data.len() {
+        let end = data[at..]
+            .iter()
+            .position(|&c| c == b'\n')
+            .map_or(data.len(), |p| at + p + 1);
+        let line = &data[at..end];
+        if matches!(line.first(), Some(b' ' | b'\t')) {
+            let prev_ends = data[prev_start..prev_break].trim_ascii_end().last();
+            let starts = line.trim_ascii_start().first();
+            if structured && (prev_ends == Some(&b'=') || starts == Some(&b'=')) {
+                let out = out.get_or_insert_with(Vec::new);
+                out.extend_from_slice(&data[copied..prev_break]);
+                copied = at;
+            }
+        } else {
+            let head = |name: &[u8]| {
+                line.len() >= name.len() && line[..name.len()].eq_ignore_ascii_case(name)
+            };
+            structured = head(b"content-type:") || head(b"content-disposition:");
         }
+        prev_start = at;
+        prev_break = if line.ends_with(b"\r\n") {
+            end - 2
+        } else if line.ends_with(b"\n") {
+            end - 1
+        } else {
+            end
+        };
+        at = end;
     }
+    let mut out = out?;
+    out.extend_from_slice(&data[copied..]);
     Some(out)
 }
 
@@ -169,20 +215,33 @@ fn lenient_decode(part: &MessagePart<'_>) -> Option<Vec<u8>> {
 /// parser), so attachments and bodies are scanned, those of attached messages
 /// too.
 ///
-/// Three things a mail reader shows that the parser leaves out are added: the
-/// last part of a multipart nothing closed, a base64 part with a stray byte in
-/// it (read as far as it decodes), and a file uuencoded into a text part.
-pub(crate) fn extract_email<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+/// Four things are added to what the parser gives. Three are what a mail
+/// reader shows: the last part of a multipart nothing closed, a base64 part
+/// with a stray byte in it (read as far as it decodes), and a file uuencoded
+/// into a text part. The fourth is a report: a multipart the parser found no
+/// delimiter of is handed over as one part, and says so.
+pub(crate) fn extract_email(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     fn parse(bytes: &[u8]) -> Result<Message<'_>, LimitHit> {
         MessageParser::default()
             .parse(bytes)
-            .ok_or_else(|| LimitHit::new("email: parse failed".to_string()))
+            .ok_or_else(|| LimitHit::corrupt("email: parse failed".to_string()))
     }
     let first = Parsed(Some(parse(data)?));
+    // A fold next to the `=` of a boundary hides it from the parser: read the
+    // message again with the fold removed, if it was a multipart the parser
+    // could not take apart.
+    let unfolded = if leaves(&first)?.iter().any(|l| is_lost_multipart(l.1)) {
+        unfold_parameters(data)
+    } else {
+        None
+    };
+    let (data, first) = match &unfolded {
+        Some(bytes) => {
+            drop(first);
+            (bytes.as_slice(), Parsed(Some(parse(bytes)?)))
+        }
+        None => (data, first),
+    };
     let closings = missing_closings(&first, data);
     let completed;
     let msg = if closings.is_empty() {
@@ -192,21 +251,27 @@ pub(crate) fn extract_email<R>(
         drop(first);
         Parsed(Some(parse(&completed)?))
     };
-    let mut entries: Vec<(String, std::borrow::Cow<'_, [u8]>)> = Vec::new();
+    type Held<'a> = (String, std::borrow::Cow<'a, [u8]>, Option<&'static str>);
+    let mut entries: Vec<Held<'_>> = Vec::new();
     for (name, part, bytes) in leaves(&msg)? {
         if let Some(decoded) = lenient_decode(part) {
-            entries.push((format!("{name}-decoded"), decoded.into()));
+            entries.push((format!("{name}-decoded"), decoded.into(), None));
         }
-        entries.push((name, bytes.into()));
+        let lost = is_lost_multipart(part) && !bytes.trim_ascii().is_empty();
+        entries.push((name, bytes.into(), lost.then_some(MULTIPART_NOT_FOUND)));
     }
-    for (name, bytes) in entries {
+    for (name, bytes, unsupported) in entries {
         budget.count_entry()?;
         let cap = budget.reserve()?;
         if bytes.len() as u64 > cap {
-            return Err(LimitHit::new("email part exceeds budget".to_string()));
+            let name = crate::tree::quoted(&name);
+            budget.over_cap(cap, bytes.len() as u64, format_args!("email part '{name}'"))?;
+            continue;
         }
         budget.commit(bytes.len() as u64);
-        if let Some(r) = visit(Entry::new(name.clone(), bytes.to_vec()), budget) {
+        let mut entry = Entry::new(name, bytes.to_vec());
+        entry.unsupported = unsupported;
+        if let Some(r) = visit(entry, budget) {
             return Ok(Some(r));
         }
         // A file uuencoded into the text, as old mailers sent attachments.

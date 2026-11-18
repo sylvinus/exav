@@ -24,8 +24,19 @@
 # `cvdupdate` directory). Cisco's database.clamav.net serves only freshclam and
 # cvdupdate, and blocks other clients.
 
+# Both containers run as the image's non-root user with a read-only root
+# filesystem, no capabilities and no privilege escalation. A new named volume
+# mounted at a path the image owns starts out owned by 65532. To reuse a volume
+# a root process filled, see "A volume that root filled" in the Docker guide.
+x-hardening: &hardening
+  user: "65532:65532"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
 services:
   exav:
+    <<: *hardening
     image: ghcr.io/sylvinus/exav:latest
     ports:
       # clamd-compatible; `clamdscan --stream` over TCP works. Published on
@@ -33,6 +44,13 @@ services:
       - "127.0.0.1:3310:3310"
     volumes:
       - exav-db:/var/lib/exav
+      # Where an object larger than the spill threshold (16M) waits while it is
+      # scanned; the root filesystem is read-only. Each file is unlinked as soon
+      # as it is created. To keep them off disk, replace this line with
+      # `tmpfs: ["/tmp:size=4g"]` on the service: a tmpfs counts against the
+      # container's memory, so size it as the Docker guide's --read-only
+      # section says.
+      - exav-spill:/tmp
     # The image's HEALTHCHECK, said here too: podman ignores it on an image
     # that does not carry Docker mediatypes (older tags, or a registry that
     # re-exports as OCI).
@@ -45,6 +63,7 @@ services:
     restart: unless-stopped
 
   updater:
+    <<: *hardening
     image: ghcr.io/sylvinus/exav:latest
     # Fetch into the shared volume and nothing else. "Updater" is not a flag:
     # it is --auto-update with no listener, so the two halves cannot disagree.
@@ -63,3 +82,4 @@ services:
 
 volumes:
   exav-db:
+  exav-spill:

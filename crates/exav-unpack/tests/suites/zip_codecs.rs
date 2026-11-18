@@ -1,6 +1,6 @@
 //! ZIP members compressed with a codec the `zip` crate itself can't decode
 //! (LZMA method 14, BZIP2 method 12) must still be decompressed by exav's own
-//! decoders and scanned — a payload behind an exotic codec must not hide. And one
+//! decoders and scanned: a payload behind an exotic codec must not hide. And one
 //! undecodable member must never abort the whole archive.
 
 use exav_unpack::{Budget, Format, Limits, extract};
@@ -76,7 +76,7 @@ fn zip_lzma_member_is_decoded_once_when_streamed() {
 }
 
 /// Dual indexing: a member present only as a Local File Header (not in the
-/// central directory) must still be extracted — this defeats central/local
+/// central directory) must still be extracted: this defeats central/local
 /// mismatch hiding.
 #[test]
 fn zip_orphan_local_header_is_scanned() {
@@ -94,7 +94,7 @@ fn zip_orphan_local_header_is_scanned() {
 }
 
 /// An encrypted ZIP using a common malware-distribution password ("infected")
-/// is cracked with NO caller-supplied password — exav's built-in default list.
+/// is cracked with NO caller-supplied password, from exav's built-in default list.
 #[test]
 #[cfg(feature = "decrypt")]
 fn zip_default_password_infected_is_cracked() {
@@ -109,7 +109,7 @@ fn zip_default_password_infected_is_cracked() {
 }
 
 /// A ZIP whose central directory is missing/corrupt (no EOCD) must NOT error as
-/// LimitsExceeded — exav falls back to the local-header scan and salvages the
+/// LimitsExceeded: exav falls back to the local-header scan and salvages the
 /// member, so a payload in a forged/truncated archive is still found. (Regression
 /// from the diff campaign: such files were mislabeled `LIMITS-EXCEEDED`.)
 #[test]
@@ -141,7 +141,7 @@ fn zip_corrupt_central_dir_salvages_local_member() {
 }
 
 /// A ZIP member compressed with XZ (method 95) must be decoded via exav's own
-/// xz decoder and scanned — the `zip` crate can't handle it.
+/// xz decoder and scanned: the `zip` crate can't handle it.
 #[test]
 #[cfg(feature = "xz")]
 fn zip_xz_member_is_decoded() {
@@ -594,6 +594,32 @@ fn orphan_stored_member_is_extracted() {
     assert!(e.iter().any(|x| x.name == "hidden.txt"));
 }
 
+/// An orphan said to be over the room is read when what it says is not all in
+/// the file: a stored one is the bytes it stores, one of a made-up method
+/// read as stored is what of it is here, and so is one the file ends inside
+/// (the first volume of a split archive).
+#[test]
+fn an_orphan_said_over_the_room_is_read_when_that_is_not_in_the_file() {
+    use std::io::Write;
+    let stored = lfh_sized("a.txt", 0, EICAR, 1 << 30);
+    assert!(any_has_eicar(&orphan_entries(&stored)), "stored");
+    let made_up = lfh_sized("a.txt", 47506, EICAR, 1 << 30);
+    assert!(any_has_eicar(&orphan_entries(&made_up)), "made-up method");
+    // What of it is here over the room is that limit.
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 16;
+    let e = extract(Format::Zip, &made_up, &mut Budget::new(limits)).unwrap();
+    let why = e.iter().find(|x| x.name == "a.txt");
+    let why = why.and_then(|x| x.unsupported);
+    assert_eq!(why, Some("orphan zip member exceeds size budget"), "{e:?}");
+    let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+    e.write_all(EICAR).unwrap();
+    let deflated = e.finish().unwrap();
+    let mut cut = lfh("a.txt", 8, 0, &deflated, Some(deflated.len() as u32 + 4096));
+    cut[22..26].copy_from_slice(&(1u32 << 30).to_le_bytes());
+    assert!(any_has_eicar(&orphan_entries(&cut)), "cut");
+}
+
 #[test]
 fn orphan_encrypted_member_is_reported_not_dropped() {
     // Flag bit 0 set: encrypted. The orphan path has no central-directory CRC to
@@ -630,7 +656,7 @@ fn orphan_unsupported_codec_is_reported_not_dropped() {
 #[test]
 fn orphan_member_with_a_nonsense_method_is_read_as_stored() {
     // Method 47506 is in no version of APPNOTE. Live APK packers stamp exactly
-    // this on `AndroidManifest.xml` — together with a corrupt central directory,
+    // this on `AndroidManifest.xml`, together with a corrupt central directory,
     // so the member is reachable only through the orphan scan. Gating that scan on
     // a recognised method drops the one member the packer went to the trouble of
     // hiding, and the archive then scans clean. Android reads such a member as
@@ -655,7 +681,7 @@ fn a_chance_signature_with_a_nonsense_method_is_still_rejected() {
     // The counterweight to the test above: with the method no longer decisive, the
     // name is what separates a member from four bytes that happened to spell
     // `PK\x03\x04`. A name of raw binary corroborates nothing, so the header must
-    // still be refused — otherwise every ordinary file carrying those bytes turns
+    // still be refused, otherwise every ordinary file carrying those bytes turns
     // unscannable.
     let e = orphan_entries(&lfh("\u{1}\u{2}\u{1b}\u{7f}", 47506, 0, b"junk", None));
     assert!(
@@ -759,7 +785,7 @@ fn chance_pk34_bytes_are_not_treated_as_members() {
 }
 
 /// A member whose local header defers its sizes to a trailing data descriptor
-/// must still be carved and scanned — on a live corpus this was the single
+/// must still be carved and scanned: on a live corpus this was the single
 /// biggest source of UNSCANNABLE, i.e. the most content exav declined to look at.
 #[test]
 fn orphan_streaming_member_with_data_descriptor_is_recovered() {
@@ -814,7 +840,7 @@ fn orphan_streaming_member_without_a_descriptor_falls_back_to_the_next_header() 
 #[test]
 fn orphan_stored_member_with_deferred_size_is_reported_not_guessed() {
     // A STORED member has no self-terminating stream, so without a descriptor
-    // there is no honest way to know where it ends — guessing would absorb the
+    // there is no honest way to know where it ends: guessing would absorb the
     // following headers into its content. Must be reported, not invented.
     let blob = lfh("stored.bin", 0, 0x0008, b"", Some(0));
     let e = orphan_entries(&blob);
@@ -1237,6 +1263,29 @@ fn orphan_member_cut_off_by_the_end_of_the_file_is_decoded_not_reported() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// An LZMA member cut off by the end of the file gives every byte 7-Zip
+/// gives, with no slack: the decoder hands over the symbols of the last bytes
+/// present too, which a sans-I/O decoder keeps back.
+#[test]
+#[cfg(feature = "lzip")]
+fn an_lzma_member_cut_off_by_the_end_of_the_file_gives_what_7zip_gives() {
+    let zip = fixture("cut_lzma.zip");
+    let (start, comp) = first_member(&zip);
+    let content = cut_content(false);
+    let (clean, found) = CUT_7ZIP[4];
+    for (pct, oracle) in [(CUT_CLEAN, clean), (CUT_FOUND, found)] {
+        let got = orphan_entries(&zip[..start + comp * pct / 100]);
+        let [e] = &got[..] else {
+            panic!("cut at {pct}%: {:?}", entry_summary(&got));
+        };
+        assert!(
+            e.unsupported.is_none() && content.starts_with(&e.data) && e.data.len() >= oracle,
+            "cut at {pct}%: {} bytes, 7-Zip {oracle}",
+            e.data.len()
+        );
+    }
+}
+
 /// Damage part way through a member, with the rest of it after the damage, is
 /// reported: those bytes are present and were not decoded. Stored data has no
 /// structure to damage. The deflate decoders do not see this damage and
@@ -1318,7 +1367,7 @@ fn zip_ppmd_member_is_decoded() {
 }
 
 /// A deflate member that decompresses past the per-member budget must be
-/// reported as metadata-only, not returned as its truncated prefix — a prefix
+/// reported as metadata-only, not returned as its truncated prefix: a prefix
 /// reads as a complete member and would be scanned, and found clean, on partial
 /// content.
 #[test]
@@ -1344,4 +1393,32 @@ fn orphan_member_over_the_size_budget_is_reported_not_truncated() {
             m.data.len()
         );
     }
+}
+
+/// A member of a method APPNOTE defines and nothing here decodes (16, IBM
+/// z/OS CMPSC), listed in the central directory, is reported as a method not
+/// decoded. The member after it is still reached.
+#[test]
+fn a_defined_method_nothing_decodes_is_reported_as_unsupported() {
+    use exav_unpack::tree::ReasonKind;
+    let blob = zip_of(&[
+        ("packed.bin", 16, b"\x01\x02\x03\x04", 0, 4),
+        (
+            "after.txt",
+            0,
+            SMALL_MEMBER,
+            crc(SMALL_MEMBER),
+            SMALL_MEMBER.len() as u32,
+        ),
+    ]);
+    let entries = extract(Format::Zip, &blob, &mut Budget::new(Limits::default())).unwrap();
+    let packed = entries.iter().find(|e| e.name == "packed.bin").unwrap();
+    assert!(packed.data.is_empty(), "{packed:?}");
+    assert_eq!(
+        packed.unsupported,
+        Some("unsupported zip compression method")
+    );
+    assert_eq!(packed.reason_kind, Some(ReasonKind::Unsupported));
+    let after = entries.iter().find(|e| e.name == "after.txt").unwrap();
+    assert_eq!(after.data, SMALL_MEMBER);
 }

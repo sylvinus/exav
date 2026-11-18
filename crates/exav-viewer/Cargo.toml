@@ -13,7 +13,7 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# Nine modules are built from this crate, one per feature, so that a page
+# Eleven modules are built from this crate, one per feature, so that a page
 # downloads only the engine of what it opens (`scripts/build-wasm.sh`).
 [features]
 default = []
@@ -23,12 +23,17 @@ image = ["exav-render/image", "exav-render/webp", "exav-render/ico", "exav-rende
 dwg = ["exav-render/dwg"]
 # IFC, STL, OBJ, PLY and glTF models, meshed.
 model = ["exav-render/ifc", "exav-render/stl", "exav-render/obj", "exav-render/ply", "exav-render/gltf"]
-# Markdown, read into a tree of blocks and inlines.
-text = ["exav-render/markdown"]
+# Markdown, read into a tree of blocks and inlines; JSON and XML indented and a
+# diff's lines marked; and how a file's bytes are read as text by exav-unpack's
+# rule (encoding and binary check; the page decodes).
+text = ["exav-render/markdown", "exav-render/text-view", "dep:exav-unpack", "exav-unpack/text"]
 # XLS, ODS, FODS and Numbers, converted to XLSX for the spreadsheet engine.
 sheets = ["exav-render/office-sheets"]
 # PPT, ODP, FODP and Keynote, converted to PPTX for the presentation engine.
 slides = ["exav-render/office-slides"]
+# CSV and TSV, converted to XLSX for the spreadsheet engine (the reader of the
+# encoding and the separator, and the XLSX writer, none of the workbook readers).
+table = ["exav-render/office-csv"]
 # DOC, ODT, FODT and RTF, converted to DOCX for the document engine (opt-in:
 # `converter: "exav"`).
 docs = ["exav-render/office-docs"]
@@ -37,10 +42,30 @@ pdf-jpx = ["exav-render/jp2"]
 # pdf.js's JBIG2Decode and CCITTFaxDecode decoder, in place of PDFium's
 # (jbig2_nowasm_fallback.js). One module, as pdf.js loads one for both.
 pdf-jbig2 = ["exav-render/jbig2", "exav-render/ccitt"]
+# What a file is, from its first bytes, by exav's own detection (exav-unpack's
+# for containers, PDF, RTF, DXF and DWG, exav-render's for images and for the
+# PLY, GLB and IFC models; only the detectors are reached, the readers and
+# decoders are not linked), and a ZIP's
+# central directory, read by exav-unpack's ZIP reader from the last bytes of
+# the file, for the Office page and for the limits on a ZIP's directory; and
+# which Office formats a compound file, a ZIP or a PowerPoint 2 to 4 file is
+# (exav-unpack's compound file reader and BinHex header).
+sniff = [
+    "dep:exav-unpack", "exav-unpack/zip", "exav-unpack/text", "exav-unpack/chm",
+    "exav-unpack/tnef", "exav-unpack/rtf", "exav-unpack/dxf", "exav-unpack/dwg", "exav-unpack/iso",
+    "exav-unpack/arc", "exav-unpack/ole", "exav-unpack/binhex",
+    "exav-render/ifc", "exav-render/ply", "exav-render/gltf",
+    "exav-render/image", "exav-render/webp", "exav-render/ico", "exav-render/pnm", "exav-render/qoi", "exav-render/dds", "exav-render/ff", "exav-render/hdr", "exav-render/jp2", "exav-render/jbig2", "exav-render/jxl", "exav-render/raw",
+]
 
 [dependencies]
 exav-render = { path = "../exav-render", version = "0.0.3", default-features = false }
+exav-unpack = { path = "../exav-unpack", version = "0.0.3", default-features = false, optional = true }
 wasm-bindgen = "=0.2.129"
+
+# The compound files of the sniff module's tests.
+[dev-dependencies]
+exav-unpack = { path = "../exav-unpack", version = "0.0.3", default-features = false, features = ["test-util"] }
 
 # zenjxl-decoder reads `std::time::Instant` for every frame, which panics on
 # this target: the copy here reads a clock that says zero there, and is the

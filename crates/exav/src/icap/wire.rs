@@ -52,7 +52,7 @@ impl IcapMethod {
 }
 
 /// A parsed ICAP request head: the request line plus the ICAP headers. The
-/// encapsulated HTTP message is not part of this — it is read separately, using
+/// encapsulated HTTP message is not part of this: it is read separately, using
 /// the offsets in [`RequestHead::encapsulated`].
 #[derive(Debug, Clone)]
 pub(super) struct RequestHead {
@@ -67,8 +67,8 @@ pub(super) struct RequestHead {
 /// so one absurd line is rejected before it is accumulated.
 const MAX_LINE: usize = 16 * 1024;
 
-/// Read one ICAP head — everything up to and including the blank line that ends
-/// it — from `r`, refusing to buffer more than `max` bytes.
+/// Read one ICAP head (everything up to and including the blank line that ends
+/// it) from `r`, refusing to buffer more than `max` bytes.
 ///
 /// `Ok(None)` means the client closed the connection cleanly between requests,
 /// which is how a keep-alive connection normally ends and is not an error.
@@ -203,8 +203,8 @@ impl RequestHead {
 
     /// The `Preview` size, or `None` when the client sent no preview.
     ///
-    /// The number itself is not what drives the read — the preview body is
-    /// chunked and ends with its own terminator — but a value that is not a
+    /// The number itself is not what drives the read (the preview body is
+    /// chunked and ends with its own terminator), but a value that is not a
     /// plain decimal number means the head was not produced by an ICAP client,
     /// so it is an error rather than a shrug.
     pub(super) fn preview(&self) -> Result<Option<usize>, ParseError> {

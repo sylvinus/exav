@@ -1,4 +1,4 @@
-//! Structural validation of image formats — ClamAV's `Heuristics.Broken.Media.*`
+//! Structural validation of image formats: ClamAV's `Heuristics.Broken.Media.*`
 //! family, reported under `--alert-broken-media`.
 //!
 //! The premise is that a decoder is forgiving and a parser is not. Every viewer

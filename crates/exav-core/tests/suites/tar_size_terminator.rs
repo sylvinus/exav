@@ -1,17 +1,17 @@
 //! POSIX lets a tar header's size field end in NUL, in a space, or in both, and
 //! writers disagree. Every terminator a real writer emits must parse.
 //!
-//! This is asserted through `analyze` rather than through the unpacker's
-//! `extract`, deliberately. There are TWO tar readers in the tree: `formats::tar`
-//! (backed by the `tar` crate) serves the buffered `extract` path that
-//! `exav-unpack list` uses, while the SCAN path streams and goes through
-//! `parse_tar_headers`. Only the second one had the defect, so a test written
-//! against `extract` passes while the scanner sees nothing — which is exactly how
-//! this survived: listing a broken archive showed every member correctly.
+//! This is asserted through `analyze` as well as through the unpacker's
+//! `extract`, deliberately. There were two tar readers in the tree: the `tar`
+//! crate served the buffered `extract` path that `exav-unpack list` uses, while
+//! the scan path went through a header walk of its own. Only the second one had
+//! the defect, so a test written against `extract` passed while the scanner saw
+//! nothing, which is how this survived: listing a broken archive showed every
+//! member correctly. Both paths now go through `formats::tar`.
 //!
 //! The failure was total and silent. An unparseable size ends the header walk, so
 //! a first-member failure yields zero members and the archive scans as an empty
-//! tar — clean. Every npm package tarball is written by node-tar, which uses the
+//! tar, clean. Every npm package tarball is written by node-tar, which uses the
 //! space-then-NUL form.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze};
@@ -61,10 +61,10 @@ fn tar_with_size_terminator(name: &str, body: &[u8], size_field: &str) -> Vec<u8
 /// tar into a `.tgz` does not help either: the decompressed bytes are scanned
 /// raw as well, and the payload is verbatim in those. Both versions passed
 /// against the unfixed parser. Only a member that is ITSELF compressed forces
-/// the walk — the payload cannot be reached without extracting the member.
+/// the walk: the payload cannot be reached without extracting the member.
 /// The payload is padded with a long compressible run before being gzipped.
 /// Deflate emits a STORED block for 68 bytes on their own, which leaves the
-/// signature sitting in the clear inside the "compressed" member — the guard in
+/// signature sitting in the clear inside the "compressed" member; the guard in
 /// `finds_eicar` catches that, and the padding is what makes the block actually
 /// compress.
 fn gz(payload: &[u8]) -> Vec<u8> {
@@ -136,13 +136,12 @@ fn a_size_field_terminated_by_a_space_alone_is_parsed() {
     );
 }
 
-/// The two tar readers must agree.
+/// The buffered and the streaming paths must agree.
 ///
-/// `formats::tar` (the `tar` crate) serves the buffered `extract` path that
-/// `exav-unpack list` uses; the SCAN path streams through `parse_tar_headers`.
-/// Only the second one had the size-terminator defect, so listing an affected
-/// archive showed every member correctly while the scanner saw none — the
-/// diagnostic tool actively contradicted the bug.
+/// When they had a reader each, only the streaming one had the
+/// size-terminator defect, so listing an affected archive showed every member
+/// correctly while the scanner saw none: the diagnostic tool contradicted the
+/// bug.
 ///
 /// Pinning them together is what stops the next divergence hiding the same way.
 #[test]
@@ -178,7 +177,7 @@ fn both_tar_readers_see_the_same_members() {
         );
         assert!(
             found_by_scan,
-            "{label}: the streaming reader disagrees with the buffered one — \
+            "{label}: the streaming reader disagrees with the buffered one: \
              `exav-unpack list` would show this member while a scan misses it"
         );
     }

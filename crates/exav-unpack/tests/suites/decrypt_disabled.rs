@@ -1,12 +1,12 @@
 //! Without the `decrypt` feature, encrypted members are reported unsupported and
-//! never decrypted (the cipher stack isn't compiled in) — the same as when no
+//! never decrypted (the cipher stack isn't compiled in): the same as when no
 //! password is supplied, and never a silent clean. Compiled/run only in a
 //! no-decrypt build: `cargo test -p exav-unpack --no-default-features --features zip`.
 use exav_unpack::{Budget, Format, Limits, extract};
 
 #[test]
 fn encrypted_zip_is_unsupported_without_decrypt() {
-    // Both WinZip-AES and legacy ZipCrypto members, with a password supplied —
+    // Both WinZip-AES and legacy ZipCrypto members, with a password supplied,
     // which must be ignored, because there is no cipher stack to use it.
     for data in [
         &include_bytes!("../fixtures/encrypted/zip_aes256_store.zip")[..],

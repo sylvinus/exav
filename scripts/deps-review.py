@@ -158,14 +158,14 @@ class Graph:
 _BLOCK = re.compile(r"/\*.*?\*/", re.S)
 _LINE = re.compile(r"//.*$", re.M)
 _UNSAFE = re.compile(r"\bunsafe\b")
-_FORBID = re.compile(r"#!\[(?:forbid|deny)\(\s*unsafe_code\s*\)\]")
+_FORBID = re.compile(r"#!\[(forbid|deny)\(\s*unsafe_code\s*\)\]")
 _GATED = re.compile(r"#!\[cfg_attr\(([^\]]*?),\s*(?:forbid|deny)\(\s*unsafe_code\s*\)\s*\)\]", re.S)
 
 
 def unsafe_uses(pkg):
     """(count of the `unsafe` keyword in src/ with comments stripped, how it is forbidden).
 
-    The second is "", "forbid", or "forbid when <cfg>" for a crate that forbids
+    The second is "", "forbid", "deny", or "forbid when <cfg>" for a crate that forbids
     it only under a condition (its SIMD feature off): then the count is code
     that may not be compiled in.
     """
@@ -181,8 +181,9 @@ def unsafe_uses(pkg):
         text = _LINE.sub("", _BLOCK.sub("", text))
         n += len(_UNSAFE.findall(text))
         if f.name in ("lib.rs", "main.rs"):
-            if _FORBID.search(text):
-                note = "forbid"
+            if m := _FORBID.search(text):
+                # A module can allow what `deny` refuses, not what `forbid` does.
+                note = m.group(1)
             elif not note and (g := _GATED.search(text)):
                 note = "forbid when " + " ".join(g.group(1).split())
     return n, note
@@ -332,7 +333,7 @@ def upstream_latest(net, entry):
 
 
 def declared_pins(manifests):
-    """Every `=` requirement in a manifest: {(crate): {manifests}}."""
+    """Every `=` requirement or upper bound (`<`) in a manifest: {(crate): {manifests}}."""
     pins = {}
     for path in manifests:
         t = tomllib.loads(path.read_text())
@@ -343,7 +344,7 @@ def declared_pins(manifests):
         for tab in tables:
             for key, spec in tab.items():
                 req = spec if isinstance(spec, str) else spec.get("version", "")
-                if isinstance(req, str) and req.startswith("="):
+                if isinstance(req, str) and (req.startswith("=") or "<" in req):
                     name = spec.get("package", key) if isinstance(spec, dict) else key
                     pins.setdefault(name, set()).add(str(path.relative_to(ROOT)))
     return pins
@@ -405,7 +406,7 @@ def report_register(net, reg):
         else:
             status = "ok"
         rows.append((f"`{name}`", where, status))
-    print("### Pins (`=` requirements)\n")
+    print("### Pins (`=` requirements and upper bounds)\n")
     print(table(["crate", "manifests", "register"], [r for r in rows if r[2] != "ok"] or [("all pins are in the register", "", "")]))
 
     print("### Patches (`[patch]`)\n")
@@ -422,13 +423,18 @@ def report_register(net, reg):
     for v in reg.get("vendored", []):
         up = upstream_latest(net, v) if v.get("track", "none") != "none" else None
         ours = v.get("version", "unrecorded")
+        reviewed = v.get("reviewed")
+        # The release `up` names, before its date.
+        up_release = up.split()[0].lstrip("v") if up else None
         flag = ""
         if not Path(ROOT / v["path"]).exists():
             flag = "**path is gone**"
         elif ours == "unrecorded":
             flag = "record the upstream version"
+        elif reviewed and up_release == reviewed.lstrip("v"):
+            flag = f"reviewed at {reviewed}: nothing to take"
         elif up and not up.lstrip("v").startswith(ours):
-            flag = "upstream moved"
+            flag = "upstream moved" + (f" past the review at {reviewed}" if reviewed else "")
         rows.append((f"`{v['path']}`", v["upstream"], ours, up or "not tracked", v["kind"], flag))
     print(table(["where", "upstream", "vendored", "upstream now", "kind", "flag"], rows))
 

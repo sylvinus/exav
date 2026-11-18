@@ -53,7 +53,7 @@ impl Node {
     /// assignment of the unknowns can satisfy the expression, so a caller may
     /// safely skip evaluating those (expensive) subsigs. Unknowns appearing in
     /// multiple leaves are treated independently (an over-approximation), so the
-    /// result can be a false "possible" but never a false "impossible" — pruning
+    /// result can be a false "possible" but never a false "impossible": pruning
     /// stays FN-safe.
     pub(super) fn can_be_true(
         &self,
@@ -275,8 +275,8 @@ impl Parser<'_> {
         }
         self.i += 1;
         // Discard everything up to the next operator. The suffix is not always
-        // numeric — two live `.lnk` signatures carry the *header bytes* they
-        // match on there (`0:4C202020011402`) — so stopping at the first
+        // numeric: two live `.lnk` signatures carry the *header bytes* they
+        // match on there (`0:4C202020011402`), so stopping at the first
         // non-digit would leave the rest of it to be parsed as an expression.
         while !matches!(self.peek(), None | Some(b'&' | b'|' | b')')) {
             self.i += 1;
@@ -305,8 +305,8 @@ impl Parser<'_> {
         let x = self.count()?;
         if self.peek() == Some(b',') {
             self.i += 1;
-            // A trailing comma with no second count — `0=2,&1&2` in
-            // `Unix.Trojan.Elknot-2` — is tolerated and means the same as no
+            // A trailing comma with no second count (`0=2,&1&2` in
+            // `Unix.Trojan.Elknot-2`) is tolerated and means the same as no
             // comma at all.
             return Some((x, self.count()));
         }
@@ -362,7 +362,7 @@ mod tests {
     }
 
     /// A `:`-suffixed subsignature reference means the number before the colon,
-    /// and the reference stays live. Established against clamscan, not guessed —
+    /// and the reference stays live. Established against clamscan, not guessed:
     /// see [`Parser::skip_colon_suffix`].
     #[test]
     fn a_colon_suffix_on_a_subsig_reference_is_discarded() {

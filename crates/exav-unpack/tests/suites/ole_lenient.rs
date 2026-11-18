@@ -1,5 +1,5 @@
-//! A compound file (OLE2/CFB) whose directory red-black tree is malformed — e.g.
-//! sibling entries whose names violate the required ordering — is rejected
+//! A compound file (OLE2/CFB) whose directory red-black tree is malformed (e.g.
+//! sibling entries whose names violate the required ordering) is rejected
 //! outright by a strict CFB reader, so a naive implementation would report the
 //! whole document "not fully scanned". Many real Office documents and OLE-based
 //! malware carry exactly this defect. exav falls back to a lenient flat
@@ -26,7 +26,7 @@ fn any_has_eicar(entries: &[exav_unpack::Entry]) -> bool {
 #[test]
 fn strict_cfb_reader_rejects_the_fixture() {
     let blob = fixture("malformed_dir_order.ole");
-    // The strict reader must fail — otherwise this test wouldn't exercise the
+    // The strict reader must fail, otherwise this test wouldn't exercise the
     // lenient fallback at all.
     let res = cfb::CompoundFile::open(std::io::Cursor::new(blob));
     assert!(

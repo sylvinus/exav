@@ -1,4 +1,4 @@
-//! VHDX — the modern Windows virtual disk.
+//! VHDX: the modern Windows virtual disk.
 //!
 //! Windows mounts a VHDX on double-click, with no third-party tool, which makes
 //! it one of the more plausible delivery containers on that platform. It
@@ -13,7 +13,7 @@
 //! visible to a raw scan wherever they happen to land. Reading the disk still
 //! matters: blocks are placed in arbitrary file order and sparse ranges are
 //! absent entirely, so a payload spanning a block boundary appears in the file
-//! only as two disjoint fragments — and a filesystem inside cannot be walked at
+//! only as two disjoint fragments, and a filesystem inside cannot be walked at
 //! all until the guest disk is put back in order.
 //!
 //! The disk is a [`VDisk`]: one member when it fits the buffer limit, else its
@@ -39,7 +39,7 @@ const METADATA_SIGNATURE: &[u8; 8] = b"metadata";
 
 /// A region table holds at most 2047 entries per the specification.
 const MAX_REGION_ENTRIES: u32 = 2047;
-/// Likewise for metadata items — the table is one 64 KiB region.
+/// Likewise for metadata items: the table is one 64 KiB region.
 const MAX_METADATA_ENTRIES: u16 = 2047;
 /// Both tables are one 64 KiB region.
 const TABLE_LEN: usize = 64 * 1024;
@@ -283,11 +283,11 @@ impl Layout for Vhdx<'_> {
 }
 
 /// Walk a VHDX's disk.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let file_len = src.len() as u64;
     if file_len <= REGION_TABLE_1 || bytes_at(src, 0, 8).as_deref() != Some(b"vhdxfile".as_slice())
     {
@@ -313,7 +313,7 @@ pub(crate) fn walk<T>(
     };
     if g.has_parent {
         // The blocks this image lacks live in the parent, which is a separate
-        // file — the same shape as a differencing VHD.
+        // file: the same shape as a differencing VHD.
         return report(
             NAME,
             g.virtual_size,
@@ -350,7 +350,7 @@ pub(crate) fn walk<T>(
     };
     layout.unlocatable = total_blocks.saturating_sub(layout.covered(total_blocks));
     let allowance = budget.remaining_scan();
-    vdisk::walk(VDisk::new(src, layout, allowance), budget, visit)
+    vdisk::walk(VDisk::new(src, Box::new(layout), allowance), budget, visit)
 }
 
 // The tests lay out their inputs by index arithmetic on small constants.

@@ -11,8 +11,9 @@
  * unchanged. Every message from the frame is checked before it reaches a
  * store, since the frame runs the code a hostile file would attack.
  */
-import { createDetector } from "../core/detect.js";
-import { BUILTIN_ORDER, CONVERTED_FORMATS, MATCHERS, WASM_IMAGES } from "../core/formats.js";
+import { checkPackageLimits, checkSniffBytes, checkSniffTimeout, createDetector, readsHead } from "../core/detect.js";
+import { BUILTIN_ORDER, CONVERTED_FORMATS } from "../core/formats.js";
+import { highlightId, MAX_HIGHLIGHTS } from "../core/highlights.js";
 import { asRasterError, isPage, MAX_PICTURE_EDGE, MAX_PICTURE_PIXELS, RasterError } from "../core/pictures.js";
 import { picturesOver } from "../core/raster.js";
 import { createSourceReader } from "../core/source.js";
@@ -23,8 +24,10 @@ import type {
   ArchiveMember,
   BuiltinFormat,
   Controllers,
+  Detector,
+  FileSource,
   FormatId,
-  FormatMatcher,
+  Highlight,
   OutlineEntry,
   Raster,
   RasterOptions,
@@ -35,10 +38,12 @@ import type {
   ViewerFile,
 } from "../core/types.js";
 import { errorCode } from "../core/viewer.js";
-import { checkDelivery, prepare, readRefusal, type Delivery, type Prepared } from "./delivery.js";
+import { addressGiven, checkDelivery, prepare, readRefusal, refusesAddress, type Delivery, type Prepared } from "./delivery.js";
 import { policyMismatch, type FrameOrigins } from "./policy.js";
 import {
   checkFrameMessage,
+  checkOptions,
+  frameMatcher,
   HELLO,
   linkTarget,
   MAX_DRAWS,
@@ -51,6 +56,7 @@ import {
   type CommandMessage,
   type CommandTarget,
   type ControllerKey,
+  type FrameHighlight,
   type FrameMessage,
   type FrameOptions,
   type NavKey,
@@ -59,6 +65,7 @@ import {
   type RasterMessage,
   type RasterResult,
   type ReplaceMessage,
+  type SniffMessage,
   type Snapshots,
   type Statics,
   type StatusSnapshot,
@@ -97,8 +104,41 @@ export interface SandboxConfig {
    * Default: the browser's `confirm`.
    */
   confirmLink?: (url: string, file: ViewerFile) => boolean | Promise<boolean>;
+  /**
+   * After the question about a link is answered, how long the frame's links
+   * are dropped, in milliseconds, so that a frame cannot ask again at once.
+   * Default 2000; 0: no pause.
+   */
+  linkQuietMs?: number;
   /** How long the frame may take to start. Default 20_000 ms. */
   startTimeoutMs?: number;
+  /**
+   * How long the detection of a file's first bytes may take, in milliseconds,
+   * before the file's name and type decide. The detection runs in the frame,
+   * which this page sends the bytes and which answers what the file is; the
+   * frame uses the same value for the files inside an archive.
+   * Default 30,000; 0: no timeout.
+   */
+  sniffTimeoutMs?: number;
+  /**
+   * How many bytes from the start of a file are read to tell what it is (the
+   * files inside an archive too). Default 65,536. A file this page reads (a
+   * Blob, bytes, ranges, or an address it fetches for the frame) is read by
+   * this page, with a range request for an address, which it makes for the
+   * file anyway; a file the frame is given the address of is read by the
+   * frame where its policy lets it fetch the address (a PDF), else told by its
+   * name and type. 0: files are told by their name and type alone.
+   */
+  sniffBytes?: number;
+  /**
+   * The limits on a ZIP's directory, checked in the frame before it opens an
+   * Office file or an archive, as the options of the same names of
+   * `createViewer`: `maxExtractedBytes` (default 512 MiB), `maxMembers`
+   * (20,000) and `maxCompressionRatio` (1000); 0: no limit.
+   */
+  maxExtractedBytes?: number;
+  maxMembers?: number;
+  maxCompressionRatio?: number;
   /**
    * How each kind of file reaches the frame (see the Security page for
    * what each lets the frame do). Defaults: PDF and archives "ranges";
@@ -139,26 +179,43 @@ export interface SandboxedViewer extends Viewer {
 /** Keys taken from a frame in one second, at most. */
 export const KEY_RATE = 30;
 
+/** Why a file is not delivered: no format the frame opens is what its bytes or its name say. */
+const NOT_OPENED = Symbol("not opened");
+
 const ALL: readonly BuiltinFormat[] = BUILTIN_ORDER;
 /** The converted formats only when named: they need the converter. */
 const DEFAULT: readonly BuiltinFormat[] = ALL.filter((f) => !CONVERTED_FORMATS.includes(f));
-
-function matcher(id: BuiltinFormat): FormatMatcher {
-  if (id !== "image") return MATCHERS[id];
-  // The frame decodes what browsers do not draw.
-  const all = [MATCHERS.image, WASM_IMAGES];
-  return {
-    types: all.flatMap((m) => m.types ?? []),
-    extensions: all.flatMap((m) => m.extensions ?? []),
-    extensionOverrides: all.flatMap((m) => m.extensionOverrides ?? []),
-  };
-}
 
 function toStatus(s: StatusSnapshot): Status {
   return s.phase === "error" ? { phase: "error", error: { code: s.code } } : s;
 }
 
 const defaultConfirm = (url: string) => window.confirm(`Open this link in a new tab?\n\n${url}`);
+
+/** The default of `linkQuietMs`. */
+export const LINK_QUIET_MS = 2000;
+
+function checkLinkQuietMs(n: number | undefined): number {
+  if (n === undefined) return LINK_QUIET_MS;
+  if (!Number.isSafeInteger(n) || n < 0) throw new RangeError(`linkQuietMs: a whole number of milliseconds, 0 for none, not ${String(n)}`);
+  return n;
+}
+
+/**
+ * Whether the user has just clicked or pressed a key in this page, or in a
+ * frame of it, which activates the page too. True where the browser cannot say.
+ */
+function activated(): boolean {
+  return "userActivation" in navigator ? navigator.userActivation.isActive : true;
+}
+
+/** The size a file of the tree states before it is read, or null (a URL, a source resolved on demand). */
+function sizeOf(source: FileSource): number | null {
+  if ("bytes" in source) return source.bytes.byteLength;
+  if ("blob" in source) return source.blob.size;
+  if ("ranges" in source) return source.ranges.size;
+  return null;
+}
 
 /**
  * Why a picture from the frame is not the one asked for, or null. The size
@@ -178,11 +235,21 @@ export function rasterMismatch(asked: Omit<RasterOptions, "signal">, got: Extrac
 /** The viewer's `plugins` are empty: they live in the frame. */
 export function createSandboxedViewer(config: SandboxConfig): SandboxedViewer {
   checkDelivery(config.delivery, config.origins);
+  const limits = checkPackageLimits(config);
+  const linkQuietMs = checkLinkQuietMs(config.linkQuietMs);
+  checkSniffTimeout(config.sniffTimeoutMs);
   const formats = (config.formats ?? DEFAULT).filter((f) => ALL.includes(f));
-  const detector = createDetector(formats.map((id) => ({ id, match: matcher(id) })));
+  // By name and type only: the bytes are told in the frame (`sniff`).
+  const detector = createDetector(
+    formats.map((id) => ({ id, match: frameMatcher(id) })),
+    undefined,
+    undefined,
+    checkSniffBytes(config.sniffBytes),
+    limits,
+  );
   /** Each frame shown, by what sends it its theme again. */
   const shown = new Set<() => void>();
-  const mount = (host: HTMLElement, file: ViewerFile): Session => mountFrame(config, formats, detector.detect, host, file, shown);
+  const mount = (host: HTMLElement, file: ViewerFile): Session => mountFrame({ ...config, linkQuietMs }, formats, detector, host, file, shown);
   return {
     ...detector,
     plugins: [],
@@ -215,17 +282,22 @@ interface Proxy {
 function mountFrame(
   config: SandboxConfig,
   formats: readonly BuiltinFormat[],
-  detect: (file: ViewerFile) => FormatId | null,
+  detector: Detector,
   host: HTMLElement,
   file: ViewerFile,
   shown: Set<() => void>,
 ): Session {
-  const format = file.format ?? detect(file);
-  const known = formats.find((f) => f === format) ?? null;
+  const detect = detector.detect;
+  // What the name and the type say, until the first bytes of a file at hand
+  // are read (`decide`).
+  let format = file.format ?? detect(file);
+  let known = formats.find((f) => f === format) ?? null;
   const abort = new AbortController();
   let ended = false;
   /** The file as the frame will get it, read from the start. */
   let prepared: Promise<Prepared> | null = null;
+  /** What the file is shown as and the source to deliver, once known; null where no format the frame opens. */
+  let decision: Promise<{ as: BuiltinFormat; source: FileSource } | null> | null = null;
   /** The file on screen: the one `replace` last took. */
   let current = file;
   /** The bytes of each file read by ranges that is alive, by the number the frame names it with (0 is the first). */
@@ -235,11 +307,21 @@ function mountFrame(
   /** The frame's reads not answered yet. */
   const reads = new Map<number, { length: number; abort: AbortController }>();
   let outstanding = 0;
+  /** Bytes of the tree's files being read for the frame, all fetches together: at most `TREE.maxFileBytes`. */
+  let fetching = 0;
   let refusedOnce = false;
   let port: MessagePort | null = null;
   let iframe: HTMLIFrameElement | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let confirming = false;
+  /** Until when the frame's links are dropped: a moment after each answer, so that a frame cannot ask again at once. */
+  let quietUntil = 0;
+  /** The formats the frame was published for, null for all of them, once it is ready. */
+  let published: readonly BuiltinFormat[] | null = null;
+  let isReady: () => void = () => {};
+  const ready = new Promise<void>((resolve) => (isReady = resolve));
+  /** The `sniff` calls not answered yet: undefined is no answer. */
+  const sniffs = new Map<number, (format: BuiltinFormat | null | undefined) => void>();
   let nextCall = 1;
   const pending = new Map<number, () => void>();
   const sessions = new Map<number, Proxy>();
@@ -252,6 +334,8 @@ function mountFrame(
   let started = false;
   /** The newest `replace` call, and the one before it still to be answered. */
   let latest = 0;
+  /** The calls of `replace` so far: the one that reads its bytes to tell its format yields to a newer one. */
+  let asked = 0;
   let superseding: AbortController | null = null;
   let answered: Promise<unknown> = Promise.resolve();
   let lastDocument = 0;
@@ -273,7 +357,9 @@ function mountFrame(
         get file() {
           return id === 0 ? current : info.file;
         },
-        format: info.format,
+        get format() {
+          return id === 0 ? format : info.format;
+        },
         status,
         controllers,
         // A member shown by an archive is replaced by opening another.
@@ -287,6 +373,17 @@ function mountFrame(
     return p;
   };
   const root = proxy(0, { file, format });
+
+  /**
+   * The highlights given to each session, by session and highlight id: their
+   * labels, colours and quotes are read from here, never from the frame.
+   */
+  const given = new Map<number, Map<string, FrameHighlight>>();
+  const giveHighlights = (session: number, list: readonly Highlight[]): FrameHighlight[] => {
+    const withIds = list.slice(0, MAX_HIGHLIGHTS).map((h, i) => ({ ...h, id: highlightId(h, i) }) as FrameHighlight);
+    given.set(session, new Map(withIds.map((h) => [h.id, h])));
+    return withIds;
+  };
 
   const fail = (code: ViewerError["code"], cause: unknown) => {
     if (ended) return;
@@ -347,9 +444,8 @@ function mountFrame(
       .read(offset, length, AbortSignal.any([abort.signal, own.signal]))
       .then(
         (bytes): BytesMessage => {
-          // Its own buffer, exactly the bytes, to transfer.
-          const data = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength ? bytes : bytes.slice();
-          return { type: "bytes", id, data: data.buffer as ArrayBuffer };
+          // A copy to transfer: the buffer may be one the host keeps.
+          return { type: "bytes", id, data: bytes.slice().buffer as ArrayBuffer };
         },
         (error): BytesMessage => {
           if (!abort.signal.aborted && !own.signal.aborted) console.warn(`${format ?? "viewer"}: a read for the sandboxed frame failed`, error);
@@ -382,8 +478,18 @@ function mountFrame(
     reads.set(id, { length: 0, abort: own });
     const signal = AbortSignal.any([abort.signal, own.signal]);
     let opened: ReturnType<typeof createSourceReader> | undefined;
+    /** What this fetch adds to `fetching`. */
+    let counted = 0;
     void (async (): Promise<BytesMessage> => {
-      opened = createSourceReader(await tree.open(path, signal), signal);
+      const source = await tree.open(path, signal);
+      // A source that states its size is judged before it is read.
+      const size = sizeOf(source);
+      if (size !== null) {
+        if (size > TREE.maxFileBytes || fetching + size > TREE.maxFileBytes) return { type: "bytes", id, error: "refused" };
+        counted = size;
+        fetching += size;
+      }
+      opened = createSourceReader(source, signal);
       const bytes = await opened.bytes();
       if (bytes.byteLength > TREE.maxFileBytes) return { type: "bytes", id, error: "refused" };
       // Its own buffer, to transfer: the source may keep the one it read.
@@ -395,6 +501,7 @@ function mountFrame(
       })
       .then((m) => {
         opened?.dispose();
+        fetching -= counted;
         if (reads.get(id)?.abort !== own) return;
         reads.delete(id);
         reply(m);
@@ -633,6 +740,24 @@ function mountFrame(
     if (pictures) c.pictures = picturesOver(pictures, (page, options) => draw(id, page, options, pictures.get().space));
     const viewport = store("viewport");
     if (viewport) c.viewport = watchedStore(id, "viewport", viewport);
+    const highlights = store("highlights");
+    if (highlights)
+      c.highlights = {
+        ...derived(highlights, (s) => ({
+          items: s.items.map((i) => {
+            const h = given.get(id)?.get(i.id);
+            return {
+              ...i,
+              ...(h?.color !== undefined && { color: h.color }),
+              ...(h?.label !== undefined && { label: h.label }),
+              ...(h && "text" in h && { text: h.text }),
+            };
+          }),
+          current: s.current,
+        })),
+        set: (list) => void command(id, "highlights", "set", [giveHighlights(id, list)]),
+        goTo: (h) => void command(id, "highlights", "goTo", [h]),
+      };
     const archive = store("archive");
     if (archive) {
       const state = writable(archiveState(id, archive.get()));
@@ -656,9 +781,18 @@ function mountFrame(
         // error, said here rather than left to the policy to block.
         const mismatch = policyMismatch(message.policy, config.origins ?? {});
         if (mismatch) return fail(errorCode(format), new Error(mismatch));
+        published = message.formats;
+        isReady();
         // Likewise a frame published without this file's format: said here, with its cause.
-        if (known && message.formats && !message.formats.includes(known)) return fail(errorCode(format), new Error(`the frame was published without ${known}: name it in the \`formats\` of the Vite plugin, or with \`--format\``));
-        void send();
+        // The format is the bytes' where they are read, so after they are.
+        void (decision ?? Promise.resolve(null)).then(
+          () => {
+            if (ended) return;
+            if (known && message.formats && !message.formats.includes(known)) return fail(errorCode(format), new Error(`the frame was published without ${known}: name it in the \`formats\` of the Vite plugin, or with \`--format\``));
+            void send();
+          },
+          () => undefined,
+        );
         return;
       }
       case "read":
@@ -704,6 +838,9 @@ function mountFrame(
         resolve?.(message.ok);
         return;
       }
+      case "sniffed":
+        // An answer to no call is ignored too.
+        return sniffs.get(message.call)?.(message.format);
       case "key": {
         if (!keys.has(message.key) || !iframe) return;
         const now = performance.now();
@@ -715,8 +852,11 @@ function mountFrame(
       }
       case "link": {
         const url = linkTarget(message.url);
-        // One question at a time: a frame cannot queue a hundred.
-        if (!url || confirming) return;
+        // One question at a time, none right after an answer, and none the
+        // user did not just click or press a key for: a frame can neither
+        // queue a hundred, nor ask again as soon as one is answered, nor ask
+        // by itself.
+        if (!url || confirming || performance.now() < quietUntil || !activated()) return;
         confirming = true;
         void Promise.resolve()
           .then(() => (config.confirmLink ?? defaultConfirm)(url, file))
@@ -724,7 +864,10 @@ function mountFrame(
             if (yes && !ended) window.open(url, "_blank", "noopener,noreferrer");
           })
           .catch(() => undefined)
-          .finally(() => (confirming = false));
+          .finally(() => {
+            confirming = false;
+            quietUntil = performance.now() + (config.linkQuietMs ?? LINK_QUIET_MS);
+          });
         return;
       }
     }
@@ -739,6 +882,87 @@ function mountFrame(
       return { kind: "ranges", size: p.ranges.size, head };
     }
     return p.kind === "url" ? { kind: "url", url: p.url } : { kind: "blob", blob: p.blob };
+  };
+
+  /**
+   * What `f` is: what the frame tells from its first bytes (`askFrame`),
+   * which this page reads where it reads the file anyway (an address by a
+   * range request), and the frame where it is given the address and may
+   * fetch it; else what its name and type say. And the source to deliver,
+   * which is `f`'s, with a `resolve` answered once for the detection and the
+   * delivery. An address the delivery refuses (`refusesAddress`) is not asked
+   * for anything.
+   */
+  const decide = async (f: ViewerFile, signal: AbortSignal): Promise<{ format: FormatId | null; source: FileSource }> => {
+    let source = f.source!;
+    const named = f.format ?? detect(f);
+    if (!readsHead(f, detector.headBytes)) return { format: named, source };
+    let address: { url: string; init?: RequestInit } | null = "url" in source ? source : null;
+    if ("resolve" in source) {
+      const original = source;
+      const answer = original.resolve(signal);
+      // The head's read and the delivery's each ask once; a later call (a signed address that expired) is the host's.
+      let shared = 2;
+      source = { resolve: (s) => (shared-- > 0 ? answer : original.resolve(s)) };
+      const r = await answer;
+      if (typeof r === "string") address = { url: r };
+    }
+    const as = formats.find((x) => x === named) ?? null;
+    let asked: SniffMessage["source"] | null = null;
+    if (address) {
+      if (refusesAddress(address, as, f, config)) return { format: named, source };
+      // The frame is given the address: this page makes no request for it,
+      // and the frame reads the start itself where its policy lets it fetch.
+      const given = addressGiven(address, as, f, config);
+      if (given && !given.fetchable) return { format: named, source };
+      if (given) asked = { kind: "url", url: given.url };
+    }
+    if (!asked) {
+      const reader = createSourceReader(source, signal);
+      try {
+        const head = await reader.head(detector.headBytes);
+        if (!head) return { format: named, source };
+        asked = { kind: "head", head: head.bytes.slice().buffer, size: head.size };
+      } finally {
+        reader.dispose();
+      }
+    }
+    const said = await askFrame(f, asked, signal);
+    return { format: said === undefined ? named : said, source };
+  };
+
+  /**
+   * What the frame says `f` is, told by `source`: a format it was published
+   * for and this viewer opens, or null for none. Undefined when it has not
+   * answered in `sniffTimeoutMs`, or names another format: the name and the
+   * type decide then.
+   */
+  const askFrame = async (f: ViewerFile, source: SniffMessage["source"], signal: AbortSignal): Promise<BuiltinFormat | null | undefined> => {
+    const stopped = new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+    await Promise.race([ready, stopped]);
+    if (signal.aborted || ended || !port) return undefined;
+    const call = nextCall++;
+    const timeoutMs = checkSniffTimeout(config.sniffTimeoutMs);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const answer = new Promise<BuiltinFormat | null | undefined>((resolve) => {
+      sniffs.set(call, resolve);
+      if (timeoutMs > 0) timeout = setTimeout(() => resolve(undefined), timeoutMs);
+      void stopped.then(() => resolve(undefined));
+    });
+    const message: SniffMessage = {
+      type: "sniff",
+      call,
+      formats,
+      file: { name: f.name, type: f.type ?? "", path: f.path ?? f.name },
+      source,
+      sniff: { timeoutMs: config.sniffTimeoutMs, bytes: detector.headBytes },
+    };
+    port.postMessage(message, source.kind === "head" ? [source.head] : []);
+    const format = await answer;
+    clearTimeout(timeout);
+    sniffs.delete(call);
+    if (!format) return format;
+    return formats.includes(format) && (published === null || published.includes(format)) ? format : undefined;
   };
 
   const readWhole = (p: Prepared): Snapshots["warnings"] => (p.kind === "blob" && p.readWhole ? [{ key: "source_read_whole", count: 1 }] : []);
@@ -756,8 +980,11 @@ function mountFrame(
         file: { name: file.name, type: file.type ?? "", path: file.path ?? file.name, format: known },
         source: sourceOf(p, 0, transfer),
         ...(file.tree ? { tree: { path: file.tree.path, paths: file.tree.paths.slice(0, TREE.maxPaths) } } : {}),
-        options: config.options ?? {},
+        // Plain data, as the frame will check it: a function or a key like `__proto__` never leaves this page.
+        options: checkOptions({ ...config.options, sniff: { timeoutMs: config.sniffTimeoutMs, bytes: config.sniffBytes }, limits: detector.limits }),
         theme: themeFor(config, host),
+        ...(file.highlights && { highlights: giveHighlights(0, file.highlights) }),
+        ...(file.focusHighlight !== undefined && { focusHighlight: file.focusHighlight }),
       };
       port.postMessage(message, transfer);
       started = true;
@@ -773,10 +1000,30 @@ function mountFrame(
    * at a time: a newer call while an older one is being read supersedes it
    * (that one resolves true, as in the page), and while one is with the frame
    * the next waits for its answer.
+   *
+   * The next document goes to the same frame, in the realm the one before
+   * ran in: a host that needs each file isolated from the others mounts a
+   * new session for it instead.
    */
   const replace = async (next: ViewerFile): Promise<boolean> => {
     if (ended || !started || !port || !known || !next.source) return false;
-    if ((next.format ?? detect(next)) !== known) return false;
+    const mineAsked = ++asked;
+    let nextFormat = next.format ?? detect(next);
+    let nextSource = next.source;
+    if (readsHead(next, detector.headBytes)) {
+      // As the first document: what its bytes say, when they say anything.
+      try {
+        ({ format: nextFormat, source: nextSource } = await decide(next, abort.signal));
+      } catch (error) {
+        if (abort.signal.aborted) return true;
+        console.warn(`${format ?? "viewer"}: the next document could not be read`, error);
+        root.status.set({ phase: "error", error: { code: errorCode(format), cause: error } });
+        return true;
+      }
+      // Superseded by a newer call, or the session ended: not a failure.
+      if (mineAsked !== asked || ended || !port) return true;
+    }
+    if (nextFormat !== known) return false;
     const mine = ++latest;
     superseding?.abort();
     const own = new AbortController();
@@ -784,7 +1031,7 @@ function mountFrame(
     const signal = AbortSignal.any([abort.signal, own.signal]);
     let p: Prepared;
     try {
-      p = await prepare(next.source, known, next, { delivery: config.delivery, origins: config.origins, signal });
+      p = await prepare(nextSource, known, next, { delivery: config.delivery, origins: config.origins, signal });
     } catch (error) {
       // Superseded, or the session ended: not a failure. Otherwise the old document stays, under the error.
       if (signal.aborted) return true;
@@ -820,21 +1067,8 @@ function mountFrame(
     return true;
   };
 
-  if (!file.source) {
-    // Nothing to show yet: the UI shows the placeholder.
-  } else if (!known) {
-    root.status.set({ phase: "error", error: { code: errorCode(format) } });
-  } else {
-    // The host reads the file, or gives the frame an address its policy
-    // allows: the frame reaches nothing else.
-    prepared = prepare(file.source, known, file, {
-      delivery: config.delivery,
-      origins: config.origins,
-      signal: abort.signal,
-      progress: (share) => root.status.get().phase === "loading" && root.status.set({ phase: "loading", step: "file", progress: share }),
-    });
-    // Refused or failed: said at once, without waiting for the frame.
-    prepared.catch((error) => !abort.signal.aborted && fail(errorCode(format), error));
+  /** Shows the file in a frame of its own. */
+  const showFrame = () => {
     const frame = document.createElement("iframe");
     // Scripts only: an opaque origin, no popups, no navigation of this page,
     // no downloads, no forms, no modal dialogs. Of the powerful features,
@@ -866,13 +1100,53 @@ function mountFrame(
     frame.src = config.url;
     iframe = frame;
     host.append(frame);
+  };
+
+  if (!file.source) {
+    // Nothing to show yet: the UI shows the placeholder.
+  } else if (!known && !readsHead(file, detector.headBytes)) {
+    root.status.set({ phase: "error", error: { code: errorCode(format) } });
+  } else {
+    const given = file.source;
+    // What the file is: the frame tells it by its first bytes where they are
+    // at hand, else its name and type decide.
+    decision = (readsHead(file, detector.headBytes) ? decide(file, abort.signal) : Promise.resolve({ format, source: given })).then((d) => {
+      format = d.format;
+      known = formats.find((f) => f === format) ?? null;
+      return known ? { as: known, source: d.source } : null;
+    });
+    // The host reads the file, or gives the frame an address its policy
+    // allows: the frame reaches nothing else.
+    prepared = decision.then((o) =>
+      o
+        ? prepare(o.source, o.as, file, {
+            delivery: config.delivery,
+            origins: config.origins,
+            signal: abort.signal,
+            progress: (share) => root.status.get().phase === "loading" && root.status.set({ phase: "loading", step: "file", progress: share }),
+          })
+        : Promise.reject(NOT_OPENED),
+    );
+    // Refused or failed: said at once, without waiting for the frame.
+    prepared.catch((error) => {
+      if (abort.signal.aborted) return;
+      if (error !== NOT_OPENED) return fail(errorCode(format), error);
+      root.status.set({ phase: "error", error: { code: errorCode(format) } });
+      teardown();
+      iframe?.remove();
+      iframe = null;
+    });
+    // At once: the frame is asked what the bytes are, or opens the format the name gives.
+    showFrame();
   }
 
   return {
     get file() {
       return current;
     },
-    format: root.session.format,
+    get format() {
+      return format;
+    },
     status: root.session.status,
     controllers: root.session.controllers,
     replace,

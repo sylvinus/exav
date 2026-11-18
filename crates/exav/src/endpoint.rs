@@ -6,8 +6,8 @@
 //! clamd://0.0.0.0:3310        the clamd protocol over TCP
 //! clamd:///var/run/exav.sock  the clamd protocol over a Unix socket
 //! icap://0.0.0.0:1344         ICAP over TCP
-//! 0.0.0.0:3310                no scheme — clamd, the older of the two
-//! /var/run/exav.sock          no scheme, a path — clamd over a Unix socket
+//! 0.0.0.0:3310                no scheme: clamd, the older of the two
+//! /var/run/exav.sock          no scheme, a path: clamd over a Unix socket
 //! ```
 //!
 //! Two flags, and the protocol travels in the value. A flag per protocol would
@@ -35,7 +35,7 @@ impl Proto {
     fn parse(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             // `clamd`, not `clamav`: ClamAV is the project, clamd is the daemon
-            // and the protocol — and it reads as a peer of `icap`, which is also
+            // and the protocol, and it reads as a peer of `icap`, which is also
             // a protocol rather than a product.
             "clamd" => Ok(Self::Clamd),
             "icap" => Ok(Self::Icap),
@@ -77,9 +77,47 @@ pub(crate) struct Endpoint {
     ///
     /// On the address rather than in a flag for the same reason `mode` is: it
     /// bounds *this* listener. A flag would have to name a protocol to apply to,
-    /// so two listeners would need two flags — and the one without a flag would
+    /// so two listeners would need two flags, and the one without a flag would
     /// be stuck on a constant nobody could reach.
     pub max_connections: Option<usize>,
+    /// The most seconds a connection waits for its client, from
+    /// `?idle-secs=120`: each read of a clamd client (its first command, the
+    /// next of a session, the next chunk of `INSTREAM`); an ICAP connection
+    /// between requests or inside one. On the address, as `max-connections`
+    /// is, because it bounds this listener's clients.
+    pub idle_secs: Option<u64>,
+    /// The most seconds a connection stays open, from `?session-secs=3600`,
+    /// counted from accept. Once it has passed, no new clamd command and no new
+    /// ICAP request is read; one that began before is answered. `None`: no limit.
+    pub session_secs: Option<u64>,
+    /// The most seconds the writes of one reply may wait for the client, summed
+    /// over the writes of that reply, from `?reply-secs=60`: everything written
+    /// for one clamd command, or for one ICAP request. `None`: no limit beyond
+    /// the per-write timeout.
+    pub reply_secs: Option<u64>,
+    /// The most seconds one clamd command or ICAP request may take to arrive
+    /// in full, from `?request-secs=600`: from its first byte to the end of its
+    /// `INSTREAM` data or request body. `Some(0)` (`off`): no limit; `None`:
+    /// the default.
+    pub request_secs: Option<u64>,
+    /// Requests served on one ICAP connection before it is closed, from
+    /// `?max-requests=100`. `Some(0)` (`off`): no limit; `None`: the default.
+    pub max_requests: Option<u64>,
+    /// The largest ICAP head plus encapsulated HTTP headers of one request,
+    /// from `?max-header-bytes=64K`.
+    pub max_header_bytes: Option<usize>,
+    /// The ICAP `Preview` size this listener offers, from `?preview-bytes=4096`;
+    /// `off` leaves the header out.
+    pub preview_bytes: Option<crate::OrOff<usize>>,
+    /// Whether this ICAP listener sends `Transfer-Preview: *`, from
+    /// `?transfer-preview=*`; `false` for `off`, which leaves the header out.
+    pub transfer_preview: Option<bool>,
+    /// Seconds an ICAP client may keep this listener's `OPTIONS` answer, from
+    /// `?options-ttl-secs=3600`; `off` leaves the header out.
+    pub options_ttl_secs: Option<crate::OrOff<u32>>,
+    /// Which ICAP blocks carry `X-Infection-Found`, from
+    /// `?infection-header=detections`.
+    pub infection_header: Option<InfectionHeader>,
     /// ICAP service names to answer on, from the path (`icap://h:1344/avscan`)
     /// or from a repeated `?service=avscan&service=srv_clamav`. Empty keeps
     /// the default set.
@@ -92,18 +130,75 @@ pub(crate) struct Endpoint {
     pub services: Vec<String>,
 }
 
+/// When an ICAP block carries the c-icap `X-Infection-Found` header.
+///
+/// c-icap's vocabulary has one header for "this object is not OK", and a whole
+/// class of ICAP clients decides clean-or-not from that header alone rather than
+/// from the response body: a health-check script, a mail gateway, the shell
+/// wrapper a content scanner shells out to. Those clients read a `200` carrying
+/// a block page and no `X-Infection-Found` as **clean**, which is the one answer
+/// exav must never give for an object it did not fully examine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum InfectionHeader {
+    /// Every block carries it. A signature match is reported under its own
+    /// name; a partial verdict under a `Heuristics.Exav.*` name that says
+    /// which condition blocked it, alongside the `X-Exav-Category` /
+    /// `X-Exav-Reason` pair that spells it out for a client that reads them.
+    #[default]
+    Blocks,
+    /// Only a signature match carries it, so the header means a database
+    /// detection and nothing else. A client that keys on it alone then treats
+    /// an unscannable object as clean, which is why this is not the default.
+    Detections,
+}
+
+impl InfectionHeader {
+    pub(crate) fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "blocks" => Ok(Self::Blocks),
+            "detections" => Ok(Self::Detections),
+            other => Err(format!("expected `blocks` or `detections`, got `{other}`")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocks => "blocks",
+            Self::Detections => "detections",
+        }
+    }
+}
+
 impl Endpoint {
-    /// Names of the server-side tunables this address carries: `?mode=`,
-    /// `?max-connections=`, and the ICAP service (path or `?service=`). A
-    /// `--connect` client dials `addr` and honours none of these, so an
-    /// address carrying any of them is refused client-side rather than quietly
-    /// dropped. Unknown keys never reach here — the parser refuses those for
-    /// both flags.
+    /// Names of the server-side tunables this address carries: every `?…`
+    /// option and the ICAP service (path or `?service=`). A `--connect` client
+    /// dials `addr` and honours none of these, so an address carrying any of
+    /// them is refused client-side rather than quietly dropped. Unknown keys
+    /// never reach here: the parser refuses those for both flags.
     pub(crate) fn server_side_options(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
         if self.max_connections.is_some() {
             out.push("max-connections");
         }
+        if self.idle_secs.is_some() {
+            out.push("idle-secs");
+        }
+        if self.session_secs.is_some() {
+            out.push("session-secs");
+        }
+        if self.reply_secs.is_some() {
+            out.push("reply-secs");
+        }
+        if self.request_secs.is_some() {
+            out.push("request-secs");
+        }
+        if self.max_requests.is_some() {
+            out.push("max-requests");
+        }
+        if self.max_header_bytes.is_some() {
+            out.push("max-header-bytes");
+        }
+        out.extend(self.icap_service_options());
         if !self.services.is_empty() {
             out.push("service");
         }
@@ -112,6 +207,19 @@ impl Endpoint {
         }
         out
     }
+
+    /// The keys given of those that set what an ICAP service answers.
+    fn icap_service_options(&self) -> Vec<&'static str> {
+        [
+            (self.preview_bytes.is_some(), "preview-bytes"),
+            (self.transfer_preview.is_some(), "transfer-preview"),
+            (self.options_ttl_secs.is_some(), "options-ttl-secs"),
+            (self.infection_header.is_some(), "infection-header"),
+        ]
+        .into_iter()
+        .filter_map(|(set, key)| set.then_some(key))
+        .collect()
+    }
 }
 
 /// The `?…` options of one address, before they are attached to a place.
@@ -119,6 +227,16 @@ impl Endpoint {
 struct Options {
     mode: Option<u32>,
     max_connections: Option<usize>,
+    idle_secs: Option<u64>,
+    session_secs: Option<u64>,
+    reply_secs: Option<u64>,
+    request_secs: Option<u64>,
+    max_requests: Option<u64>,
+    max_header_bytes: Option<usize>,
+    preview_bytes: Option<crate::OrOff<usize>>,
+    transfer_preview: Option<bool>,
+    options_ttl_secs: Option<crate::OrOff<u32>>,
+    infection_header: Option<InfectionHeader>,
     services: Option<Vec<String>>,
 }
 
@@ -129,7 +247,7 @@ impl Endpoint {
     /// answered before it answered any other and the one a bare `host:port` in
     /// an existing deployment means. A value beginning `/` is a Unix socket
     /// path; anything else is `host:port`, optionally followed by `/<service>`
-    /// for ICAP. That rule needs no third spelling and cannot be ambiguous — a
+    /// for ICAP. That rule needs no third spelling and cannot be ambiguous: a
     /// filesystem path and a host:port pair have disjoint first characters, so
     /// the leading `/` decides before any `/` inside can matter.
     pub(crate) fn parse(s: &str) -> Result<Self, String> {
@@ -150,7 +268,7 @@ impl Endpoint {
         }
         let opts = parse_query(query, s)?;
         let (addr, path) = if rest.starts_with('/') {
-            // Every `/` belongs to the socket path — a filesystem path is not a
+            // Every `/` belongs to the socket path: a filesystem path is not a
             // URL, and splitting one would name a directory as a service.
             (
                 Addr::Unix {
@@ -180,13 +298,44 @@ impl Endpoint {
                 "`{s}`: ICAP is a TCP protocol; give it a host:port"
             ));
         }
+        if proto == Proto::Clamd {
+            for (set, key) in [
+                (opts.max_requests.is_some(), "max-requests"),
+                (opts.max_header_bytes.is_some(), "max-header-bytes"),
+            ] {
+                if set {
+                    return Err(format!(
+                        "`{s}`: {key} bounds an ICAP request, and the clamd protocol has none"
+                    ));
+                }
+            }
+        }
         let services = resolve_services(proto, path, opts.services, s)?;
-        Ok(Self {
+        let e = Self {
             proto,
             addr,
             max_connections: opts.max_connections,
+            idle_secs: opts.idle_secs,
+            session_secs: opts.session_secs,
+            reply_secs: opts.reply_secs,
+            request_secs: opts.request_secs,
+            max_requests: opts.max_requests,
+            max_header_bytes: opts.max_header_bytes,
+            preview_bytes: opts.preview_bytes,
+            transfer_preview: opts.transfer_preview,
+            options_ttl_secs: opts.options_ttl_secs,
+            infection_header: opts.infection_header,
             services,
-        })
+        };
+        if proto == Proto::Clamd
+            && let Some(key) = e.icap_service_options().first()
+        {
+            return Err(format!(
+                "`{s}`: {key} sets what an ICAP service answers, and the clamd protocol has no \
+                 such answer"
+            ));
+        }
+        Ok(e)
     }
 }
 
@@ -195,7 +344,7 @@ impl Endpoint {
 ///
 /// This also catches the one mistake the comma grammar makes reachable.
 /// `--listen` separates addresses with commas and the argument parser splits on
-/// them before this ever runs, so `?service=one,two` arrives as two values —
+/// them before this ever runs, so `?service=one,two` arrives as two values:
 /// `icap://h:1344?service=one` and a bare `two`. Both would otherwise look like
 /// addresses, and exav would bind an ICAP listener answering on the wrong set
 /// plus a clamd listener on a host called `two`. Requiring a port turns that
@@ -216,7 +365,7 @@ fn check_host_port(hostport: &str, whole: &str) -> Result<String, String> {
 ///
 /// Giving both is refused rather than resolved. They are two spellings of one
 /// setting, and picking a winner means the losing half sits on the command line
-/// looking like it is in force — the failure this whole address grammar exists
+/// looking like it is in force, the failure this whole address grammar exists
 /// to remove.
 fn resolve_services(
     proto: Proto,
@@ -226,7 +375,7 @@ fn resolve_services(
 ) -> Result<Vec<String>, String> {
     // A service on a clamd address is a mistake with a plausible cause: an ICAP
     // URL pasted under the wrong scheme. Say which protocol has services.
-    // Refused in either spelling — accepting `?service=` here and dropping it
+    // Refused in either spelling: accepting `?service=` here and dropping it
     // would leave the operator a listener answering on names they configured
     // and a command line that says otherwise.
     if proto == Proto::Clamd && (path.is_some() || query.is_some()) {
@@ -294,6 +443,33 @@ fn parse_query(query: Option<&str>, whole: &str) -> Result<Options, String> {
         match k {
             "mode" => opts.mode = Some(parse_mode(v, whole)?),
             "max-connections" => opts.max_connections = Some(parse_max_connections(v, whole)?),
+            "idle-secs" => opts.idle_secs = Some(parse_idle_secs(v, whole)?),
+            "session-secs" => opts.session_secs = Some(parse_session_secs(v, whole)?),
+            "reply-secs" => opts.reply_secs = Some(parse_reply_secs(v, whole)?),
+            "request-secs" => opts.request_secs = Some(parse_or_off(v, whole, "request-secs=600")?),
+            "max-requests" => opts.max_requests = Some(parse_or_off(v, whole, "max-requests=100")?),
+            "max-header-bytes" => opts.max_header_bytes = Some(parse_header_bytes(v, whole)?),
+            "preview-bytes" => {
+                opts.preview_bytes = Some(
+                    crate::parse_size_or_omit(v)
+                        .map_err(|e| format!("`{whole}`: preview-bytes: {e}"))?,
+                );
+            }
+            "transfer-preview" => {
+                opts.transfer_preview = Some(parse_transfer_preview(v, whole)?);
+            }
+            "options-ttl-secs" => {
+                opts.options_ttl_secs = Some(
+                    crate::parse_secs_or_omit(v)
+                        .map_err(|e| format!("`{whole}`: options-ttl-secs: {e}"))?,
+                );
+            }
+            "infection-header" => {
+                opts.infection_header = Some(
+                    InfectionHeader::parse(v)
+                        .map_err(|e| format!("`{whole}`: infection-header: {e}"))?,
+                );
+            }
             // Singular, and repeated rather than replaced: each occurrence adds
             // one name, so the key describes its own value. `services=a` reading
             // as one name would be a plural that never holds a list.
@@ -303,8 +479,10 @@ fn parse_query(query: Option<&str>, whole: &str) -> Result<Options, String> {
                 .push(parse_service(v, whole)?),
             other => {
                 return Err(format!(
-                    "`{whole}`: unknown address option `{other}` \
-                     (known: mode, max-connections, service)"
+                    "`{whole}`: unknown address option `{other}` (known: mode, \
+                     max-connections, idle-secs, session-secs, reply-secs, request-secs, \
+                     max-requests, max-header-bytes, preview-bytes, transfer-preview, \
+                     options-ttl-secs, infection-header, service)"
                 ));
             }
         }
@@ -316,13 +494,13 @@ fn parse_query(query: Option<&str>, whole: &str) -> Result<Options, String> {
 ///
 /// The escape hatch from the path form, for the one deployment shape the path
 /// cannot express: two proxies whose configurations disagree about which name to
-/// use, pointed at one exav. Repeat the key for each —
+/// use, pointed at one exav. Repeat the key for each:
 /// `?service=avscan&service=srv_clamav`.
 ///
 /// A comma-separated `service=a,b` cannot do it: `--listen` separates
 /// *addresses* with a comma, so it would end this address before this parser
-/// ever saw it. One separator per level — commas between addresses, `&` between
-/// one address's options — which leaves each key naming exactly one value.
+/// ever saw it. One separator per level (commas between addresses, `&` between
+/// one address's options), which leaves each key naming exactly one value.
 fn parse_service(v: &str, whole: &str) -> Result<String, String> {
     let name = v.trim();
     if name.is_empty() {
@@ -344,6 +522,20 @@ fn parse_service(v: &str, whole: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
+/// `*` or `off`. RFC 3507 asks that one `Transfer-*` header hold `*`, and
+/// `Transfer-Preview` is the only one exav sends, so a list of extensions
+/// would break that rule or repeat what `*` already says.
+fn parse_transfer_preview(v: &str, whole: &str) -> Result<bool, String> {
+    match v.trim() {
+        "*" => Ok(true),
+        v if v.eq_ignore_ascii_case("off") => Ok(false),
+        _ => Err(format!(
+            "`{whole}`: transfer-preview is `*` (preview every object) or `off`: exav \
+             sends no other Transfer-* header, and RFC 3507 asks that one of them hold `*`"
+        )),
+    }
+}
+
 /// Concurrent connections a listener accepts. `0` is refused rather than read as
 /// "no limit": a listener that accepts nothing is a scanner that answers nothing,
 /// and every other `0` in exav's settings means the opposite.
@@ -352,6 +544,62 @@ fn parse_max_connections(v: &str, whole: &str) -> Result<usize, String> {
         Ok(0) | Err(_) => Err(format!(
             "`{whole}`: max-connections must be a positive number of connections, \
              e.g. max-connections=200"
+        )),
+        Ok(n) => Ok(n),
+    }
+}
+
+/// The most seconds a connection waits for its client. No `off`, and no `0`:
+/// without it a client that sends nothing keeps its connection for good.
+fn parse_idle_secs(v: &str, whole: &str) -> Result<u64, String> {
+    positive_secs(v, whole, "idle-secs=120", "")
+}
+
+/// The most seconds a connection stays open. Absent means no limit; `0` and
+/// `off` are refused, as a limit that is not one would be read as a short one.
+fn parse_session_secs(v: &str, whole: &str) -> Result<u64, String> {
+    positive_secs(v, whole, "session-secs=3600", "; leave it out for no limit")
+}
+
+/// The most seconds the writes of one reply may wait for the client. Absent
+/// means no limit; `0` and `off` are refused, as for [`parse_session_secs`].
+fn parse_reply_secs(v: &str, whole: &str) -> Result<u64, String> {
+    positive_secs(v, whole, "reply-secs=60", "; leave it out for no limit")
+}
+
+/// A count or a number of seconds for the option `example` shows, with a
+/// default: `off` or `0` is no limit, as for the flags.
+fn parse_or_off(v: &str, whole: &str, example: &str) -> Result<u64, String> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("off") {
+        return Ok(0);
+    }
+    v.parse::<u64>().map_err(|_| {
+        let key = example.split('=').next().unwrap_or(example);
+        format!("`{whole}`: {key} must be a number or `off`, e.g. {example}")
+    })
+}
+
+/// The largest ICAP request head: a size of at least 1K, no `off`, since it is
+/// what stops a client that sends header bytes forever.
+fn parse_header_bytes(v: &str, whole: &str) -> Result<usize, String> {
+    let n =
+        crate::parse_size_not_off(v).map_err(|e| format!("`{whole}`: max-header-bytes: {e}"))?;
+    if n < 1024 {
+        return Err(format!(
+            "`{whole}`: max-header-bytes below 1K fits no ICAP request's headers"
+        ));
+    }
+    usize::try_from(n).map_err(|_| format!("`{whole}`: max-header-bytes is too large"))
+}
+
+/// A positive number of seconds for the option `example` shows, `tail` added
+/// to the error.
+fn positive_secs(v: &str, whole: &str, example: &str, tail: &str) -> Result<u64, String> {
+    let key = example.split('=').next().unwrap_or(example);
+    match v.trim().parse::<u64>() {
+        Ok(0) | Err(_) => Err(format!(
+            "`{whole}`: {key} must be a positive number of seconds, e.g. {example}{tail}"
         )),
         Ok(n) => Ok(n),
     }
@@ -407,6 +655,56 @@ impl std::fmt::Display for Endpoint {
         }
         if let Some(n) = self.max_connections {
             write!(f, "{sep}max-connections={n}")?;
+            sep = '&';
+        }
+        if let Some(n) = self.idle_secs {
+            write!(f, "{sep}idle-secs={n}")?;
+            sep = '&';
+        }
+        if let Some(n) = self.session_secs {
+            write!(f, "{sep}session-secs={n}")?;
+            sep = '&';
+        }
+        if let Some(n) = self.reply_secs {
+            write!(f, "{sep}reply-secs={n}")?;
+            sep = '&';
+        }
+        let or_off = |n: u64| {
+            if n == 0 {
+                "off".to_string()
+            } else {
+                n.to_string()
+            }
+        };
+        if let Some(n) = self.request_secs {
+            write!(f, "{sep}request-secs={}", or_off(n))?;
+            sep = '&';
+        }
+        if let Some(n) = self.max_requests {
+            write!(f, "{sep}max-requests={}", or_off(n))?;
+            sep = '&';
+        }
+        if let Some(n) = self.max_header_bytes {
+            write!(f, "{sep}max-header-bytes={n}")?;
+            sep = '&';
+        }
+        let shown = |v: Option<String>| v.unwrap_or_else(|| "off".to_string());
+        if let Some(n) = self.preview_bytes {
+            let n = shown(n.value().map(|n| n.to_string()));
+            write!(f, "{sep}preview-bytes={n}")?;
+            sep = '&';
+        }
+        if let Some(on) = self.transfer_preview {
+            write!(f, "{sep}transfer-preview={}", if on { "*" } else { "off" })?;
+            sep = '&';
+        }
+        if let Some(n) = self.options_ttl_secs {
+            let n = shown(n.value().map(|n| n.to_string()));
+            write!(f, "{sep}options-ttl-secs={n}")?;
+            sep = '&';
+        }
+        if let Some(h) = self.infection_header {
+            write!(f, "{sep}infection-header={}", h.as_str())?;
         }
         Ok(())
     }
@@ -438,6 +736,36 @@ pub(crate) fn listeners_of(flag: &str, values: &[String]) -> Result<Vec<Endpoint
             ));
         }
         out.push(e);
+    }
+    Ok(out)
+}
+
+/// [`listeners_of`] for `--listen-health`, which reads `?mode=`,
+/// `?max-connections=` and `?idle-secs=` only: an option it would not read is
+/// refused, as an unknown key is.
+pub(crate) fn health_listeners_of(values: &[String]) -> Result<Vec<Endpoint>, String> {
+    let out = listeners_of("--listen-health", values)?;
+    for e in &out {
+        let mut unread: Vec<&str> = [
+            (!e.services.is_empty(), "service"),
+            (e.session_secs.is_some(), "session-secs"),
+            (e.reply_secs.is_some(), "reply-secs"),
+            (e.request_secs.is_some(), "request-secs"),
+            (e.max_requests.is_some(), "max-requests"),
+            (e.max_header_bytes.is_some(), "max-header-bytes"),
+        ]
+        .into_iter()
+        .filter_map(|(set, key)| set.then_some(key))
+        .collect();
+        // Its OPTIONS answer is fixed, and it blocks nothing.
+        unread.extend(e.icap_service_options());
+        if !unread.is_empty() {
+            return Err(format!(
+                "`{e}`: a health address answers PING and OPTIONS and nothing else, \
+                 so {} means nothing there",
+                unread.join(", ")
+            ));
+        }
     }
     Ok(out)
 }
@@ -506,7 +834,7 @@ mod tests {
 
     #[test]
     fn a_listener_carries_its_own_connection_cap() {
-        // It bounds *this* listener, so it travels with it — and it applies to
+        // It bounds *this* listener, so it travels with it, and it applies to
         // either protocol and either kind of socket, which is exactly what a
         // per-protocol flag could not express without one flag per protocol.
         assert_eq!(
@@ -542,6 +870,223 @@ mod tests {
     }
 
     #[test]
+    fn a_listener_carries_its_idle_wait() {
+        assert_eq!(ep("0.0.0.0:3310?idle-secs=30").idle_secs, Some(30));
+        assert_eq!(ep("/run/x.sock?idle-secs=5").idle_secs, Some(5));
+        assert_eq!(ep("icap://0.0.0.0:1344?idle-secs=30").idle_secs, Some(30));
+        assert_eq!(ep("0.0.0.0:3310").idle_secs, None);
+        assert_eq!(
+            ep("/run/x.sock?mode=660&max-connections=8&idle-secs=30").to_string(),
+            "clamd:///run/x.sock?mode=660&max-connections=8&idle-secs=30"
+        );
+        assert_eq!(ep("h:1?idle-secs=9").to_string(), "clamd://h:1?idle-secs=9");
+        assert_eq!(ep("h:1?idle-secs=9").server_side_options(), ["idle-secs"]);
+        // No `0` and no `off`: a client that sends nothing would keep its
+        // connection for good.
+        for bad in [
+            "0.0.0.0:3310?idle-secs=0",
+            "0.0.0.0:3310?idle-secs=off",
+            "0.0.0.0:3310?idle-secs=-1",
+            "0.0.0.0:3310?idle-secs=",
+            "icap://0.0.0.0:1344?idle-secs=0",
+        ] {
+            assert!(Endpoint::parse(bad).is_err(), "{bad:?} parsed");
+        }
+    }
+
+    #[test]
+    fn a_listener_carries_its_lifetime_and_reply_budget() {
+        assert_eq!(ep("0.0.0.0:3310?session-secs=60").session_secs, Some(60));
+        assert_eq!(ep("/run/x.sock?reply-secs=5").reply_secs, Some(5));
+        assert_eq!(
+            ep("icap://0.0.0.0:1344?session-secs=60&reply-secs=5").session_secs,
+            Some(60)
+        );
+        assert_eq!(
+            ep("icap://0.0.0.0:1344?session-secs=60&reply-secs=5").reply_secs,
+            Some(5)
+        );
+        // Off when absent.
+        let plain = ep("0.0.0.0:3310");
+        assert_eq!((plain.session_secs, plain.reply_secs), (None, None));
+        assert_eq!(
+            ep("/run/x.sock?reply-secs=5&mode=660&session-secs=60&idle-secs=30").to_string(),
+            "clamd:///run/x.sock?mode=660&idle-secs=30&session-secs=60&reply-secs=5"
+        );
+        assert_eq!(
+            ep("h:1?session-secs=9").to_string(),
+            "clamd://h:1?session-secs=9"
+        );
+        assert_eq!(
+            ep("h:1?reply-secs=9").to_string(),
+            "clamd://h:1?reply-secs=9"
+        );
+        // A `--connect` client has neither.
+        assert_eq!(
+            ep("h:1?session-secs=9&reply-secs=9").server_side_options(),
+            ["session-secs", "reply-secs"]
+        );
+        // No `0`, no `off`: leaving the key out is how to have no limit.
+        for key in ["session-secs", "reply-secs"] {
+            for value in ["0", "off", "-1", "", "soon", "1.5"] {
+                for scheme in ["", "icap://"] {
+                    let bad = format!("{scheme}0.0.0.0:3310?{key}={value}");
+                    let e = Endpoint::parse(&bad).unwrap_err();
+                    assert!(e.contains(key) && e.contains("positive"), "{bad}: {e}");
+                }
+            }
+        }
+    }
+
+    /// A health address reads its mode, connections and idle time; what it
+    /// would not read is refused, not kept and ignored.
+    #[test]
+    fn a_health_address_refuses_what_it_does_not_read() {
+        let health = |v: &str| health_listeners_of(&[v.to_string()]);
+        for ok in [
+            "clamd://127.0.0.1:3311?max-connections=8&idle-secs=5",
+            "/run/h.sock?mode=660",
+            "icap://127.0.0.1:1345",
+        ] {
+            assert!(health(ok).is_ok(), "{ok}");
+        }
+        for (bad, key) in [
+            ("icap://127.0.0.1:1345/avscan", "service"),
+            ("icap://127.0.0.1:1345?service=a", "service"),
+            ("clamd://127.0.0.1:3311?session-secs=60", "session-secs"),
+            ("clamd://127.0.0.1:3311?reply-secs=5", "reply-secs"),
+            ("clamd://127.0.0.1:3311?request-secs=5", "request-secs"),
+            ("icap://127.0.0.1:1345?max-requests=5", "max-requests"),
+            (
+                "icap://127.0.0.1:1345?max-header-bytes=8K",
+                "max-header-bytes",
+            ),
+            ("icap://127.0.0.1:1345?preview-bytes=0", "preview-bytes"),
+            (
+                "icap://127.0.0.1:1345?transfer-preview=off",
+                "transfer-preview",
+            ),
+            (
+                "icap://127.0.0.1:1345?options-ttl-secs=9",
+                "options-ttl-secs",
+            ),
+            (
+                "icap://127.0.0.1:1345?infection-header=blocks",
+                "infection-header",
+            ),
+        ] {
+            let e = health(bad).unwrap_err();
+            assert!(e.contains(key) && e.contains("health"), "{bad}: {e}");
+        }
+    }
+
+    /// What an ICAP service answers: a default when absent, `0` and `off`
+    /// apart where both mean something, and refused on a clamd address.
+    #[test]
+    fn a_listener_carries_what_its_icap_service_answers() {
+        use crate::OrOff;
+        let e = ep("icap://h:1?preview-bytes=1K&transfer-preview=off\
+                    &options-ttl-secs=0&infection-header=detections");
+        assert_eq!(e.preview_bytes, Some(OrOff::On(1024)));
+        assert_eq!(e.transfer_preview, Some(false));
+        assert_eq!(e.options_ttl_secs, Some(OrOff::On(0)));
+        assert_eq!(e.infection_header, Some(InfectionHeader::Detections));
+        assert_eq!(
+            e.to_string(),
+            "icap://h:1?preview-bytes=1024&transfer-preview=off&options-ttl-secs=0\
+             &infection-header=detections"
+        );
+        assert_eq!(
+            e.server_side_options(),
+            [
+                "preview-bytes",
+                "transfer-preview",
+                "options-ttl-secs",
+                "infection-header"
+            ]
+        );
+        let e = ep("icap://h:1?preview-bytes=off&transfer-preview=*&options-ttl-secs=off");
+        assert_eq!(e.preview_bytes, Some(OrOff::Off));
+        assert_eq!(e.transfer_preview, Some(true));
+        assert_eq!(e.options_ttl_secs, Some(OrOff::Off));
+        assert_eq!(
+            e.to_string(),
+            "icap://h:1?preview-bytes=off&transfer-preview=*&options-ttl-secs=off"
+        );
+        let e = ep("icap://h:1");
+        assert!(e.preview_bytes.is_none() && e.transfer_preview.is_none());
+        assert!(e.options_ttl_secs.is_none() && e.infection_header.is_none());
+        for (bad, says) in [
+            ("icap://h:1?preview-bytes=lots", "preview-bytes"),
+            ("icap://h:1?transfer-preview=exe", "RFC 3507"),
+            ("icap://h:1?transfer-preview=", "transfer-preview"),
+            ("icap://h:1?options-ttl-secs=-1", "options-ttl-secs"),
+            ("icap://h:1?infection-header=sometimes", "infection-header"),
+            ("h:1?preview-bytes=0", "ICAP"),
+            ("clamd://h:1?transfer-preview=off", "ICAP"),
+            ("/run/x.sock?options-ttl-secs=9", "ICAP"),
+            ("h:1?infection-header=blocks", "ICAP"),
+        ] {
+            let e = Endpoint::parse(bad).unwrap_err();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
+    }
+
+    /// The time a request has to arrive, on either protocol, and the two
+    /// bounds of an ICAP connection: a default when absent, `off` where no
+    /// limit is safe.
+    #[test]
+    fn a_listener_carries_its_request_bounds() {
+        assert_eq!(ep("h:1?request-secs=30").request_secs, Some(30));
+        assert_eq!(ep("icap://h:1?request-secs=off").request_secs, Some(0));
+        assert_eq!(ep("h:1?request-secs=0").request_secs, Some(0));
+        assert_eq!(ep("h:1").request_secs, None);
+        let e = ep("icap://h:1?max-requests=off&max-header-bytes=8K");
+        assert_eq!((e.max_requests, e.max_header_bytes), (Some(0), Some(8192)));
+        assert_eq!(
+            e.to_string(),
+            "icap://h:1?max-requests=off&max-header-bytes=8192"
+        );
+        assert_eq!(
+            ep("h:1?request-secs=off").to_string(),
+            "clamd://h:1?request-secs=off"
+        );
+        assert_eq!(
+            ep("icap://h:1?request-secs=9&max-requests=2").server_side_options(),
+            ["request-secs", "max-requests"]
+        );
+        for (bad, says) in [
+            ("h:1?request-secs=soon", "request-secs"),
+            ("icap://h:1?max-requests=-1", "max-requests"),
+            ("icap://h:1?max-header-bytes=100", "1K"),
+            ("icap://h:1?max-header-bytes=off", "max-header-bytes"),
+            // ICAP's alone: clamd has no request head and no request count.
+            ("h:1?max-requests=5", "ICAP"),
+            ("/run/x.sock?max-header-bytes=8K", "ICAP"),
+        ] {
+            let e = Endpoint::parse(bad).unwrap_err();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_address_option_lists_the_known_ones() {
+        let e = Endpoint::parse("h:1?nope=1").unwrap_err();
+        for key in [
+            "session-secs",
+            "reply-secs",
+            "request-secs",
+            "max-header-bytes",
+            "preview-bytes",
+            "transfer-preview",
+            "options-ttl-secs",
+            "infection-header",
+        ] {
+            assert!(e.contains(key), "{e}");
+        }
+    }
+
+    #[test]
     fn a_mode_that_cannot_work_is_refused() {
         // Written the way an operator writes one, with or without the leading
         // zero.
@@ -549,7 +1094,7 @@ mod tests {
         assert_eq!(parse_mode("0660", "-").unwrap(), 0o660);
         // Octal, in range, and reachable: a socket nobody may write to is an
         // outage with a listening socket in front of it. Nothing here rounds a
-        // bad value to a good one — an operator who wrote something else meant
+        // bad value to a good one: an operator who wrote something else meant
         // something else, and a mode quietly repaired is one they believe is in
         // force.
         for bad in [
@@ -593,7 +1138,7 @@ mod tests {
         assert_eq!(e.to_string(), "icap://h:1344?service=one&service=two");
         // A comma cannot spell the list: `--listen` separates addresses with
         // one, so it would end this address before this parser saw it. One
-        // separator per level — commas between addresses, `&` within one —
+        // separator per level (commas between addresses, `&` within one),
         // which is also why the key is singular: each one names a single value.
         let err = Endpoint::parse("icap://h:1344?service=one,two").unwrap_err();
         assert!(err.contains("repeat the key"), "{err}");
@@ -604,7 +1149,7 @@ mod tests {
         assert!(err.contains("no port") && err.contains("service="), "{err}");
         // A comma in the path is an operator reaching for a list. Answer with
         // the spelling that works, rather than accepting a service whose name
-        // contains a comma — which would 404 every request and look right.
+        // contains a comma, which would 404 every request and look right.
         let err = Endpoint::parse("icap://h:1344/one,two").unwrap_err();
         assert!(err.contains("?service=one&service=two"), "{err}");
     }
@@ -655,7 +1200,7 @@ mod tests {
     #[test]
     fn icap_over_a_unix_socket_is_refused() {
         // A proxy has no way to reach one, so binding it would be a listener
-        // nothing can connect to — worse than an error.
+        // nothing can connect to, worse than an error.
         let e = Endpoint::parse("icap:///var/run/exav.sock").unwrap_err();
         assert!(e.contains("TCP"), "{e}");
     }

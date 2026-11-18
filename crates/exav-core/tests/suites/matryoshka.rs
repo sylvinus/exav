@@ -3,13 +3,13 @@
 //! Every other extractor test asks "does this format work?". This one asks the
 //! question that matters at the seams: **does each format hand off to the next?**
 //! A layer that decodes correctly but types its member wrongly, or emits it in a
-//! shape the next handler will not take, breaks the chain — and a broken chain
+//! shape the next handler will not take, breaks the chain, and a broken chain
 //! looks exactly like a clean file.
 //!
 //! It earned its keep immediately: the first run came back `OK`. A compressed
 //! QCOW2 cluster whose host offset happened to be **odd** was being read as the
-//! "reads as zeroes" flag and silently zero-filled, so one cluster — the one
-//! holding everything below it — became a hole. Nothing errored. See
+//! "reads as zeroes" flag and silently zero-filled, so one cluster (the one
+//! holding everything below it) became a hole. Nothing errored. See
 //! `a_compressed_cluster_at_an_odd_host_offset_is_not_dropped` in
 //! `exav-unpack/tests/diskimage.rs` for the narrow regression test.
 //!
@@ -36,7 +36,7 @@
 //! Two things are asserted, and the second matters more than the first:
 //!
 //! 1. Given depth to work with, exav reaches the payload at the bottom.
-//! 2. One level short of it, the verdict is `LimitsExceeded` — never `Clean`. A
+//! 2. One level short of it, the verdict is `LimitsExceeded`, never `Clean`. A
 //!    scanner that gives up quietly on a deeply nested archive has been evaded
 //!    by nothing more than a shell loop.
 
@@ -75,7 +75,7 @@ fn the_payload_under_twenty_six_formats_is_found() {
             "unexpected signature {signature}"
         ),
         other => panic!(
-            "the chain broke somewhere in the {FORMATS} formats — every one must \
+            "the chain broke somewhere in the {FORMATS} formats: every one must \
              hand its member to the next one's detector, got {other:?}"
         ),
     }
@@ -100,7 +100,7 @@ fn no_depth_short_of_the_payload_ever_reads_as_clean() {
     // Samples across the chain rather than just testing the boundary: a layer
     // that quietly produced nothing would show up as `Clean` at its own depth
     // while the boundary case still looked right. Stepping rather than testing
-    // every level keeps the runtime down — each deep scan re-expands the
+    // every level keeps the runtime down: each deep scan re-expands the
     // nine-megabyte VHDX in the middle of the chain.
     for depth in (1..DEPTH).step_by(3) {
         let v = scan_at(depth);

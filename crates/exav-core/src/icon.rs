@@ -13,7 +13,10 @@
 //! is bounds-checked and every arithmetic step avoids overflow so hostile or
 //! truncated input can never panic.
 
+use exav_unpack::pe::Headers;
 use serde::{Deserialize, Serialize};
+
+use crate::byte_source::ByteSource;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -99,50 +102,44 @@ impl IconDb {
     }
 
     /// Parse `.idb` text (one `name:group1:group2:hashblob` entry per line,
-    /// `#`-comments and blank lines skipped). Malformed lines and entries with
-    /// an invalid hash blob are silently skipped.
-    pub fn extend_from_text(&mut self, text: &str) {
+    /// `#`-comments and blank lines skipped). Returns how many other lines
+    /// were not loaded: malformed, or with an invalid hash blob.
+    pub fn extend_from_text(&mut self, text: &str) -> usize {
         while self.buckets.len() < 3 {
             self.buckets.push(IconBucket::default());
         }
+        let mut skipped = 0;
         for raw in text.lines() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() != 4 {
-                continue;
-            }
-            let (name, g1, g2, blob) = (parts[0], parts[1], parts[2], parts[3]);
-            let metric = match parse_blob(blob) {
-                Some(m) => m,
-                None => continue,
-            };
-            let es = match enginesize(metric.side) {
-                Some(e) => e,
-                None => continue,
-            };
-            let bucket = &mut self.buckets[es];
-            let g1i = match intern(&mut bucket.group1, g1) {
-                Some(i) => i,
-                None => continue,
-            };
-            let g2i = match intern(&mut bucket.group2, g2) {
-                Some(i) => i,
-                None => continue,
-            };
-            bucket.entries.push(IconEntry {
-                name: name.to_string(),
-                g1: g1i,
-                g2: g2i,
-                metric,
-            });
+            skipped += usize::from(self.add_line(line).is_none());
         }
+        skipped
     }
 
-    /// Does any loaded entry — whose group names satisfy the optional `g1`/`g2`
-    /// constraints (`None` ⇒ any) — match one of the per-scan PE icon metrics?
+    /// One `.idb` line, `None` when it is not loaded.
+    fn add_line(&mut self, line: &str) -> Option<()> {
+        let parts: Vec<&str> = line.split(':').collect();
+        let &[name, g1, g2, blob] = parts.as_slice() else {
+            return None;
+        };
+        let metric = parse_blob(blob)?;
+        let bucket = &mut self.buckets[enginesize(metric.side)?];
+        let g1 = intern(&mut bucket.group1, g1)?;
+        let g2 = intern(&mut bucket.group2, g2)?;
+        bucket.entries.push(IconEntry {
+            name: name.to_string(),
+            g1,
+            g2,
+            metric,
+        });
+        Some(())
+    }
+
+    /// Does any loaded entry (whose group names satisfy the optional `g1`/`g2`
+    /// constraints, `None` ⇒ any) match one of the per-scan PE icon metrics?
     /// Returns the matching entry's signature name.
     pub fn match_pe(
         &self,
@@ -260,36 +257,13 @@ fn rd_u32(d: &[u8], off: usize) -> Option<u32> {
 // PE resource walk (§3)
 // ---------------------------------------------------------------------------
 
-/// Section-table view used to map resource-content RVAs to file offsets.
-struct SectionMap {
-    size_of_headers: u32,
-    /// (virtual_address, extent, pointer_to_raw_data)
-    sections: Vec<(u32, u32, u32)>,
-}
-
-impl SectionMap {
-    fn rva_to_off(&self, rva: u32) -> Option<usize> {
-        if (rva as u64) < self.size_of_headers as u64 {
-            return usize::try_from(rva).ok();
-        }
-        for &(va, extent, raw) in &self.sections {
-            let start = va as u64;
-            let end = start + extent as u64;
-            if rva as u64 >= start && (rva as u64) < end {
-                let off = raw as u64 + (rva as u64 - start);
-                return usize::try_from(off).ok();
-            }
-        }
-        None
-    }
-}
-
 /// A bounded view over a PE's resource directory tree.
 struct Resources<'a> {
     data: &'a [u8],
     /// File offset of the resource root (the resource-directory base).
     rbase: usize,
-    map: SectionMap,
+    /// Maps the RVAs of resource contents to file offsets.
+    headers: Headers,
     /// Directory entries still to be looked at. A node can list thousands of
     /// entries that point back at itself, which the depth limit alone leaves
     /// as an exponential walk.
@@ -300,11 +274,11 @@ struct Resources<'a> {
 const MAX_RESOURCE_ENTRIES: u32 = 4096;
 
 impl<'a> Resources<'a> {
-    fn new(data: &'a [u8], rbase: usize, map: SectionMap) -> Self {
+    fn new(data: &'a [u8], rbase: usize, headers: Headers) -> Self {
         Resources {
             data,
             rbase,
-            map,
+            headers,
             entries_left: std::cell::Cell::new(MAX_RESOURCE_ENTRIES),
         }
     }
@@ -381,7 +355,7 @@ impl<'a> Resources<'a> {
                 let leaf = self.rbase.checked_add(off_field as usize)?;
                 let crva = rd_u32(self.data, leaf)?;
                 let csize = rd_u32(self.data, leaf.checked_add(4)?)? as usize;
-                let coff = self.map.rva_to_off(crva)?;
+                let coff = self.headers.rva_to_offset(crva)?;
                 return Some((coff, csize));
             }
         }
@@ -438,7 +412,7 @@ impl<'a> Resources<'a> {
 }
 
 /// File offsets of every `String` entry inside a PE's `VS_VERSION_INFO`
-/// resource — the anchor set an `VI:` signature offset matches against.
+/// resource: the anchor set an `VI:` signature offset matches against.
 ///
 /// A `VI:` pattern is anchored, not windowed: probed against two real binaries,
 /// a pattern matches only when it begins exactly at the start of a version-info
@@ -446,7 +420,7 @@ impl<'a> Resources<'a> {
 /// never elsewhere in the resource. Every offset clamscan accepted was such a
 /// key start.
 ///
-/// clamscan accepts a *subset* of these — on one binary it took the first eight
+/// clamscan accepts a *subset* of these: on one binary it took the first eight
 /// of nine keys, on another six of nine, with no positional or uniqueness rule
 /// that accounts for which. exav anchors on all of them deliberately. The set is
 /// a superset, so no `VI:` signature that fires there fails to fire here, and
@@ -476,7 +450,7 @@ pub fn version_info_anchors(data: &[u8]) -> Vec<u64> {
     // Walk the block for `String` entries. Each is
     // `wLength|wValueLength|wType|szKey…`, 4-byte aligned, so a scan on the
     // alignment grid finds every one without needing to model the full nested
-    // `StringFileInfo`/`StringTable` hierarchy — which packers routinely
+    // `StringFileInfo`/`StringTable` hierarchy, which packers routinely
     // malform anyway.
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -487,7 +461,7 @@ pub fn version_info_anchors(data: &[u8]) -> Vec<u64> {
         // inside the block.
         if wtype == 1 && wlen > 6 && i + wlen <= block.len() {
             let key = i + 6;
-            // The key is a NUL-terminated UTF-16 run of printable ASCII — the
+            // The key is a NUL-terminated UTF-16 run of printable ASCII: the
             // known version-info key names all are, and requiring it keeps the
             // grid scan from anchoring on arbitrary binary.
             let mut j = key;
@@ -511,72 +485,25 @@ pub fn version_info_anchors(data: &[u8]) -> Vec<u64> {
     out
 }
 
-/// Shared setup for the resource-tree walkers: parse the PE, map the resource
-/// directory to a file offset, and build the view over it.
+/// Shared setup for the resource-tree walkers: read the PE headers, map the
+/// resource directory to a file offset, and build the view over it.
 fn resource_view(data: &[u8]) -> Option<(Resources<'_>, usize)> {
-    let pe = crate::pe::headers(data)?;
-    let oh = pe.header.optional_header?;
-    let rsrc = oh.data_directories.get_resource_table()?;
-    if rsrc.virtual_address == 0 || rsrc.size == 0 {
+    let headers = Headers::read(&|off, len| ByteSource::window(data, off, len))?;
+    // The resource table is the third data directory.
+    let rsrc = *headers.directories.get(2)?;
+    if rsrc.address == 0 || rsrc.size == 0 {
         return None;
     }
-    let mut sections = Vec::with_capacity(pe.sections.len());
-    for s in &pe.sections {
-        let extent = if s.size_of_raw_data != 0 {
-            s.size_of_raw_data
-        } else {
-            s.virtual_size.max(s.size_of_raw_data)
-        };
-        sections.push((s.virtual_address, extent, s.pointer_to_raw_data));
-    }
-    let map = SectionMap {
-        size_of_headers: oh.windows_fields.size_of_headers,
-        sections,
-    };
-    let rbase = map.rva_to_off(rsrc.virtual_address)?;
+    let rbase = headers.rva_to_offset(rsrc.address)?;
     if rbase >= data.len() {
         return None;
     }
-    Some((Resources::new(data, rbase, map), rbase))
+    Some((Resources::new(data, rbase, headers), rbase))
 }
 
 /// Parse a PE and return the DIB slices of its first icon group.
 fn pe_icon_dibs(data: &[u8]) -> Vec<&[u8]> {
-    let Some(pe) = crate::pe::headers(data) else {
-        return Vec::new();
-    };
-    let oh = match pe.header.optional_header {
-        Some(o) => o,
-        None => return Vec::new(),
-    };
-    let rsrc = match oh.data_directories.get_resource_table() {
-        Some(d) => d,
-        None => return Vec::new(),
-    };
-    if rsrc.virtual_address == 0 || rsrc.size == 0 {
-        return Vec::new();
-    }
-    let mut sections = Vec::with_capacity(pe.sections.len());
-    for s in &pe.sections {
-        let extent = if s.size_of_raw_data != 0 {
-            s.size_of_raw_data
-        } else {
-            s.virtual_size.max(s.size_of_raw_data)
-        };
-        sections.push((s.virtual_address, extent, s.pointer_to_raw_data));
-    }
-    let map = SectionMap {
-        size_of_headers: oh.windows_fields.size_of_headers,
-        sections,
-    };
-    let rbase = match map.rva_to_off(rsrc.virtual_address) {
-        Some(o) => o,
-        None => return Vec::new(),
-    };
-    if rbase >= data.len() {
-        return Vec::new();
-    }
-    Resources::new(data, rbase, map).collect_dibs()
+    resource_view(data).map_or_else(Vec::new, |(resources, _)| resources.collect_dibs())
 }
 
 // ---------------------------------------------------------------------------
@@ -1459,12 +1386,8 @@ mod tests {
             d.extend_from_slice(&u32::from(i).to_le_bytes());
             d.extend_from_slice(&(0x8000_0000u32 | 24).to_le_bytes());
         }
-        let map = SectionMap {
-            size_of_headers: 0,
-            sections: Vec::new(),
-        };
         let start = std::time::Instant::now();
-        assert!(Resources::new(&d, 0, map).collect_dibs().is_empty());
+        assert!(Resources::new(&d, 0, Headers::default()).collect_dibs().is_empty());
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
@@ -1509,6 +1432,162 @@ mod tests {
 
     fn metric_of(side: usize, r: u8, g: u8, b: u8) -> IconMetric {
         dib_to_metric(&build_dib(side, r, g, b)).expect("metric")
+    }
+
+    /// Where `pe_with_icon` puts the optional header and the section header,
+    /// and the fields of both that the tests below change.
+    const PE_AT: usize = 0x40;
+    const OPT: usize = PE_AT + 24;
+    const SECTION: usize = OPT + 0xe0;
+    const SECTION_COUNT: usize = PE_AT + 6;
+    const OPTIONAL_SIZE: usize = PE_AT + 20;
+    const DIRECTORY_COUNT: usize = OPT + 92;
+    const VIRTUAL_SIZE: usize = SECTION + 8;
+    const RAW_SIZE: usize = SECTION + 16;
+    /// The resource tree is at the start of the section, in the file at 0x400.
+    const SECTION_RVA: u32 = 0x1000;
+    const TREE: usize = 0x400;
+
+    /// A PE32 with one section at RVA 0x1000 and its raw data at 0x400. The
+    /// section holds a resource tree with one icon group of one 32x32 icon:
+    /// the tree, then the group data 208 bytes in, then the icon `dib_at`
+    /// bytes in.
+    fn pe_with_icon(dib_at: usize) -> Vec<u8> {
+        fn put(v: &mut [u8], at: usize, bytes: &[u8]) {
+            v[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        const DIR: u32 = 0x8000_0000;
+        let dib = build_dib(32, 0x20, 0x90, 0xd0);
+        let group = 208;
+        let mut tree = vec![0u8; group + 20];
+        // Each directory has one entry, but the root has two.
+        let dir = |t: &mut Vec<u8>, at: usize, entries: &[(u32, u32)]| {
+            put(t, at + 14, &(entries.len() as u16).to_le_bytes());
+            for (i, (id, target)) in entries.iter().enumerate() {
+                put(t, at + 16 + i * 8, &id.to_le_bytes());
+                put(t, at + 20 + i * 8, &target.to_le_bytes());
+            }
+        };
+        dir(&mut tree, 0, &[(3, DIR | 104), (14, DIR | 32)]);
+        // Type 14 (the group), name 1, language 0x409, its data entry.
+        dir(&mut tree, 32, &[(1, DIR | 56)]);
+        dir(&mut tree, 56, &[(0x409, DIR | 80)]);
+        dir(&mut tree, 80, &[(0x409, 176)]);
+        // Type 3 (the icon), name 1, language 0x409, its data entry.
+        dir(&mut tree, 104, &[(1, DIR | 128)]);
+        dir(&mut tree, 128, &[(0x409, DIR | 152)]);
+        dir(&mut tree, 152, &[(0x409, 192)]);
+        put(&mut tree, 176, &(SECTION_RVA + group as u32).to_le_bytes());
+        put(&mut tree, 180, &20u32.to_le_bytes());
+        put(&mut tree, 192, &(SECTION_RVA + dib_at as u32).to_le_bytes());
+        put(&mut tree, 196, &(dib.len() as u32).to_le_bytes());
+        // The group: one entry, the icon with id 1.
+        put(&mut tree, group + 2, &1u16.to_le_bytes());
+        put(&mut tree, group + 4, &1u16.to_le_bytes());
+        put(&mut tree, group + 6 + 12, &1u16.to_le_bytes());
+
+        let size = dib_at + dib.len();
+        let mut f = vec![0u8; TREE + size];
+        put(&mut f, 0, b"MZ");
+        put(&mut f, 0x3c, &(PE_AT as u32).to_le_bytes());
+        put(&mut f, PE_AT, b"PE\0\0");
+        put(&mut f, PE_AT + 4, &0x14cu16.to_le_bytes());
+        put(&mut f, SECTION_COUNT, &1u16.to_le_bytes());
+        put(&mut f, OPTIONAL_SIZE, &0xe0u16.to_le_bytes());
+        put(&mut f, OPT, &0x10bu16.to_le_bytes());
+        put(&mut f, OPT + 60, &0x200u32.to_le_bytes());
+        put(&mut f, DIRECTORY_COUNT, &16u32.to_le_bytes());
+        // The resource directory is the third.
+        put(&mut f, OPT + 96 + 16, &SECTION_RVA.to_le_bytes());
+        put(&mut f, OPT + 96 + 20, &(tree.len() as u32).to_le_bytes());
+        put(&mut f, SECTION, b".rsrc");
+        put(&mut f, VIRTUAL_SIZE, &(size as u32).to_le_bytes());
+        put(&mut f, SECTION + 12, &SECTION_RVA.to_le_bytes());
+        put(&mut f, RAW_SIZE, &(size as u32).to_le_bytes());
+        put(&mut f, SECTION + 20, &(TREE as u32).to_le_bytes());
+        put(&mut f, TREE, &tree);
+        put(&mut f, TREE + dib_at, &dib);
+        f
+    }
+
+    fn put_u32_at(f: &mut [u8], at: usize, x: u32) {
+        f[at..at + 4].copy_from_slice(&x.to_le_bytes());
+    }
+
+    #[test]
+    fn the_synthetic_pe_has_its_icon() {
+        let pe = pe_with_icon(232);
+        let want = metric_of(32, 0x20, 0x90, 0xd0);
+        assert_eq!(pe_icon_metrics(&pe), vec![want]);
+    }
+
+    /// The raw data of a section goes on past the page of its virtual size
+    /// (0x10 here): the part past the page has no address in the section.
+    #[test]
+    fn an_icon_in_the_raw_data_past_the_page_of_the_virtual_size_is_not_read() {
+        let mut pe = pe_with_icon(0x1100);
+        put_u32_at(&mut pe, RAW_SIZE, 0x2000);
+        // The page of the virtual size reaches the icon.
+        put_u32_at(&mut pe, VIRTUAL_SIZE, 0x1200);
+        assert_eq!(pe_icon_metrics(&pe).len(), 1);
+        put_u32_at(&mut pe, VIRTUAL_SIZE, 0x10);
+        assert_eq!(pe_icon_metrics(&pe).len(), 0);
+    }
+
+    /// A section with a virtual size and no raw data has no bytes in the
+    /// file: the bytes at its pointer are another section's, or none.
+    #[test]
+    fn a_section_with_no_raw_data_has_no_icon_in_the_file() {
+        let mut pe = pe_with_icon(232);
+        put_u32_at(&mut pe, RAW_SIZE, 0);
+        put_u32_at(&mut pe, VIRTUAL_SIZE, 0x2000);
+        assert_eq!(pe_icon_metrics(&pe).len(), 0);
+        // With no virtual size either, the raw size is taken: here 0.
+        put_u32_at(&mut pe, VIRTUAL_SIZE, 0);
+        assert_eq!(pe_icon_metrics(&pe).len(), 0);
+    }
+
+    /// More data directories than the 16 there are names for are the
+    /// first 16.
+    #[test]
+    fn a_directory_count_beyond_16_still_has_the_resource_directory() {
+        let mut pe = pe_with_icon(232);
+        put_u32_at(&mut pe, DIRECTORY_COUNT, 17);
+        assert_eq!(pe_icon_metrics(&pe).len(), 1);
+    }
+
+    /// A section count that the file cannot hold: the sections that are
+    /// there are read.
+    #[test]
+    fn a_section_count_beyond_the_file_still_has_the_sections_there() {
+        let mut pe = pe_with_icon(232);
+        pe[SECTION_COUNT..SECTION_COUNT + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(pe_icon_metrics(&pe).len(), 1);
+    }
+
+    /// A section name that says it is a long one and is not.
+    #[test]
+    fn a_section_name_that_is_a_bad_long_name_does_not_stop_the_icon() {
+        let mut pe = pe_with_icon(232);
+        pe[SECTION..SECTION + 4].copy_from_slice(b"/zz\0");
+        assert_eq!(pe_icon_metrics(&pe).len(), 1);
+    }
+
+    /// The data directories are those the optional header holds: past its
+    /// end are the section headers, whatever they spell.
+    #[test]
+    fn a_directory_past_the_end_of_the_optional_header_is_not_read() {
+        let mut pe = pe_with_icon(232);
+        // The optional header ends before the third directory, and the
+        // section header follows it there. Its name spells a resource
+        // directory at 0x1000, for a reader that takes the directories
+        // from past the end of the optional header.
+        let end = OPT + 0x70;
+        pe.copy_within(SECTION..SECTION + 40, end);
+        pe[OPTIONAL_SIZE..OPTIONAL_SIZE + 2].copy_from_slice(&0x70u16.to_le_bytes());
+        pe[end..end + 4].copy_from_slice(&SECTION_RVA.to_le_bytes());
+        pe[end + 4..end + 8].copy_from_slice(&0x80u32.to_le_bytes());
+        assert_eq!(pe_icon_metrics(&pe).len(), 0);
     }
 
     #[test]

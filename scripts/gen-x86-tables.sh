@@ -3,7 +3,7 @@
 #
 # The generator reads the tables off `iced-x86` (MIT; attributed in NOTICE)
 # rather than transcribing them from a manual, because a hand-copied opcode
-# table is wrong in ways no review catches — a missing immediate byte gives a
+# table is wrong in ways no review catches: a missing immediate byte gives a
 # wrong length, and a wrong length desynchronises every instruction after it.
 #
 # The generator is its own workspace, outside this one: it has to be runnable

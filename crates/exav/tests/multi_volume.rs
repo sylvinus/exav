@@ -1,7 +1,7 @@
 //! `exav -r <dir>` must see a multi-volume archive as the archive it is.
 //!
 //! A set split across `big.zip.001`, `.002`, `.003` is one file cut at arbitrary
-//! byte offsets. Scanned a file at a time — which is all a directory walk does —
+//! byte offsets. Scanned a file at a time (which is all a directory walk does),
 //! no piece holds the whole payload and every line reads `OK`, so whatever the
 //! archive holds is never looked at. The fixture below cuts the payload
 //! *through the middle of the signature bytes*, so no individual part can
@@ -155,7 +155,7 @@ fn a_split_archive_in_a_directory_is_rejoined_and_reported() {
 
 #[test]
 fn a_set_with_a_hole_is_reported_never_clean() {
-    // Its bytes belong to an archive nothing can now read — not us, not the tool
+    // Its bytes belong to an archive nothing can now read, not us, not the tool
     // that wrote it. Passing them over as clean would hide exactly that.
     let dir = TempDir::new().unwrap();
     write_split_set(dir.path(), "gap", 3, &[0, 2]);

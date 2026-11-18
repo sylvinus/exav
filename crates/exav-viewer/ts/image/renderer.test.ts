@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 
-import type { Controllers, RenderContext, Status } from "../core/types.js";
+import { FormatMismatch } from "../core/mismatch.js";
+import type { Controllers, Detector, RenderContext, Status } from "../core/types.js";
 import { decodeInWorker as decode } from "./decode.js";
 import type { ImageOptions } from "./index.js";
 import { renderer } from "./renderer.js";
@@ -147,7 +148,7 @@ it("publishes its controllers before it says ready", async () => {
 });
 
 /** A file the browser does not draw, so that exav-render's decoder is asked, and answers with `reason`. */
-async function mountUndrawable(reason: string) {
+async function mountUndrawable(reason: string, detector?: Pick<Detector, "detectFile">) {
   vi.stubGlobal("Image", function () {
     const img = document.createElement("img");
     Object.defineProperty(img, "src", {
@@ -167,6 +168,7 @@ async function mountUndrawable(reason: string) {
     signal: new AbortController().signal,
     status: (s: Status) => statuses.push(s),
     controllers() {},
+    detector,
   } as unknown as RenderContext<ImageOptions>;
   try {
     return { statuses, handle: await renderer.mount(document.createElement("div"), ctx), error: undefined };
@@ -179,6 +181,20 @@ it("says a camera RAW file with no preview holds none, in a status of its own", 
   const { statuses, handle } = await mountUndrawable("no-preview");
   expect(handle).toBeDefined();
   expect(statuses).toEqual([{ phase: "loading" }, { phase: "error", error: { code: "image_no_preview", cause: expect.any(Error) } }]);
+});
+
+it("says the bytes are another format, for the session to route, when the decoders refuse a file the detection types otherwise", async () => {
+  const detectFile = vi.fn(async () => "pdf");
+  const { error } = await mountUndrawable("undecodable", { detectFile });
+  expect(error).toBeInstanceOf(FormatMismatch);
+  expect((error as FormatMismatch).format).toBe("pdf");
+  // Told the bytes the source holds, not the ones sent to the worker.
+  expect(detectFile).toHaveBeenCalledWith(expect.anything(), new Uint8Array([1, 2, 3]), 3, expect.anything(), expect.any(Function));
+  // Where the detection finds an image, or nothing else, the refusal is the decoder's own.
+  for (const found of ["image", null]) {
+    const again = await mountUndrawable("undecodable", { detectFile: async () => found } as unknown as Pick<Detector, "detectFile">);
+    expect(again.error, String(found)).toEqual(new Error("undecodable"));
+  }
 });
 
 it("leaves every other decoder failure to the viewer's own error for an image", async () => {

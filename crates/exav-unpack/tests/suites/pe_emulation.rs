@@ -3,7 +3,7 @@
 //! A runtime packer's format is whatever its author chose; what every one of
 //! them has in common is that the stub must rebuild the original image in
 //! memory and jump to it. exav runs the stub in a sandboxed x86 interpreter and
-//! captures that moment, which is why it does not need a decoder per packer —
+//! captures that moment, which is why it does not need a decoder per packer,
 //! and why a packer nobody has written a decoder for still gets unpacked.
 //!
 //! These tests drive the public `extract(Format::PePacked, …)` entry point with
@@ -130,7 +130,7 @@ fn a_packed_image_is_recovered_by_running_its_stub() {
     );
     assert!(
         !file.windows(MARKER.len()).any(|w| w == MARKER),
-        "which is present nowhere in the packed file — only running it finds it"
+        "which is present nowhere in the packed file: only running it finds it"
     );
 }
 
@@ -208,7 +208,7 @@ fn a_stub_that_loops_forever_is_bounded_and_yields_nothing() {
 
 #[test]
 fn an_ordinary_program_is_not_routed_to_the_emulator() {
-    // A normal PE — entry point at the start of a read-only code section — is
+    // A normal PE (entry point at the start of a read-only code section) is
     // not emulated at all. The cost of the emulator has to fall on files that
     // look packed, not on every executable that gets scanned.
     let mut file = packed_pe(&decrypt_stub(0x100, 0x5a), b"payload");

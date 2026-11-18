@@ -1,6 +1,6 @@
 # exav-unpack-wasm
 
-WebAssembly bindings for [`exav-unpack`](../exav-unpack) — **memory-safe,
+WebAssembly bindings for [`exav-unpack`](../exav-unpack): **memory-safe,
 in-browser archive extraction** with no server round-trip and no native/C
 dependencies. Because `exav-unpack` is pure Rust, the whole extractor (zip, rar,
 7z, cab, arj, lha, tar, gz, xz, bz2, iso, cpio, ar, xar, ole, pdf, email, upx)
@@ -24,7 +24,7 @@ This emits a `pkg/` directory with the `.wasm` module + JS bindings.
 
 **Publish from this directory with `npm publish`, never `wasm-pack publish`.**
 `wasm-pack` regenerates `pkg/package.json` on every build, and that manifest
-lists only the three build artifacts — no `LICENSE`, no `NOTICE`, no author.
+lists only the three build artifacts: no `LICENSE`, no `NOTICE`, no author.
 Publishing from `pkg/` would ship a compiled module that statically links a large
 permissively-licensed dependency graph with none of its required attribution.
 The manifest here carries the full `files` list; `prepublishOnly` refuses to
@@ -42,7 +42,7 @@ Three, and each is a complete choice rather than a starting point:
 | `minimal` | `build:minimal` | zip, gzip, tar |
 
 **Why the emulator is not in the default.** `pe-emu` unpacks a packed executable
-by running its own stub under an x86 interpreter — the one component that
+by running its own stub under an x86 interpreter, the one component that
 follows control flow the scanned file supplies rather than parsing data it
 supplies. Its bounds are a fixed 120M-instruction budget that no caller can
 lower, so a page that hits it hangs the tab, and that is not something a user
@@ -80,7 +80,7 @@ for (const m of members) {
 }
 ```
 
-Hand it a `File` instead of bytes and the archive is never held whole — members
+Hand it a `File` instead of bytes and the archive is never held whole: members
 are read one at a time, straight out of the file on disk:
 
 ```js
@@ -93,12 +93,17 @@ await archive.close();
 ```
 
 - `detectFormat(bytes)` → the format name, or `undefined` if unrecognised.
+- `zipTail(tail, size)` → a ZIP's central directory from the last bytes of a
+  `size`-byte file, for a reader that fetches by ranges: `{ headers }` (where
+  the members' local headers are), `{ needs }` (the offset from which more
+  bytes are needed), or `undefined` for what the ZIP reader does not open.
+  Call it after `init()`.
 - `unpack(bytes, passwords?, limits?)` → a promise for an array of
   `{ name, bytes: Uint8Array, data: ReadableStream, encrypted, unsupported }`.
   A member exav could not extract comes back with `unsupported` set and no data,
-  rather than being dropped or handed back as raw bytes — so "the archive holds
+  rather than being dropped or handed back as raw bytes, so "the archive holds
   nothing dangerous" and "I could not read this member" stay distinguishable.
-  Member names are returned **verbatim** — sanitize paths before writing them
+  Member names are returned **verbatim**: sanitize paths before writing them
   anywhere.
 - `Archive.open(source, limits?, options?)` → an archive you can `list()` and
   `extract()` member by member. `source` is a `File`/`Blob`, a `Uint8Array`, or
@@ -107,7 +112,7 @@ await archive.close();
 
 ### Why a `File` uses a Worker
 
-exav's archive readers are synchronous — the same code the CLI runs, rather than
+exav's archive readers are synchronous: the same code the CLI runs, rather than
 a second implementation written against async I/O, because two readers of the
 same bytes are two sets of answers about them. Reading a `File` synchronously
 needs `FileReaderSync`, which browsers provide only inside a Worker, so that is
@@ -118,7 +123,7 @@ The Worker is also what makes a decoder crash survivable. `wasm32-unknown-unknow
 is a `panic = "abort"` target, so the `catch_unwind` that turns a decoder panic
 into a returned limit everywhere else in exav catches nothing here: a panic traps
 the module and every later call into that instance fails. A Worker is disposable
-in a way a page is not — the trap takes an instance you do not own, every pending
+in a way a page is not: the trap takes an instance you do not own, every pending
 request is rejected with the reason rather than left unanswered, the Worker is
 replaced, and the next archive opens on a fresh one. An archive opened on the old
 one reports that it was replaced instead of waiting forever on a Worker that can
@@ -141,8 +146,11 @@ const archive = await Archive.open(file, undefined, {
 `list()` decodes nothing it can avoid: where an archive carries an index (a
 ZIP's central directory, a tar's headers) it decompresses nothing, and
 `uncompressedSize` is what the archive declares, or -1 where it declares none
-(a gzip or xz stream). `extract(i)` walks the archive up to member `i`, skipping
-the members before it undecoded where the format allows; a format read whole
+(a gzip or xz stream). A member's `synthetic` is true for the one member of a
+single-stream format (gzip, bzip2, xz, zstd...), which the format does not name:
+its `name` (`gzip-content`) is the library's. `extract(i)` walks the archive up
+to member `i`, skipping the members before it undecoded where the format
+allows; a format read whole
 (7z, RAR) is decoded to be listed or extracted from, so for those,
 `extractAll()` is one pass where `extract(i)` over every `i` is many.
 
@@ -158,7 +166,6 @@ const archive = await Archive.open(file, {
   maxScannedBytes: 1024 * 1024 * 1024, // cumulative bytes fed to the matcher
   maxMembers: 5000,
   maxRecursion: 4,                     // archives inside archives
-  maxCompressionRatio: 200,            // decompression ratio
   allowedFormats: ["Zip", "Tar"],      // open only these; anything else is reported
 });
 ```
@@ -183,11 +190,13 @@ the tab can give. Running out is not an error you can catch: the module aborts
 and takes its instance with it, so your `await` never resolves and you get no
 result at all.
 
-`maxMembers` (100000), `maxRecursion` (16) and `maxCompressionRatio` (1000) keep
-the library's values — they bound counts and shapes rather than bytes, so the
-address space is not what constrains them.
+`maxMembers` (100000) and `maxRecursion` (16) keep the library's values: they
+bound counts and shapes rather than bytes, so the address space is not what
+constrains them. There is no compression-ratio limit to set: the library asks
+the ratio only of a member past `maxBufferBytes`, and a member is held whole
+here, so such a member is over the buffer limit first.
 
-Raise them if the page can afford it — a desktop app in a Web Worker is not a
+Raise them if the page can afford it: a desktop app in a Web Worker is not a
 phone browser.
 - `isVolumePart(name)` → whether a *filename* marks one part of a byte-split
   archive. Names only, so it is cheap enough to run over a whole drop.
@@ -201,7 +210,7 @@ phone browser.
 ## Split archives
 
 `big.7z.001`, `.002`, `.003` is one archive cut at arbitrary byte offsets. Open
-any part on its own and there is no header, no directory, nothing to detect —
+any part on its own and there is no header, no directory, nothing to detect,
 which is what a multi-file drop hands you. `joinVolumes` turns the group back
 into files `Archive.open` can take:
 
@@ -214,7 +223,7 @@ for (const s of sets) {
 ```
 
 `incomplete` is `null` for a set that rejoined, and otherwise a string saying
-why it could not — with `data` holding the pieces that *were* present. Those are
+why it could not, with `data` holding the pieces that *were* present. Those are
 handed back rather than dropped on purpose: their bytes belong to an archive
 nothing can read any more, and letting them vanish silently is the one outcome
 worth avoiding. Files that are not part of a set are simply absent from the

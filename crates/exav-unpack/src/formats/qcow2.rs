@@ -1,4 +1,4 @@
-//! QCOW2 — QEMU's copy-on-write disk image.
+//! QCOW2: QEMU's copy-on-write disk image.
 //!
 //! 7-Zip opens these, every hypervisor reads them, and `qemu-img convert -c`
 //! produces one whose clusters are **compressed** (deflate, or zstd where the
@@ -13,7 +13,7 @@
 //! The disk is addressed through two levels of tables. A guest offset splits
 //! into an L1 index, an L2 index and an offset within the cluster; `L1[i]` gives
 //! the location of an L2 table, and `L2[j]` gives the location of the cluster
-//! itself — or marks it unallocated (reads as zeroes) or compressed. The tables
+//! itself, or marks it unallocated (reads as zeroes) or compressed. The tables
 //! are read from the source as clusters are reached, never held.
 //!
 //! The disk is a [`VDisk`]: one member when it fits the buffer limit, else its
@@ -129,7 +129,7 @@ impl Layout for Qcow2<'_> {
         // Bit 0 means "reads as zeroes" for a *plain* entry only. In a
         // compressed descriptor it is part of the host offset, so testing it
         // unconditionally drops every compressed cluster that happens to
-        // start at an odd byte — silently, as a hole of zeroes that scans
+        // start at an odd byte, silently, as a hole of zeroes that scans
         // clean.
         if e == 0 || (!compressed && e & L2_ZERO != 0) {
             return Map::Zero; // unallocated or explicitly zero
@@ -203,7 +203,7 @@ impl Layout for Qcow2<'_> {
 
     fn reports(&self, health: &Health) -> Vec<(u64, &'static str)> {
         // A cluster whose compressed bytes are *present* but will not decode is
-        // content exav failed to read — it must be reported. A cluster pointing
+        // content exav failed to read: it must be reported. A cluster pointing
         // past the end of the file is content that is not there at all, which
         // is a truncated image rather than a hidden payload, and stays quiet.
         // Reported alongside the disk, not instead of it: zero-filling a failed
@@ -246,7 +246,7 @@ fn open(src: &dyn ByteSource) -> Opened<'_> {
     let unread = |why| Opened::Unread(virtual_size, false, why);
 
     // A backing file holds the clusters this image does not, and it is not in
-    // this file — the same shape as a differencing VHD.
+    // this file: the same shape as a differencing VHD.
     if backing_file_size > 0 {
         return unread(
             "QCOW2 with a backing file: the disk is a delta against an image not in this file",
@@ -315,11 +315,11 @@ fn open(src: &dyn ByteSource) -> Opened<'_> {
 }
 
 /// Walk a QCOW2 image's disk.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     match open(src) {
         Opened::No => Ok(None),
         Opened::Unread(size, encrypted, why) => {
@@ -327,7 +327,7 @@ pub(crate) fn walk<T>(
         }
         Opened::Disk(layout) => {
             let allowance = budget.remaining_scan();
-            vdisk::walk(VDisk::new(src, layout, allowance), budget, visit)
+            vdisk::walk(VDisk::new(src, Box::new(layout), allowance), budget, visit)
         }
     }
 }
@@ -372,7 +372,7 @@ mod tests {
         let Opened::Disk(layout) = open(src) else {
             panic!("the image should open as a disk");
         };
-        let mut d = VDisk::new(src, layout, u64::MAX);
+        let mut d = VDisk::new(src, Box::new(layout), u64::MAX);
         let mut out = vec![0u8; n];
         d.read_exact(&mut out).unwrap();
         (out, d.health().undecodable())
@@ -462,8 +462,8 @@ mod tests {
         let Opened::Disk(layout) = open(&src) else {
             panic!("a disk")
         };
-        let mut d = VDisk::new(&src, layout, u64::MAX);
-        let at = |d: &mut VDisk<'_, Qcow2<'_>>, i: usize| {
+        let mut d = VDisk::new(&src, Box::new(layout), u64::MAX);
+        let at = |d: &mut VDisk<'_>, i: usize| {
             d.seek(SeekFrom::Start((i * cluster + 1000) as u64))
                 .unwrap();
             let mut b = vec![0u8; 4096];

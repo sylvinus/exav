@@ -53,6 +53,9 @@ mod compiler;
 mod error;
 #[cfg(feature = "yara")]
 #[allow(dead_code)]
+mod feed;
+#[cfg(feature = "yara")]
+#[allow(dead_code)]
 mod ir;
 #[cfg(feature = "yara")]
 #[allow(dead_code)]
@@ -68,6 +71,12 @@ mod scanner;
 // whole surface a standalone consumer needs.
 #[cfg(feature = "yara")]
 pub use compiler::{Compiler, ExternalValue};
+#[cfg(feature = "yara")]
+pub(crate) use feed::{YaraFeed, YaraPass};
+/// What a read of an object found of the patterns: nothing, without the
+/// engine.
+#[cfg(not(feature = "yara"))]
+pub(crate) type YaraPass = ();
 #[cfg(feature = "yara")]
 pub use error::{Error, Result};
 #[cfg(feature = "yara")]
@@ -270,23 +279,46 @@ impl YaraDb {
     /// them simply do not match.
     #[cfg(feature = "yara")]
     pub fn scan(&self, data: &[u8], filename: Option<&str>) -> Vec<String> {
-        self.scan_source(&data, filename, usize::MAX)
+        self.scan_source(
+            &data,
+            filename,
+            false,
+            &crate::engine::WholeLimits::NONE,
+            None,
+        )
+    }
+
+    /// The search of the patterns in `src`, for a read of `src` that serves
+    /// other searches too to feed, and [`Self::scan_source`] to be handed the
+    /// answer. `None` when there is nothing to search for.
+    #[cfg(feature = "yara")]
+    pub(crate) fn feed<'a>(
+        &'a self,
+        src: &'a dyn crate::byte_source::ByteSource,
+        whole: &crate::engine::WholeLimits,
+    ) -> Option<YaraFeed<'a>> {
+        self.rules()?.feed(src, whole)
     }
 
     /// As [`Self::scan`], over an object that need not be held in memory.
-    /// `materialize` is the largest such object read whole where a regex or
-    /// a module needs it so.
+    /// `whole.materialize` is the largest such object read whole where a
+    /// regex or a module needs it so, and `whole.regex_steps` what a regexp
+    /// pattern's searches may do. `pass` is what a read of the object found
+    /// of the patterns, when it was made already.
     #[cfg(feature = "yara")]
     pub(crate) fn scan_source(
         &self,
         src: &dyn crate::byte_source::ByteSource,
         filename: Option<&str>,
-        materialize: usize,
+        carved: bool,
+        whole: &crate::engine::WholeLimits,
+        pass: Option<YaraPass>,
     ) -> Vec<String> {
         let Some(rules) = self.rules() else {
             return Vec::new();
         };
         let mut scanner = Scanner::new(rules);
+        scanner.set_carved(carved);
         if let Some(path) = filename {
             scanner.set_global("filepath", path);
             let base = file_basename(path);
@@ -295,7 +327,7 @@ impl YaraDb {
                 scanner.set_global("extension", ext);
             }
         }
-        let results = scanner.scan_source(src, materialize);
+        let results = scanner.scan_source(src, whole, pass);
         // A condition that ran out of steps evaluated to undefined, and one
         // that saw part of a pattern's matches or no module values may be
         // wrong, so a rule may have failed to match for that reason alone.
@@ -320,7 +352,9 @@ impl YaraDb {
         &self,
         _src: &dyn crate::byte_source::ByteSource,
         _filename: Option<&str>,
-        _materialize: usize,
+        _carved: bool,
+        _whole: &crate::engine::WholeLimits,
+        _pass: Option<YaraPass>,
     ) -> Vec<String> {
         Vec::new()
     }

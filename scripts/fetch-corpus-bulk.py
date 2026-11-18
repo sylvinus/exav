@@ -6,7 +6,7 @@ into corpus/samples/_bulk/<type>/<sha>.bin.
 
   MALWAREBAZAAR_API_KEY=... python3 scripts/fetch-corpus-bulk.py [PER_TYPE] [TOTAL_CAP]
 
-LIVE MALWARE — static scan only, never execute. corpus/ is gitignored.
+LIVE MALWARE: static scan only, never execute. corpus/ is gitignored.
 """
 import io
 import os
@@ -26,7 +26,7 @@ OUT = corpus_dir("samples", "_bulk")
 # free-space checks target the (same) filesystem the corpus lives on
 HERE = corpus_dir()
 
-# Diverse file types: executables, archives, documents, scripts — each exercises
+# Diverse file types: executables, archives, documents, scripts. Each exercises
 # different exav code paths (PE/ELF parsing, unpacking, normalization, hashing).
 FILE_TYPES = [
     "exe", "dll", "elf", "apk", "msi",

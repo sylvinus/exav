@@ -9,9 +9,10 @@ import { fileURLToPath } from "node:url";
 
 import { expect, test, type Frame, type Page } from "@playwright/test";
 
+import { LINK_QUIET_MS } from "../ts/frame/index.js";
 import { failOnViolations, violations } from "./csp.js";
 import { decodePng, difference, type Pixels } from "./pixels.js";
-import { openSample, pick } from "./samples.js";
+import { openSample, pick, sample } from "./samples.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -195,6 +196,17 @@ for (const served of ["headers", "meta"] as const) {
 }
 
 test.describe("the host", () => {
+  test("runs no detection of its own: the frame tells a PDF named .png, from the frame's files alone", async ({ page }) => {
+    const fetched: string[] = [];
+    page.on("request", (r) => fetched.push(new URL(r.url()).pathname));
+    await page.goto("./?lang=en");
+    await page.getByTestId("file-input").setInputFiles({ name: "report.png", mimeType: "image/png", buffer: sample("report.pdf") });
+    await expect(page.locator(".demo-frame .exav-viewer-outline-entry")).toHaveText(["Scope", "Findings", "Actions"]);
+    const detection = fetched.filter((p) => /sniff/.test(p));
+    expect(detection.length).toBeGreaterThan(0);
+    expect(detection.filter((p) => !p.includes("/frame/"))).toEqual([]);
+  });
+
   test("a link followed in a document is the host's to open, after asking", async ({ page, context }) => {
     const frame = await open(page, "report.pdf");
     const asked: string[] = [];
@@ -206,15 +218,18 @@ test.describe("the host", () => {
     // An engine opens a link: the frame asks the host.
     await frame.evaluate(() => window.open("https://example.com/a"));
     await expect.poll(() => asked).toEqual(["The document links to https://example.com/a. Open it in a new tab?"]);
-    // Declined: nothing opened. Accepted: opened, without access back.
+    // Declined: nothing opened. Accepted: opened, without access back. The
+    // host drops the frame's links for a while after each answer.
     answer = true;
+    await page.waitForTimeout(LINK_QUIET_MS + 100);
     const popup = context.waitForEvent("page");
     await frame.evaluate(() => window.open("https://example.com/b"));
     const opened = await popup;
     expect(opened.url()).toBe("https://example.com/b");
     expect(await opened.evaluate(() => window.opener)).toBeNull();
     await opened.close();
-    // Not http(s), relative, or sent around the port: never asked.
+    // Not http(s), relative, or sent around the port: never asked (once the host answers links again).
+    await page.waitForTimeout(LINK_QUIET_MS + 100);
     await frame.evaluate(() => {
       window.open("javascript:alert(1)");
       window.open("/e2e/big.pdf");
@@ -228,6 +243,24 @@ test.describe("the host", () => {
     const frame = await open(page, "report.pdf");
     await frame.evaluate(() => (location.href = "/frame/licenses/README.txt"));
     await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "error");
+  });
+
+  // What keeps a frame from sending anything elsewhere by navigating itself
+  // is the host page's own policy: the demo's has no `frame-src`, so
+  // `default-src 'self'` applies to its frames.
+  test("a frame that navigates to another origin is refused by the host page's policy, before a request is made", async ({ page }) => {
+    const frame = await open(page, "report.pdf");
+    const other = elsewhere(page);
+    const requests: string[] = [];
+    await page.route(`${other}/**`, (route) => {
+      requests.push(route.request().url());
+      return route.abort();
+    });
+    await frame.evaluate((to) => (location.href = `${to}/frame/licenses/README.txt`), other);
+    await expect.poll(() => violations(page).some((v) => /frame-src|child-src/.test(v) && v.includes(other))).toBe(true);
+    await page.waitForTimeout(500);
+    expect(requests).toEqual([]);
+    violations(page).splice(0);
   });
 
   test("one frame per file: the next file gets a new one, the last is gone", async ({ page }) => {

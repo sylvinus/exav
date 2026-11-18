@@ -1,4 +1,4 @@
-//! `exav-pe-emu` — unpack a packed Windows executable by running its own stub.
+//! `exav-pe-emu`: unpack a packed Windows executable by running its own stub.
 //!
 //! Point it at a packed PE and it prints what the stub did and writes the image
 //! the stub rebuilt. When the stub wins, it says so and why, and writes nothing:

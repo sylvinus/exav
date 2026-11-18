@@ -1,68 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import { clip, decodeText, MAX_LINE, sanitize, splitLines } from "./decode.js";
+import { clip, MAX_LINE, sanitize, splitLines } from "./decode.js";
 
-const bytes = (...parts: (string | number[])[]) =>
-  Uint8Array.from(parts.flatMap((p) => (typeof p === "string" ? [...new TextEncoder().encode(p)] : p)));
 const ch = (code: number) => String.fromCharCode(code);
-
-/** UTF-16 of `s` with a byte-order mark. */
-function utf16(s: string, order: "le" | "be"): Uint8Array {
-  const out = [order === "le" ? 0xff : 0xfe, order === "le" ? 0xfe : 0xff];
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    out.push(...(order === "le" ? [c & 0xff, c >> 8] : [c >> 8, c & 0xff]));
-  }
-  return Uint8Array.from(out);
-}
-
-describe("decodeText", () => {
-  it("reads UTF-8, with or without a byte-order mark", () => {
-    expect(decodeText(bytes("naïve café ✓"))).toEqual({ text: "naïve café ✓", encoding: "utf-8" });
-    expect(decodeText(bytes([0xef, 0xbb, 0xbf], "hello"))?.text).toBe("hello");
-  });
-
-  it("reads UTF-16 by its mark, in both byte orders, astral characters included", () => {
-    const s = "Zażółć 😀 ok";
-    expect(decodeText(utf16(s, "le"))).toEqual({ text: s, encoding: "utf-16le" });
-    expect(decodeText(utf16(s, "be"))).toEqual({ text: s, encoding: "utf-16be" });
-  });
-
-  it("falls back to windows-1252 for bytes that are not UTF-8", () => {
-    // 0xE9 alone is not UTF-8; 0x80 is the euro sign in windows-1252.
-    expect(decodeText(bytes("caf", [0xe9], " ", [0x80]))).toEqual({ text: "café €", encoding: "windows-1252" });
-  });
-
-  it("does not take a character cut by the end of a partial read for an error", () => {
-    const whole = bytes("é"); // 0xC3 0xA9
-    expect(decodeText(whole.subarray(0, 1), true)?.encoding).toBe("utf-8");
-    expect(decodeText(bytes("ab", [0xc3]), true)).toEqual({ text: "ab", encoding: "utf-8" });
-    // Not partial: the same bytes are not UTF-8.
-    expect(decodeText(bytes("ab", [0xc3]))?.encoding).toBe("windows-1252");
-  });
-
-  it("refuses a file with a NUL in its head, and UTF-32", () => {
-    expect(decodeText(bytes("text", [0], "more"))).toBeNull();
-    // One NUL among many characters, too few for the control-character ratio to catch.
-    expect(decodeText(bytes("ordinary words ".repeat(200), [0], "and more words"))).toBeNull();
-    expect(decodeText(Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d]))).toBeNull();
-    expect(decodeText(Uint8Array.from([0xff, 0xfe, 0, 0, 0x41, 0, 0, 0]))).toBeNull();
-    expect(decodeText(Uint8Array.from([0, 0, 0xfe, 0xff, 0, 0, 0, 0x41]))).toBeNull();
-    // UTF-16 without a mark is all NULs for ASCII: not guessed.
-    expect(decodeText(Uint8Array.from([0x68, 0, 0x69, 0]))).toBeNull();
-  });
-
-  it("refuses bytes that are mostly control characters even with no NUL", () => {
-    const noise = Uint8Array.from({ length: 1000 }, (_, i) => 1 + (i % 7));
-    expect(decodeText(noise)).toBeNull();
-    // A few stray controls in a text are still a text.
-    expect(decodeText(bytes("a log line\u001b[0m\n".repeat(50)))).not.toBeNull();
-  });
-
-  it("accepts an empty file", () => {
-    expect(decodeText(new Uint8Array())).toEqual({ text: "", encoding: "utf-8" });
-  });
-});
 
 describe("sanitize", () => {
   it("makes every bidirectional override, embedding and isolate visible", () => {

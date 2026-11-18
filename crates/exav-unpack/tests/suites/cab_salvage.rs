@@ -37,6 +37,25 @@ fn entries(cab: &[u8]) -> Vec<Entry> {
     extract(Format::Cab, &cab, &mut Budget::new(Limits::default())).unwrap()
 }
 
+/// A cabinet whose directory cannot be read is damaged: it is no limit that a
+/// budget set. (A scan counts a carved candidate that is damaged as a magic
+/// found by chance, and one that hit a limit as a real find.)
+#[test]
+fn a_cabinet_with_a_damaged_directory_is_damage_not_a_limit() {
+    let cab = mszip_cab(&text(5000));
+    // The folder's compression type is one no cabinet has.
+    let mut bad_type = cab.clone();
+    bad_type[36 + 6..36 + 8].copy_from_slice(&0x4c7au16.to_le_bytes());
+    // The name of the file has lost its end.
+    let mut bad_name = cab.clone();
+    let name_at = u32::from_le_bytes(cab[16..20].try_into().unwrap()) as usize + 16;
+    bad_name[name_at..name_at + 300].fill(b'x');
+    for (what, damaged) in [("type", bad_type), ("name", bad_name)] {
+        let err = extract(Format::Cab, &damaged, &mut Budget::new(Limits::default())).unwrap_err();
+        assert!(err.is_corrupt(), "{what}: {err:?}");
+    }
+}
+
 #[test]
 fn a_block_whose_deflate_stream_ends_early_keeps_what_it_decoded_and_is_reported() {
     let data = text(20_000);

@@ -93,10 +93,10 @@ with a bzip2 or xz run, as macOS writes compressed images, starts with that
 run's magic, and its trailer is what names it a disk image.) `walk()` then
 hands the members to a visitor one at a time. A format whose
 decoder reads forward, or finds its members by an index it reads from where it
-is (ZIP, tar, CAB, ISO, 7z, WIM, xar, the filesystems, the single-stream
-compressors, …) produces each member as a reader that decodes as it is read,
-so neither the container nor the member is resident. A format whose decoder
-needs random access over the whole container (RAR, OLE, PDF, CHM, ARJ, …) is
+is (ZIP, tar, CAB, CHM, ISO, 7z, WIM, xar, RAR, OLE, email, the filesystems,
+the single-stream compressors, …) produces each member as a reader that decodes
+as it is read, so neither the container nor the member is resident. A format
+whose decoder needs random access over the whole container (PDF, ARJ, …) is
 read whole, bounded before it is allocated, up to `--max-object-bytes`; past it
 the container is `LIMITS-EXCEEDED`. Which it is is a property of the decoder, not of how exav was
 invoked; [Supported formats](/unpack/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole)
@@ -123,7 +123,7 @@ sets each; the crate's, the command's and the WebAssembly package's are under
 |---|---|---|
 | output bytes | what formats decoded whole produce across the tree | 1 GiB, lowered to fit `--max-process-bytes` |
 | per-member size | a member decoded whole (a streamed member is bounded by the ratio and matcher budgets) | `--max-object-bytes` 256M |
-| compression ratio | output ÷ input, the decompression-bomb guard | 1000 |
+| compression ratio | output ÷ input, the decompression-bomb guard, asked of a member past `--max-object-bytes`; it leaves the member out and the walk goes on | `--max-compression-ratio` 1000 |
 | file count | members across the archive and everything nested | `--max-members` 100000 |
 | recursion depth | archives inside archives | `--max-unpack-depth` 16 |
 | matcher bytes | bytes fed to the matcher across the tree, a CPU bound | `--max-matcher-bytes` 10G |

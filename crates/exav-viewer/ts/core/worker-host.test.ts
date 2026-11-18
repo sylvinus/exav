@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createWorkerHost } from "./worker-host.js";
+import { createWorkerHost, serve } from "./worker-host.js";
 
 /** A worker that answers only when told to, and records being terminated. */
 function fakeWorker() {
@@ -70,5 +70,35 @@ describe("createWorkerHost", () => {
     expect(settled).toBe(false);
     expect(worker!.terminated).toBe(false);
     host.destroy();
+  });
+});
+
+describe("serve", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** What `serve` posts for one request that `handle` fails with `error`. */
+  async function replyTo(error: unknown) {
+    const scope = {
+      onmessage: null as ((e: MessageEvent) => void) | null,
+      posted: [] as { ok: boolean; fatal?: boolean }[],
+      postMessage(message: { ok: boolean; fatal?: boolean }) {
+        scope.posted.push(message);
+      },
+    };
+    vi.stubGlobal("self", scope);
+    serve<string, string>(async () => {
+      throw error;
+    });
+    scope.onmessage?.({ data: { id: 1, request: "x" } } as MessageEvent);
+    await vi.waitFor(() => expect(scope.posted).toHaveLength(1));
+    return scope.posted[0]!;
+  }
+
+  it("reports a trap and an exhausted stack as fatal, so the worker is replaced", async () => {
+    expect((await replyTo(new WebAssembly.RuntimeError("unreachable"))).fatal).toBe(true);
+    expect((await replyTo(new RangeError("Maximum call stack size exceeded"))).fatal).toBe(true);
+    expect((await replyTo(new Error("not a drawing"))).fatal).toBe(false);
   });
 });

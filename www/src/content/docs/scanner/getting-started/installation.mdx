@@ -54,6 +54,16 @@ signature updates over HTTP(S)):
 cargo install exav --features http
 ```
 
+The build uses the release profile of the published binaries: overflow checks,
+fat LTO and one codegen unit, for a longer build that needs about 3 GiB of
+memory at its peak. On a smaller machine, `--profile fast-build` keeps the
+overflow checks and builds faster with less memory, for larger and slower
+binaries:
+
+```sh
+cargo install exav --profile fast-build
+```
+
 See [Feature flags](/scanner/reference/feature-flags/) for all build options.
 
 ## Build from source
@@ -70,6 +80,12 @@ See [Feature flags](/scanner/reference/feature-flags/) for all build options.
    cargo build --release -p exav      # -> target/release/exav
    ./target/release/exav --help
    ```
+
+   The repository's release profile builds with fat LTO and one codegen
+   unit: smaller and faster binaries, for a longer build that needs about
+   3 GiB of memory at its peak. The Docker image is built the same way.
+   `cargo build --profile fast-build -p exav` (to
+   `target/fast-build/exav`) is the shorter build.
 
 3. Put the binary somewhere on your `PATH`:
 
@@ -117,9 +133,12 @@ same clamd port 3310 and protocol. It fetches signatures itself from a source yo
 name, such as a `cvdupdate` mirror of Cisco's database:
 
 ```sh
-docker run -d -p 3310:3310 -v exav-db:/var/lib/exav \
+docker run -d -p 127.0.0.1:3310:3310 -v exav-db:/var/lib/exav \
   -e EXAV_SIG_SOURCES=https://clamav-mirror.internal/ ghcr.io/sylvinus/exav
 ```
+
+The port is published on localhost only, because the clamd protocol has no
+authentication.
 
 Without a source it waits for another container to fill the volume. See the
 [Docker guide](/scanner/guides/docker/) for signature population, environment variables,

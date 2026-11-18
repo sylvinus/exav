@@ -23,14 +23,14 @@ fn parse_decimal(field: &[u8]) -> Option<u64> {
 }
 
 /// Walk an `ar` archive, each member streamed from where it lies.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let mut source = crate::source::Reader::new(src);
     let members = stream_offsets(&mut source, budget.limits().max_buffer_bytes)?;
-    crate::stream::stream_stored(&mut source, budget, visit, members)
+    crate::stream::stream_stored_ranges(src, budget, visit, members)
 }
 
 /// Parse member offsets from a seekable source (the reader-based streaming
@@ -48,7 +48,7 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
         .and_then(|_| source.read_exact(&mut magic))
         .map_err(|e| LimitHit::corrupt(format!("ar: {e}")))?;
     if magic != MAGIC {
-        return Err(LimitHit::new("ar: bad magic".to_string()));
+        return Err(LimitHit::corrupt("ar: bad magic".to_string()));
     }
     let mut out: Vec<Region> = Vec::new();
     let mut name_table: Vec<u8> = Vec::new();

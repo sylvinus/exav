@@ -41,7 +41,9 @@ exav-render, MIT, with, in the image module, source derivatives of image
 used under the MIT License). Upstream: https://github.com/image-rs/image
 (The image-rs Developers) and https://github.com/image-rs/image-tiff
 (Copyright (c) 2018 PistonDevelopers). The DWG module also holds exav-unpack's
-DXF and DWG readers, MIT.
+DXF and DWG readers, MIT. The image module reads the previews of camera RAW
+files, DNG among them: This product includes DNG technology under license by
+Adobe.
 
 Build-time crates (proc-macro2, quote, syn, unicode-ident, thiserror-impl,
 fax_derive, multiversion_no_op, wasm-bindgen-macro,

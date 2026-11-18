@@ -1,6 +1,6 @@
 //! `Target:11` (Flash) signatures must run on SWF movies and nowhere else.
 //!
-//! 257 official signatures — 94 `.ldb` and 163 `.ndb` — key on target 11. They
+//! 257 official signatures (94 `.ldb` and 163 `.ndb`) key on target 11. They
 //! loaded fine but never fired, because `target_ok` had no `FileType` to gate
 //! them on and defaulted to "skip". That is a silent clean by omission: the
 //! signature is in the database, the file is an SWF, and the scan returns `OK`.
@@ -9,12 +9,12 @@
 //! run through clamscan with a single-signature database to establish what
 //! ClamAV does:
 //!
-//! * `FWS` (uncompressed) — FOUND. Uncompressed movies are still SWF, and the
+//! * `FWS` (uncompressed): FOUND. Uncompressed movies are still SWF, and the
 //!   magic is the bare three bytes: a garbage version byte and a nonsense length
 //!   field do not stop it typing as SWF.
-//! * `CWS` (zlib) — FOUND, both because the container itself is typed SWF and
+//! * `CWS` (zlib): FOUND, both because the container itself is typed SWF and
 //!   because the inflated body is scanned.
-//! * an untyped binary and a PE carrying the identical bytes — OK. A target-11
+//! * an untyped binary and a PE carrying the identical bytes: OK. A target-11
 //!   signature must not reach content that merely contains the pattern.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};

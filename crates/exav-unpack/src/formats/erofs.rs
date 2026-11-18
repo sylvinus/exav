@@ -16,21 +16,36 @@
 //!
 //! An inode is addressed by its number: the 32-byte slot it begins at, from the
 //! inode area. Data stored plain, with its tail after the inode, and in chunks
-//! (with holes) is read. A file stored compressed is reported, not read, and so
-//! is a file in chunks on another device. A symbolic link or a device node holds
-//! no file's bytes and is not emitted. The checksum is not checked.
+//! (with holes) is read, and so is a file stored compressed (see below). A file
+//! in chunks on another device is reported, not read. A symbolic link or a
+//! device node holds no file's bytes and is not emitted. The checksum is not
+//! checked.
+//!
+//! A compressed file is a list of extents, each the bytes of one physical
+//! cluster (a run of blocks) decoded alone, with LZ4, LZMA, DEFLATE or Zstandard.
+//! An index of logical clusters, one per block of the file, says where each
+//! extent begins and how long it is, as a head and the non-heads after it; the
+//! index is the full one (8 bytes a cluster) or the compact one (a block address
+//! and cluster types packed, 2 or 16 clusters at a time). A cluster that is not
+//! compressed is stored plain, or rotated (interlaced). The last extent can be
+//! kept after the index (tail packing). The file is read one extent at a time:
+//! what is held is the index in a window, the coded bytes of one physical
+//! cluster and its decoder, whose output is read 64 KiB at a time. A file that
+//! keeps its tail in the packed inode (fragments), or has the extent records
+//! of the newer format, is reported, not read.
 
 // Every sum and product on a header's number is checked or saturating here; a
 // plain one fails the build, so the next edit cannot add the unchecked kind.
 #![deny(clippy::arithmetic_side_effects)]
 
 use std::collections::HashSet;
-use std::io::{Read, Seek};
+use std::io::{Cursor, Read};
 
 use super::vol::{
-    Attrs, Emit, Got, List, Next, Piece, Pieces, Plan, Vol, give, le16, le32, le64, read_file,
+    Attrs, Emit, Fill, Got, List, Next, Piece, Pieces, Plan, Step, UNREADABLE, Vol, give, le16,
+    le32, le64, read_file,
 };
-use crate::source::{ByteSource, Reader};
+use crate::source::ByteSource;
 use crate::stream::Visit;
 use crate::{Budget, LimitHit, Mtime};
 
@@ -42,8 +57,49 @@ const MAX_DIR: u64 = 64 << 20;
 
 /// How the data of an inode is laid out.
 const FLAT_PLAIN: u16 = 0;
+const COMPRESSED_FULL: u16 = 1;
 const FLAT_INLINE: u16 = 2;
+const COMPRESSED_COMPACT: u16 = 3;
 const CHUNK_BASED: u16 = 4;
+
+/// The superblock's incompatible features that matter to compressed files. The
+/// first is also the flag of the configurations of the algorithms.
+const BIG_PCLUSTER: u32 = 0x2;
+const COMPR_CFGS: u32 = 0x2;
+
+/// The header's flags (`h_advise`) of a compressed file. The first is, in the
+/// full layout, the flag of the newer format with extent records.
+const COMPACTED_2B: u16 = 0x1;
+const EXTENTS: u16 = 0x1;
+const BIG_PCLUSTER_1: u16 = 0x2;
+const BIG_PCLUSTER_2: u16 = 0x4;
+const INLINE_PCLUSTER: u16 = 0x8;
+const INTERLACED_PCLUSTER: u16 = 0x10;
+const FRAGMENT_PCLUSTER: u16 = 0x20;
+/// The top bit of the header's last byte: the whole file is in the packed
+/// inode.
+const FRAGMENT_INODE: u8 = 0x80;
+
+/// The compression algorithms, as the header numbers them.
+const LZ4: u8 = 0;
+const LZMA: u8 = 1;
+const DEFLATE: u8 = 2;
+const ZSTD: u8 = 3;
+
+/// The types of a logical cluster.
+const PLAIN: u8 = 0;
+const HEAD1: u8 = 1;
+const NONHEAD: u8 = 2;
+const HEAD2: u8 = 3;
+/// In a non-head, the flag that makes its distance the number of blocks of
+/// the physical cluster.
+const D0_CBLKCNT: u32 = 1 << 11;
+
+/// How much of a file's index is read at a time.
+const INDEX_WINDOW: usize = 4096;
+
+/// How much of a compressed file one step gives.
+const CHUNK: usize = 1 << 16;
 
 /// The address of a chunk that is a hole.
 const NULL_ADDR: u32 = 0xFFFF_FFFF;
@@ -67,6 +123,10 @@ struct Erofs {
     /// Where the inode area begins, and the number of the root.
     meta: u64,
     root: u64,
+    /// Whether physical clusters may be longer than a block, and how large a
+    /// dictionary the LZMA streams were made with (0: not said).
+    big: bool,
+    lzma_dict: u32,
 }
 
 /// An inode.
@@ -136,7 +196,7 @@ impl Erofs {
                 // A file of less than a block has no block: no address either.
                 if whole > 0 {
                     let Some(at) = u64::from(ino.union).checked_mul(self.bs) else {
-                        return Got::Short(Vec::new());
+                        return Got::Partial(Vec::new(), UNREADABLE);
                     };
                     pieces.push(Piece::Disk(at, whole));
                 }
@@ -152,9 +212,13 @@ impl Erofs {
             }
             CHUNK_BASED => match self.chunks(ino) {
                 Some(plan) => read_file(v, Pieces::new(plan, size), size, cap),
-                None => Got::Short(Vec::new()),
+                None => Got::Partial(Vec::new(), NO_CHUNKS),
             },
-            _ => Got::Why("EROFS compressed file not read"),
+            COMPRESSED_FULL | COMPRESSED_COMPACT => match Zfile::open(self, v, ino) {
+                Ok(z) => read_file(v, z, size, cap),
+                Err(why) => Got::Why(why),
+            },
+            _ => Got::Why("EROFS file in a data layout exav does not read"),
         }
     }
 
@@ -267,14 +331,47 @@ fn open(v: &mut Vol) -> Option<Erofs> {
     }
     let bs = 1u64.checked_shl(bits)?;
     let meta = u64::from(le32(&b, 40)).checked_mul(bs)?;
+    let incompat = le32(&b, 80);
+    let lzma_dict = match incompat & COMPR_CFGS != 0 {
+        // The configurations follow the superblock, which is 128 bytes and
+        // the extension slots of 16.
+        true => {
+            let slots = 16u64.saturating_mul(u64::from(b[13]));
+            let after = 1024u64.saturating_add(128).saturating_add(slots);
+            lzma_dict(v, after, le16(&b, 84))?
+        }
+        false => 0,
+    };
     let fs = Erofs {
         bs,
         meta,
         root: u64::from(le16(&b, 14)),
+        big: incompat & BIG_PCLUSTER != 0,
+        lzma_dict,
     };
     // The root is a directory.
     let root = fs.inode(v, fs.root)?;
     (root.mode & S_IFMT == S_IFDIR).then_some(fs)
+}
+
+/// The dictionary size the LZMA streams were made with, from the
+/// configurations that follow the superblock: for each algorithm of the bitmap
+/// `algs`, in the order of their numbers, a length and that many bytes. 0 where
+/// the LZMA stream has none.
+fn lzma_dict(v: &mut Vol, mut at: u64, algs: u16) -> Option<u32> {
+    let mut dict = 0;
+    for alg in 0..16u16 {
+        if algs & (1 << alg) == 0 {
+            continue;
+        }
+        let len = u64::from(le16(&v.at(at, 2)?, 0));
+        let start = at.checked_add(2)?;
+        if alg == u16::from(LZMA) {
+            dict = le32(&v.at(start, crate::bytes::to_usize(len.min(4)))?, 0);
+        }
+        at = start.checked_add(len)?;
+    }
+    Some(dict)
 }
 
 /// How many entries of a file's chunk map are read at once.
@@ -348,31 +445,688 @@ impl Plan for Chunks {
     }
 }
 
+const PACKED: &str = "EROFS file whose data is in the packed inode (fragments) not read";
+const EXTENT_FORMAT: &str = "EROFS compressed file in the format with extent records not read";
+const DAMAGED: &str = "EROFS compressed file with a damaged header";
+const NO_CHUNKS: &str = "EROFS file with a chunk format exav does not read";
+const NO_EXTENT: &str = "EROFS compressed file whose map of extents is unreadable or damaged";
+const NO_PLAIN: &str = "EROFS compressed file with a stored extent longer than its blocks";
+const OVER_LIMIT: &str =
+    "EROFS compressed file with a physical cluster over the buffer limit (--max-object-bytes)";
+const NO_CODED: &str = "EROFS compressed file with an extent whose coded bytes could not be opened";
+const CUT_CODED: &str = "EROFS compressed file whose coded bytes did not decode to their extent";
+
+/// A logical cluster of a compressed file, as its index says.
+struct Lcl {
+    kind: u8,
+    /// Where in the cluster the extent that starts there starts (a head), or
+    /// the cluster's size (a non-head).
+    clusterofs: u64,
+    /// In a non-head, how many clusters back its head is, and how many on the
+    /// next one.
+    delta0: u64,
+    delta1: u64,
+    /// In a head, the block of its physical cluster, and in a non-head that
+    /// says it, how many blocks the physical cluster has.
+    pblk: u64,
+    cblks: Option<u64>,
+    /// Where the index goes on after this cluster's pack.
+    next: u64,
+}
+
+/// An extent of a file: `llen` bytes from `la`, stored as `at` says.
+struct Ext {
+    la: u64,
+    llen: u64,
+    at: Where,
+}
+
+enum Where {
+    Hole,
+    /// Stored as it is, in a physical cluster of `plen` bytes at `pa`; the
+    /// first block's share of it is at the end when it is interlaced.
+    Plain {
+        pa: u64,
+        plen: u64,
+        interlaced: bool,
+    },
+    /// Coded with `algo`, in `plen` bytes at `pa`.
+    Coded {
+        pa: u64,
+        plen: u64,
+        algo: u8,
+    },
+}
+
+/// The last extent of a file, whose coded bytes are kept after its index.
+struct Tail {
+    /// The cluster of its head, and the place and length of its bytes.
+    lcn: u64,
+    at: u64,
+    len: u64,
+}
+
+/// The bytes of an extent that are being given.
+enum Src {
+    Zeros,
+    /// Stretches of the volume (offset, length), in order, and which is next.
+    Disk([(u64, u64); 2], usize),
+    Coded(Box<dyn Read>),
+}
+
+struct Run {
+    left: u64,
+    src: Src,
+}
+
+/// A compressed file, produced an extent at a time, each decoded as it is read.
+struct Zfile {
+    bs: u64,
+    size: u64,
+    compact: bool,
+    advise: u16,
+    /// A logical cluster is `1 << lb` bytes.
+    lb: u32,
+    /// The algorithms of the two kinds of head.
+    algo: [u8; 2],
+    /// Where the index begins, and how many clusters it has.
+    ebase: u64,
+    total: u64,
+    lzma_dict: u32,
+    tail: Option<Tail>,
+    /// A window of the index, and where it starts.
+    index: Vec<u8>,
+    index_at: u64,
+    /// The next byte of the file, the extent being given, and the bytes of
+    /// holes given.
+    la: u64,
+    run: Option<Run>,
+    holes: u64,
+}
+
+impl Zfile {
+    /// The compressed file `ino`, or why it is not read.
+    fn open(fs: &Erofs, v: &mut Vol, ino: &Inode) -> Result<Zfile, &'static str> {
+        let compact = ino.layout == COMPRESSED_COMPACT;
+        let pos = ino.after.checked_next_multiple_of(8).ok_or(DAMAGED)?;
+        let h = v.at(pos, 8).ok_or(DAMAGED)?;
+        if h[7] & FRAGMENT_INODE != 0 {
+            return Err(PACKED);
+        }
+        let advise = le16(&h, 4);
+        let bits = fs.bs.trailing_zeros().saturating_add(u32::from(h[7] & 15));
+        let algo = [h[6] & 15, h[6] >> 4];
+        if algo.iter().any(|&a| a > ZSTD) {
+            return Err(DAMAGED);
+        }
+        if !compact && advise & EXTENTS != 0 {
+            return Err(EXTENT_FORMAT);
+        }
+        let big = advise & (BIG_PCLUSTER_1 | BIG_PCLUSTER_2);
+        // Both or neither of the two, in the compact layout.
+        let mixed = compact && (big & BIG_PCLUSTER_1 != 0) != (big & BIG_PCLUSTER_2 != 0);
+        if (big != 0 && !fs.big) || mixed || bits > 31 {
+            return Err(DAMAGED);
+        }
+        if advise & FRAGMENT_PCLUSTER != 0 {
+            return Err(PACKED);
+        }
+        // The index follows the header, and in the full layout 8 bytes more.
+        let skip = if compact { 8 } else { 16 };
+        let mut z = Zfile {
+            bs: fs.bs,
+            size: ino.size,
+            compact,
+            advise,
+            lb: bits,
+            algo,
+            ebase: pos.checked_add(skip).ok_or(DAMAGED)?,
+            total: ino.size.div_ceil(fs.bs),
+            lzma_dict: fs.lzma_dict,
+            tail: None,
+            index: Vec::new(),
+            index_at: 0,
+            la: 0,
+            run: None,
+            holes: 0,
+        };
+        let idata = u64::from(le16(&h, 2));
+        if advise & INLINE_PCLUSTER != 0 && idata != 0 {
+            z.tail = Some(z.find_tail(v, idata).ok_or(DAMAGED)?);
+        }
+        Ok(z)
+    }
+
+    /// `n` bytes of the index at `off`, through a window.
+    fn index(&mut self, v: &mut Vol, off: u64, n: usize) -> Option<&[u8]> {
+        let end = off.checked_add(n as u64)?;
+        let held = self.index_at.checked_add(self.index.len() as u64)?;
+        if off < self.index_at || end > held {
+            self.index.clear();
+            let room = v.len.checked_sub(off)?;
+            let want = crate::bytes::to_usize(room.min(INDEX_WINDOW as u64));
+            if want < n || !v.append(off, want, &mut self.index) {
+                self.index.clear();
+                return None;
+            }
+            self.index_at = off;
+        }
+        let from = crate::bytes::to_usize(off.saturating_sub(self.index_at));
+        self.index.get(from..from.checked_add(n)?)
+    }
+
+    fn load(&mut self, v: &mut Vol, lcn: u64, ahead: bool) -> Option<Lcl> {
+        match self.compact {
+            true => self.load_compact(v, lcn, ahead),
+            false => self.load_full(v, lcn),
+        }
+    }
+
+    /// Cluster `lcn` of the full index: 8 bytes each.
+    fn load_full(&mut self, v: &mut Vol, lcn: u64) -> Option<Lcl> {
+        let pos = self.ebase.checked_add(lcn.checked_mul(8)?)?;
+        let e: [u8; 8] = self.index(v, pos, 8)?.try_into().ok()?;
+        let advise = le16(&e, 0);
+        let kind = (advise & 3) as u8;
+        let next = pos.checked_add(8)?;
+        let lsz = 1u64 << self.lb;
+        if kind == NONHEAD {
+            let mut d0 = u32::from(le16(&e, 4));
+            let mut cblks = None;
+            if d0 & D0_CBLKCNT != 0 {
+                if self.advise & (BIG_PCLUSTER_1 | BIG_PCLUSTER_2) == 0 {
+                    return None;
+                }
+                cblks = Some(u64::from(d0 & !D0_CBLKCNT));
+                d0 = 1;
+            }
+            return Some(Lcl {
+                kind,
+                clusterofs: lsz,
+                delta0: u64::from(d0),
+                delta1: u64::from(le16(&e, 6)),
+                pblk: 0,
+                cblks,
+                next,
+            });
+        }
+        let clusterofs = u64::from(le16(&e, 2));
+        (clusterofs < lsz).then(|| Lcl {
+            kind,
+            clusterofs,
+            delta0: 0,
+            delta1: 0,
+            pblk: u64::from(le32(&e, 4)),
+            cblks: None,
+            next,
+        })
+    }
+
+    /// Cluster `lcn` of the compact index: packs of 2 clusters in 8 bytes or
+    /// of 16 in 32, each ending in a 4-byte block address, the packs starting
+    /// at a multiple of their size. `ahead` also finds how far the next head is.
+    fn load_compact(&mut self, v: &mut Vol, lcn: u64, ahead: bool) -> Option<Lcl> {
+        let lb = self.lb;
+        if lcn >= self.total || lb > 14 {
+            return None;
+        }
+        // A few clusters of 4 bytes bring the index to a multiple of 32, then
+        // packs of 16 clusters of 2 bytes as long as they fit, then 4 bytes.
+        let a4 = (32u64.saturating_sub(self.ebase % 32) / 4) & 7;
+        let a2 = if self.advise & COMPACTED_2B != 0 && a4 < self.total {
+            (self.total.saturating_sub(a4) / 16).saturating_mul(16)
+        } else {
+            0
+        };
+        let (mut pos, mut shift, mut l) = (self.ebase, 2u32, lcn);
+        if l >= a4 {
+            pos = pos.checked_add(a4.checked_mul(4)?)?;
+            l = l.saturating_sub(a4);
+            if l < a2 {
+                shift = 1;
+            } else {
+                pos = pos.checked_add(a2.checked_mul(2)?)?;
+                l = l.saturating_sub(a2);
+            }
+        }
+        pos = pos.checked_add(l.checked_shl(shift)?)?;
+        let (vcnt, pack) = match shift {
+            2 => (2usize, 8usize),
+            _ if lb <= 12 => (16, 32),
+            _ => return None,
+        };
+        let start = pos & !(pack as u64).saturating_sub(1);
+        let i = crate::bytes::to_usize(pos.saturating_sub(start) >> shift);
+        let mut b = [0u8; 32];
+        b[..pack].copy_from_slice(self.index(v, start, pack)?);
+        let next = start.checked_add(pack as u64)?;
+        // The entries are `encode` bits, a `lobits` number and 2 of type.
+        let encode = pack
+            .saturating_sub(4)
+            .saturating_mul(8)
+            .checked_div(vcnt)
+            .unwrap_or(0);
+        let lobits = lb.max(12);
+        let low = 1u32
+            .checked_shl(lobits)
+            .map_or(u32::MAX, |m| m.saturating_sub(1));
+        let entry = |k: usize| -> (u32, u8) {
+            let bit = encode.saturating_mul(k);
+            let w = le32(&b, bit / 8) >> (bit % 8);
+            (w & low, ((w >> lobits) & 3) as u8)
+        };
+        let big = self.advise & BIG_PCLUSTER_1 != 0;
+        let (lo, kind) = entry(i);
+        if kind == NONHEAD {
+            // How far the next head is: this entry and those after it that are
+            // not heads, and where they run to the end of the pack, how many
+            // more the last of them says.
+            let mut delta1 = 0u64;
+            if ahead {
+                for j in i..vcnt {
+                    let (l, t) = entry(j);
+                    if t != NONHEAD {
+                        break;
+                    }
+                    delta1 = delta1.saturating_add(1);
+                    if j.saturating_add(1) == vcnt && l & D0_CBLKCNT == 0 {
+                        delta1 = delta1.saturating_add(u64::from(l.saturating_sub(1)));
+                    }
+                }
+            }
+            let mut lcl = Lcl {
+                kind,
+                clusterofs: 1u64 << lb,
+                delta0: u64::from(lo),
+                delta1,
+                pblk: 0,
+                cblks: None,
+                next,
+            };
+            if lo & D0_CBLKCNT != 0 {
+                if self.advise & (BIG_PCLUSTER_1 | BIG_PCLUSTER_2) == 0 {
+                    return None;
+                }
+                lcl.cblks = Some(u64::from(lo & !D0_CBLKCNT));
+                lcl.delta0 = 1;
+            } else if i.saturating_add(1) == vcnt {
+                // The last entry holds the distance to the next head, and its
+                // distance back is that of the entry before it, plus one.
+                let (plo, pkind) = entry(i.saturating_sub(1));
+                let back = match pkind {
+                    NONHEAD if plo & D0_CBLKCNT != 0 => 1,
+                    NONHEAD => plo,
+                    _ => 0,
+                };
+                lcl.delta0 = u64::from(back).saturating_add(1);
+            }
+            return Some(lcl);
+        }
+        if u64::from(lo) >= 1u64 << lb {
+            return None;
+        }
+        // The block of the head: the pack's base address and the blocks of the
+        // physical clusters of the heads before it in the pack.
+        let mut blocks = if big { 0u64 } else { 1 };
+        let mut j = i as i64;
+        while j > 0 {
+            j = j.saturating_sub(1);
+            let (l, t) = entry(j as usize);
+            if big {
+                if t == NONHEAD {
+                    if l & D0_CBLKCNT != 0 {
+                        j = j.saturating_sub(1);
+                        blocks = blocks.saturating_add(u64::from(l & !D0_CBLKCNT));
+                    } else if l <= 1 {
+                        return None;
+                    } else {
+                        j = j.saturating_sub(i64::from(l).saturating_sub(2));
+                    }
+                } else {
+                    blocks = blocks.saturating_add(1);
+                }
+            } else {
+                if t == NONHEAD {
+                    j = j.saturating_sub(i64::from(l));
+                }
+                if j >= 0 {
+                    blocks = blocks.saturating_add(1);
+                }
+            }
+        }
+        let base = u64::from(le32(&b, pack.saturating_sub(4)));
+        Some(Lcl {
+            kind,
+            clusterofs: u64::from(lo),
+            delta0: 0,
+            delta1: 0,
+            pblk: base.checked_add(blocks)?,
+            cblks: None,
+            next,
+        })
+    }
+
+    /// The head that cluster `lcn`, `dist` clusters ahead of its head or of a
+    /// non-head that leads to it, belongs to: its place and its entry. The
+    /// blocks of its physical cluster are in `known` if a non-head said.
+    fn lookback(
+        &mut self,
+        v: &mut Vol,
+        mut lcn: u64,
+        mut dist: u64,
+        known: &mut Option<u64>,
+    ) -> Option<(u64, Lcl)> {
+        while dist > 0 && lcn >= dist {
+            lcn = lcn.saturating_sub(dist);
+            let l = self.load(v, lcn, false)?;
+            if l.kind == NONHEAD {
+                *known = l.cblks.or(*known);
+                dist = l.delta0;
+                continue;
+            }
+            return Some((lcn, l));
+        }
+        None
+    }
+
+    /// The head of the extent that has the byte `la`, and where that extent
+    /// starts.
+    fn head(
+        &mut self,
+        v: &mut Vol,
+        la: u64,
+        known: &mut Option<u64>,
+    ) -> Option<(u64, Lcl, u64, u64)> {
+        let lsz = 1u64 << self.lb;
+        let lcn = la >> self.lb;
+        let endoff = la & lsz.saturating_sub(1);
+        let m = self.load(v, lcn, false)?;
+        *known = m.cblks;
+        let next = m.next;
+        let (hlcn, head) = if m.kind != NONHEAD && endoff >= m.clusterofs {
+            (lcn, m)
+        } else {
+            // Before the head of its own cluster, the byte is the end of the
+            // extent before.
+            let back = if m.kind != NONHEAD { 1 } else { m.delta0 };
+            self.lookback(v, lcn, back, known)?
+        };
+        let start = hlcn.checked_mul(lsz)?.checked_add(head.clusterofs)?;
+        Some((hlcn, head, start, next))
+    }
+
+    /// Where the last extent's coded bytes are, kept after the index: right
+    /// after the pack of the last cluster, `idata` bytes.
+    fn find_tail(&mut self, v: &mut Vol, idata: u64) -> Option<Tail> {
+        let last = self.size.checked_sub(1)?;
+        let mut known = None;
+        let (lcn, _, _, next) = self.head(v, last, &mut known)?;
+        let within = next.checked_rem(self.bs)?;
+        (within.checked_add(idata)? <= self.bs).then_some(Tail {
+            lcn,
+            at: next,
+            len: idata,
+        })
+    }
+
+    /// How many blocks the physical cluster of the head at `hlcn` has.
+    fn blocks(&mut self, v: &mut Vol, hlcn: u64, head: &Lcl, known: Option<u64>) -> Option<u64> {
+        let after = hlcn.checked_add(1)?;
+        let big = match head.kind {
+            HEAD1 => self.advise & BIG_PCLUSTER_1 != 0,
+            _ => self.advise & BIG_PCLUSTER_2 != 0,
+        };
+        // Without the flag, or at the end of the file, it is one block.
+        if !big || after.checked_mul(1u64 << self.lb)? >= self.size {
+            return Some(known.unwrap_or(1));
+        }
+        if let Some(k) = known {
+            return Some(k);
+        }
+        let n = self.load(v, after, false)?;
+        match n.kind {
+            NONHEAD if n.delta0 != 1 => None,
+            NONHEAD => n.cblks,
+            _ => Some(1),
+        }
+    }
+
+    /// How many bytes the extent that starts at `start`, whose head is
+    /// cluster `hlcn`, has: to the next head, or to the end of the file.
+    fn length(&mut self, v: &mut Vol, hlcn: u64, start: u64) -> Option<u64> {
+        let mut lcn = hlcn;
+        loop {
+            if lcn.checked_mul(1u64 << self.lb)? >= self.size {
+                return self.size.checked_sub(start);
+            }
+            let l = self.load(v, lcn, true)?;
+            let mut step = l.delta1;
+            if l.kind == NONHEAD {
+                if step == 0 {
+                    step = 1;
+                }
+            } else if lcn != hlcn {
+                // The next head ends it.
+                return lcn
+                    .checked_mul(1u64 << self.lb)?
+                    .checked_add(l.clusterofs)?
+                    .checked_sub(start);
+            } else {
+                step = 1;
+            }
+            lcn = lcn.checked_add(step)?;
+        }
+    }
+
+    /// The extent that starts at byte `la`.
+    fn extent(&mut self, v: &mut Vol, la: u64) -> Option<Ext> {
+        let mut known = None;
+        let (hlcn, head, start, _) = self.head(v, la, &mut known)?;
+        if start != la {
+            return None;
+        }
+        let llen = self.length(v, hlcn, start)?;
+        if llen == 0 {
+            return None;
+        }
+        let tail = self
+            .tail
+            .as_ref()
+            .filter(|t| t.lcn == hlcn)
+            .map(|t| (t.at, t.len));
+        let (pa, plen) = match tail {
+            Some(t) => t,
+            None => {
+                let blocks = self.blocks(v, hlcn, &head, known)?;
+                if blocks == 0 || head.pblk == u64::from(u32::MAX) {
+                    return Some(Ext {
+                        la,
+                        llen,
+                        at: Where::Hole,
+                    });
+                }
+                (
+                    head.pblk.checked_mul(self.bs)?,
+                    blocks.checked_mul(self.bs)?,
+                )
+            }
+        };
+        let at = match head.kind {
+            PLAIN => Where::Plain {
+                pa,
+                plen,
+                interlaced: self.advise & INTERLACED_PCLUSTER != 0 && tail.is_none(),
+            },
+            kind => Where::Coded {
+                pa,
+                plen,
+                algo: self.algo[usize::from(kind == HEAD2)],
+            },
+        };
+        Some(Ext { la, llen, at })
+    }
+
+    /// The bytes of `e` as they are read.
+    fn start(&mut self, v: &mut Vol, e: Ext) -> Option<Run> {
+        let src = match e.at {
+            Where::Hole => Src::Zeros,
+            Where::Plain {
+                pa,
+                plen,
+                interlaced,
+            } => {
+                if e.llen > plen {
+                    return None;
+                }
+                // The share of the first block is kept at the end, so that a
+                // block can be read in place.
+                let first = match interlaced {
+                    true => self
+                        .bs
+                        .saturating_sub(e.la.checked_rem(self.bs)?)
+                        .min(e.llen),
+                    false => 0,
+                };
+                let at = pa.checked_add(plen.checked_sub(first)?)?;
+                Src::Disk([(at, first), (pa, e.llen.checked_sub(first)?)], 0)
+            }
+            Where::Coded { pa, plen, algo } => {
+                if plen > v.max as u64 {
+                    return None;
+                }
+                let mut packed = v.at(pa, crate::bytes::to_usize(plen))?;
+                // The coded bytes end the physical cluster, with zeros before.
+                let lead = packed.iter().position(|&b| b != 0)?;
+                packed.drain(..lead);
+                Src::Coded(self.decoder(algo, packed, e.llen, v.max as u64)?)
+            }
+        };
+        Some(Run { left: e.llen, src })
+    }
+
+    /// A reader of the first `llen` bytes the coded bytes `packed` decode to.
+    fn decoder(&self, algo: u8, packed: Vec<u8>, llen: u64, max: u64) -> Option<Box<dyn Read>> {
+        let input = Cursor::new(packed);
+        Some(match algo {
+            LZ4 => Box::new(super::lz4::BlockReader::new(input.into_inner(), llen)),
+            LZMA => {
+                // The first byte is the properties, inverted, and the range
+                // coder's first byte, always 0, is not there.
+                let mut packed = input.into_inner();
+                let props = !*packed.first()?;
+                *packed.first_mut()? = 0;
+                // What the output can reach back to is no more than it is.
+                let dict = match self.lzma_dict {
+                    0 => u64::MAX,
+                    d => u64::from(d),
+                };
+                let dict = u32::try_from(dict.min(llen.max(4096)).min(max.max(4096))).ok()?;
+                let stream =
+                    lzma_rust2::LzmaStream::new_with_props(llen, props, dict, None).ok()?;
+                Box::new(super::lzma::SansIo::new(Cursor::new(packed), stream))
+            }
+            DEFLATE => Box::new(crate::inflate::Inflate::new(input).take(llen)),
+            _ => Box::new(super::zstd::ZstdReader::new(input).take(llen)),
+        })
+    }
+}
+
+impl Fill for Zfile {
+    fn holes(&self) -> u64 {
+        self.holes
+    }
+
+    fn fill(&mut self, v: &mut Vol, out: &mut Vec<u8>) -> Step {
+        let mut run = match self.run.take() {
+            Some(run) => run,
+            None => {
+                if self.la >= self.size {
+                    return Step::End;
+                }
+                let Some(e) = self.extent(v, self.la) else {
+                    return Step::Broken(NO_EXTENT);
+                };
+                // The last extent is as long as the file is.
+                let e = Ext {
+                    llen: e.llen.min(self.size.saturating_sub(self.la)),
+                    ..e
+                };
+                let why = match e.at {
+                    Where::Coded { plen, .. } if plen > v.max as u64 => OVER_LIMIT,
+                    Where::Coded { .. } => NO_CODED,
+                    _ => NO_PLAIN,
+                };
+                match self.start(v, e) {
+                    Some(run) => run,
+                    None => return Step::Broken(why),
+                }
+            }
+        };
+        let want = run.left.min(CHUNK as u64);
+        let n = crate::bytes::to_usize(want);
+        let base = out.len();
+        let (got, cut) = match &mut run.src {
+            Src::Zeros => {
+                out.resize(base.saturating_add(n), 0);
+                self.holes = self.holes.saturating_add(want);
+                (want, "")
+            }
+            Src::Disk(pieces, at) => {
+                let got = loop {
+                    let Some(&(off, len)) = pieces.get(*at) else {
+                        break 0;
+                    };
+                    if len == 0 {
+                        *at = at.saturating_add(1);
+                        continue;
+                    }
+                    let take = len.min(want);
+                    if !v.append(off, crate::bytes::to_usize(take), out) {
+                        break 0;
+                    }
+                    pieces[*at] = (off.saturating_add(take), len.saturating_sub(take));
+                    break take;
+                };
+                (got, UNREADABLE)
+            }
+            Src::Coded(r) => {
+                out.resize(base.saturating_add(n), 0);
+                let k = r.read(&mut out[base..]).unwrap_or(0);
+                out.truncate(base.saturating_add(k));
+                (k as u64, CUT_CODED)
+            }
+        };
+        if got == 0 {
+            return Step::Broken(cut);
+        }
+        run.left = run.left.saturating_sub(got);
+        self.la = self.la.saturating_add(got);
+        if run.left > 0 {
+            self.run = Some(run);
+        }
+        Step::More
+    }
+}
+
 /// Walk an EROFS image given whole as a source.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
-    super::volumes::entries(budget, visit, "", |budget, sink| {
-        walk_volume(Reader::new(src), src.len() as u64, budget, sink)
-    })
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    super::volumes::walk_source(src, budget, visit, walk_volume)
 }
 
 /// Walk the EROFS image `disk`, which is `len` bytes long, handing each file
 /// to `visit`.
-pub(crate) fn walk_volume<D: Read + Seek, R>(
-    mut disk: D,
+pub(crate) fn walk_volume(
+    disk: &mut dyn super::vol::Disk,
     len: u64,
     budget: &mut Budget,
-    visit: Emit<R>,
-) -> Result<Option<R>, LimitHit> {
+    visit: Emit,
+) -> crate::Extracted {
     let max = crate::bytes::to_usize(budget.limits().max_buffer_bytes);
-    let mut v = Vol {
-        disk: &mut disk,
-        len,
-        max,
-    };
+    let mut v = Vol { disk, len, max };
     let head = v
         .at(0, crate::bytes::to_usize(len.min(1028)))
         .unwrap_or_default();
@@ -559,10 +1313,10 @@ mod tests {
         let mut out = Vec::new();
         let mut budget = Budget::new(limits);
         let len = img.len() as u64;
-        let end = walk_volume(Cursor::new(img), len, &mut budget, &mut |e, _| {
+        let end = walk_volume(&mut Cursor::new(img), len, &mut budget, &mut |e, _| {
             let e = e.whole();
             out.push((e.name, e.data, e.unsupported));
-            None::<()>
+            None
         });
         (out, end.map(|_| ()))
     }
@@ -652,7 +1406,19 @@ mod tests {
     }
 
     #[test]
-    fn a_compressed_file_is_reported_and_so_is_a_chunk_on_another_device() {
+    fn a_file_in_chunks_of_a_size_no_chunk_has_is_reported_for_it() {
+        let mut img = Img::new();
+        // The chunk size is the block's, shifted by the low 5 bits.
+        let f = img.inode(CHUNK_BASED, 0o100644, 100, 0x1F, b"");
+        let root = img.dir(&[("f", f, 1)]);
+        let (e, end) = walked(&img.finish(root), Limits::default());
+        end.unwrap();
+        assert_eq!(e[0].2, Some(NO_CHUNKS));
+        assert!(e[0].1.is_empty());
+    }
+
+    #[test]
+    fn a_compressed_file_with_no_index_and_a_chunk_on_another_device_are_reported() {
         let mut img = Img::new();
         let z = img.inode(1, 0o100644, 100, 0, b"");
         let at = img.blocks(&pat(BS));
@@ -664,7 +1430,8 @@ mod tests {
         let (e, end) = walked(&img.finish(root), Limits::default());
         end.unwrap();
         let by = |n: &str| e.iter().find(|m| m.0 == n).unwrap();
-        assert_eq!(by("z").2, Some("EROFS compressed file not read"));
+        // The index of "z" is not there: what it gives is not the file.
+        assert!(by("z").2.is_some(), "{:?}", by("z").1.len());
         assert_eq!(by("o").2, Some("file could not be read from the volume"));
     }
 
@@ -715,7 +1482,8 @@ mod tests {
             max_buffer_bytes: 100,
             ..Limits::default()
         });
-        let (e, end) = collected(|emit| walk_volume(Cursor::new(&img[..]), len, &mut budget, emit));
+        let (e, end) =
+            collected(|emit| walk_volume(&mut Cursor::new(&img[..]), len, &mut budget, emit));
         end.unwrap();
         let mut hole = vec![0u8; BS];
         hole.extend(pat(BS));
@@ -752,7 +1520,8 @@ mod tests {
             max_buffer_bytes: 100,
             ..Limits::default()
         });
-        let (e, end) = collected(|emit| walk_volume(Cursor::new(&img[..]), len, &mut budget, emit));
+        let (e, end) =
+            collected(|emit| walk_volume(&mut Cursor::new(&img[..]), len, &mut budget, emit));
         end.unwrap();
         assert_eq!(e.len(), 1);
         assert!(e[0].1, "read as it goes");

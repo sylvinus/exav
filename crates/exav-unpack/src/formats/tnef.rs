@@ -6,7 +6,7 @@
 //! carve attachment attributes out for the engine to recurse into.
 //!
 //! Structure (little-endian): a `u32` signature `0x223E9F78`, a `u16` key, then a
-//! sequence of attribute records — a `u8` level (`1` = message, `2` = attachment),
+//! sequence of attribute records: a `u8` level (`1` = message, `2` = attachment),
 //! a `u32` whose low 16 bits are the attribute id and high 16 the type, a `u32`
 //! length, `length` data bytes, and a `u16` checksum (not verified). We emit the
 //! attachment-level attributes `attAttachData` (`0x800F`, the file bytes),
@@ -33,14 +33,14 @@ fn attachment_name(bytes: &[u8]) -> String {
 }
 
 /// Walk a TNEF blob, each attachment streamed from where it lies.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let mut source = crate::source::Reader::new(src);
     let members = stream_offsets(&mut source, budget.limits().max_buffer_bytes)?;
-    crate::stream::stream_stored(&mut source, budget, visit, members)
+    crate::stream::stream_stored_ranges(src, budget, visit, crate::stream::Region::list(members))
 }
 
 /// Streaming variant: walk the TLV records off a seekable source and return each

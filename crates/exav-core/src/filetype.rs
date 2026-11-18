@@ -4,6 +4,7 @@
 //! Drives routing to unpackers and structural analyzers.
 
 use crate::byte_source::ByteSource;
+use crate::unpack;
 
 /// File-type magic rules loaded from ClamAV `.ftm` databases. Each is a literal
 /// byte prefix at a fixed offset that assigns a [`FileType`]. Applied ONLY as a
@@ -34,21 +35,29 @@ impl FtmMagics {
     /// only absolute-offset (`magictype 0`) rules whose magic is purely literal
     /// hex and whose `CL_TYPE` maps to a [`FileType`] exav models; wildcarded
     /// magics and unmodelled types are skipped (the engine still type-detects
-    /// natively; these only fill gaps).
-    pub fn extend_from_text(&mut self, text: &str) {
+    /// natively; these only fill gaps). Returns how many lines did not parse
+    /// (not those skipped on purpose).
+    pub fn extend_from_text(&mut self, text: &str) -> usize {
+        let mut skipped = 0;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             let f: Vec<&str> = line.split(':').collect();
-            if f.len() < 6 || f[0] != "0" {
+            if f.len() < 6 {
+                skipped += 1;
+                continue;
+            }
+            if f[0] != "0" {
                 continue;
             }
             let Ok(offset) = f[1].parse::<usize>() else {
+                skipped += 1;
                 continue;
             };
             let Some(magic) = parse_literal_hex(f[2]) else {
+                skipped += 1;
                 continue;
             };
             if magic.is_empty() || magic.len() > 64 {
@@ -59,6 +68,7 @@ impl FtmMagics {
             };
             self.rules.push(FtmRule { offset, magic, ft });
         }
+        skipped
     }
 
     /// First magic that matches `data`, if any. Intended as the `Unknown`
@@ -175,17 +185,17 @@ pub enum FileType {
     Alz,         // ALZ archive
     Egg,         // EGG archive
     Hwp3,        // Hangul HWP v3 document
-    IshieldMsi,  // InstallShield MSI installer (recognised, not unpacked)
-    IshieldCab,  // InstallShield InstallScript cabinet (recognised, not unpacked)
+    IshieldMsi,  // InstallShield setup executable (its files decoded)
+    IshieldCab,  // InstallShield InstallScript cabinet (decoded)
     IshieldZ,    // InstallShield `.z` archive (decoded)
-    CryptFf,     // CryptFF-encrypted file (recognised, not decrypted)
+    CryptFf,     // CryptFF file (its content decoded)
     Ext,         // ext2/3/4 filesystem image (walked)
     Lrzip,       // lrzip stream (recognised, not decoded)
     Zoo,         // ZOO archive (decoded)
-    AppleSingle, // AppleSingle/AppleDouble container (recognised, not read)
+    AppleSingle, // AppleSingle/AppleDouble file (its forks read)
     StuffIt,     // StuffIt / StuffIt X archive (recognised, not decoded)
     Fat,         // FAT12/16/32 filesystem
-    Inno,        // Inno Setup installer (recognised, not decoded)
+    Inno,        // Inno Setup installer (its files read)
     Ntfs,        // NTFS filesystem
     Zstd,        // Zstandard compressed stream
     Lzip,        // Lzip compressed stream
@@ -227,6 +237,9 @@ pub enum FileType {
     Cramfs,   // cramfs image
     Romfs,    // romfs image
     Erofs,    // EROFS image
+    // The scripts of an HTML object, normalised: a view that both HTML
+    // (`Target:3`) and text (`Target:7`) signatures match.
+    ScriptView,
 }
 
 impl FileType {
@@ -308,6 +321,7 @@ impl FileType {
             FileType::Unknown => "data",
             FileType::HtmlView => "normalised HTML",
             FileType::TextView => "normalised text",
+            FileType::ScriptView => "normalised script",
         }
     }
 }
@@ -345,23 +359,16 @@ pub(crate) fn identify_source_with(
 fn identify_with(buf: &[u8], detect: impl FnOnce() -> Option<crate::unpack::Format>) -> FileType {
     // Executables and RTF: types core recognises itself (not extractable
     // containers, so `exav-unpack` doesn't know them).
-    if buf.starts_with(b"MZ") {
-        return FileType::Pe;
-    }
-    if buf.starts_with(b"\x7fELF") {
-        return FileType::Elf;
-    }
     // Thin Mach-O magics only. The universal/"fat" magics (CA FE BA BE /
-    // CA FE BA BF) are deliberately NOT matched here, so a fat binary falls
+    // CA FE BA BF) are deliberately NOT matched, so a fat binary falls
     // through to `unpack::detect` → `Format::Machofat` and gets split into its
     // per-arch slices (each a thin Mach-O, re-scanned). CA FE BA BE is also the
     // Java `.class` magic; `machofat` detection rejects those.
-    if buf.starts_with(&[0xCF, 0xFA, 0xED, 0xFE])
-        || buf.starts_with(&[0xFE, 0xED, 0xFA, 0xCF])
-        || buf.starts_with(&[0xCE, 0xFA, 0xED, 0xFE])
-        || buf.starts_with(&[0xFE, 0xED, 0xFA, 0xCE])
-    {
-        return FileType::MachO;
+    match crate::unpack::executable_kind(buf) {
+        Some(crate::unpack::Executable::Pe) => return FileType::Pe,
+        Some(crate::unpack::Executable::Elf) => return FileType::Elf,
+        Some(crate::unpack::Executable::MachO) => return FileType::MachO,
+        None => {}
     }
     if buf.starts_with(b"{\\rtf") {
         return FileType::Rtf;
@@ -382,147 +389,43 @@ fn identify_with(buf: &[u8], detect: impl FnOnce() -> Option<crate::unpack::Form
     // broader `FileType`.
     // A DXF drawing has no ClamAV type: an ASCII one is text to ClamAV and
     // stays so here, for `Target:7`; what it embeds is extracted from the
-    // magic (`MAGIC_DISPATCH_ONLY`).
+    // magic (`unpack::tree::MAGIC_DISPATCH_ONLY`).
     match detect() {
         Some(crate::unpack::Format::Dxf) | None => {}
-        Some(fmt) => return filetype_of_format(fmt),
-    }
-    // Content-sniffed text-ish types (core-specific).
-    if buf.starts_with(b"#!") {
-        return FileType::Script;
-    }
-    if looks_like_html(buf) {
-        return FileType::Html;
-    }
-    if looks_like_email(buf) {
-        return FileType::Email;
-    }
-    // Mostly-printable content with no more specific type is ASCII/UTF-8 text.
-    // ClamAV distinguishes text from binary so `Target:7` (text) signatures apply
-    // only to text; mirroring that keeps text sigs off binary blobs.
-    if looks_textual(buf) {
-        return FileType::Text;
-    }
-    FileType::Unknown
-}
-
-/// True if the head looks like text (ASCII *or* UTF-8) rather than binary.
-/// Generous on purpose: a NUL byte or a high density of non-whitespace control
-/// bytes marks binary, but high bytes (0x80..=0xff) are accepted so non-ASCII
-/// UTF-8 text still types as text. Otherwise non-English text malware would
-/// type as binary and lose its `Target:7` (ASCII-text) coverage.
-fn looks_textual(buf: &[u8]) -> bool {
-    let head = &buf[..buf.len().min(8192)];
-    if head.is_empty() {
-        return false;
-    }
-    let mut ctrl = 0usize;
-    for &b in head {
-        if b == 0 {
-            return false; // NUL ⇒ binary
-        }
-        if b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r' | 0x0c) {
-            ctrl += 1;
+        Some(fmt) => {
+            if crate::unpack::is_found_by_string(fmt)
+                && let Some(own) = text_kept(fmt, buf)
+            {
+                return own;
+            }
+            return filetype_of_format(fmt);
         }
     }
-    ctrl * 20 < head.len() // < 5% non-whitespace control bytes
+    text_type(buf).unwrap_or(FileType::Unknown)
 }
 
-/// Heuristic HTML detection (HTML has no magic bytes). ClamAV types content as
-/// HTML and applies `Target:3` signatures only to it; exav mirrors that so an
-/// HTML-exploit sig does not fire on, say, obfuscated JavaScript that merely
-/// contains `Uint32Array(0x..)`. Conservative: requires a real structural tag in
-/// the (text-ish) head. Plain JS/text is left `Unknown` and is still covered by
-/// `Target:7` text signatures.
-fn looks_like_html(buf: &[u8]) -> bool {
-    let head = &buf[..buf.len().min(8192)];
-    // Must be text-ish (mostly printable); skip binary that happens to contain
-    // an angle-bracket sequence.
-    let printable = head
-        .iter()
-        .filter(|&&b| b == b'\t' || b == b'\n' || b == b'\r' || (0x20..=0x7e).contains(&b))
-        .count();
-    if head.is_empty() || printable * 10 < head.len() * 9 {
-        return false;
+/// The type core gives a kind of text: what [`unpack::text_kind`] says it is.
+fn text_type_of(kind: unpack::TextKind) -> FileType {
+    match kind {
+        unpack::TextKind::Script => FileType::Script,
+        unpack::TextKind::Message => FileType::Email,
+        unpack::TextKind::Page => FileType::Html,
+        unpack::TextKind::Plain => FileType::Text,
     }
-    let lower = head.to_ascii_lowercase();
-    const MARKERS: &[&[u8]] = &[
-        b"<!doctype html",
-        b"<html",
-        b"<head",
-        b"<body",
-        b"<script",
-        b"<iframe",
-        b"<title",
-        b"<table",
-        b"<style",
-        b"<meta ",
-        b"<div",
-        b"<span",
-        b"<a href",
-        b"<img ",
-    ];
-    MARKERS
-        .iter()
-        .any(|m| memchr::memmem::find(&lower, m).is_some())
 }
 
-/// How much of the start is read to judge a message by its headers.
-const EMAIL_HEAD: usize = 64 * 1024;
-
-/// Heuristic RFC822/MIME detection (email has no magic bytes).
-///
-/// An mbox (`From ` separator), or a header block that starts with a header
-/// field and carries a MIME header and a header only mail has. Names are not
-/// case sensitive and the first field is any: a mail client writes its own
-/// (`X-Mozilla-Status`, `X-Account-Key`) ahead of the rest, and a gateway adds
-/// a long run of `Received` fields before the MIME headers.
-fn looks_like_email(buf: &[u8]) -> bool {
-    let head = &buf[..buf.len().min(EMAIL_HEAD)];
-    if head.starts_with(b"From ") {
-        return true; // mbox
-    }
-    // The header block: up to the first empty line.
-    let end = head
-        .windows(2)
-        .position(|w| w == b"\n\n")
-        .into_iter()
-        .chain(head.windows(4).position(|w| w == b"\r\n\r\n"))
-        .min()
-        .unwrap_or(head.len());
-    let block = &head[..end];
-    let field_name = |line: &[u8]| -> Option<String> {
-        let colon = line.iter().position(|&b| b == b':')?;
-        let name = &line[..colon];
-        (!name.is_empty()
-            && name.len() <= 64
-            && name.iter().all(|b| b.is_ascii_graphic() && *b != b':'))
-        .then(|| String::from_utf8_lossy(name).to_ascii_lowercase())
-    };
-    let mut lines = block.split(|&b| b == b'\n');
-    let Some(first) = lines.next().and_then(field_name) else {
-        return false;
-    };
-    // Folded lines start with white space and name nothing.
-    let names: Vec<String> = std::iter::once(first.clone())
-        .chain(lines.filter_map(field_name))
-        .collect();
-    let has = |n: &str| names.iter().any(|x| x == n);
-    let mime = has("mime-version") || has("content-type");
-    const ONLY_MAIL: &[&str] = &[
-        "received",
-        "return-path",
-        "from",
-        "to",
-        "subject",
-        "date",
-        "message-id",
-        "delivered-to",
-        "mime-version",
-    ];
-    // A part saved on its own starts with its `Content-Type`.
-    mime && (first == "content-type" || ONLY_MAIL.iter().any(|n| has(n)))
+/// The type core's own checks give a text. `None` for what is not text.
+fn text_type(buf: &[u8]) -> Option<FileType> {
+    unpack::text_kind(buf).map(text_type_of)
 }
+
+/// The type a text keeps, when `detect` gives `fmt` for a string it finds in
+/// the object; `None` when `fmt` is the type (see [`unpack::text_keeps`]).
+fn text_kept(fmt: unpack::Format, buf: &[u8]) -> Option<FileType> {
+    unpack::text_keeps(fmt, buf).map(text_type_of)
+}
+
+pub(crate) use crate::unpack::{field_name_len, looks_like_html};
 
 /// Whether a MIME document is an **MHTML web archive** rather than a mail
 /// message: a saved web page (`.mht`), not something that travelled through a
@@ -558,10 +461,10 @@ pub(crate) fn looks_like_mhtml(buf: &[u8]) -> bool {
 /// but is mapped for completeness.)
 ///
 /// Several formats have no ClamAV `CL_TYPE_*` of their own and land on
-/// `FileType::Unknown`. Since the scanner reaches an extractor through
-/// `FileType`, such a format would never be extracted at all; they are listed in
-/// [`MAGIC_DISPATCH_ONLY`] and dispatched straight from the magic instead.
-/// `scan_dispatch_covers_every_format` holds the two lists together.
+/// `FileType::Unknown`; they are listed in [`unpack::tree::MAGIC_DISPATCH_ONLY`]
+/// and read from their magic, as the walk's typer does for every format.
+/// `a_type_a_signature_gives_names_the_format_it_is` holds the list and the
+/// mapping together.
 pub(crate) fn filetype_of_format(fmt: crate::unpack::Format) -> FileType {
     use crate::unpack::Format;
     match fmt {
@@ -642,83 +545,38 @@ pub(crate) fn filetype_of_format(fmt: crate::unpack::Format) -> FileType {
         Format::OneNote => FileType::OneNote,
         Format::Rtf => FileType::Rtf,
         // `Format` is `#[non_exhaustive]`, so the compiler can no longer prove
-        // this mapping is total. `scan_dispatch_covers_every_format` proves it
-        // instead, walking `Format::ALL` and failing on any variant that does
-        // not round-trip. That catches a missing arm here for the same reason
-        // the compiler used to, and with a better message.
+        // this mapping is total. `a_type_a_signature_gives_names_the_format_it_is`
+        // proves it instead, walking `Format::ALL` and failing on any variant
+        // that does not round-trip. That catches a missing arm here for the
+        // same reason the compiler used to, and with a better message.
         _ => FileType::Unknown,
     }
 }
 
-/// Formats that [`filetype_of_format`] maps to `FileType::Unknown` yet still
-/// have real content to extract, so the scanner dispatches them from the magic
-/// rather than from the file type.
-///
-/// `Upx`/`PePacked` are deliberately absent: they are content-detected on an
-/// already-typed executable, not returned by `detect`.
-/// Containers that live *inside* an executable: an installer or self-extractor
-/// whose payload is appended to a PE/ELF stub.
-///
-/// `identify` answers `Pe`/`Elf` for these (correctly, since they are real
-/// executables and the PE signature scan has to run on them), and
-/// `unpack_format` has no mapping from an executable to a container, so the
-/// extractor is never reached. Embedded-archive carving covers the case where
-/// the appended data is a *recognisable* archive (a ZIP glued to a stub), but
-/// not where it is the installer's own format: NSIS's compressed blocks and
-/// Inno Setup's chunked LZMA look like nothing in particular, so a carve finds
-/// no candidate and the file scans clean with every packaged file unexamined.
-///
-/// So these are dispatched from the magic instead, exactly as
-/// [`MAGIC_DISPATCH_ONLY`] is. `scan_dispatch_covers_every_format` holds the
-/// lists and the mapping together.
-pub(crate) const EXECUTABLE_CONTAINERS: &[crate::unpack::Format] = &[
-    crate::unpack::Format::Nsis,
-    crate::unpack::Format::Sfx,
-    crate::unpack::Format::Autoit,
-    crate::unpack::Format::Inno,
-];
-
-pub(crate) const MAGIC_DISPATCH_ONLY: &[crate::unpack::Format] = &[
-    crate::unpack::Format::Dmg,
-    crate::unpack::Format::Vhd,
-    crate::unpack::Format::Lzw,
-    crate::unpack::Format::Lzma,
-    crate::unpack::Format::Rpm,
-    crate::unpack::Format::Qcow2,
-    crate::unpack::Format::Vmdk,
-    crate::unpack::Format::Vhdx,
-    crate::unpack::Format::Dxf,
-    crate::unpack::Format::Dwg,
-];
-
 #[cfg(test)]
 mod tests {
-    use crate::unpack::Format;
+    use crate::unpack::{Format, tree};
 
-    /// Every format the magic detector recognises must be reachable by the
-    /// scanner. A format that lands on `FileType::Unknown` and is not listed in
-    /// [`MAGIC_DISPATCH_ONLY`] is never handed to an extractor at all: its
-    /// members are simply not scanned, and the file is reported clean on the
-    /// strength of a raw pattern scan that cannot see compressed content.
-    ///
-    /// This is a real regression that shipped: `.Z`, DMG, VHD, QCOW2 and VMDK
-    /// each had a working extractor that nothing ever called.
+    /// The type a signature gives an object (`HandlerType:`) names the format
+    /// that reads it: every format that has a type of its own is found from its
+    /// type. A format that lands on `FileType::Unknown` has none, and is read
+    /// from its magic ([`tree::MAGIC_DISPATCH_ONLY`]); the runtime packers are
+    /// found on an executable and not by `detect`.
     #[test]
-    fn scan_dispatch_covers_every_format() {
+    fn a_type_a_signature_gives_names_the_format_it_is() {
         for &fmt in Format::ALL {
-            // Runtime packers are detected on an already-typed executable
-            // rather than by `detect`, so they have no file type to map.
-            if matches!(fmt, Format::Upx | Format::PePacked) {
-                continue;
-            }
-            if super::MAGIC_DISPATCH_ONLY.contains(&fmt) {
+            if matches!(fmt, Format::Upx | Format::PePacked)
+                || tree::MAGIC_DISPATCH_ONLY.contains(&fmt)
+            {
                 continue;
             }
             let ft = super::filetype_of_format(fmt);
             assert_eq!(
-                crate::unpack_format(ft),
-                Some(fmt),
-                "{fmt:?} maps to {ft:?}, which the scanner does not dispatch                  back to {fmt:?}, so its contents would go unscanned. Give it a                  FileType, or add it to MAGIC_DISPATCH_ONLY."
+                crate::declared_by(ft),
+                tree::Declared::Format(fmt),
+                "{fmt:?} maps to {ft:?}, which does not name {fmt:?}: its contents \
+                 would go unscanned when a signature types an object so. Give it a \
+                 FileType, or add it to MAGIC_DISPATCH_ONLY."
             );
         }
     }
@@ -873,5 +731,226 @@ mod tests {
             identify(b"Server: x\r\nContent-Length: 3\r\nContent-Type: text/plain\r\n\r\nhi"),
             FileType::Email
         );
+    }
+
+    /// What clamscan 1.4.3 types as mail from a file's first bytes alone: no
+    /// MIME header, no second header, any body, markup in it included.
+    #[test]
+    fn a_file_that_starts_with_a_mail_header_is_a_message() {
+        for first in [
+            "From a@b Mon Jan  1 00:00:00 2024",
+            "From: a@b",
+            "Received: from x by y",
+            "Received-SPF: pass",
+            "Return-Path: <a@b>",
+            "Return-path: <a@b>",
+            "To: a@b",
+            "Subject: x",
+            "Message-ID: <1@b>",
+            "Message-Id: <1@b>",
+            "Date: Mon, 1 Jan 2024 00:00:00 +0000",
+            "Delivered-To: a@b",
+            "Envelope-to: a@b",
+            "X-Original-To: a@b",
+            "X-Envelope-From: a@b",
+            "X-Apparently-To: a@b",
+            "X-Real-To: a@b",
+            "X-Sieve: CMU Sieve 2.2",
+            "X-UIDL: 1",
+        ] {
+            for body in [
+                "",
+                "\n\nhi",
+                "\r\n\r\nhi",
+                "\n\n<html><body>hi</body></html>",
+                "\n\n<script>x</script>",
+                "\n\n\x00\x01binary",
+            ] {
+                let m = format!("{first}{body}");
+                assert_eq!(identify(m.as_bytes()), FileType::Email, "{m:?}");
+            }
+        }
+    }
+
+    /// What a text starts with, and the type its own checks give it.
+    const TEXTS: [(&[u8], FileType); 6] = [
+        (b"From: a@b\n\nhi ", FileType::Email),
+        (b"Received: from x by y\n\nhi ", FileType::Email),
+        (
+            b"MIME-Version: 1.0\nContent-Type: text/plain\n\nhi ",
+            FileType::Email,
+        ),
+        (b"#!/bin/sh\necho ", FileType::Script),
+        (
+            b"<html><body>lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
+              eiusmod tempor incididunt ut labore et dolore magna aliqua, ut enim ad minim ",
+            FileType::Html,
+        ),
+        (b"just some notes, ", FileType::Text),
+    ];
+
+    #[cfg(all(
+        feature = "screnc",
+        feature = "binhex",
+        feature = "xdp",
+        feature = "autoit"
+    ))]
+    const SCRIPT_GUID: [u8; 16] = [
+        0xA3, 0x48, 0x4B, 0xBE, 0x98, 0x6C, 0x4A, 0xA9, 0x99, 0x4C, 0x53, 0x0A, 0x86, 0xD6, 0x48,
+        0x7D,
+    ];
+
+    /// A string `detect` searches for in an object (the Script Encoder
+    /// marker, an XDP tag, the BinHex line, an AutoIt marker) does not retype
+    /// a message, a script, a page or a text that holds it: it keeps its type,
+    /// so the signatures of that type and its views apply.
+    #[test]
+    fn a_string_found_in_a_text_does_not_retype_it() {
+        let strings: [&[u8]; 5] = [
+            b"#@~^AAAAAA==",
+            b"<xdp><pdf><chunk>",
+            b"(This file must be converted with BinHex 4.0)",
+            b"AU3!EA06",
+            b"AU3!EA05",
+        ];
+        for s in strings {
+            for (start, want) in TEXTS {
+                let file = [start, s, b"\n"].concat();
+                assert_eq!(identify(&file), want, "{file:?}");
+            }
+        }
+        // The marker of a script by itself, first in a text.
+        assert_eq!(identify(b"AU3!EA06 and notes\n"), FileType::Text);
+    }
+
+    /// Where the string is the header of the format, the format is the type:
+    /// a Script Encoder file and a BinHex file start with theirs, an XDP has
+    /// its root element, a compiled script its marker after the script GUID.
+    /// A page, and a message with a mail header first, keep their type.
+    #[cfg(all(
+        feature = "screnc",
+        feature = "binhex",
+        feature = "xdp",
+        feature = "autoit"
+    ))]
+    #[test]
+    fn the_header_of_a_format_found_by_a_string_types_a_text() {
+        let blob: &[u8] = b"#@~^AAAAAA==xxxxxxxx^#~@";
+        let binhex: &[u8] = b"(This file must be converted with BinHex 4.0)\r:#@9TB:";
+        let root: &[u8] =
+            b"<?xml version=\"1.0\"?>\n<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\">";
+        let au3 = [&SCRIPT_GUID[..], b"AU3!EA06"].concat();
+        assert_eq!(identify(blob), FileType::Screnc);
+        assert_eq!(identify(binhex), FileType::Binhex);
+        assert_eq!(identify(root), FileType::Xdp);
+        assert_eq!(
+            identify(&[b"just notes\n", &au3[..], b"\n"].concat()),
+            FileType::Autoit
+        );
+        // Not first: the start says what it is.
+        for s in [blob, binhex] {
+            for (start, want) in TEXTS {
+                let file = [start, s].concat();
+                assert_eq!(identify(&file), want, "{file:?}");
+            }
+        }
+        // The XDP root and the AutoIt marker type a text and a script, and not
+        // a page or a message that starts with a mail header.
+        for s in [root, &au3[..]] {
+            for (start, want) in TEXTS {
+                let file = [start, s, b"\n"].concat();
+                let page_or_mail = want == FileType::Html
+                    || start.starts_with(b"From: ")
+                    || start.starts_with(b"Received: ");
+                if page_or_mail {
+                    assert_eq!(identify(&file), want, "{file:?}");
+                } else {
+                    let typed = if s == root {
+                        FileType::Xdp
+                    } else {
+                        FileType::Autoit
+                    };
+                    assert_eq!(identify(&file), typed, "{file:?}");
+                }
+            }
+        }
+    }
+
+    /// A PDF header in the first kilobyte types a text, a script and a message
+    /// told by its MIME headers as a PDF, and not a page or a message that
+    /// starts with a mail header. Clamscan 1.4.3 does the same. Past the
+    /// first kilobyte, or with no digit after the dash, it is a string.
+    #[test]
+    fn a_pdf_header_near_the_start_types_a_text_but_not_a_page_or_a_message() {
+        for (start, want) in TEXTS {
+            let file = [start, b"\n%PDF-1.4\n"].concat();
+            let typed = match want {
+                FileType::Html | FileType::Email if start.starts_with(b"From") => want,
+                FileType::Html => want,
+                FileType::Email if start.starts_with(b"Received") => want,
+                _ => FileType::Pdf,
+            };
+            assert_eq!(identify(&file), typed, "{file:?}");
+            let late = [start, &[b'.'; 1100][..], b"\n%PDF-1.4\n"].concat();
+            assert_eq!(identify(&late), want, "past the first kilobyte");
+            let nodigit = [start, b"\n%PDF-x\n"].concat();
+            assert_eq!(identify(&nodigit), want, "no digit");
+        }
+        // At the first byte it is the header, whatever the PDF holds.
+        assert_eq!(identify(b"%PDF-1.4\n<html><body>"), FileType::Pdf);
+    }
+
+    /// A message whose headers carry a MIME header is a message before it is a
+    /// page, whichever header comes first and whatever its first part is: clamscan
+    /// opens a message with an HTML part, and typing it as HTML would not.
+    #[test]
+    fn a_message_with_an_html_part_is_a_message_not_a_page() {
+        for head in [
+            "Cc: a@b\nMIME-Version: 1.0",
+            "X-Mozilla-Status: 0001\nSubject: x\nMIME-Version: 1.0",
+            "from: a@b\nmime-version: 1.0",
+            "MIME-Version: 1.0",
+            "Content-Type: multipart/related; boundary=\"BB\"\nMIME-Version: 1.0",
+        ] {
+            let m = format!(
+                "{head}\nContent-Type: multipart/related; boundary=\"BB\"\n\n\
+                 --BB\nContent-Type: text/html\n\n<html><body>hi</body></html>\n--BB--\n"
+            );
+            assert_eq!(identify(m.as_bytes()), FileType::Email, "{head:?}");
+        }
+        // A page is still a page, whatever its first line holds.
+        for page in [
+            "<title>Note: x</title>\n<html><body>hi</body></html>\n",
+            "<html>\n<body>Content-Type: text/html\nMIME-Version: 1.0</body></html>\n",
+        ] {
+            assert_eq!(identify(page.as_bytes()), FileType::Html, "{page:?}");
+        }
+    }
+
+    /// Case counts, the colon is followed by a space, and nothing comes first.
+    #[test]
+    fn what_clamscan_does_not_type_as_mail_is_not_typed_as_mail() {
+        for text in [
+            "Cc: a@b\n\nhi",
+            "Reply-To: a@b\n\nhi",
+            "X-Mailer: x\n\nhi",
+            "X-Mozilla-Status: 0001\n\nhi",
+            "from: a@b\nto: c@d\nsubject: x\n\nhi",
+            "FROM: a@b\nTO: c@d\nSUBJECT: x\n\nhi",
+            "return-path: <a@b>\n\nhi",
+            "Message-id: <1@b>\n\nhi",
+            "From:a@b\n\nhi",
+            "Date:Mon\n\nhi",
+            "To:",
+            " From: a@b\nTo: c@d\n\nhi",
+            "\nFrom: a@b\nTo: c@d\n\nhi",
+            "\r\nFrom: a@b\r\nTo: c@d\r\n\r\nhi",
+            "\u{feff}From: a@b\n\nhi",
+            "This is a note.\nFrom: me\nRegards\n",
+            "<html>\nFrom: a@b\nTo: c@d\n\nhi",
+            "Server: x\r\nDate: Mon\r\n\r\nhi",
+        ] {
+            assert_ne!(identify(text.as_bytes()), FileType::Email, "{text:?}");
+        }
     }
 }

@@ -62,7 +62,7 @@ pub(super) struct SevenZReader<'a> {
 
 impl<'a> SevenZReader<'a> {
     /// Bytes left to read. Used to cap `Vec::with_capacity` for attacker-declared
-    /// counts — a count can't exceed the bytes remaining to parse it from, so a
+    /// counts: a count can't exceed the bytes remaining to parse it from, so a
     /// bogus huge count can't drive a huge pre-allocation.
     pub fn remaining(&self) -> usize {
         self.data.len().saturating_sub(self.pos)

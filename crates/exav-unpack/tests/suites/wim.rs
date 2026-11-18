@@ -1,4 +1,4 @@
-//! WIM — the Windows Imaging Format.
+//! WIM: the Windows Imaging Format.
 //!
 //! Windows opens a `.wim` natively and 7-Zip opens one too, so it is an ordinary
 //! delivery container. Its file data is chunk-compressed, meaning a payload
@@ -11,7 +11,7 @@
 //! is checked only when checksums are verified.
 //!
 //! Fixtures come from **wimlib** (`wimcapture`), one per compression format,
-//! plus `hard_LZX.wim` — 48 KiB of real x86-64 code (453 `E8` bytes, so LZX's
+//! plus `hard_LZX.wim`: 48 KiB of real x86-64 code (453 `E8` bytes, so LZX's
 //! call translation has to be undone correctly) and 40 KB of incompressible
 //! random data (which forces stored blocks), spanning several chunks.
 //!

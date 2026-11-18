@@ -124,8 +124,59 @@ struct Header {
     body: usize,
 }
 
+/// The first line of every PLY file.
+fn has_magic(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"ply\n") || bytes.starts_with(b"ply\r\n")
+}
+
+/// The line without the `{ ... }` remarks of the format's own example.
+fn without_remarks(text: &str) -> String {
+    match (text.find('{'), text.rfind('}')) {
+        (Some(a), Some(b)) if a < b => format!("{} {}", &text[..a], &text[b + 1..]),
+        _ => text.to_string(),
+    }
+}
+
+fn format_named(name: &str) -> Option<Format> {
+    match name {
+        "ascii" => Some(Format::Ascii),
+        "binary_little_endian" => Some(Format::Little),
+        "binary_big_endian" => Some(Format::Big),
+        _ => None,
+    }
+}
+
+/// Whether `head`, the start of a file, is the header of a PLY file this
+/// reader names: the magic line, then lines up to a `format` line that gives
+/// ascii or a byte order. An `element`, `property` or `end_header` line before
+/// it says no, and so does a line cut short. Cheap: the body is not looked at.
+pub fn is_ply(head: &[u8]) -> bool {
+    if !has_magic(head) {
+        return false;
+    }
+    let window = &head[..head.len().min(MAX_HEADER)];
+    for line in window.split_inclusive(|&b| b == b'\n').skip(1) {
+        let Ok(text) = std::str::from_utf8(line) else {
+            return false;
+        };
+        if !line.ends_with(b"\n") {
+            return false;
+        }
+        let text = without_remarks(text);
+        match text.split_ascii_whitespace().collect::<Vec<_>>().as_slice() {
+            ["format", name, _version] => return format_named(name).is_some(),
+            [first, ..] if matches!(*first, "format" | "element" | "property" | "end_header") => {
+                return false;
+            }
+            // Comments, and the lines of a writer's own that `header` skips.
+            _ => {}
+        }
+    }
+    false
+}
+
 fn header(bytes: &[u8]) -> Result<Header, Error> {
-    if !bytes.starts_with(b"ply\n") && !bytes.starts_with(b"ply\r\n") {
+    if !has_magic(bytes) {
         return Err(Error::NotPly);
     }
     let window = &bytes[..bytes.len().min(MAX_HEADER)];
@@ -138,21 +189,12 @@ fn header(bytes: &[u8]) -> Result<Header, Error> {
             return Err(Error::NotPly);
         }
         let text = std::str::from_utf8(line).map_err(|_| Error::NotPly)?;
-        // The `{ ... }` remarks of the format's own example are not words.
-        let text = match (text.find('{'), text.rfind('}')) {
-            (Some(a), Some(b)) if a < b => format!("{} {}", &text[..a], &text[b + 1..]),
-            _ => text.to_string(),
-        };
+        let text = without_remarks(text);
         let words: Vec<&str> = text.split_ascii_whitespace().collect();
         match words.as_slice() {
             ["ply"] | ["comment", ..] | ["obj_info", ..] | [] => {}
             ["format", name, _version] => {
-                format = Some(match *name {
-                    "ascii" => Format::Ascii,
-                    "binary_little_endian" => Format::Little,
-                    "binary_big_endian" => Format::Big,
-                    _ => return Err(Error::Unsupported("format")),
-                });
+                format = Some(format_named(name).ok_or(Error::Unsupported("format"))?);
             }
             ["element", name, count] => {
                 if elements.len() >= MAX_ELEMENTS {

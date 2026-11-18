@@ -163,7 +163,10 @@ sub-expression yields, so it propagates through the operators without a special
 case and the rule does not match. `ScanResults::budget_exhausted()` reports that
 it happened: the results are then a lower bound, and exav-core reports the scan
 `LimitsExceeded` unless something matched. A pattern that reaches
-`MAX_MATCHES` (1M, as in yara-x) is treated the same way. Large community feeds evaluate in the low millions of steps for a whole
+`MAX_MATCHES` (1M, as in yara-x) is treated the same way. A pattern every use
+of which names one offset (`$a at 0`, `any of ($a, $b) at 0`) is looked for
+there alone, as yara-x anchors it, so its matches elsewhere never count.
+Large community feeds evaluate in the low millions of steps for a whole
 scan, so the ceiling costs real rules nothing.
 
 ## Measured real-world coverage

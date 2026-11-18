@@ -1,8 +1,8 @@
-//! ZOO — an archive format old enough that not opening it is a hiding place.
+//! ZOO: an archive format old enough that not opening it is a hiding place.
 //!
 //! **The oracle is the format itself.** `store.zoo` holds its members
 //! uncompressed and `default.zoo` / `high_per.zoo` hold the same files through
-//! ZOO's two codecs (LZD, a 13-bit LZW; and LZH, Dhesi's own — not the LHA one
+//! ZOO's two codecs (LZD, a 13-bit LZW; and LZH, Dhesi's own, not the LHA one
 //! despite the name). A decoder validated against its own output proves
 //! nothing, so the assertion here is that the compressed archives reproduce,
 //! byte for byte, what the stored one already holds. A subtly wrong decoder
@@ -55,7 +55,8 @@ fn stored_members_come_out_whole() {
     // Pinned against a direct read of the ZOO directory entries: one member,
     // `license`, `org_size` 11357, stored/LZD/LZH across the three fixtures.
     // Without this the cross-codec test below could pass on three empty
-    // archives agreeing with each other.
+    // archives agreeing with each other. The entry's variable part names the
+    // directory `..`: The Unarchiver's `lsar` lists `../license`.
     let c = contents("store.zoo");
     assert_eq!(
         c.len(),
@@ -63,7 +64,7 @@ fn stored_members_come_out_whole() {
         "got {:?}",
         c.iter().map(|(n, _)| n).collect::<Vec<_>>()
     );
-    assert_eq!(c[0].0, "license");
+    assert_eq!(c[0].0, "../license");
     assert_eq!(
         c[0].1.len(),
         11357,
@@ -75,12 +76,15 @@ fn stored_members_come_out_whole() {
 fn the_compressed_archives_decode_to_exactly_what_the_stored_one_holds() {
     // What the suite exists for. Nothing here trusts the decoder's own
     // output: LZD and LZH have to reproduce the stored bytes exactly.
+    // The archives were written from different directories (`default.zoo`
+    // names none), so members are matched by their file name.
+    let file = |n: &String| n.rsplit('/').next().unwrap_or(n).to_string();
     let stored = contents("store.zoo");
     for name in ["default.zoo", "high_per.zoo"] {
         let got = contents(name);
         assert_eq!(
-            got.iter().map(|(n, _)| n).collect::<Vec<_>>(),
-            stored.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            got.iter().map(|(n, _)| file(n)).collect::<Vec<_>>(),
+            stored.iter().map(|(n, _)| file(n)).collect::<Vec<_>>(),
             "{name} must hold the same members as store.zoo"
         );
         for ((gn, gd), (sn, sd)) in got.iter().zip(stored.iter()) {
@@ -88,7 +92,7 @@ fn the_compressed_archives_decode_to_exactly_what_the_stored_one_holds() {
                 gd,
                 sd,
                 "{name}: member {gn} decoded to {} bytes, but {sn} in store.zoo \
-                 is {} — a codec that is subtly wrong emits plausible bytes, not \
+                 is {}: a codec that is subtly wrong emits plausible bytes, not \
                  an error",
                 gd.len(),
                 sd.len()
@@ -130,6 +134,25 @@ fn an_archive_zoo_wrote_reports_nothing() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+/// A member of a method zoo does not define is reported as a method not
+/// decoded, not as damage.
+#[test]
+fn an_unknown_method_is_reported_as_unsupported() {
+    use exav_unpack::tree::ReasonKind;
+    let mut img = fixture("store.zoo");
+    let start = u32::from_le_bytes(img[24..28].try_into().unwrap()) as usize;
+    assert_eq!(img[start + 5], 0, "the first member is stored");
+    img[start + 5] = 7;
+    let e = members(&img);
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(e[0].data.is_empty(), "{e:?}");
+    assert_eq!(
+        e[0].unsupported,
+        Some("ZOO member uses a compression method exav does not decode")
+    );
+    assert_eq!(e[0].reason_kind, Some(ReasonKind::Unsupported));
 }
 
 #[test]

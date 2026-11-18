@@ -4,9 +4,16 @@
 //! - Markdown (`.md`, `.markdown`): [`markdown::visible_text`].
 //! - HTML, the XML parts of Office and OpenDocument files, PDF:
 //!   `exav_unpack::text`, over html5gum's tokenizer, quick-xml and hayro.
+//! - The hyperlinks of an Office Open XML package, each label with its
+//!   target from the `.rels` parts, and an email's headers:
+//!   `exav_unpack::text` too.
 //! - AutoCAD drawings (DXF and DWG): what the drawing model holds as text:
 //!   TEXT and MTEXT, attributes with their tags and prompts, dimension
-//!   overrides, multileaders' text, block and layer names.
+//!   overrides, multileaders' text, block and layer names. A DWG's
+//!   hyperlinks too: each target and description a line, and each
+//!   description that is not its target as a link.
+//! - IFC models and other STEP files: the strings of each instance (names,
+//!   descriptions, property values), one instance to a line.
 //! - Office documents the XML parts do not reach (feature `text-office`):
 //!   DOC, XLS, PPT, RTF, Word 2003 XML, SpreadsheetML 2003, SYLK, the flat
 //!   OpenDocument files, Numbers, Pages and Keynote, from what the
@@ -23,6 +30,7 @@
 
 use super::cad::{self, Drawing, Entity, EntityKind};
 use super::dwg::mtext_lines;
+use super::ifc::step::is_step;
 use super::markdown;
 pub use super::markdown::Visible;
 
@@ -32,15 +40,26 @@ fn is_markdown(name: &str, head: &[u8]) -> bool {
     (lower.ends_with(".md") || lower.ends_with(".markdown")) && exav_unpack::text::looks_text(head)
 }
 
-/// Whether a file or member called `name`, starting with `head` (a kilobyte is
-/// enough), is a kind of document [`visible_text`] reads. Cheap: nothing is
-/// parsed.
-pub fn wants(name: &str, head: &[u8]) -> bool {
+/// Whether the file or member `src` called `name` is a kind of document
+/// [`visible_text`] reads. Cheap: nothing is parsed, but a ZIP's directory is
+/// read when its name does not say what it is.
+pub fn wants(name: &str, src: &dyn exav_unpack::ByteSource) -> bool {
+    let window = src.window(0, 1024);
+    let head = &window[..];
     is_markdown(name, head)
-        || exav_unpack::text::kind(name, head).is_some()
+        || exav_unpack::text::kind(name, src).is_some()
         || cad::looks_like_dwg(head)
+        || is_r2007_dwg(head)
         || cad::looks_like_dxf(head)
+        || is_step(head)
         || office_wants(name, head)
+}
+
+/// An R2007 DWG (`AC1021` and five zero bytes), whose file header ends at
+/// 0x480: more than the kilobyte `wants` is given, so [`cad::looks_like_dwg`]
+/// cannot tell. The whole file is checked when it is read.
+fn is_r2007_dwg(head: &[u8]) -> bool {
+    head.starts_with(b"AC1021") && head.get(6..11) == Some(&[0u8; 5][..])
 }
 
 #[cfg(feature = "text-office")]
@@ -64,9 +83,14 @@ pub fn visible_text(
 ) -> Option<Visible> {
     let head = &data[..data.len().min(1024)];
     if is_markdown(name, head) {
-        return Some(markdown::visible_text(&String::from_utf8_lossy(data), cap));
+        // Read as exav-unpack reads text, binary bytes included, as its XML
+        // parts are.
+        return Some(markdown::visible_text(
+            &exav_unpack::text::decode(data),
+            cap,
+        ));
     }
-    if let Some(kind) = exav_unpack::text::kind(name, head) {
+    if let Some(kind) = exav_unpack::text::kind(name, &data) {
         let e = exav_unpack::text::extract(kind, data, cap, limits);
         return Some(Visible {
             text: e.text,
@@ -78,6 +102,9 @@ pub fn visible_text(
     }
     if let Some(v) = drawing(data, head, cap, limits) {
         return Some(v);
+    }
+    if is_step(head) {
+        return step(data, cap);
     }
     #[cfg(feature = "text-office")]
     return office(name, data, cap, limits);
@@ -112,7 +139,7 @@ fn office(name: &str, data: &[u8], cap: usize, limits: &exav_unpack::Limits) -> 
 /// of memory, and the text is `truncated` when it did not fit.
 fn drawing(data: &[u8], head: &[u8], cap: usize, limits: &exav_unpack::Limits) -> Option<Visible> {
     let within = cad::limits_within(limits.max_buffer_bytes);
-    let read = if cad::looks_like_dwg(head) {
+    let read = if cad::looks_like_dwg(data) {
         cad::read_dwg_with(data, &within)
     } else if cad::looks_like_dxf(head) {
         cad::read_dxf_with(data, &within)
@@ -141,14 +168,96 @@ fn drawing(data: &[u8], head: &[u8], cap: usize, limits: &exav_unpack::Limits) -
         cap,
         truncated: false,
     };
+    // The hyperlinks first, so that a text cut at the cap keeps them.
+    let links = hyperlink_lines(&drawing, &mut lines);
     drawing_lines(&drawing, &mut lines);
     Some(Visible {
         text: lines.text,
         truncated: lines.truncated || cut,
+        links,
+        sections: Vec::new(),
+        unreadable: None,
+    })
+}
+
+/// A drawing's hyperlinks: each target and each text a line, and as a link
+/// (description, target) each whose description is not its target. Stops at
+/// the cap, which `out.truncated` then says.
+fn hyperlink_lines(d: &Drawing, out: &mut Lines) -> Vec<(String, String)> {
+    let mut links = Vec::new();
+    for h in &d.hyperlinks {
+        out.line(&h.url);
+        for t in &h.texts {
+            out.line(t);
+        }
+        if out.truncated {
+            break;
+        }
+        let url = h.url.trim();
+        let label = h.texts.first().map_or("", |t| t.trim());
+        if !url.is_empty() && label != url {
+            links.push((label.to_string(), url.to_string()));
+        }
+    }
+    links
+}
+
+/// The text of an IFC model or another STEP file: the strings of each
+/// instance (names, descriptions, property values, labels), one instance to a
+/// line. An IfcRoot's GlobalId, its first attribute, is left out, and so is
+/// an instance that cannot be read.
+fn step(data: &[u8], cap: usize) -> Option<Visible> {
+    use super::ifc::step::{StepFile, Value, decode_string};
+    fn strings(v: &Value<'_>, first: bool, out: &mut Vec<String>) {
+        match v {
+            Value::Str(s) if !(first && is_global_id(s)) => {
+                let s = decode_string(s);
+                if !s.trim().is_empty() {
+                    out.push(s);
+                }
+            }
+            Value::Typed(_, v) => strings(v, false, out),
+            Value::List(l) => l.iter().for_each(|v| strings(v, false, out)),
+            _ => {}
+        }
+    }
+    let file = StepFile::parse(data).ok()?;
+    let mut lines = Lines {
+        text: String::new(),
+        cap,
+        truncated: false,
+    };
+    let mut found = Vec::new();
+    for id in file.ids() {
+        if lines.truncated {
+            break;
+        }
+        if !file.raw(id).is_some_and(|r| r.contains(&b'\'')) {
+            continue;
+        }
+        let Some(params) = file.params(id) else {
+            continue;
+        };
+        found.clear();
+        for (i, v) in params.iter().enumerate() {
+            strings(v, i == 0, &mut found);
+        }
+        lines.line(&found.join(" "));
+    }
+    Some(Visible {
+        text: lines.text,
+        truncated: lines.truncated,
         links: Vec::new(),
         sections: Vec::new(),
         unreadable: None,
     })
+}
+
+/// An IFC GlobalId: 22 characters of its base 64 alphabet.
+fn is_global_id(s: &[u8]) -> bool {
+    s.len() == 22
+        && s.iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$')
 }
 
 struct Lines {

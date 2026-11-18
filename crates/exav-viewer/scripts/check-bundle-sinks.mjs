@@ -29,7 +29,7 @@ export const ALLOWED = [
   { sink: "innerHTML", around: /case["`]innerHTML["`]:/, why: "React: a prop name it skips" },
   { sink: "dangerouslySetInnerHTML", around: /["`]dangerouslySetInnerHTML["`]|\.dangerouslySetInnerHTML[=!.]/, why: "React: its own handling of the prop, unused by the package" },
   { sink: "javascript:", around: /["`]javascript:throw new Error\('(React has blocked a javascript: URL|A React form was unexpectedly submitted)/, why: "React: the URLs it puts in place of a javascript: URL" },
-  { sink: "Function(", around: /`Function\(\$\{\w+\}\)`/, why: "wasm-bindgen's debug string of a function: text" },
+  { sink: "Function(", around: /`Function\(\$\{\w+(\.name)?\}\)`/, why: "wasm-bindgen's debug string of a function (`${name}` until 0.2.129, `${val.name}` from 0.2.130): text" },
   { sink: "importScripts", around: /importScripts\(p \? p\.createScriptURL\(\$\{/, why: "@exav/viewer's frame: the text of a worker's blob (ts/frame/app/workers.ts)" },
   { sink: "parseFromString", around: /parseFromString\(\w+\)\{if\(this\._currentFragment=\[\]/, why: "pdf.js's own XML parser, a method of its class: no DOM" },
   { sink: "parseFromString", around: /new \w+\(\{(lowerCaseName|hasAttributes):!0\}\)\.parseFromString\(/, why: "pdf.js's own XML parser" },

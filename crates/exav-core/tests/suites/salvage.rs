@@ -1,5 +1,5 @@
 //! A truncated / corrupt compressed member must still have its RECOVERABLE
-//! prefix scanned — malware in the part that did decode is caught, never hidden
+//! prefix scanned: malware in the part that did decode is caught, never hidden
 //! by the decode error on the missing tail. (Regression guard: marking the whole
 //! member Unscannable and discarding the salvageable bytes would hide EICAR in a
 //! truncated gzip that `zcat` recovers fine.)
@@ -22,7 +22,7 @@ fn gzip(payload: &[u8], level: flate2::Compression) -> Vec<u8> {
 fn truncated_gzip_still_scans_recoverable_content() {
     let db = Scanner::builtin();
     // EICAR up front, then a large filler tail. Stored (uncompressed) DEFLATE so
-    // compressed offsets track payload offsets — cutting the tail predictably
+    // compressed offsets track payload offsets: cutting the tail predictably
     // removes only filler, leaving EICAR before the cut and recoverable.
     let mut payload = eicar().to_vec();
     payload.extend(vec![b'B'; 16384]);
@@ -111,8 +111,8 @@ fn a_compressed_file_cut_short_is_scanned_as_far_as_it_goes() {
 /// A ZIP that OPENS but whose first member cannot be read: the central directory
 /// is intact, so the archive parses, and the failure only arrives when the member
 /// itself is reached. Word documents carrying an embedded ZIP land here routinely
-/// — the embedded copy's central directory records offsets relative to the whole
-/// document, so they point outside the carved slice.
+/// (the embedded copy's central directory records offsets relative to the whole
+/// document, so they point outside the carved slice).
 fn zip_with_an_unreadable_first_member() -> Vec<u8> {
     let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     z.start_file(
@@ -151,7 +151,7 @@ fn carrier_with_an_eicar_zip(prefix: Vec<u8>) -> Vec<u8> {
 
 #[test]
 fn one_unreadable_member_does_not_take_the_rest_of_the_archive_with_it() {
-    // A WELL-FORMED archive with a single bad member — the ordinary case, not an
+    // A WELL-FORMED archive with a single bad member: the ordinary case, not an
     // exotic one. Every recorded offset is correct and members 2 and 3 are
     // perfectly readable; only the first member's local header signature is
     // destroyed.
@@ -189,7 +189,7 @@ fn one_unreadable_member_does_not_take_the_rest_of_the_archive_with_it() {
     //
     // That last part is not cosmetic. Corrupting the magic at offset 0 instead
     // makes the file stop being detected as a ZIP at all, so it reaches the
-    // embedded-carve path and the payload is found for an unrelated reason — a
+    // embedded-carve path and the payload is found for an unrelated reason: a
     // version of this test written that way passed against the unfixed engine and
     // proved nothing.
     let cd = blob
@@ -220,8 +220,8 @@ fn an_archive_that_wont_open_is_unscannable_not_over_a_limit() {
     // The two verdicts are not interchangeable wording. `Unscannable` is a member
     // exav could not read, and the walk goes on to everything else in the file;
     // `LimitsExceeded` is a budget stop, which aborts the walk and takes the
-    // containing scan with it. Nothing here is near a limit — the archive simply
-    // does not parse — so calling it one costs every later member.
+    // containing scan with it. Nothing here is near a limit (the archive simply
+    // does not parse), so calling it one costs every later member.
     //
     // What that cost looks like: a Word document whose `1Table` stream carried an
     // embedded ZIP of this shape came back `LimitsExceeded`, because the abort

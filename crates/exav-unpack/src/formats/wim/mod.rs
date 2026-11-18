@@ -1,4 +1,4 @@
-//! WIM — the Windows Imaging Format.
+//! WIM: the Windows Imaging Format.
 //!
 //! Windows mounts a `.wim` natively (`DISM`, and Explorer via `wimmount`), 7-Zip
 //! opens one, and it is the payload format of every Windows installer image. As
@@ -303,10 +303,7 @@ fn read_resource(
     }
     let mut reader = open_resource(src, res, codec, chunk_size, max_buffer)?;
     let mut out = Vec::new();
-    reader
-        .by_ref()
-        .take(size.saturating_add(1))
-        .read_to_end(&mut out)
+    crate::source::read_capped(&mut reader, &mut out, size.saturating_add(1))
         .map_err(|_| "WIM resource did not decode")?;
     Ok(out)
 }
@@ -334,13 +331,13 @@ impl Read for Checked<'_> {
 mod lzx;
 
 /// A member that is only a report.
-fn report<T>(
+fn report(
     name: String,
     size: u64,
     reason: &'static str,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     emit_entry(Entry::unsupported(name, size, false, reason), budget, visit)
 }
 
@@ -351,11 +348,11 @@ const HEADER_READ: usize = 256;
 /// tree are read from where they are in the source; each file resource is then
 /// decoded a chunk at a time as it is read, so neither the image nor a
 /// resource is held.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let head = src.window(0, HEADER_READ);
     let data: &[u8] = &head;
     if !crate::formats::sniff::is(data, crate::Format::Wim) {
@@ -572,7 +569,7 @@ fn collect_names(meta: &[u8], out: &mut HashMap<[u8; HASH_LEN], String>) {
 /// Each chunk starts with a 256-byte table of 4-bit code lengths for 512
 /// symbols, low nibble first. The bitstream that follows is read as 16-bit
 /// little-endian words into a left-aligned 32-bit window, most significant bit
-/// first — and long match lengths escape into *bytes* taken from the same
+/// first, and long match lengths escape into *bytes* taken from the same
 /// position, so the bit reader and the byte reader share one cursor.
 // A codec, as `lzx` is: its sums are on bit counts, code lengths of 15 or
 // less and a 16-bit offset slot, and on positions inside the chunk it was

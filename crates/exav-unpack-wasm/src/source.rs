@@ -17,7 +17,7 @@ use wasm_bindgen::prelude::*;
 
 /// How much one fetch pulls.
 ///
-/// The archive readers ask for small pieces — a ZIP central-directory walk
+/// The archive readers ask for small pieces: a ZIP central-directory walk
 /// reads two-byte and four-byte fields. Serving each of those with its own trip
 /// out to JS would make opening an archive thousands of round trips, so reads
 /// are served from a window this size and only a miss goes out.
@@ -170,7 +170,7 @@ pub(crate) enum Src {
 
 impl Src {
     /// Read a `Blob` synchronously. Fails outside a Worker, where
-    /// `FileReaderSync` does not exist — the whole constraint this design is
+    /// `FileReaderSync` does not exist, the whole constraint this design is
     /// built around, so it is reported as itself rather than as a read error
     /// somewhere later.
     pub(crate) fn from_blob(blob: web_sys::Blob) -> Result<Self, JsValue> {

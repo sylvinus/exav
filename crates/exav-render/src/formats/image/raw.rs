@@ -36,6 +36,8 @@
 //! the compression numbers, where the Exif of a CR3 is) was read off CC0
 //! sample files from raw.pixls.us, with tools of our own, not from another
 //! implementation.
+//!
+//! This product includes DNG technology under license by Adobe.
 
 use super::{Channels, DECODE_MAX, Error, Pixels, Samples};
 use crate::image_codecs;

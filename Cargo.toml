@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/exav", "crates/exav-core", "crates/exav-grep", "crates/exav-unpack", "crates/exav-pe-emu", "crates/exav-x86", "crates/exav-update", "crates/exav-imagehash", "crates/exav-render"]
+members = ["crates/exav", "crates/exav-core", "crates/exav-grep", "crates/exav-unpack", "crates/exav-pe-emu", "crates/exav-x86", "crates/exav-update", "crates/exav-imagehash", "crates/exav-render", "crates/exav-qr"]
 exclude = ["fuzz", "crates/exav-unpack-wasm", "crates/exav-viewer"]
 
 [workspace.package]
@@ -35,8 +35,24 @@ walkdir = "2.5"
 # Catch integer overflow in release too: on hostile input a silent wraparound
 # could bypass a size/offset budget. A panic here is contained by the
 # per-file catch_unwind in the CLI.
+#
+# Fat LTO and one codegen unit: smaller and faster binaries, for a longer build
+# that needs about 3 GiB of memory at its peak.
+#
+# A member's own `[profile]` is what `cargo install` reads, and the workspace's
+# is not packaged, so scripts/release.sh copies these two into the manifests of
+# the packages that have a binary.
 [profile.release]
 overflow-checks = true
+lto = true
+codegen-units = 1
+
+# `cargo install exav --profile fast-build`: the overflow checks kept, a shorter
+# build with less memory, for larger and slower binaries.
+[profile.fast-build]
+inherits = "release"
+lto = false
+codegen-units = 16
 
 # Tests keep full debug info and debug assertions; only codegen changes.
 #

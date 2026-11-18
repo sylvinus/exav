@@ -301,41 +301,34 @@ impl HashDb {
     /// algorithm is inferred from the hex digest length
     /// (32=MD5, 40=SHA1, 64=SHA256). `SIZE` may be `*` (any) or a byte count
     /// that the file length must match. Call [`HashDb::finalize`] when done.
-    pub fn extend_from_text(&mut self, text: &str) {
-        self.extend_from_text_prov(text, false);
+    pub fn extend_from_text(&mut self, text: &str) -> usize {
+        self.extend_from_text_prov(text, false)
     }
 
     /// As [`HashDb::extend_from_text`], tagging every parsed entry with `unofficial`
     /// provenance (set for signatures from a non-`.cvd` database). The clean name
     /// is stored; `.UNOFFICIAL` is applied at report time in compat mode.
-    pub fn extend_from_text_prov(&mut self, text: &str, unofficial: bool) {
+    /// Returns how many lines did not parse.
+    pub fn extend_from_text_prov(&mut self, text: &str, unofficial: bool) -> usize {
+        let mut skipped = 0;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             let Some((hash, size, name)) = parse_hash_line(line) else {
+                skipped += 1;
                 continue;
             };
-            match hash.len() {
-                32 => {
-                    if let Some(k) = hex_array::<16>(hash) {
-                        self.md5.insert(k, size, name, unofficial);
-                    }
-                }
-                40 => {
-                    if let Some(k) = hex_array::<20>(hash) {
-                        self.sha1.insert(k, size, name, unofficial);
-                    }
-                }
-                64 => {
-                    if let Some(k) = hex_array::<32>(hash) {
-                        self.sha256.insert(k, size, name, unofficial);
-                    }
-                }
-                _ => {}
-            }
+            let added = match hash.len() {
+                32 => hex_array::<16>(hash).map(|k| self.md5.insert(k, size, name, unofficial)),
+                40 => hex_array::<20>(hash).map(|k| self.sha1.insert(k, size, name, unofficial)),
+                64 => hex_array::<32>(hash).map(|k| self.sha256.insert(k, size, name, unofficial)),
+                _ => None,
+            };
+            skipped += usize::from(added.is_none());
         }
+        skipped
     }
 
     /// The digests [`Self::lookup`] can match for an object of `size` bytes:
@@ -400,55 +393,46 @@ impl SectionHashDb {
     /// Parse `.mdb`/`.mdu`/`.msb` lines (`SectionSize:HASH:Name`). The first
     /// field is the size, the second the hash: the opposite field order from
     /// `.hdb`, so this does not reuse `parse_hash_line`.
-    pub fn extend_from_text(&mut self, text: &str) {
-        self.extend_from_text_prov(text, false);
+    pub fn extend_from_text(&mut self, text: &str) -> usize {
+        self.extend_from_text_prov(text, false)
     }
 
     /// As [`SectionHashDb::extend_from_text`], tagging each entry's `unofficial`
-    /// provenance.
-    pub fn extend_from_text_prov(&mut self, text: &str, unofficial: bool) {
+    /// provenance. Returns how many lines did not parse.
+    pub fn extend_from_text_prov(&mut self, text: &str, unofficial: bool) -> usize {
+        let mut skipped = 0;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             let mut parts = line.split(':');
-            let size = match parts.next() {
-                Some(s) => s.trim(),
-                None => continue,
+            let (Some(size), Some(hash)) = (parts.next(), parts.next()) else {
+                skipped += 1;
+                continue;
             };
-            let hash = match parts.next() {
-                Some(h) => h.trim(),
-                None => continue,
-            };
+            let (size, hash) = (size.trim(), hash.trim());
             let name = parts.next().map(|s| s.trim()).unwrap_or("Unnamed");
             let size = if size == "*" {
                 None
             } else {
                 match size.parse::<u64>() {
                     Ok(s) => Some(s),
-                    Err(_) => continue,
+                    Err(_) => {
+                        skipped += 1;
+                        continue;
+                    }
                 }
             };
-            match hash.len() {
-                32 => {
-                    if let Some(k) = hex_array::<16>(hash) {
-                        self.md5.insert(k, size, name, unofficial);
-                    }
-                }
-                40 => {
-                    if let Some(k) = hex_array::<20>(hash) {
-                        self.sha1.insert(k, size, name, unofficial);
-                    }
-                }
-                64 => {
-                    if let Some(k) = hex_array::<32>(hash) {
-                        self.sha256.insert(k, size, name, unofficial);
-                    }
-                }
-                _ => {}
-            }
+            let added = match hash.len() {
+                32 => hex_array::<16>(hash).map(|k| self.md5.insert(k, size, name, unofficial)),
+                40 => hex_array::<20>(hash).map(|k| self.sha1.insert(k, size, name, unofficial)),
+                64 => hex_array::<32>(hash).map(|k| self.sha256.insert(k, size, name, unofficial)),
+                _ => None,
+            };
+            skipped += usize::from(added.is_none());
         }
+        skipped
     }
 
     /// Look up a section by its raw size and computed digests; returns the

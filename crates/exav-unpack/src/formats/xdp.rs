@@ -1,52 +1,183 @@
-//! Adobe XDP (XML Data Package) — an XML wrapper carrying a base64-encoded PDF.
+//! Adobe XDP (XML Data Package): an XML wrapper carrying a base64-encoded PDF.
 //!
 //! A malicious PDF is frequently smuggled inside an `.xdp`: the bytes live in one
 //! or more `<chunk>…</chunk>` elements under `<pdf>` (itself under the `<xdp>`
 //! root). We concatenate every chunk's base64 payload, decode it, and emit the
 //! reconstructed PDF as a single member for the engine to recurse into.
 //!
-//! Parsing is a plain byte scan (no XML entity handling needed for the base64
-//! text), fully bounds-checked so truncated/hostile input cannot panic.
+//! Parsing is a plain byte scan, fully bounds-checked so truncated/hostile
+//! input cannot panic. A chunk's character references are read, as an XML
+//! reader does; CDATA sections and comments in a chunk are not.
+//!
+//! The format is also found by a string in a text ([`looks_like_xdp`]): a text
+//! whose root is not an XDP's and whose chunks are not base64 has no PDF, and
+//! is only a text.
 
 use crate::*;
 use base64::Engine;
 
-/// True if `data` looks like an Adobe XDP document. Conservative: requires the
-/// `<pdf` + `<chunk>` pair (the smuggled-PDF shape) or an explicit `<xdp` root.
+/// Whether `data` names XDP's tags anywhere in its first 64 KiB: `<pdf` and
+/// `<chunk`, or `<xdp`.
 pub(crate) fn looks_like_xdp(data: &[u8]) -> bool {
     let head = &data[..data.len().min(65536)];
     let has = |needle: &[u8]| memchr::memmem::find(head, needle).is_some();
     (has(b"<pdf") && has(b"<chunk")) || has(b"<xdp")
 }
 
-pub(crate) fn extract_xdp<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    // Collect the base64 text of every <chunk>…</chunk>, whitespace stripped.
+/// Whether `data` holds `<xdp:xdp` in its first 64 KiB: the namespaced tag of
+/// the root element every XDP an Adobe tool writes opens with. A bare `<xdp`
+/// is a string in a text.
+pub(crate) fn has_adobe_root(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(65536)];
+    memchr::memmem::find(head, b"<xdp:xdp").is_some()
+}
+
+/// Whether the root element of `data`, past the XML declaration, processing
+/// instructions, comments and a doctype, is `xdp` under any prefix.
+fn root_is_xdp(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(65536)];
+    let mut rest = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    loop {
+        rest = rest.trim_ascii_start();
+        let skip = if rest.starts_with(b"<?") {
+            memchr::memmem::find(&rest[2..], b"?>").map(|at| 2 + at + 2)
+        } else if rest.starts_with(b"<!--") {
+            memchr::memmem::find(&rest[4..], b"-->").map(|at| 4 + at + 3)
+        } else if rest.starts_with(b"<!") {
+            declaration_len(rest)
+        } else {
+            break;
+        };
+        let Some(skip) = skip else {
+            return false;
+        };
+        rest = &rest[skip..];
+    }
+    let Some(tag) = rest.strip_prefix(b"<") else {
+        return false;
+    };
+    let end = tag
+        .iter()
+        .position(|&b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/'))
+        .unwrap_or(tag.len());
+    let name = &tag[..end];
+    name.rsplit(|&b| b == b':').next() == Some(b"xdp")
+}
+
+/// The length of the markup declaration `s` starts with (`<!DOCTYPE …>`), to
+/// its `>`: past quoted literals, and an internal subset in brackets with the
+/// declarations and comments in it.
+fn declaration_len(s: &[u8]) -> Option<usize> {
+    let mut i = 2;
+    let mut depth = 0usize;
+    while i < s.len() {
+        match s[i] {
+            q @ (b'"' | b'\'') => i += 1 + memchr::memchr(q, &s[i + 1..])?,
+            b'<' if s[i..].starts_with(b"<!--") => {
+                i += 4 + memchr::memmem::find(&s[i + 4..], b"-->")? + 2;
+            }
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b'>' if depth == 0 => return Some(i + 1),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Where the next `<chunk>` start tag is in `data` from `pos`: `<chunk` then
+/// `>`, `/` or whitespace, not `<chunks>` or `<chunk-id>`.
+fn next_chunk(data: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let at = pos + memchr::memmem::find(&data[pos..], b"<chunk")?;
+        match data.get(at + 6) {
+            Some(&b) if b != b'>' && b != b'/' && !b.is_ascii_whitespace() => pos = at + 6,
+            _ => return Some(at),
+        }
+    }
+}
+
+/// Appends the text of a chunk's body to `out`, as the base64 decoder reads
+/// it: character references resolved, whitespace dropped. A reference that
+/// is not to an ASCII character is kept as written, which does not decode.
+fn chunk_text(body: &[u8], out: &mut Vec<u8>) {
+    let mut i = 0;
+    while i < body.len() {
+        if body[i] == b'&'
+            && let Some((c, len)) = char_ref(&body[i..])
+        {
+            if !c.is_ascii_whitespace() {
+                out.push(c);
+            }
+            i += len;
+            continue;
+        }
+        if !body[i].is_ascii_whitespace() {
+            out.push(body[i]);
+        }
+        i += 1;
+    }
+}
+
+fn is_base64(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')
+}
+
+/// The ASCII character of the character reference `s` starts with
+/// (`&#65;`, `&#x41;`), and its length.
+fn char_ref(s: &[u8]) -> Option<(u8, usize)> {
+    let rest = s.strip_prefix(b"&#")?;
+    let (digits, radix) = match rest.strip_prefix(b"x") {
+        Some(hex) => (hex, 16),
+        None => (rest, 10),
+    };
+    let n = digits
+        .iter()
+        .take_while(|&&b| char::from(b).is_digit(radix))
+        .count();
+    if digits.get(n) != Some(&b';') {
+        return None;
+    }
+    let text = std::str::from_utf8(&digits[..n]).ok()?;
+    let c = u8::try_from(u32::from_str_radix(text, radix).ok()?).ok()?;
+    c.is_ascii().then_some((c, s.len() - digits.len() + n + 1))
+}
+
+pub(crate) fn extract_xdp(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
+    let rooted = root_is_xdp(data);
+    // Collect the base64 text of every <chunk>…</chunk>.
     let mut b64: Vec<u8> = Vec::new();
     let mut pos = 0usize;
-    while pos < data.len() {
-        // Find the next "<chunk" start tag.
-        let Some(rel) = memchr::memmem::find(&data[pos..], b"<chunk") else {
-            break;
-        };
-        let tag_start = pos + rel;
+    while let Some(tag_start) = next_chunk(data, pos) {
         // The chunk body begins after the '>' that closes the opening tag.
-        let Some(gt) = memchr::memchr(b'>', &data[tag_start.min(data.len())..]) else {
+        let Some(gt) = memchr::memchr(b'>', &data[tag_start..]) else {
             break;
         };
-        let body_start = (tag_start + gt + 1).min(data.len());
-        // The body ends at the next "</chunk" (or EOF for a truncated doc).
+        let body_start = tag_start + gt + 1;
+        // `<chunk/>` has no body.
+        if data[body_start - 2] == b'/' {
+            pos = body_start;
+            continue;
+        }
+        // The body ends at the next "</chunk" (or EOF for a truncated doc). A
+        // chunk that starts before it is the element; the one before was a
+        // string.
         let body_end = memchr::memmem::find(&data[body_start..], b"</chunk")
             .map(|r| body_start + r)
             .unwrap_or(data.len());
-        b64.extend(
-            data[body_start..body_end]
-                .iter()
-                .filter(|b| !b.is_ascii_whitespace()),
-        );
+        if let Some(inner) = next_chunk(data, body_start)
+            && inner < body_end
+        {
+            pos = inner;
+            continue;
+        }
+        let from = b64.len();
+        chunk_text(&data[body_start..body_end], &mut b64);
+        // In a text, a chunk that is not base64 is words, not part of a PDF.
+        if !rooted && !b64[from..].iter().all(|&b| is_base64(b)) {
+            b64.truncate(from);
+        }
         // Bound the accumulated base64 so an XDP bomb can't blow past the budget
         // before we decode (4 base64 chars -> 3 bytes).
         let cap_peek = budget
@@ -65,11 +196,13 @@ pub(crate) fn extract_xdp<R>(
         return Ok(None);
     }
 
+    let decoded = base64::engine::general_purpose::STANDARD.decode(&b64);
+    if decoded.is_err() && !rooted {
+        return Ok(None);
+    }
     budget.count_entry()?;
     let cap = budget.reserve()?;
-    let out = base64::engine::general_purpose::STANDARD
-        .decode(&b64)
-        .map_err(|e| LimitHit::corrupt(format!("xdp base64: {e}")))?;
+    let out = decoded.map_err(|e| LimitHit::corrupt(format!("xdp base64: {e}")))?;
     if out.len() as u64 > cap {
         return Err(LimitHit::new(
             "xdp: embedded PDF exceeds budget".to_string(),
@@ -115,6 +248,104 @@ mod tests {
             .into_bytes();
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Xdp, &xdp, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].data, pdf);
+    }
+
+    #[test]
+    fn character_references_in_a_chunk_are_read() {
+        let pdf = b"%PDF-1.4 MALWARETEST with escaped line ends";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pdf);
+        let (a, b) = b64.split_at(8);
+        let a = format!("&#{};&#x{:x};{}", a.as_bytes()[0], a.as_bytes()[1], &a[2..]);
+        let xdp = format!(
+            "<?xml version=\"1.0\"?>\n<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\">\
+             <pdf><document><chunk>{a}&#10;&#xD;&#x0a;{b}&#13;</chunk></document></pdf></xdp:xdp>"
+        );
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Xdp, &xdp.as_bytes(), &mut budget).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].data, pdf);
+    }
+
+    #[test]
+    fn a_text_that_names_the_tags_is_only_a_text() {
+        for text in [
+            &b"let s = \"<xdp><pdf><chunk>{b64}</chunk></pdf></xdp>\";\n"[..],
+            b"// <pdf> holds a <chunk>, and the root is <xdp:xdp ...>.\n",
+            b"notes\n<pdf><chunk>&#x2603;</chunk> and <chunk>QU JD!</chunk>\n",
+            b"an unclosed <xdp><pdf><chunk>QUJ",
+        ] {
+            let mut budget = Budget::new(Limits::default());
+            let entries = extract(Format::Xdp, &text, &mut budget);
+            assert!(entries.unwrap().is_empty(), "{}", text.escape_ascii());
+        }
+        // Before the budget: the rest of a long text is not a chunk.
+        let small = Limits {
+            max_buffer_bytes: 16,
+            ..Limits::default()
+        };
+        let long = [&b"<pdf><chunk>"[..], &b"a text, not base64. ".repeat(10)].concat();
+        let mut budget = Budget::new(small);
+        assert!(extract(Format::Xdp, &long, &mut budget).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_xdp_whose_chunk_does_not_decode_is_corrupt() {
+        for xdp in [
+            &b"<?xml version=\"1.0\"?><!-- <a> --><?xfa generator=\"x\"?>\n\
+               <xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\"><pdf><chunk>{b64}</chunk>"[..],
+            b"\xEF\xBB\xBF<x:xdp xmlns:x=\"http://ns.adobe.com/xdp/\"><pdf><chunk>QUJD&#xE9;</chunk>",
+            b"<xdp><pdf><chunk>QUJ\n", // no closing tag
+        ] {
+            let mut budget = Budget::new(Limits::default());
+            let hit = extract(Format::Xdp, &xdp, &mut budget).unwrap_err();
+            assert_eq!(hit.kind, LimitKind::Corrupt, "{}", xdp.escape_ascii());
+        }
+    }
+
+    /// In a text, a chunk that is not base64 is left out and the others are
+    /// read; a mention of the tag before a chunk does not hide it.
+    #[test]
+    fn a_text_keeps_the_chunks_that_decode() {
+        let pdf = b"%PDF-1.4 x";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pdf);
+        for text in [
+            format!("notes\n<pdf><chunk>{b64}</chunk> and <chunk>&#x2603;</chunk>\n"),
+            format!("see the <chunk> tag. <pdf><chunk>{b64}</chunk></pdf>"),
+            format!("<chunk>x y!</chunk> <pdf><chunk>{b64}</chunk>"),
+        ] {
+            let mut budget = Budget::new(Limits::default());
+            let entries = extract(Format::Xdp, &text.as_bytes(), &mut budget).unwrap();
+            assert_eq!(entries.len(), 1, "{text}");
+            assert_eq!(entries[0].data, pdf, "{text}");
+        }
+    }
+
+    /// The root is found past a doctype that holds a `>`, and only `<chunk>`
+    /// elements are chunks.
+    #[test]
+    fn the_root_and_the_chunks_are_found_as_xml_has_them() {
+        let pdf = b"%PDF-1.4 x";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pdf);
+        // The root is the XDP's, so a chunk that does not decode is damage.
+        for prolog in [
+            "<!DOCTYPE xdp [ <!ELEMENT a (b)> ]>",
+            "<!DOCTYPE x SYSTEM \"a>b\">",
+            "<!DOCTYPE x [ <!-- ] > --> ]>",
+        ] {
+            let xdp = format!("{prolog}\n<xdp:xdp><pdf><chunk>QUJ</chunk></pdf></xdp:xdp>");
+            let mut budget = Budget::new(Limits::default());
+            let hit = extract(Format::Xdp, &xdp.as_bytes(), &mut budget).unwrap_err();
+            assert_eq!(hit.kind, LimitKind::Corrupt, "{prolog}");
+        }
+        // Elements whose names start with `chunk`, and an empty chunk.
+        let xdp = format!(
+            "<xdp:xdp><pdf><chunk-id>7</chunk-id><chunks><chunk/>\
+             <chunk n=\"1\">{b64}</chunk></chunks></pdf></xdp:xdp>"
+        );
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Xdp, &xdp.as_bytes(), &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data, pdf);
     }

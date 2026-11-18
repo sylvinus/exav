@@ -11,7 +11,7 @@ DBDIR   ?= exav-db
 EXAVDB  ?= exav.exavdb
 
 .DEFAULT_GOAL := build
-.PHONY: build release test test-native test-yara-diff test-wasm test-js test-viewer test-www test-formats formats test-helm wasm-sizes lint fmt msrv stack-frames deps-review av-audit miri publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
+.PHONY: build release test test-native test-yara-diff test-wasm test-js test-viewer test-www test-formats formats test-helm wasm-sizes lint fmt msrv stack-frames compiled-once deps-review av-audit miri publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
 
 ## build: compile the release binary
 build release:
@@ -74,10 +74,16 @@ test-native:
 	$(CARGO) test -p exav-render --no-default-features --features ifc,stl,obj,ply,gltf
 	# Markdown, behind `markdown`, as @exav/viewer's text module builds it.
 	$(CARGO) test -p exav-render --no-default-features --features markdown
+	# JSON, XML and diff lines, behind `text-view`, as @exav/viewer's text
+	# module builds them.
+	$(CARGO) test -p exav-render --no-default-features --features text-view
 	# The office converters (spreadsheets, presentations, text documents),
 	# behind `office-*`, as @exav/viewer's sheets, slides and docs modules
 	# build them: each alone, since slides compile part of sheets, then all
 	# of them with the test writers the integration tests build documents with.
+	# `office-csv` is CSV into XLSX, with the XLSX writer and none of the
+	# readers, as the viewer's sniff module builds it.
+	$(CARGO) test -p exav-render --no-default-features --features office-csv
 	$(CARGO) test -p exav-render --no-default-features --features office-sheets
 	$(CARGO) test -p exav-render --no-default-features --features office-slides,office-test-util
 	$(CARGO) test -p exav-render --no-default-features --features office-docs,office-test-util
@@ -97,6 +103,18 @@ test-native:
 	$(CARGO) test -p exav-core --features visible-text-office --test all visible_text
 	$(CARGO) test -p exav-grep --features text-office --test text --test text_office
 	$(CARGO) test -p exav --features visible-text-office --test office_text
+	# QR codes in images (`qr`): the reader in exav-render, `--qr` in exav, and
+	# the exav-qr command (a second binary of exav-grep, tested with it).
+	$(CARGO) test -p exav-render --features qr
+	$(CARGO) test -p exav-core --features qr --test all
+	$(CARGO) test -p exav-grep --features qr
+	$(CARGO) test -p exav --features qr
+	# The compressor and nesting cases of allmatch_parity are behind
+	# exav-core's own format features, which `all-formats` does not name.
+	$(CARGO) test -p exav-core --features gzip,bzip2,xz,zip,tar --test all allmatch_parity
+	# The viewer's wasm crate, natively: its own workspace, so `--workspace`
+	# does not reach it.
+	$(CARGO) test --manifest-path crates/exav-viewer/Cargo.toml --all-features
 
 ## test-yara-diff: the yara-x A/B differential harness. Compiles the SAME rules
 ##                 with both engines and asserts equal matching-rule sets. NOT
@@ -144,9 +162,10 @@ test-viewer:
 test-www:
 	./scripts/test-www.sh
 
-## formats: write the pages generated from the format registry
-##          (formats/registry.json): the format matrix and the viewer's
-##          summary sentence in the READMEs and the site.
+## formats: write what is generated from the format registry
+##          (formats/registry.json): the viewer's summary sentence in the
+##          READMEs and the site. The site's formats page reads the registry
+##          itself.
 formats:
 	node scripts/formats.mjs generate
 
@@ -179,9 +198,12 @@ lint:
 	$(CARGO) clippy --all-targets --features exav-core/http -- -D warnings
 	$(CARGO) clippy -p exav-core --all-targets --features unstable-internals -- -D warnings
 	$(CARGO) clippy -p exav-render --all-targets --features dwg -- -D warnings
+	$(CARGO) clippy -p exav --all-targets --no-default-features --features yara,zip -- -D warnings
 	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features ifc,stl,obj,ply,gltf -- -D warnings
 	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features markdown -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features text-view -- -D warnings
 	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features text-pdf -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features office-csv -- -D warnings
 	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features office-sheets -- -D warnings
 	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features office-slides -- -D warnings
 	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features office-docs -- -D warnings
@@ -191,6 +213,10 @@ lint:
 	$(CARGO) clippy -p exav-core --all-targets --features visible-text-office -- -D warnings
 	$(CARGO) clippy -p exav-grep --all-targets --features text-office -- -D warnings
 	$(CARGO) clippy -p exav-unpack --all-targets --features text-pdf -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --features qr -- -D warnings
+	$(CARGO) clippy -p exav-core --all-targets --features qr -- -D warnings
+	$(CARGO) clippy -p exav-grep --all-targets --features qr -- -D warnings
+	$(CARGO) clippy -p exav --all-targets --features qr -- -D warnings
 
 ## fmt: format the code
 fmt:
@@ -217,6 +243,23 @@ stack-frames:
 	$(CARGO) test --release -p exav-render --features office-docs,office-slides,office-sheets --test nesting --no-run
 	python3 -I scripts/stack-frames.py $(EXAV) \
 	  $$(ls -t target/release/deps/nesting-* | grep -v '\.d$$' | head -1)
+
+## compiled-once: the code of exav's crates is compiled once in a binary: no
+##                 function defined by two crates, no reader compiled for two
+##                 types, no generic family outside the list in
+##                 scripts/compiled-once.py. Builds each binary alone, as the
+##                 release workflow does (the package set changes the binary),
+##                 and the wasm with its names kept. Needs `nm` and `c++filt`.
+compiled-once:
+	$(CARGO) build --release -p exav
+	$(CARGO) build --release -p exav-grep
+	$(CARGO) build --release -p exav-grep --features qr --bin exav-qr
+	$(CARGO) build --release -p exav-unpack
+	$(CARGO) build --release --manifest-path crates/exav-unpack-wasm/Cargo.toml \
+	  --target wasm32-unknown-unknown --config profile.release.strip=false
+	python3 -I scripts/compiled-once.py target/release/exav target/release/exav-grep \
+	  target/release/exav-qr target/release/exav-unpack \
+	  crates/exav-unpack-wasm/target/wasm32-unknown-unknown/release/exav_unpack_wasm.wasm
 
 ## deps-review: the dependency report of docs/DEPENDENCIES.md ("Lifecycle"):
 ##              versions, release age, `unsafe`, vendored copies against their

@@ -37,10 +37,9 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek};
 
 use super::vol::{Attrs, Emit, Got, Next, Piece, Pieces, Plan, Vol, give, le16, le32, read_file};
-use crate::source::{ByteSource, Reader};
+use crate::source::ByteSource;
 use crate::stream::Visit;
 use crate::{Budget, LimitHit, Mtime};
 
@@ -599,30 +598,24 @@ fn open(v: &mut Vol) -> Option<(Fat, Dir)> {
 }
 
 /// Walk a FAT volume given whole as a source.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
-    super::volumes::entries(budget, visit, "", |budget, sink| {
-        walk_volume(Reader::new(src), src.len() as u64, budget, sink)
-    })
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    super::volumes::walk_source(src, budget, visit, walk_volume)
 }
 
 /// Walk the FAT volume `disk`, which is `len` bytes long, handing each file to
 /// `visit`.
-pub(crate) fn walk_volume<D: Read + Seek, R>(
-    mut disk: D,
+pub(crate) fn walk_volume(
+    disk: &mut dyn super::vol::Disk,
     len: u64,
     budget: &mut Budget,
-    visit: Emit<R>,
-) -> Result<Option<R>, LimitHit> {
+    visit: Emit,
+) -> crate::Extracted {
     let max = crate::bytes::to_usize(budget.limits().max_buffer_bytes);
-    let mut v = Vol {
-        disk: &mut disk,
-        len,
-        max,
-    };
+    let mut v = Vol { disk, len, max };
     match v.at(0, 512) {
         Some(boot) if is_fat(&boot) => {}
         _ => return Ok(None),
@@ -1068,10 +1061,10 @@ mod tests {
         let mut out = Vec::new();
         let mut budget = Budget::new(limits);
         let len = d.len() as u64;
-        let end = walk_volume(Cursor::new(d), len, &mut budget, &mut |e, _| {
+        let end = walk_volume(&mut Cursor::new(d), len, &mut budget, &mut |e, _| {
             let e = e.whole();
             out.push((e.name, e.data.len(), e.unsupported));
-            None::<()>
+            None
         });
         (out, end.map(|_| ()))
     }
@@ -1154,7 +1147,8 @@ mod tests {
         };
         let mut budget = Budget::new(limits);
         let len = d.len() as u64;
-        let (e, end) = collected(|emit| walk_volume(Cursor::new(&d[..]), len, &mut budget, emit));
+        let (e, end) =
+            collected(|emit| walk_volume(&mut Cursor::new(&d[..]), len, &mut budget, emit));
         end.unwrap();
         assert_eq!(e[0].0.name, "BIG.BIN");
         assert_eq!(e[0].0.data, vec![1u8; 4000]);

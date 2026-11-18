@@ -14,7 +14,7 @@
 //! GUIDs are stored in the usual mixed-endian in-memory layout (first three
 //! fields little-endian). We locate each FileDataStoreObject by its GUID and
 //! carve the declared bytes; `cbLength` is attacker-controlled, so it is clamped
-//! to the bytes actually present — a hostile/truncated file cannot panic.
+//! to the bytes actually present: a hostile/truncated file cannot panic.
 
 use crate::*;
 
@@ -25,7 +25,7 @@ pub(crate) const ONENOTE_HEADER_GUID: [u8; 16] = [
 ];
 
 /// FileDataStoreObject GUID `{BDE316E7-2665-4511-A4C4-8D4D0B7A9EAC}` (in-memory
-/// byte order) — the start marker of every embedded-file record.
+/// byte order), the start marker of every embedded-file record.
 const FILE_DATA_STORE_GUID: [u8; 16] = [
     0xE7, 0x16, 0xE3, 0xBD, 0x65, 0x26, 0x11, 0x45, 0xA4, 0xC4, 0x8D, 0x4D, 0x0B, 0x7A, 0x9E, 0xAC,
 ];
@@ -40,13 +40,13 @@ pub(crate) fn is_onenote(data: &[u8]) -> bool {
 }
 
 /// Walk a OneNote section, each embedded file streamed from where it lies.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let members = stream_offsets(src);
-    crate::stream::stream_stored(&mut crate::source::Reader::new(src), budget, visit, members)
+    crate::stream::stream_stored_ranges(src, budget, visit, crate::stream::Region::list(members))
 }
 
 /// Every embedded-file record as `(name, offset, size)`, the payloads left in

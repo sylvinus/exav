@@ -7,16 +7,16 @@
 // Each build has the filesystems its features give it.
 #![allow(dead_code)]
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::cell::Cell;
+use std::io::{self, Read, SeekFrom};
+use std::rc::Rc;
 
-use crate::{Budget, Entry, LimitHit, Mtime};
+use crate::{Budget, Entry, Mtime};
 
-/// A `Read + Seek` volume, whichever it is.
-pub(crate) trait Disk: Read + Seek {}
-impl<T: Read + Seek + ?Sized> Disk for T {}
+pub(crate) use crate::stream::Disk;
 
 /// How much of the volume one read asks of it at once.
-const STEP: usize = 1 << 20;
+pub(crate) const STEP: usize = 1 << 20;
 
 /// The volume, read at offsets the filesystem's own numbers give.
 pub(crate) struct Vol<'a> {
@@ -59,14 +59,19 @@ impl Vol<'_> {
     }
 }
 
+/// Why a file is reported when the volume does not give all of it and nothing
+/// more is known.
+pub(crate) const UNREADABLE: &str = "file could not be read from the volume";
+
 /// What reading a file of a volume came to.
 pub(crate) enum Got<'a> {
     Whole(Vec<u8>),
-    /// What could be read of a file the volume does not hold all of.
-    Short(Vec<u8>),
+    /// What could be read of a file that breaks part way, and why it does.
+    Partial(Vec<u8>, &'static str),
     /// A file too long to hold, of that many bytes, to be read as it goes. It
-    /// fails with an error where the volume stops giving its bytes.
-    Stream(Box<dyn Read + 'a>, u64),
+    /// fails with an error where the volume stops giving its bytes. The cell
+    /// counts the bytes of holes it has given.
+    Stream(Box<dyn Read + 'a>, u64, Rc<Cell<u64>>),
     /// Longer than a member may be, of that many bytes, and not a file this
     /// reader can read as it goes: reported, and the walk goes on.
     Big(u64),
@@ -81,15 +86,15 @@ impl Got<'_> {
     pub(crate) fn entry(self, path: String) -> Entry {
         match self {
             Got::Whole(d) => Entry::new(path, d),
-            Got::Short(d) => Entry {
-                unsupported: Some("file could not be read from the volume"),
+            Got::Partial(d, why) => Entry {
+                unsupported: Some(why),
                 ..Entry::new(path, d)
             },
-            Got::Stream(_, size) => {
+            Got::Stream(_, size, _) => {
                 Entry::unsupported(path, size, false, "file was not read as it goes")
             }
             Got::Big(size) => {
-                Entry::unsupported(path, size, false, "file exceeds the per-member size budget")
+                Entry::over_limit(path, size, "file exceeds the per-member size budget")
             }
             Got::Why(why) => Entry::unsupported(path, 0, false, why),
             Got::Locked(why) => Entry::unsupported(path, 0, true, why),
@@ -102,8 +107,9 @@ pub(crate) enum Found<'a> {
     /// A member held whole.
     Held(Entry),
     /// A member read as it goes: its name, mode and time in the entry, which
-    /// has no data, and the reader of its bytes.
-    Read(Entry, &'a mut dyn Read),
+    /// has no data, the reader of its bytes, and the count of the bytes of
+    /// holes it has given.
+    Read(Entry, &'a mut dyn Read, Rc<Cell<u64>>),
 }
 
 impl Found<'_> {
@@ -113,7 +119,7 @@ impl Found<'_> {
     pub(crate) fn whole(self) -> Entry {
         match self {
             Found::Held(e) => e,
-            Found::Read(mut e, r) => {
+            Found::Read(mut e, r, _) => {
                 if let Err(err) = r.take(32 << 20).read_to_end(&mut e.data) {
                     e.unsupported = Some(Box::leak(err.to_string().into_boxed_str()));
                 }
@@ -124,7 +130,7 @@ impl Found<'_> {
 }
 
 /// What a filesystem walker hands each file to.
-pub(crate) type Emit<'a, R> = &'a mut dyn FnMut(Found<'_>, &mut Budget) -> Option<R>;
+pub(crate) type Emit<'a> = &'a mut dyn FnMut(Found<'_>, &mut Budget) -> Option<crate::Stop>;
 
 /// What one step of producing a file's bytes came to.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,20 +139,27 @@ pub(crate) enum Step {
     More,
     /// The file is over.
     End,
-    /// The volume does not give the rest of the file.
-    Broken,
+    /// The volume does not give the rest of the file, for that reason.
+    Broken(&'static str),
 }
 
 /// The bytes of a file, produced a piece at a time.
 pub(crate) trait Fill {
-    /// Append the next bytes of the file to `out`, at most [`STEP`] of them.
+    /// Append the next bytes of the file to `out`, at most [`STEP`] of them
+    /// (a file stored in units, one unit, which is within the buffer limit).
+    /// Those of one call are all of a hole or none.
     fn fill(&mut self, v: &mut Vol, out: &mut Vec<u8>) -> Step;
+
+    /// The bytes of holes appended so far.
+    fn holes(&self) -> u64 {
+        0
+    }
 }
 
 /// A file read to its end where it is as long as `size`, which is held, so
 /// it is within what a member may hold. What was read stays where the
 /// volume stops giving more.
-pub(crate) fn drain<'a>(fill: &mut impl Fill, v: &mut Vol, size: u64) -> Got<'a> {
+pub(crate) fn drain<'a>(fill: &mut dyn Fill, v: &mut Vol, size: u64) -> Got<'a> {
     let mut out = Vec::new();
     let end = loop {
         match fill.fill(v, &mut out) {
@@ -154,17 +167,31 @@ pub(crate) fn drain<'a>(fill: &mut impl Fill, v: &mut Vol, size: u64) -> Got<'a>
             other => break other,
         }
     };
-    if end == Step::End && out.len() as u64 == size {
-        Got::Whole(out)
-    } else {
-        Got::Short(out)
+    match end {
+        Step::End if out.len() as u64 == size => Got::Whole(out),
+        Step::Broken(why) => Got::Partial(out, why),
+        _ => Got::Partial(out, UNREADABLE),
     }
 }
 
 /// A file of `size` bytes: held when it is within `cap`, else read as it goes.
+#[inline]
 pub(crate) fn read_file<'a, 'b, F: Fill + 'a>(
     v: &'a mut Vol<'b>,
-    mut fill: F,
+    fill: F,
+    size: u64,
+    cap: u64,
+) -> Got<'a>
+where
+    'b: 'a,
+{
+    read_boxed(v, Box::new(fill), size, cap)
+}
+
+/// [`read_file`], the one compiled copy.
+fn read_boxed<'a, 'b>(
+    v: &'a mut Vol<'b>,
+    mut fill: Box<dyn Fill + 'a>,
     size: u64,
     cap: u64,
 ) -> Got<'a>
@@ -172,8 +199,9 @@ where
     'b: 'a,
 {
     if size <= cap {
-        return drain(&mut fill, v, size);
+        return drain(&mut *fill, v, size);
     }
+    let holes = Rc::new(Cell::new(0));
     Got::Stream(
         Box::new(Streamed {
             v,
@@ -181,41 +209,50 @@ where
             buf: Vec::new(),
             at: 0,
             step: Step::More,
+            hole: false,
+            holes: Rc::clone(&holes),
         }),
         size,
+        holes,
     )
 }
 
 /// A [`Fill`] as a `Read`.
-struct Streamed<'a, 'b, F> {
+struct Streamed<'a, 'b> {
     v: &'a mut Vol<'b>,
-    fill: F,
+    fill: Box<dyn Fill + 'a>,
     buf: Vec<u8>,
     at: usize,
     step: Step,
+    /// `buf` is a hole.
+    hole: bool,
+    /// The bytes of holes given so far.
+    holes: Rc<Cell<u64>>,
 }
 
-impl<F: Fill> Read for Streamed<'_, '_, F> {
+impl Read for Streamed<'_, '_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         loop {
             if let Some(rest) = self.buf.get(self.at..).filter(|r| !r.is_empty()) {
                 let n = rest.len().min(out.len());
                 out[..n].copy_from_slice(&rest[..n]);
                 self.at = self.at.saturating_add(n);
+                if self.hole {
+                    self.holes.set(self.holes.get().saturating_add(n as u64));
+                }
                 return Ok(n);
             }
             match self.step {
                 Step::End => return Ok(0),
-                Step::Broken => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "file could not be read from the volume",
-                    ));
+                Step::Broken(why) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, why));
                 }
                 Step::More => {
                     self.buf.clear();
                     self.at = 0;
+                    let before = self.fill.holes();
                     self.step = self.fill.fill(self.v, &mut self.buf);
+                    self.hole = self.fill.holes() > before;
                 }
             }
         }
@@ -245,23 +282,29 @@ pub(crate) trait Plan {
 }
 
 /// A [`Plan`]'s stretches as the first `left` bytes of a file.
-pub(crate) struct Pieces<P> {
-    plan: P,
+pub(crate) struct Pieces<'a> {
+    plan: Box<dyn Plan + 'a>,
     left: u64,
     cur: Option<Piece>,
+    holes: u64,
 }
 
-impl<P: Plan> Pieces<P> {
-    pub(crate) fn new(plan: P, size: u64) -> Self {
+impl<'a> Pieces<'a> {
+    pub(crate) fn new(plan: impl Plan + 'a, size: u64) -> Self {
         Pieces {
-            plan,
+            plan: Box::new(plan),
             left: size,
             cur: None,
+            holes: 0,
         }
     }
 }
 
-impl<P: Plan> Fill for Pieces<P> {
+impl Fill for Pieces<'_> {
+    fn holes(&self) -> u64 {
+        self.holes
+    }
+
     fn fill(&mut self, v: &mut Vol, out: &mut Vec<u8>) -> Step {
         if self.left == 0 {
             return Step::End;
@@ -271,7 +314,7 @@ impl<P: Plan> Fill for Pieces<P> {
             None => match self.plan.next(v) {
                 Next::Piece(p) => p,
                 // The file is longer than what the volume says it holds.
-                Next::End | Next::Broken => return Step::Broken,
+                Next::End | Next::Broken => return Step::Broken(UNREADABLE),
             },
         };
         let (Piece::Disk(_, len) | Piece::Zeros(len)) = piece;
@@ -281,11 +324,12 @@ impl<P: Plan> Fill for Pieces<P> {
             Piece::Disk(off, _) => v.append(off, n, out),
             Piece::Zeros(_) => {
                 out.resize(out.len().saturating_add(n), 0);
+                self.holes = self.holes.saturating_add(take);
                 true
             }
         };
         if !read {
-            return Step::Broken;
+            return Step::Broken(UNREADABLE);
         }
         self.left = self.left.saturating_sub(take);
         // What is left of the piece, if any.
@@ -328,38 +372,39 @@ pub(crate) struct Attrs {
 /// The file at `path`, read under the bounds a member has and handed to
 /// `visit`: held when it fits, else read as it goes. The caller has counted
 /// the member.
-pub(crate) fn give<'a, R>(
+#[inline]
+pub(crate) fn give<'a>(
     budget: &mut Budget,
-    visit: Emit<R>,
+    visit: Emit,
     path: String,
     attrs: Attrs,
     read: impl FnOnce(u64) -> Got<'a>,
-) -> Result<Option<R>, LimitHit> {
+) -> crate::Extracted {
     let cap = budget.reserve()?;
     Ok(hand(budget, visit, path, attrs, read(cap)))
 }
 
 /// What a volume gave of the file at `path`, handed to `visit`. The caller has
 /// counted the member.
-pub(crate) fn hand<R>(
+pub(crate) fn hand(
     budget: &mut Budget,
-    visit: Emit<R>,
+    visit: Emit,
     path: String,
     attrs: Attrs,
     got: Got<'_>,
-) -> Option<R> {
+) -> Option<crate::Stop> {
     let (mut entry, mut stream) = match got {
-        Got::Stream(reader, size) => {
+        Got::Stream(reader, size, holes) => {
             let mut e = Entry::new(path, Vec::new());
             e.comp_size = size;
-            (e, Some(reader))
+            (e, Some((reader, holes)))
         }
         other => (other.entry(path), None),
     };
     entry.mode = attrs.mode;
     entry.mtime = attrs.mtime;
     match stream.as_mut() {
-        Some(reader) => visit(Found::Read(entry, &mut **reader), budget),
+        Some((reader, holes)) => visit(Found::Read(entry, &mut **reader, Rc::clone(holes)), budget),
         None => {
             budget.commit(entry.data.len() as u64);
             visit(Found::Held(entry), budget)
@@ -402,7 +447,7 @@ pub(crate) fn le64(d: &[u8], off: usize) -> u64 {
 /// What a walk handed over, each member whole with whether it was read as it
 /// goes, and what the walk returned. For the readers' tests.
 #[cfg(test)]
-pub(crate) fn collected<T>(run: impl FnOnce(Emit<()>) -> T) -> (Vec<(Entry, bool)>, T) {
+pub(crate) fn collected<T>(run: impl FnOnce(Emit) -> T) -> (Vec<(Entry, bool)>, T) {
     let mut out = Vec::new();
     let end = run(&mut |found, _| {
         let streamed = matches!(found, Found::Read(..));
@@ -456,7 +501,7 @@ mod tests {
             Piece::Zeros(STEP as u64 + 5),
         ];
         let got = read_file(&mut v, Pieces::new(plan(pieces, true), size), size, 10);
-        let Got::Stream(mut r, n) = got else {
+        let Got::Stream(mut r, n, holes) = got else {
             panic!("not read as it goes");
         };
         assert_eq!(n, size);
@@ -465,6 +510,8 @@ mod tests {
         let mut want = data;
         want.resize(size as usize, 0);
         assert!(out == want, "the bytes differ");
+        // The bytes of the hole are counted as given, the others not.
+        assert_eq!(holes.get(), STEP as u64 + 5);
     }
 
     #[test]
@@ -481,7 +528,7 @@ mod tests {
             plan(vec![Piece::Disk(0, 100), Piece::Disk(100, 200)], true),
         ] {
             let got = read_file(&mut v, Pieces::new(pieces, 300), 300, 10);
-            let Got::Stream(mut r, _) = got else {
+            let Got::Stream(mut r, _, _) = got else {
                 panic!("not read as it goes");
             };
             let mut out = Vec::new();
@@ -514,7 +561,55 @@ mod tests {
             80,
             80,
         );
-        assert!(matches!(short, Got::Short(d) if d == vec![7u8; 60]));
+        assert!(matches!(short, Got::Partial(d, why) if d == vec![7u8; 60] && why == UNREADABLE));
+    }
+
+    /// A file of 4 steps of 10 bytes that breaks at the third, for its own
+    /// reason.
+    struct Breaks(u8);
+
+    impl Fill for Breaks {
+        fn fill(&mut self, _: &mut Vol, out: &mut Vec<u8>) -> Step {
+            self.0 = self.0.saturating_add(1);
+            if self.0 == 3 {
+                return Step::Broken("this file breaks here");
+            }
+            out.extend_from_slice(&[self.0; 10]);
+            Step::More
+        }
+    }
+
+    /// What a file says of the way it breaks reaches the member, held or read
+    /// as it goes, with the bytes before the break.
+    #[test]
+    fn a_file_that_breaks_part_way_gives_its_bytes_and_its_own_reason() {
+        let mut c = Cursor::new(Vec::new());
+        let mut v = Vol {
+            disk: &mut c,
+            len: 0,
+            max: 1 << 20,
+        };
+        let mut want = vec![1u8; 10];
+        want.extend([2u8; 10]);
+        match read_file(&mut v, Breaks(0), 40, 40) {
+            Got::Partial(d, why) => {
+                assert_eq!(d, want);
+                assert_eq!(why, "this file breaks here");
+            }
+            _ => panic!("not held short"),
+        }
+        let Got::Stream(mut r, ..) = read_file(&mut v, Breaks(0), 40, 10) else {
+            panic!("not read as it goes");
+        };
+        let mut out = Vec::new();
+        let err = r.read_to_end(&mut out).expect_err("the file breaks");
+        assert_eq!(out, want);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "this file breaks here");
+        // The entry of a held one carries the reason.
+        let e = Got::Partial(want, "this file breaks here").entry("f".into());
+        assert_eq!(e.unsupported, Some("this file breaks here"));
+        assert_eq!(e.data.len(), 20);
     }
 
     #[test]

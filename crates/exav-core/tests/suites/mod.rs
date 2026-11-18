@@ -14,15 +14,24 @@ mod broken_executable;
 #[cfg(feature = "unstable-internals")]
 mod bytecode_gating;
 // NB: gate container suites on `all-formats`, never on exav-core's own per-format
-// features (`zip`, `ole`, …). Those are NOT implied by `all-formats` — it
-// forwards to `exav-unpack/all-formats` — so `#[cfg(feature = "zip")]` here is
+// features (`zip`, `ole`, …). Those are NOT implied by `all-formats` (it
+// forwards to `exav-unpack/all-formats`), so `#[cfg(feature = "zip")]` here is
 // off in a default build and silently skips the suite.
 #[cfg(feature = "all-formats")]
 mod cdb_stream;
 #[cfg(feature = "all-formats")]
 mod checksum_mismatch;
 #[cfg(feature = "all-formats")]
+mod chm_oversize;
+#[cfg(feature = "all-formats")]
+mod compat_formats;
+mod crafted_tables;
+#[cfg(feature = "all-formats")]
 mod cut_short_members;
+#[cfg(feature = "all-formats")]
+mod detect_order;
+#[cfg(feature = "all-formats")]
+mod email_multipart;
 #[cfg(feature = "all-formats")]
 mod embedded_carve;
 #[cfg(feature = "all-formats")]
@@ -30,16 +39,22 @@ mod encrypted_archives;
 mod exec_offsets;
 #[cfg(feature = "all-formats")]
 mod format_registry;
+#[cfg(feature = "all-formats")]
+mod fs_member_breaks;
 #[cfg(feature = "image-hash")]
 mod fuzzy_img_formats;
 #[cfg(feature = "all-formats")]
 mod heuristic_alerts;
 #[cfg(feature = "all-formats")]
 mod heuristic_names;
+mod import_hash;
+#[cfg(feature = "all-formats")]
+mod ishield_msi;
 #[cfg(feature = "all-formats")]
 mod limits_alerts;
 #[cfg(feature = "all-formats")]
 mod match_location;
+mod matcher_steps;
 #[cfg(feature = "all-formats")]
 mod matryoshka;
 #[cfg(feature = "all-formats")]
@@ -51,6 +66,14 @@ mod one_scan;
 mod ooxml_container;
 #[cfg(feature = "all-formats")]
 mod oversize_container;
+mod pe_past_limit;
+#[cfg(feature = "qr")]
+mod qr;
+#[cfg(feature = "all-formats")]
+mod rar_damaged_header;
+#[cfg(feature = "all-formats")]
+mod ratio_skip;
+mod regex_steps;
 mod salvage;
 #[cfg(feature = "all-formats")]
 mod second_structure;
@@ -64,11 +87,15 @@ mod target_flash;
 mod target_text;
 #[cfg(feature = "all-formats")]
 mod tdb_attributes;
+#[cfg(feature = "all-formats")]
+mod text_keeps_type;
 mod untyped_container_dispatch;
 #[cfg(feature = "visible-text")]
 mod visible_text;
 #[cfg(feature = "visible-text-office")]
 mod visible_text_office;
+#[cfg(feature = "all-formats")]
+mod walk_edges;
 #[cfg(feature = "yara")]
 mod yara_dotnet;
 #[cfg(feature = "all-formats")]

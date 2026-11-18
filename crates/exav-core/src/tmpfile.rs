@@ -1,8 +1,8 @@
-//! Temporary files and directories, over `std::fs` alone — test support only.
+//! Temporary files and directories, over `std::fs` alone: test support only.
 //!
 //! The library itself never writes to disk; its tests do, to build databases and
 //! scan targets. Pulling a temp-file crate in for that would put `rustix` and
-//! `linux-raw-sys` — thousands of `unsafe` blocks — into every `cargo test`, for
+//! `linux-raw-sys` (thousands of `unsafe` blocks) into every `cargo test`, for
 //! a page of code `std::fs` already covers.
 //!
 //! The security properties a temp file has to have, and how they are met here:
@@ -20,7 +20,7 @@
 //!
 //! The `exav` binary carries its own copy, where this is not test-only: the daemon
 //! spills oversized streams through it. That copy carries the extra machinery a
-//! spill needs — a caller-chosen directory, unlink-on-create, and a refusal to
+//! spill needs: a caller-chosen directory, unlink-on-create, and a refusal to
 //! write after a read-back. The security properties above are the shared part.
 
 #![allow(dead_code)]

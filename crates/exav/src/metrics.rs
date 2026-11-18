@@ -1,13 +1,13 @@
 //! What a running listener can say about where its time went.
 //!
-//! A one-shot scan can be timed from outside — `time exav file`, or
+//! A one-shot scan can be timed from outside: `time exav file`, or
 //! `--profile` for a per-matcher breakdown. A listener cannot: it is a
 //! long-lived process serving objects nobody kept, and "the box is at 100% CPU"
 //! is all an operator gets from the outside. Answering *which* objects, and
 //! which matcher inside them, needs the process to keep count itself.
 //!
 //! So every scan on the clamd and ICAP listeners is timed, and the totals are
-//! reported through the clamd `STATS` command — the one channel a clamd client
+//! reported through the clamd `STATS` command, the one channel a clamd client
 //! already knows how to ask on, and which `clamdtop` already polls.
 //!
 //! Two costs, kept apart because they are not the same size:
@@ -81,6 +81,8 @@ const SLOTS: usize = 4096;
 
 /// Everything counted, in one block so that it can sit in memory the forked
 /// processes of the pool share.
+// Safety invariant: only `AtomicU64`s, alone, in arrays and in structs of
+// them, so all-zero bytes are a valid `Counters`.
 struct Counters {
     scans: AtomicU64,
     bytes: AtomicU64,
@@ -117,17 +119,34 @@ impl Counters {
 static LOCAL: Counters = Counters::new();
 
 /// The shared block, once there is one.
+// Safety invariant: null, or the start of a mapping of `size_of::<Counters>()`
+// bytes, page-aligned, zero-filled when made and never unmapped.
 static SHARED: AtomicPtr<Counters> = AtomicPtr::new(std::ptr::null_mut());
+
+// The counters of one test, apart from those the other tests of the binary
+// move from the threads of the same process.
+#[cfg(test)]
+thread_local! {
+    static OWN: std::cell::Cell<Option<&'static Counters>> = const { std::cell::Cell::new(None) };
+}
 
 /// The counters in use.
 fn c() -> &'static Counters {
+    #[cfg(test)]
+    if let Some(own) = OWN.with(std::cell::Cell::get) {
+        return own;
+    }
     let shared = SHARED.load(Ordering::Acquire);
     if shared.is_null() {
         &LOCAL
     } else {
-        // SAFETY: set only by `share_across_fork`, to a mapping that is never
-        // unmapped, is the size of `Counters`, and holds only atomics, which
-        // are valid at any bit pattern and meant to be used from many processes.
+        // SAFETY: a `&'static Counters` needs `shared` aligned, pointing to a
+        // valid `Counters` that lives for the rest of the program, and no
+        // mutation but through `UnsafeCell`. By the invariant of `SHARED` it
+        // is page-aligned (enough for `AtomicU64`), sized and never unmapped;
+        // by that of `Counters`, its zero-filled bytes are a valid value.
+        // Every access, here and in the processes sharing it, is through the
+        // atomics.
         unsafe { &*shared }
     }
 }
@@ -138,9 +157,11 @@ fn c() -> &'static Counters {
 /// On failure the counters stay each process's own and the reason is returned.
 #[cfg(unix)]
 pub(crate) fn share_across_fork() -> std::io::Result<()> {
-    // SAFETY: an anonymous shared mapping of the size of `Counters`, which the
-    // kernel zero-fills (every field is an atomic whose zero is its initial
-    // value). Nothing else refers to it, and it is never unmapped.
+    // SAFETY: `mmap` with a null address, no file and length
+    // `size_of::<Counters>()` (non-zero) has no memory precondition; it maps
+    // new page-aligned pages, zero-filled for `MAP_ANONYMOUS` (Linux, the
+    // BSDs, macOS), which nothing unmaps, so storing it keeps the invariant
+    // of `SHARED`.
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -214,7 +235,7 @@ pub(crate) fn in_flight() -> u64 {
 /// `STATS` answers only where a clamd listener exists and only for the process
 /// that answers it, and neither is a given: an ICAP-only deployment binds no
 /// clamd port at all, and under the worker pool ICAP is a forked child of its
-/// own. A line in the log is the one channel every arrangement has — which for a
+/// own. A line in the log is the one channel every arrangement has, which for a
 /// container means `docker logs` answers "how busy, how fast" without anything
 /// being wired up first.
 ///
@@ -249,8 +270,8 @@ pub(crate) fn scans() -> u64 {
 
 /// A scan in progress, and the counters it will land in when it finishes.
 ///
-/// A guard rather than a pair of calls, so a scan that leaves early — a panic
-/// caught by the surrounding handler, a client that vanished — is still counted
+/// A guard rather than a pair of calls, so a scan that leaves early (a panic
+/// caught by the surrounding handler, a client that vanished) is still counted
 /// and still leaves the in-flight gauge where it found it. A gauge that only
 /// decrements on the happy path reads as a permanently busy server.
 pub(crate) struct ScanTimer {
@@ -389,7 +410,7 @@ fn breakdown(p: &Profile) -> String {
 ///
 /// Read out before rendering rather than read field by field while formatting,
 /// so one `STATS` reply describes one instant instead of a smear across however
-/// long the formatting took — and so the rendering can be tested without a
+/// long the formatting took, and so the rendering can be tested without a
 /// process's worth of accumulated history behind it.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Snapshot {
@@ -493,6 +514,12 @@ fn render(s: &Snapshot) -> String {
 mod tests {
     use super::*;
 
+    /// Gives this test's thread counters of its own: the other tests scan
+    /// beside it, and move the process's.
+    fn own_counters() {
+        OWN.with(|o| o.set(Some(Box::leak(Box::new(Counters::new())))));
+    }
+
     #[test]
     fn every_matcher_has_a_cell_and_a_home() {
         assert_eq!(c().cells.len(), CELLS);
@@ -506,8 +533,8 @@ mod tests {
 
     #[test]
     fn stats_are_reported_before_anything_has_been_scanned() {
-        // `STATS` on a freshly started listener is the normal case — a health
-        // check, or clamdtop connecting — and a divide-by-zero there would take
+        // `STATS` on a freshly started listener is the normal case (a health
+        // check, or clamdtop connecting), and a divide-by-zero there would take
         // the daemon down on its most harmless command. Rendered from an empty
         // snapshot rather than from the process, because these counters are
         // global and every other test in this binary has already scanned.
@@ -557,7 +584,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_child_that_died_mid_scan_leaves_no_scan_in_flight() {
-        // A pid no test process has: its slot is nobody's but this test's.
+        own_counters();
         let pid = 4096 * 100 + 17;
         let slot = &c().in_flight[slot_of(pid)];
         let before = in_flight();
@@ -571,6 +598,7 @@ mod tests {
     fn the_in_flight_gauge_is_released_even_when_a_scan_leaves_early() {
         // A gauge that only decrements on the happy path reads as a permanently
         // busy server, which is the opposite of what someone polling it wants.
+        own_counters();
         let before = c().in_flight[my_slot()].load(Ordering::Relaxed);
         let t = ScanTimer::start();
         assert!(c().in_flight[my_slot()].load(Ordering::Relaxed) > before);

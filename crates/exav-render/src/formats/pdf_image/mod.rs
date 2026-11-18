@@ -20,6 +20,8 @@ pub use ccitt::{CcittParams, decode_ccitt};
 pub use jbig2::decode_jbig2;
 #[cfg(all(feature = "jbig2", feature = "image"))]
 pub(crate) use jbig2::region_pixels;
+#[cfg(feature = "qr")]
+pub(crate) use jbig2::{declared_page_pixels, declared_pixels};
 #[cfg(feature = "jp2")]
 pub use jpx::{JpxImage, JpxParams, decode_jpx};
 
@@ -35,6 +37,12 @@ impl Error {
 
     pub fn message(self) -> &'static str {
         self.0
+    }
+
+    /// Whether the image needs more memory than the limit it was given.
+    #[allow(dead_code)]
+    pub(crate) fn is_too_large(self) -> bool {
+        self.0 == "Image too large"
     }
 }
 

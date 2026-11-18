@@ -9,8 +9,12 @@ type Members = Vec<(String, Vec<u8>)>;
 
 /// Every member of `data` read as an email, and how the walk ended.
 fn members(data: &[u8]) -> (Members, Result<(), String>) {
+    members_under(data, Limits::default())
+}
+
+fn members_under(data: &[u8], limits: Limits) -> (Members, Result<(), String>) {
     let mut out = vec![];
-    let mut budget = Budget::new(Limits::default());
+    let mut budget = Budget::new(limits);
     let r = extract_each(
         Format::Email,
         data,
@@ -92,4 +96,28 @@ fn a_chain_of_attached_messages_is_read_to_a_bound_and_refused_past_it() {
     let (_, r) = members(chain(200).as_bytes());
     let why = r.expect_err("a chain this deep is not read");
     assert!(why.contains("attached to messages"), "{why}");
+}
+
+/// A part past the object limit is left out, the parts after it are read,
+/// and the walk ends with the limit.
+#[test]
+fn a_part_over_the_object_limit_does_not_hide_the_next() {
+    // 48 bytes of `Z`, then the 8 of `X`.
+    let big = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpa";
+    let mail = format!(
+        "From: a@b\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"out\"\r\n\r\n\
+         --out\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\n{big}\r\n\
+         --out\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\n{B64_X}\r\n\
+         --out--\r\n"
+    );
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 16;
+    let (m, r) = members_under(mail.as_bytes(), limits);
+    assert!(m.iter().any(|(_, d)| d == b"XXXXXXXX"), "{m:?}");
+    assert!(!m.iter().any(|(_, d)| d.starts_with(b"ZZ")), "{m:?}");
+    let why = r.expect_err("the part left out is said");
+    assert!(
+        why.contains("is larger than --max-object-bytes 16"),
+        "{why}"
+    );
 }

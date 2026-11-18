@@ -5,7 +5,7 @@ The buckets exist because "they disagreed" is almost never the useful answer.
 Most differences are one of a few known shapes, and the ones worth a human's
 attention are a small minority that the rest would otherwise bury.
 
-Timings are reported as a DEBUGGING AID ONLY — see the note in
+Timings are reported as a DEBUGGING AID ONLY: see the note in
 `difftest-scan.py`. They are measured under concurrency and against a cold page
 cache, so they are useful for spotting a wedged file or an engine that is
 dramatically slower, and useless as a benchmark. Do not quote them as one.
@@ -28,7 +28,7 @@ def load(path):
 
 
 def load_meta(path):
-    """The run totals sidecar. Aggregate only — see difftest-scan.py."""
+    """The run totals sidecar. Aggregate only; see difftest-scan.py."""
     meta = {}
     try:
         with open(path + ".meta") as f:
@@ -59,7 +59,7 @@ def classify(c, e):
         return "ERROR", "a scan failed, so there is nothing to compare"
     cs, es = sigset(c), sigset(e)
     # clam ran out of budget and said so; exav finished the same file. Counting
-    # that as a missed detection is a bucketing artifact — there is no malware
+    # that as a missed detection is a bucketing artifact: there is no malware
     # here that exav failed to find, only a scan clam declined to complete. It
     # was 43 of 97 "false negatives", i.e. the largest FN class was exav winning.
     if gave_up(c) and not es:
@@ -80,12 +80,12 @@ def classify(c, e):
         # members clamd never unpacked (confirmed by re-scanning exav's own
         # extracted members WITH clamd, which then flags them under the same
         # name). Naming this bucket FP invites fixing detections that are right.
-        return "EXAV_ONLY", "exav detected, clam clean — verify before assuming an FP"
+        return "EXAV_ONLY", "exav detected, clam clean: verify before assuming an FP"
     if cs == es:
         return "AGREE", "identical signature sets"
     if cs & es:
-        return "PARTIAL", "sets overlap — same malware, one engine also named more"
-    return "NAMEDIFF", "sets are disjoint — a real disagreement about what this is"
+        return "PARTIAL", "sets overlap: same malware, one engine also named more"
+    return "NAMEDIFF", "sets are disjoint: a real disagreement about what this is"
 
 
 def main():
@@ -142,7 +142,7 @@ def main():
                 f"  {label}: {m.get('scanned', '?')} files, {b / 1e9:.1f} GB, "
                 f"{int(m.get('scanned', 0) or 0) / e:.1f} files/s, {b / e / 1e6:.0f} MB/s"
             )
-        print("  (debugging aid, NOT a benchmark — measured under concurrency)")
+        print("  (debugging aid, NOT a benchmark: measured under concurrency)")
         print()
 
     # Which files cost exav the most. Useful for finding one that wedged a
@@ -160,7 +160,7 @@ def main():
         if not examples[b]:
             continue
         _, why = classify(*(examples[b][0][1:]))
-        print(f"=== {b} ({buckets[b]}) — {why}")
+        print(f"=== {b} ({buckets[b]}): {why}")
         for p, cv, ev in examples[b]:
             print(f"    clam: {cv}")
             print(f"    exav: {ev}")

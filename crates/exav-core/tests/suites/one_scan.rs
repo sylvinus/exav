@@ -66,7 +66,7 @@ fn the_start_of_an_oversize_input_gets_the_whole_scan() {
     }
 }
 
-/// A container over the deep-analysis limit is walked member by member, and
+/// A container over the object limit is walked member by member, and
 /// its own bytes get the constant-memory pass on every entry point.
 #[test]
 fn an_oversize_container_gets_the_same_passes_everywhere() {
@@ -77,7 +77,7 @@ fn an_oversize_container_gets_the_same_passes_everywhere() {
     let comment = String::from_utf8(eicar().to_vec()).unwrap();
     let blob = zip_with(&member, &comment);
     let mut opts = ScanOptions::default();
-    opts.deep_analysis_max = 4096;
+    opts.limits.max_buffer_bytes = 4096;
     assert!(blob.len() > 4096);
     for (entry, v) in both(&blob, &opts) {
         assert!(matches!(v, Verdict::Infected { .. }), "{entry}: {v:?}");

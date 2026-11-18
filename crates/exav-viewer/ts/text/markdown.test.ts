@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { splitLines } from "./decode.js";
 import { safeTarget, type Block, type Inline } from "./markdown.js";
 import { drawBlocks } from "./markdown-view.js";
-import { readMarkdown } from "../test/markdown.js";
+import { readMarkdown } from "../test/text-wasm.js";
 
 const TAGS = new Set(["P", "H1", "H2", "H3", "H4", "H5", "H6", "PRE", "CODE", "HR", "BLOCKQUOTE", "UL", "OL", "LI", "TABLE", "THEAD", "TBODY", "TR", "TH", "TD", "EM", "STRONG", "DEL", "BR", "SPAN"]);
 

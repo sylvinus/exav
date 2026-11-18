@@ -12,13 +12,13 @@
 //!   with genuine export directories.
 //! * **Allocating memory.** `VirtualAlloc`/`HeapAlloc` hand out pages from a
 //!   bump allocator inside the emulated address space, and the regions are
-//!   remembered — a packer that unpacks into fresh memory rather than back over
+//!   remembered: a packer that unpacks into fresh memory rather than back over
 //!   its own image leaves the payload there, so those regions are dump
 //!   candidates.
 //! * **Resolving imports.** Every export resolves to a unique address in a trap
 //!   range. Executing one is what tells the driver an API was called; the call
 //!   is then serviced here, in Rust. A stub that merely *writes* those addresses
-//!   into an import table (the common case — the imports are for the original
+//!   into an import table (the common case: the imports are for the original
 //!   program, which never runs) works for the same reason.
 //!
 //! Everything an API "does" is confined to the emulated address space. There is
@@ -216,8 +216,8 @@ enum Api {
     /// `CharNext`: advance a string pointer by one character.
     CharNext,
     /// The CRT's `__p__*` accessors, which return a *pointer to* a variable the
-    /// caller dereferences at once. Returning zero — the obvious stand-in for a
-    /// function nobody implemented — is therefore a null dereference one
+    /// caller dereferences at once. Returning zero (the obvious stand-in for a
+    /// function nobody implemented) is therefore a null dereference one
     /// instruction later, which is how every MinGW-built packed program died.
     CrtDataPointer,
     /// `GetLocaleInfo`: hand back a one-character answer. The callers are C and
@@ -832,7 +832,7 @@ impl<'a> Env<'a> {
 
         for &(name, base) in PRELOADED {
             // The image is mapped before the environment is built, and it is
-            // free to claim any base — including the address a real system DLL
+            // free to claim any base, including the address a real system DLL
             // lives at. Laying a synthetic module over it would corrupt the
             // program being unpacked and hide the emulator's own traps inside
             // it, so a colliding module is placed elsewhere instead.
@@ -859,7 +859,7 @@ impl<'a> Env<'a> {
         self.traps.contains_key(&addr)
     }
 
-    /// The return address a thread starts with — inside `kernel32`, as on
+    /// The return address a thread starts with: inside `kernel32`, as on
     /// Windows, where a thread's first frame returns into
     /// `BaseProcessStart`.
     ///
@@ -1132,7 +1132,7 @@ impl<'a> Env<'a> {
 
         // PEB_LDR_DATA followed by one LDR_DATA_TABLE_ENTRY per module. The
         // executable itself comes first in load and memory order, but not in
-        // initialisation order — which is what a stub indexing
+        // initialisation order, which is what a stub indexing
         // `Ldr->InInitializationOrderModuleList` to reach `kernel32` relies on.
         let ldr = LDR_BASE;
         let entry0 = LDR_BASE + 0x100;
@@ -1276,7 +1276,7 @@ impl<'a> Env<'a> {
         let Some(api) = api else {
             // No implementation, but stopping here would throw away everything
             // the stub already rebuilt. Return to the caller with a failure
-            // value and the arguments untouched — correct for a cdecl export,
+            // value and the arguments untouched: correct for a cdecl export,
             // and for a stdcall one it leaves the stack skewed, which is why
             // the call is recorded rather than passed over in silence.
             if self.missing_apis.len() < 64 {
@@ -1324,7 +1324,7 @@ impl<'a> Env<'a> {
                         // A system DLL a real process has loaded (or would have
                         // loaded by now) reports as present, because a stub that
                         // asks for one and is told "not loaded" concludes it is
-                        // running somewhere broken and gives up — `mscoree.dll`
+                        // running somewhere broken and gives up; `mscoree.dll`
                         // is how every packed .NET binary stopped. Anything
                         // *not* on this list still reports absent: naming an
                         // unknown DLL is how a stub probes for a sandbox, and
@@ -1836,8 +1836,8 @@ impl<'a> Env<'a> {
     /// imported function.
     ///
     /// This is not an optimisation. A packed image imports the handful of
-    /// functions its stub needs — typically `LoadLibraryA` and
-    /// `GetProcAddress` — and the stub *calls them through the IAT*, trusting
+    /// functions its stub needs (typically `LoadLibraryA` and
+    /// `GetProcAddress`), and the stub *calls them through the IAT*, trusting
     /// the loader to have filled it in. Skip this and the very first thing the
     /// stub does is an indirect call through a slot still holding an on-disk
     /// RVA, which is a fault on an address that looks meaningless.
@@ -1922,7 +1922,7 @@ impl<'a> Env<'a> {
     }
 
     /// `GetProcAddress`: by name or by ordinal. A name the emulator does not
-    /// implement still resolves — to a trap that reports itself when called —
+    /// implement still resolves (to a trap that reports itself when called),
     /// because a stub that cannot resolve an import usually aborts, and then we
     /// learn nothing at all.
     fn resolve_export(&mut self, mem: &mut Mem, hmod: u32, p: u32) -> Result<u32, Stop> {
@@ -1942,9 +1942,9 @@ impl<'a> Env<'a> {
         };
         self.bulk_bytes += (self.traps.len() as u64).saturating_mul(SCAN_CHARGE);
         // The lowest matching trap, not the first one iteration happens to
-        // reach. More than one can match — a module created twice under two
+        // reach. More than one can match (a module created twice under two
         // spellings of its name, or an alias resolved after the export table
-        // was built — and `traps` is a hash map, whose order varies from run to
+        // was built), and `traps` is a hash map, whose order varies from run to
         // run. Picking arbitrarily makes the *unpacked image* differ between
         // runs, because the address lands in the import table the stub
         // rebuilds; a scanner whose output is not reproducible cannot be
@@ -2164,7 +2164,7 @@ fn write_str(mem: &mut Mem, addr: u32, s: &str, wide: bool, cap: u32) -> Result<
 }
 
 /// Lay down PE headers for a synthetic DLL, with the export directory wired
-/// into data directory 0 — the only part of the image a stub reads.
+/// into data directory 0, the only part of the image a stub reads.
 fn write_module_headers(
     mem: &mut Mem,
     base: u32,
@@ -2294,7 +2294,7 @@ mod tests {
     /// only while one instruction does a bounded amount of it. `memcpy` moves up
     /// to 64 MiB per call. Charged a flat tick, a stub looping over it spends
     /// the entire budget's worth of copying on every tick and the run never
-    /// ends within any useful time — the budget counts calls while the machine
+    /// ends within any useful time: the budget counts calls while the machine
     /// does the work.
     #[test]
     fn a_block_copy_reports_the_bytes_it_moved() {
@@ -2386,13 +2386,13 @@ mod tests {
     /// WHY THIS IS NOT A STYLE POINT: the address `GetProcAddress` returns is
     /// written into the import table the stub rebuilds, so it ends up *inside
     /// the unpacked image*. When the choice varied, the same input produced a
-    /// different dump on different runs — 45 of 276 corpus samples — which
+    /// different dump on different runs (45 of 276 corpus samples), which
     /// makes the emulator impossible to differentially test and makes any
     /// hash-based signature over its output useless.
     ///
     /// Two traps are given the same module and name at different addresses, in
     /// both insertion orders. Whichever way the map happens to iterate, the
-    /// answer must be the same, and it must be the lower address — the one the
+    /// answer must be the same, and it must be the lower address, the one the
     /// module's own export table allocated first.
     #[test]
     fn an_export_resolves_to_the_same_address_whatever_the_map_order() {

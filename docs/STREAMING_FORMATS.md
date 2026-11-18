@@ -4,9 +4,25 @@ exav optimises for memory, not bandwidth. `walk` hands a format's members over
 straight off the seekable source, each decoded as it is read, so peak memory is
 one member's window rather than the whole decoded object. Most containers
 already work that way (every arm of `dispatch` in `stream.rs` but the last),
-including tar, zip, 7z, WIM, xar, cab, lz4, `.Z`, DMG, the virtual disks and the
-filesystem and partition readers; the rest are read whole (`read_whole`). What
-is left of those is in [BACKLOG.md](BACKLOG.md), with the reason for each.
+including tar, zip, 7z, WIM, xar, cab, CHM, RAR (volume sets too), lz4, `.Z`,
+DMG, compound files (OLE and MSI), email, the virtual disks and the filesystem
+and partition readers; the
+rest are read whole (`read_whole`). What is left of those is in
+[BACKLOG.md](BACKLOG.md), with the reason for each.
+
+**Compound files and email.** A compound file past the buffer limit is read
+through `cfb::Compound::open_source`: what is held is the list of the sectors of
+the FAT, the miniFAT and the mini stream, and the directory (up to the limit,
+and reported when it is longer); each stream is read from its sectors, and one
+past the limit (the cabinet of an MSI) is a `Read` handed over as a streamed
+member. The streams the passes after the walk need (embedded objects, a
+presentation's records, a workbook, a VBA project) are held until those have
+run, and one past the limit is reported as not examined by them. An
+`EncryptedPackage` past the limit is reported, not decrypted. A mailbox past the
+limit is split at its `From ` lines, a message within the limit is read as one
+in memory is, and a larger one is read part by part with the header block of
+one part held, each leaf's base64 or quoted-printable body decoded as it is
+read.
 
 **7z, WIM and xar** read their header, their directory tree or their table of
 contents from where it is in the source, and each member from its place in it,
@@ -15,10 +31,13 @@ coder chain, and its members are read in order, the ones before the one wanted
 decoded and dropped, which is charged to the scan budget before it is done. A
 WIM resource is a `ResourceReader` that decodes a chunk at a time; an xar
 member is a zlib reader over its range of the heap. What is still held is
-named in each: a 7z folder with an encrypted coder or with several packed
-streams (BCJ2) is decoded whole under the buffer limit, a 7z's header and a
-WIM's directory tree are held under it, and an xar's table of contents under
-64 MiB.
+named in each: a 7z's header and a WIM's directory tree are held under the
+buffer limit, and an xar's table of contents under 64 MiB. An encrypted 7z
+folder (AES, on a chain or on each stream of a BCJ2 graph) is decrypted a
+64 KiB chunk at a time; its password is found by decoding its first CRC'd
+member once before it is scanned; a folder with no CRC is read with the first
+password that decodes it and its members are reported. Each member is checked
+against its CRC as it ends.
 
 **Disks: done.** A disk is read as a `Read + Seek`, and the filesystem and
 partition readers take one, so a file comes out of a disk without the disk being
@@ -52,8 +71,12 @@ held.
   compressed ones) that the walk hands over as a streamed member, so the scan
   puts it in a spill file as it does a ZIP member. A stretch the volume does not
   give ends the stream with an error after the bytes before it; a hole reads as
-  zeros. A file stored compressed by the filesystem (decmpfs, LZNT1, EROFS) is
-  not read as it goes.
+  zeros, and is charged to the hole limit (`max_hole_bytes`) instead of the scan
+  budget. A file stored compressed by NTFS (LZNT1) is read a compression unit at
+  a time, by the clusters each has allocated, and handed over as it goes when it
+  is long; one stored compressed by HFS+ or APFS (decmpfs, in the resource
+  fork) or by EROFS is read a block or an extent at a time (a window of the
+  table or index, one coded cluster, one decoder).
 - *Partitions.* `partition::stream_offsets` already took a `Read + Seek`.
 
 A disk that fits the buffer limit is still handed over as one member, so its raw
@@ -70,13 +93,13 @@ partition (the boot code) come out as `<boot-area>`, up to 1 MiB.
 Not covered: a partition table inside a partition; differencing VHD and VHDX and QCOW2 with a
 backing file, which are reported because the parent is not in the file.
 
-**RAR: real work, deliberately not rushed.** `rar3_unpack.rs` and
-`rar5_unpack.rs` are vendored decoders that build the complete output `Vec`.
-Streaming them means turning both into resumable `Read` state machines that
-retain only the already-capped LZ window: major surgery on fuzzed,
-differential-tested code, where a subtle break costs correctness on a format
-attackers actively use. It is a focused effort of its own, not a change to slip
-in alongside others.
+**RAR: done.** `rar.rs` reads RAR4 and RAR5 where they lie: each header
+through a window of the source, each member's packed bytes through a reader
+over its range, and a compressed member decoded as it is read, so what is held
+is the LZ window and a bounded stretch of input (a solid group shares one
+window). A volume set is a `RarSpan` over its volumes. An archive with
+encrypted headers, encrypted members or RAR5 links still goes to the
+whole-archive reader when it fits the buffer limit.
 
 **PDF: measured, and not worth doing.** `extract_pdf` already decompresses
 stream objects one at a time into a budget-bounded buffer, and the file itself

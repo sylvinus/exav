@@ -8,7 +8,7 @@
 //!
 //! Three routes, tried in that order:
 //!
-//! * **aPLib-compressed packers** — Petite 2.x, FSG 2.0 and NsPack wrap the
+//! * **aPLib-compressed packers**: Petite 2.x, FSG 2.0 and NsPack wrap the
 //!   original image in an [`aplib`] stream. For these we locate the compressed
 //!   stream and decompress it, then **accept the result only if it reconstructs
 //!   a valid PE image** (`MZ`/`PE\0\0`). That output-validity gate means we do
@@ -17,7 +17,7 @@
 //!   bogus data. When it passes, the recovered original PE is emitted for
 //!   scanning. Cheapest route, so it is tried first.
 //!
-//! * **Everything else that looks packed** — Aspack, MEW, Upack, wwpack32,
+//! * **Everything else that looks packed**: Aspack, MEW, Upack, wwpack32,
 //!   PeSpin, Yoda's Cryptor, and packers with no name at all. Their stubs are
 //!   *run*, under the bounded x86 interpreter in `exav-pe-emu`, which captures
 //!   the image the stub rebuilds. Whatever scheme a packer uses, it has to
@@ -25,7 +25,7 @@
 //!   that is what this catches. The same output gate applies: a dump is emitted
 //!   only if it reads back as a PE.
 //!
-//! * **Virtualizing protectors** — VMProtect, Themida, Enigma. Never emulated:
+//! * **Virtualizing protectors**: VMProtect, Themida, Enigma. Never emulated:
 //!   the protected code was translated to a private bytecode at build time, so
 //!   there is no original image in memory at any point to capture, and running
 //!   the stub would spend the budget proving it. Reported instead.
@@ -38,6 +38,8 @@
 //! `#![forbid(unsafe_code)]` (crate root): all PE parsing is bounds-checked and
 //! returns `None`/empty rather than panicking on malformed input.
 
+use crate::pe::{Headers, PE32, PE32_PLUS, Section};
+use crate::source::ByteSource;
 use crate::{Budget, Entry, LimitHit, Sink};
 
 use super::aplib;
@@ -95,29 +97,16 @@ pub(crate) fn emulate_pe(
     (line, out)
 }
 
-/// A parsed subset of a PE file — just what packer detection and stream location
-/// need. All offsets are validated against `len` at parse time.
+/// A PE file as packer detection and stream location see it: its headers and
+/// the import and CLR data directories the packed-shape heuristics read. Kept
+/// here rather than borrowed from the emulator's parser so that *detecting* a
+/// packed file (and reporting it) still works in a build with the emulator
+/// compiled out.
 struct Pe<'a> {
     data: &'a [u8],
-    /// Address of entry point (RVA).
-    entry_rva: u32,
-    sections: Vec<Section>,
-    /// File alignment, and the import/CLR data directories: what the
-    /// packed-shape heuristics read. Kept here rather than borrowed from the
-    /// emulator's parser so that *detecting* a packed file — and reporting it —
-    /// still works in a build with the emulator compiled out.
-    file_align: u32,
+    headers: Headers,
     import_rva: u32,
     clr_rva: u32,
-}
-
-struct Section {
-    name: [u8; 8],
-    vaddr: u32,
-    vsize: u32,
-    raw_ptr: u32,
-    raw_size: u32,
-    characteristics: u32,
 }
 
 #[inline]
@@ -135,96 +124,32 @@ fn u32_le(d: &[u8], o: usize) -> Option<u32> {
 }
 
 impl<'a> Pe<'a> {
-    /// Parse the PE headers. Returns `None` if the bytes are not a well-formed
-    /// PE (bad magic, headers out of bounds, absurd section count).
+    /// Parse the PE headers. Returns `None` if the bytes are not a PE that
+    /// packer detection reads: PE32 or PE32+, with 1 to 96 sections all in
+    /// the file.
     fn parse(data: &'a [u8]) -> Option<Pe<'a>> {
-        if data.len() < 0x40 || &data[..2] != b"MZ" {
+        let headers = Headers::read(&|off, len| ByteSource::window(data, off, len))?;
+        if !(1..=96).contains(&headers.section_count)
+            || headers.sections.len() != usize::from(headers.section_count)
+            || (headers.magic != PE32 && headers.magic != PE32_PLUS)
+        {
             return None;
         }
-        let e_lfanew = u32_le(data, 0x3C)? as usize;
-        // COFF header: "PE\0\0" then 20 bytes. `checked_add` so a hostile
-        // `e_lfanew` (e.g. 0xFFFFFFFF) can't overflow the range end on 32-bit
-        // targets (wasm) before the bounds check.
-        let coff = e_lfanew.checked_add(4)?;
-        if data.get(e_lfanew..coff)? != b"PE\0\0" {
-            return None;
-        }
-        let num_sections = u16_le(data, coff + 2)? as usize;
-        let opt_size = u16_le(data, coff + 16)? as usize;
-        if num_sections == 0 || num_sections > 96 {
-            return None;
-        }
-        let opt = coff + 20;
-        let magic = u16_le(data, opt)?;
-        // AddressOfEntryPoint sits at the same offset (+16) in PE32 and PE32+.
-        if magic != 0x10b && magic != 0x20b {
-            return None;
-        }
-        let entry_rva = u32_le(data, opt + 16)?;
-        let file_align = u32_le(data, opt + 36).unwrap_or(0x200);
-        let num_dirs = u32_le(data, opt + 92).unwrap_or(0);
-        let import_rva = if num_dirs >= 2 {
-            u32_le(data, opt + 104).unwrap_or(0)
-        } else {
-            0
-        };
-        let clr_rva = if num_dirs >= 15 {
-            u32_le(data, opt + 96 + 14 * 8).unwrap_or(0)
-        } else {
-            0
-        };
-        let sec_table = opt + opt_size;
-        let mut sections = Vec::with_capacity(num_sections);
-        for i in 0..num_sections {
-            let s = sec_table + i * 40;
-            let hdr = crate::bytes::at(data, s, 40)?;
-            let mut name = [0u8; 8];
-            name.copy_from_slice(&hdr[..8]);
-            sections.push(Section {
-                name,
-                vsize: u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]),
-                vaddr: u32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]),
-                raw_size: u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]),
-                raw_ptr: u32::from_le_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]),
-                characteristics: u32::from_le_bytes([hdr[36], hdr[37], hdr[38], hdr[39]]),
-            });
-        }
+        let directory = |i: usize| headers.directories.get(i).map_or(0, |d| d.address);
         Some(Pe {
             data,
-            entry_rva,
-            sections,
-            file_align,
-            import_rva,
-            clr_rva,
+            import_rva: directory(1),
+            clr_rva: directory(14),
+            headers,
         })
     }
 
-    /// Index of the section containing `rva`.
-    fn section_of(&self, rva: u32) -> Option<usize> {
-        self.sections.iter().position(|s| {
-            let end = s.vaddr.saturating_add(s.vsize.max(s.raw_size).max(0x1000));
-            rva >= s.vaddr && rva < end
-        })
-    }
-
-    /// File offset for an RVA, if it lands inside a section's raw data.
+    /// File offset for an RVA, if it lands inside a section's raw data and
+    /// the file has it.
     fn rva_to_off(&self, rva: u32) -> Option<usize> {
-        for s in &self.sections {
-            if rva >= s.vaddr && rva < s.vaddr.saturating_add(s.vsize.max(s.raw_size)) {
-                let delta = rva - s.vaddr;
-                if delta < s.raw_size {
-                    // `checked_add`: `raw_ptr` and `delta` are both attacker-
-                    // controlled u32s; their sum can overflow a 32-bit usize.
-                    let Some(off) = (s.raw_ptr as usize).checked_add(delta as usize) else {
-                        continue;
-                    };
-                    if off <= self.data.len() {
-                        return Some(off);
-                    }
-                }
-            }
-        }
-        None
+        self.headers
+            .rva_to_offset(rva)
+            .filter(|&off| off <= self.data.len())
     }
 }
 
@@ -242,7 +167,7 @@ enum Packer {
     WwPack,
     PeSpin,
     Yoda,
-    /// A UPX-sectioned image the real UPX path declined — normally because the
+    /// A UPX-sectioned image the real UPX path declined, normally because the
     /// `PackHeader` was stripped or patched, a routine anti-unpack move. Those
     /// files reached no unpacker at all and so scanned clean; here they are at
     /// least reported. Ordinary UPX still goes to `upx.rs`, which is tried
@@ -257,8 +182,8 @@ enum Packer {
     /// Commercial **protectors** that virtualize code rather than merely
     /// compress it: the marked functions are translated into a bespoke bytecode
     /// at protect time and interpreted at runtime, so the original instructions
-    /// are *destroyed*, not hidden. No engine unpacks these — not exav, not
-    /// ClamAV, not a perfect emulator — because there is no moment at which the
+    /// are *destroyed*, not hidden. No engine unpacks these (not exav, not
+    /// ClamAV, not a perfect emulator), because there is no moment at which the
     /// original code exists in memory to recover. They are the three most common
     /// packers in current samples, so staying silent about them is the one thing
     /// worse than not unpacking them.
@@ -294,8 +219,8 @@ fn ieq(name: &[u8; 8], want: &[u8]) -> bool {
 /// conservative (strong markers only) to avoid mis-flagging ordinary PEs; a
 /// miss just means the file is scanned raw, exactly as before.
 fn identify(pe: &Pe) -> Option<Packer> {
-    // Section-name markers — the most reliable signal for these packers.
-    for s in &pe.sections {
+    // Section-name markers: the most reliable signal for these packers.
+    for s in &pe.headers.sections {
         let n = &s.name;
         if starts_with(n, b"UPX0") || starts_with(n, b"UPX1") || starts_with(n, b".UPX") {
             return Some(Packer::UpxStripped);
@@ -344,7 +269,7 @@ fn identify(pe: &Pe) -> Option<Packer> {
     // Entry-point signature for FSG (which strips section names). FSG 2.0 stubs
     // begin the decompressor with a distinctive load of the packed-source and
     // destination pointers. Match at the entry-point file offset only.
-    if let Some(off) = pe.rva_to_off(pe.entry_rva)
+    if let Some(off) = pe.rva_to_off(pe.headers.entry_point)
         && let Some(win) = crate::bytes::at(pe.data, off, 2)
     {
         // `BE xx xx xx xx` (mov esi, imm32) is the canonical FSG 2.0 stub
@@ -365,9 +290,9 @@ fn fsg_stub_plausible(pe: &Pe, ep_off: usize) -> bool {
         return false;
     };
     // A real FSG stub is short; the entry section's raw data is small.
-    let ep_section = pe.sections.iter().find(|s| {
-        let off = s.raw_ptr as usize;
-        // `saturating_add`: `raw_ptr + raw_size` (both attacker-controlled u32s)
+    let ep_section = pe.headers.sections.iter().find(|s| {
+        let off = s.raw_pointer as usize;
+        // `saturating_add`: `raw_pointer + raw_size` (both attacker-controlled u32s)
         // can overflow a 32-bit usize; a saturated end is a correct upper bound.
         ep_off >= off && ep_off < off.saturating_add(s.raw_size as usize)
     });
@@ -391,8 +316,8 @@ fn eq8(name: &[u8; 8], other: &[u8; 8]) -> bool {
 /// route the file here (in addition to the raw scan).
 pub(crate) fn is_pepack(data: &[u8]) -> bool {
     // An image this emulator already produced must not be fed back into it. It
-    // still carries the packer's section names — the names are evidence and are
-    // not rewritten — so `identify` would recognise the packer a second time,
+    // still carries the packer's section names (the names are evidence and are
+    // not rewritten), so `identify` would recognise the packer a second time,
     // the second run would find nothing to unpack (the work is already done),
     // and the file would be reported UNSCANNABLE: a successful unpack downgraded
     // by the rescan of its own output.
@@ -408,18 +333,19 @@ pub(crate) fn is_pepack(data: &[u8]) -> bool {
 /// Whether an image is laid out the way memory is rather than the way a file
 /// is: every section's raw offset equal to its virtual address, and a file
 /// alignment as coarse as the section alignment. That is what a dump looks
-/// like — a linker writes 512-byte-aligned raw data at offsets that have
+/// like: a linker writes 512-byte-aligned raw data at offsets that have
 /// nothing to do with the virtual addresses.
 fn is_memory_layout_dump(data: &[u8]) -> bool {
     let Some(pe) = Pe::parse(data) else {
         return false;
     };
-    pe.file_align >= 0x1000
-        && pe.sections.len() > 1
+    pe.headers.file_alignment >= 0x1000
+        && pe.headers.sections.len() > 1
         && pe
+            .headers
             .sections
             .iter()
-            .all(|s| s.raw_size == 0 || s.raw_ptr == s.vaddr)
+            .all(|s| s.raw_size == 0 || s.raw_pointer == s.virtual_address)
 }
 
 /// Whether a PE looks like a runtime-packed image, for the files no named
@@ -428,14 +354,14 @@ fn is_memory_layout_dump(data: &[u8]) -> bool {
 /// This is what makes the emulator general rather than a list of packers: most
 /// packers can be renamed, restubbed or stripped of their section names, but
 /// none of them can hide the *shape* of a packed image. What they all share is
-/// that the program on disk is not the program that runs — so the file carries
+/// that the program on disk is not the program that runs, so the file carries
 /// a section far larger in memory than on disk to unfold into, an entry point
 /// in the last section rather than the first, an import table with a handful of
 /// entries where a real program has hundreds, and an entry-point section marked
 /// writable because the stub writes to itself.
 ///
-/// No single signal decides it. Each one alone appears in honest software — a
-/// large `.bss`, a small import table, a compressed resource — so they are
+/// No single signal decides it. Each one alone appears in honest software (a
+/// large `.bss`, a small import table, a compressed resource), so they are
 /// scored and a threshold applied. The two strongest describe where execution
 /// starts, because that is what a packer cannot fake: its stub has to live with
 /// the packed data and write over it, so the entry point ends up somewhere no
@@ -450,12 +376,12 @@ fn looks_packed(data: &[u8]) -> bool {
     let Some(pe) = Pe::parse(data) else {
         return false;
     };
-    let Some(ep_idx) = pe.section_of(pe.entry_rva) else {
-        // An entry point outside every section is itself conclusive — no linker
+    let Some(ep_idx) = pe.headers.section_index(pe.headers.entry_point) else {
+        // An entry point outside every section is itself conclusive: no linker
         // produces that.
         return true;
     };
-    let ep = &pe.sections[ep_idx];
+    let ep = &pe.headers.sections[ep_idx];
     let mut score = 0;
 
     const WRITABLE: u32 = 0x8000_0000;
@@ -469,7 +395,7 @@ fn looks_packed(data: &[u8]) -> bool {
     // produces: this is the packed payload, sitting in the section the packer
     // added for it. Entropy alone would flag a `.rsrc` full of PNGs, and an odd
     // name alone flags a linker nobody uses; together they are decisive.
-    if pe.sections.iter().any(|s| {
+    if pe.headers.sections.iter().any(|s| {
         !is_standard_section(&s.name) && s.raw_size >= 0x1000 && section_entropy(s, data) >= 7.0
     }) {
         score += 2;
@@ -478,10 +404,11 @@ fn looks_packed(data: &[u8]) -> bool {
         score += 1;
     }
     // A section name generated per build. Packers that add a section either use
-    // a fixed marker (`UPX1`, `.aspack`) — matched by name elsewhere — or
+    // a fixed marker (`UPX1`, `.aspack`), matched by name elsewhere, or
     // randomise it to defeat exactly that, and a random name is as much of a
     // signature as a fixed one. Compilers do not emit `.OqvPZc8`.
     if pe
+        .headers
         .sections
         .iter()
         .any(|s| s.raw_size >= 0x1000 && looks_random_name(&s.name))
@@ -490,22 +417,24 @@ fn looks_packed(data: &[u8]) -> bool {
     }
     // A section reserving far more memory than it occupies on disk: the
     // destination the packed payload unfolds into.
-    if pe.sections.iter().any(|s| {
-        s.raw_size == 0 && s.vsize >= 0x1000
-            || (s.raw_size > 0 && s.vsize as u64 >= s.raw_size as u64 * 4 && s.vsize >= 0x4000)
+    if pe.headers.sections.iter().any(|s| {
+        s.raw_size == 0 && s.virtual_size >= 0x1000
+            || (s.raw_size > 0
+                && s.virtual_size as u64 >= s.raw_size as u64 * 4
+                && s.virtual_size >= 0x4000)
     }) {
         score += 1;
     }
     // Almost no imports. A packer resolves what it needs at run time, so the
     // static table holds only what the stub itself calls. A file with no import
-    // directory at all is a different thing — a driver, a resource-only DLL —
+    // directory at all is a different thing (a driver, a resource-only DLL)
     // and does not count: two weak signals should not be enough on their own.
     if pe.import_rva != 0 && import_count(&pe, data) <= 6 {
         score += 1;
     }
 
     // A managed assembly's entry point is a jump into the .NET runtime and its
-    // payload is IL, so emulating it reaches nothing — but a *packed* .NET file
+    // payload is IL, so emulating it reaches nothing, but a *packed* .NET file
     // runs a native stub first and often keeps the original CLR header. Rather
     // than veto those (which lost every Exe32pack sample), the bar is raised:
     // an ordinary managed assembly cannot clear it, and a packed one does so on
@@ -569,7 +498,7 @@ fn is_standard_section(name: &[u8; 8]) -> bool {
 }
 
 /// Whether a section name looks machine-generated rather than chosen: mixed
-/// case, and a digit or a second case switch. Deliberately narrow — every
+/// case, and a digit or a second case switch. Deliberately narrow: every
 /// convention-following name a toolchain or a named packer uses is one case
 /// (`.text`, `.MPRESS1`, `UPX0`, `.aspack`), so only a name that is neither
 /// qualifies.
@@ -596,7 +525,7 @@ fn looks_random_name(name: &[u8; 8]) -> bool {
 /// and encrypted data sits at 7.5-8.0; compiled code around 6.
 fn section_entropy(s: &Section, data: &[u8]) -> f64 {
     const SAMPLE: usize = 64 << 10;
-    let start = s.raw_ptr as usize;
+    let start = s.raw_pointer as usize;
     let end = start
         .saturating_add(s.raw_size as usize)
         .min(data.len())
@@ -622,7 +551,7 @@ fn section_entropy(s: &Section, data: &[u8]) -> f64 {
         .sum::<f64>()
 }
 
-/// Number of imported functions declared in the file's import table, capped —
+/// Number of imported functions declared in the file's import table, capped:
 /// the question is only "few or many".
 fn import_count(pe: &Pe, data: &[u8]) -> u32 {
     const CAP: u32 = 64;
@@ -630,12 +559,12 @@ fn import_count(pe: &Pe, data: &[u8]) -> u32 {
     if dir_rva == 0 {
         return 0;
     }
-    let Some(dir_off) = rva_to_file_offset(pe, dir_rva) else {
+    let Some(dir_off) = pe.rva_to_off(dir_rva) else {
         return 0;
     };
     let mut total = 0u32;
     for i in 0..32usize {
-        let d = dir_off + i * 20;
+        let d = dir_off.saturating_add(i * 20);
         let Some(desc) = crate::bytes::at(data, d, 20) else {
             break;
         };
@@ -645,7 +574,7 @@ fn import_count(pe: &Pe, data: &[u8]) -> u32 {
             break;
         }
         let thunks = if orig != 0 { orig } else { first };
-        let Some(mut off) = rva_to_file_offset(pe, thunks) else {
+        let Some(mut off) = pe.rva_to_off(thunks) else {
             continue;
         };
         while let Some(v) = crate::bytes::at(data, off, 4) {
@@ -662,17 +591,6 @@ fn import_count(pe: &Pe, data: &[u8]) -> u32 {
     total
 }
 
-/// File offset for an RVA, through the section table.
-fn rva_to_file_offset(pe: &Pe, rva: u32) -> Option<usize> {
-    let idx = pe.section_of(rva)?;
-    let s = &pe.sections[idx];
-    let delta = rva.checked_sub(s.vaddr)?;
-    if delta >= s.raw_size {
-        return None;
-    }
-    (s.raw_ptr as usize).checked_add(delta as usize)
-}
-
 /// Maximum size we will decompress an inner PE to (guards crafted streams; the
 /// budget cap further constrains this).
 const MAX_INNER: usize = 128 << 20;
@@ -682,11 +600,7 @@ const MAX_INNER: usize = 128 << 20;
 /// decompress, accepting only output that reconstructs a valid PE. Returns
 /// `Ok(None)` when nothing could be safely recovered (the caller still scans the
 /// raw bytes).
-pub(crate) fn extract_pepack<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_pepack(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     let Some(pe) = Pe::parse(data) else {
         return Ok(None);
     };
@@ -703,7 +617,7 @@ pub(crate) fn extract_pepack<R>(
         }
     }
 
-    // Then the emulator, for everything except the virtualizers — for those
+    // Then the emulator, for everything except the virtualizers: for those
     // there is no original image in memory at any point, so running the stub
     // would burn the budget to reconstruct something that does not exist.
     #[cfg(feature = "pe-emu")]
@@ -727,13 +641,13 @@ pub(crate) fn extract_pepack<R>(
         return Ok(None);
     };
     {
-        // Detected, but not an aPLib family — no verifiable unpack, and we
+        // Detected, but not an aPLib family: no verifiable unpack, and we
         // fabricate nothing. The caller still scans the raw (packed) bytes, so a
         // signature written against the stub still fires; what is NOT examined
         // is the original image the stub will unfold at runtime.
         //
         // That unexamined payload has to be surfaced. Returning `Ok(None)` here
-        // let a packed dropper scan as a clean OK — which is the one outcome the
+        // let a packed dropper scan as a clean OK, which is the one outcome the
         // scanner must never produce for content that is present but unread.
         // Reported as `unsupported`, so the verdict becomes UNSCANNABLE and the
         // member metadata still feeds `.cdb` matching.
@@ -742,7 +656,7 @@ pub(crate) fn extract_pepack<R>(
         // situations and a scanner that blurs them misleads. A compressor hides
         // an original image that exists and could be recovered; a virtualizer
         // translated the code at protect time, so there is no original image
-        // anywhere — every byte present *was* scanned, but signatures written
+        // anywhere: every byte present *was* scanned, but signatures written
         // against native instructions cannot match bytecode for a bespoke VM.
         let reason = if packer.is_virtualizer() {
             "executable protected by a code virtualizer: the protected functions \
@@ -767,13 +681,13 @@ pub(crate) fn extract_pepack<R>(
 /// image in, accepting the result only if it reconstructs a valid PE. That
 /// output check is what makes brute-forcing the stream offset safe: a wrong
 /// guess fails it and is discarded rather than handed to the matcher as data.
-fn aplib_unpack<R>(
+fn aplib_unpack(
     pe: &Pe,
     data: &[u8],
     budget: &mut Budget,
-    visit: Sink<R>,
+    visit: Sink,
     packer: Packer,
-) -> Result<Recovered<R>, LimitHit> {
+) -> Result<Recovered, LimitHit> {
     budget.count_entry()?;
     let cap = budget.reserve()?.min(MAX_INNER as u64) as usize;
 
@@ -781,13 +695,13 @@ fn aplib_unpack<R>(
     // packed payload lives in one of them), plus the byte after the entry-point
     // stub. Deduplicated, bounded.
     let mut candidates: Vec<usize> = Vec::new();
-    for s in &pe.sections {
-        let start = s.raw_ptr as usize;
+    for s in &pe.headers.sections {
+        let start = s.raw_pointer as usize;
         if start < data.len() {
             candidates.push(start);
         }
     }
-    if let Some(ep) = pe.rva_to_off(pe.entry_rva) {
+    if let Some(ep) = pe.rva_to_off(pe.headers.entry_point) {
         candidates.push(ep);
     }
     candidates.sort_unstable();
@@ -816,15 +730,15 @@ fn aplib_unpack<R>(
 /// "produced a member the sink kept going past". A sink that collects every
 /// member returns `None` for each one, so without that distinction a successful
 /// static unpack would be followed by a redundant emulation of the same file.
-pub(crate) enum Recovered<R> {
+pub(crate) enum Recovered {
     Nothing,
     Emitted,
-    Halt(R),
+    Halt(crate::Stop),
 }
 
 /// Instruction budget for one stub. Runtime packers spend on the order of a
 /// hundred instructions per byte they produce, so this is what bounds the size
-/// of image the emulator can follow to completion — and what bounds the CPU a
+/// of image the emulator can follow to completion, and what bounds the CPU a
 /// hostile file can demand. At tens of millions of ticks a second it is a few
 /// seconds in the worst case, and only for files that already look packed.
 #[cfg(feature = "pe-emu")]
@@ -833,8 +747,8 @@ const MAX_EMU_TICKS: u64 = 120_000_000;
 /// Ceiling on the emulator's address space, and on the dump it produces.
 ///
 /// These are deliberately far below the per-member buffer budget. An emulation
-/// costs *both* at once — the page table while the stub runs, and the dump
-/// afterwards — and it happens per packed member, at every nesting level, on
+/// costs *both* at once (the page table while the stub runs, and the dump
+/// afterwards), and it happens per packed member, at every nesting level, on
 /// top of everything the enclosing scan is already holding. Sized from what a
 /// real unpack needs (an image, a stack, a scratch allocation) rather than from
 /// what the budget would allow, because the budget was set for one buffer and
@@ -848,20 +762,20 @@ const MAX_EMU_DUMP: usize = 32 << 20;
 ///
 /// Three grades of result, named differently because they are different claims:
 ///
-/// * `-emulated` — the stub transferred control to the reconstructed image. The
+/// * `-emulated`: the stub transferred control to the reconstructed image. The
 ///   unpack ran to completion and the dump is the original program.
-/// * `-emulated-partial` — the run stopped early with a substantial part of the
+/// * `-emulated-partial`: the run stopped early with a substantial part of the
 ///   image rewritten. Worth scanning (the decompressed payload is in there), but
 ///   not the same as "this is the original program".
-/// * `-emulated-allocation-N` — a PE image found in memory the stub allocated,
+/// * `-emulated-allocation-N`: a PE image found in memory the stub allocated,
 ///   which is where a loader that never rewrites its own image puts the payload.
 #[cfg(feature = "pe-emu")]
-pub(crate) fn emulated_unpack<R>(
+pub(crate) fn emulated_unpack(
     data: &[u8],
     budget: &mut Budget,
-    visit: Sink<R>,
+    visit: Sink,
     label: &str,
-) -> Result<Recovered<R>, LimitHit> {
+) -> Result<Recovered, LimitHit> {
     budget.count_entry()?;
     let cap = budget.reserve()?.min(MAX_INNER as u64) as usize;
     let room = budget.pe_emulation_room();
@@ -880,7 +794,7 @@ pub(crate) fn emulated_unpack<R>(
     // The per-stub cap ending a run is the emulator's normal behavior; the
     // scan-wide one ending it means this stub was not given its full share.
     let cut_short = limits.max_ticks < MAX_EMU_TICKS && report.ticks >= limits.max_ticks;
-    let ended = |budget: &Budget, done: Recovered<R>| {
+    let ended = |budget: &Budget, done: Recovered| {
         if cut_short {
             Err(budget.pe_emulation_exhausted())
         } else {
@@ -916,7 +830,7 @@ pub(crate) fn emulated_unpack<R>(
     };
     // The same output gate the static path uses: only a buffer that reads back
     // as a PE image is emitted. A run that ended mid-decompression leaves the
-    // headers intact, so this passes for partial reconstructions too — what it
+    // headers intact, so this passes for partial reconstructions too: what it
     // rejects is a dump whose headers the stub overwrote with something else,
     // where there is no way to tell code from rubble.
     if !looks_like_pe(&unpacked.data) {
@@ -936,8 +850,8 @@ pub(crate) fn emulated_unpack<R>(
 
 fn packer_name(p: Packer) -> &'static str {
     // The vendor's own capitalisation, and the single source of truth for it.
-    // These strings reach the user twice — in the member name and, with
-    // `--detect packed`, inside `Heuristics.Packed.<name>` — and a gateway
+    // These strings reach the user twice (in the member name and, with
+    // `--detect packed`, inside `Heuristics.Packed.<name>`), and a gateway
     // filtering on an exact string needs the name the vendor uses. Spelling them
     // once here means the scanner never has to re-derive a display name, so the
     // two can't drift apart and a packer added below is reportable immediately.
@@ -961,7 +875,7 @@ fn packer_name(p: Packer) -> &'static str {
 
 /// Output-validity gate: accept a decompressed buffer only if it reconstructs a
 /// plausible PE image (`MZ` + reachable `PE\0\0`). This is what makes candidate
-/// brute-forcing safe — random or wrongly-located depack output is rejected
+/// brute-forcing safe: random or wrongly-located depack output is rejected
 /// here rather than handed to the matcher as data.
 fn looks_like_pe(out: &[u8]) -> bool {
     if out.len() < 0x40 || &out[..2] != b"MZ" {
@@ -978,7 +892,7 @@ fn looks_like_pe(out: &[u8]) -> bool {
     // only needs `e_lfanew` to point somewhere in the file, and packers exploit
     // that: MEW, BeRoEXEPacker and WinUpack all put the PE header at offset
     // 0xc or 0x10, overlapping the DOS header they no longer need. Demanding
-    // 0x40 here — a rule of thumb, not a rule — silently rejected every image
+    // 0x40 here (a rule of thumb, not a rule) silently rejected every image
     // recovered from those three, turning a working unpack into an
     // `UNSCANNABLE` report.
     let Some(e_end) = e.checked_add(24) else {
@@ -1066,8 +980,8 @@ mod tests {
 
     /// Build a PE shaped like a packed one: an empty destination section that
     /// only exists in memory, then a writable section holding the stub and its
-    /// payload, with the entry point in the latter. The two do not overlap —
-    /// the destination ends where the stub section begins — because a stub that
+    /// payload, with the entry point in the latter. The two do not overlap
+    /// (the destination ends where the stub section begins) because a stub that
     /// decompresses over its own code stops being a test of anything.
     fn packed_pe(stub: &[u8], payload: &[u8]) -> Vec<u8> {
         const DEST_RVA: u32 = 0x1000;
@@ -1117,9 +1031,9 @@ mod tests {
     #[test]
     fn an_unnamed_packer_is_emulated_and_its_payload_recovered() {
         // Nothing here names a packer: no marker section, no known stub. The
-        // file is routed to the emulator by its *shape* — entry point in a
+        // file is routed to the emulator by its *shape* (entry point in a
         // writable section, an empty section reserved to unfold into, no
-        // imports — and the payload comes back from running the stub.
+        // imports), and the payload comes back from running the stub.
         const MARKER: &[u8] = b"EXAV_EMULATED_PAYLOAD_MARKER";
         let mut plain = Vec::new();
         while plain.len() < 0xc000 {
@@ -1169,8 +1083,8 @@ mod tests {
 
     #[test]
     fn a_virtualizer_is_reported_without_being_emulated() {
-        // Running a virtualizer's stub cannot produce an original image — there
-        // isn't one — so the budget is not spent trying. The file is reported,
+        // Running a virtualizer's stub cannot produce an original image (there
+        // isn't one), so the budget is not spent trying. The file is reported,
         // as before, with no bytes invented.
         let outer = build_pe(&[b".vmp0", b".vmp1"], b"whatever", 0);
         let mut b = Budget::new(Limits::default());
@@ -1215,7 +1129,7 @@ mod tests {
         let inner = build_pe(&[b".text"], &inner_body, 0);
 
         // Pack it with the aPLib encoder and lay the stream into an NsPack-named
-        // outer PE section — exactly the shape the extractor expects.
+        // outer PE section: exactly the shape the extractor expects.
         let packed_stream = aplib::encoder::pack(&inner);
         let outer = build_pe(&[b".nsp0", b".nsp1"], &packed_stream, 1);
 
@@ -1238,12 +1152,12 @@ mod tests {
 
     #[test]
     fn detected_non_aplib_packer_is_reported_not_silently_dropped() {
-        // ASPack is detected but not decompressed. Nothing may be *fabricated* —
-        // the entry carries no data — but the file must not scan clean either:
+        // ASPack is detected but not decompressed. Nothing may be *fabricated*
+        // (the entry carries no data), but the file must not scan clean either:
         // the original image is present in the packed bytes and was not
         // examined, so it is surfaced as unsupported (→ UNSCANNABLE).
         //
-        // The opposite contract — returning no entries — would let a packed
+        // The opposite contract (returning no entries) would let a packed
         // dropper report OK, which is how a differential run against clamd
         // surfaces a real miss on UPX- and MPRESS-packed samples.
         let outer = build_pe(&[b".aspack", b".adata"], b"whatever", 0);
@@ -1304,6 +1218,143 @@ mod tests {
         out[..2].copy_from_slice(b"MZ");
         out[0x3C..0x40].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         assert!(!looks_like_pe(&out));
+    }
+
+    /// Where `build_pe` puts the optional header and the section table.
+    const OPT: usize = 0x80 + 24;
+    const TABLE: usize = OPT + 0xe0;
+
+    fn set32(d: &mut [u8], at: usize, v: u32) {
+        d[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// A PE with one section at RVA 0x1000, `vsize` long in memory, `raw`
+    /// bytes in the file, holding an import table at its start and its
+    /// thunks (three imports) `thunks` bytes into the section.
+    fn pe_with_imports(vsize: u32, raw: usize, thunks: usize) -> Vec<u8> {
+        let mut body = vec![0u8; raw];
+        let rva = (0x1000 + thunks as u32).to_le_bytes();
+        body[..4].copy_from_slice(&rva);
+        body[16..20].copy_from_slice(&rva);
+        for i in 0..3 {
+            body[thunks + i * 4..thunks + 4 + i * 4].copy_from_slice(&1u32.to_le_bytes());
+        }
+        let mut d = build_pe(&[b".text"], &body, 0);
+        set32(&mut d, TABLE + 8, vsize);
+        set32(&mut d, OPT + 92, 16);
+        set32(&mut d, OPT + 96 + 8, 0x1000);
+        d
+    }
+
+    /// An RVA past the virtual size is read from the file while it is in
+    /// the page of the virtual size and in the raw data: an entry point
+    /// there is read, one past the page is not.
+    #[test]
+    fn an_rva_past_the_virtual_size_is_mapped_to_the_end_of_its_page() {
+        let mut body = vec![0u8; 0x200];
+        // `mov esi, imm32` at RVA 0x1010.
+        body[0x10..0x15].copy_from_slice(&[0xbe, 1, 2, 3, 4]);
+        let mut d = build_pe(&[b".text"], &body, 0);
+        set32(&mut d, TABLE + 8, 0x10);
+        set32(&mut d, OPT + 16, 0x1010);
+        let pe = Pe::parse(&d).unwrap();
+        assert_eq!(identify(&pe), Some(Packer::Fsg));
+
+        // The raw data goes on past the page: not mapped there.
+        let mut d = build_pe(&[b".text"], &[0u8; 0x2000], 0);
+        set32(&mut d, TABLE + 8, 0x10);
+        let pe = Pe::parse(&d).unwrap();
+        assert!(pe.rva_to_off(0x1fff).is_some());
+        assert!(pe.rva_to_off(0x2000).is_none());
+    }
+
+    /// An entry point in the rest of the page of its section is in the
+    /// section.
+    #[test]
+    fn a_section_reaches_to_the_end_of_its_page() {
+        let mut d = build_pe(&[b".text"], &[0u8; 0x200], 0);
+        set32(&mut d, TABLE + 8, 0x10);
+        set32(&mut d, OPT + 16, 0x1100);
+        assert!(!looks_packed(&d));
+        // Past the page, no section has it.
+        set32(&mut d, OPT + 16, 0x2000);
+        assert!(looks_packed(&d));
+    }
+
+    fn imports(d: &[u8]) -> u32 {
+        import_count(&Pe::parse(d).unwrap(), d)
+    }
+
+    /// The thunks of an import table are read while they are in the page of
+    /// the virtual size of their section.
+    #[test]
+    fn imports_are_read_to_the_end_of_the_page_of_the_virtual_size() {
+        assert_eq!(imports(&pe_with_imports(0x200, 0x200, 0x100)), 3);
+        assert_eq!(imports(&pe_with_imports(0x20, 0x200, 0x100)), 3);
+        assert_eq!(imports(&pe_with_imports(0x20, 0x2000, 0xf00)), 3);
+        assert_eq!(imports(&pe_with_imports(0x20, 0x2000, 0x1100)), 0);
+    }
+
+    /// The loader maps the headers: an import table below the size of
+    /// headers is read.
+    #[test]
+    fn an_import_table_in_the_headers_is_read() {
+        let mut d = build_pe(&[b".text"], &[0u8; 0x100], 0);
+        // The room between the section table, which ends at 0x1a0, and 0x200.
+        set32(&mut d, 0x1a0, 0x1c8);
+        set32(&mut d, 0x1a0 + 16, 0x1c8);
+        for i in 0..3 {
+            set32(&mut d, 0x1c8 + i * 4, 1);
+        }
+        set32(&mut d, OPT + 92, 16);
+        set32(&mut d, OPT + 96 + 8, 0x1a0);
+        assert_eq!(imports(&d), 0);
+        set32(&mut d, OPT + 60, 0x200);
+        assert_eq!(imports(&d), 3);
+    }
+
+    /// An RVA is read from the first section that maps it, which is not
+    /// always the first that holds it.
+    #[test]
+    fn an_rva_is_read_from_the_first_section_that_maps_it() {
+        // Two sections overlap: the first has no raw data, the second does.
+        let mut body = vec![0u8; 0x100];
+        body[..4].copy_from_slice(&0x1040u32.to_le_bytes());
+        body[16..20].copy_from_slice(&0x1040u32.to_le_bytes());
+        for i in 0..3 {
+            body[0x40 + i * 4..0x44 + i * 4].copy_from_slice(&1u32.to_le_bytes());
+        }
+        let mut d = build_pe(&[b".a", b".b"], &body, 1);
+        set32(&mut d, TABLE + 40 + 12, 0x1000);
+        set32(&mut d, OPT + 92, 16);
+        set32(&mut d, OPT + 96 + 8, 0x1000);
+        assert_eq!(imports(&d), 3);
+    }
+
+    /// The data directories of a PE32+ are where PE32+ puts them.
+    #[test]
+    fn a_pe32_plus_has_its_directories_at_its_own_offset() {
+        let mut d = pe_with_imports(0x200, 0x200, 0x100);
+        set32(&mut d, OPT + 92, 0);
+        set32(&mut d, OPT + 96 + 8, 0);
+        d[OPT..OPT + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        set32(&mut d, OPT + 108, 16);
+        set32(&mut d, OPT + 112 + 8, 0x1000);
+        let pe = Pe::parse(&d).unwrap();
+        assert_eq!(pe.import_rva, 0x1000);
+        assert_eq!(imports(&d), 3);
+    }
+
+    /// A field past the end of the optional header is not read from the
+    /// bytes that follow it, which are the section table.
+    #[test]
+    fn the_optional_header_ends_where_it_says() {
+        let mut d = pe_with_imports(0x200, 0x200, 0x100);
+        // 0x60 bytes: the directory count is the last field inside.
+        d[OPT - 24 + 4 + 16..OPT - 24 + 4 + 18].copy_from_slice(&0x60u16.to_le_bytes());
+        d.copy_within(TABLE..TABLE + 40, OPT + 0x60);
+        let pe = Pe::parse(&d).unwrap();
+        assert_eq!(pe.import_rva, 0);
     }
 
     #[test]

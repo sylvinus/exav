@@ -5,7 +5,7 @@
 //!
 //! Found by differential testing: three corpus documents where `clamd` reported
 //! `Heuristics.OLE2.ContainsMacros.VBA` and exav reported nothing. Their CFB
-//! directory holds five streams and no VBA storage — the macro project is a
+//! directory holds five streams and no VBA storage: the macro project is a
 //! 10,752-byte compound file deflated inside one record.
 //!
 //! The fixtures here are built rather than vendored, so each one isolates a
@@ -98,7 +98,7 @@ fn a_stored_object_is_recovered() {
 
 /// A container's body is more records, so the walk must step *into* it rather
 /// than over it. Skipping containers would leave anything nested unreachable,
-/// which is the whole defect this suite covers — so the fixture buries the
+/// which is the whole defect this suite covers, so the fixture buries the
 /// object three levels down.
 #[test]
 #[cfg(feature = "ole")]
@@ -173,7 +173,7 @@ fn an_object_damaged_part_way_keeps_what_decoded_before_the_damage() {
 /// The tail is deliberately incompressible, so the encoder emits many blocks
 /// and the marker at the front is complete well before the cut. A small,
 /// highly compressible payload would be one block, and truncating that yields
-/// nothing at all — which is correct behaviour, just not what this is testing.
+/// nothing at all, which is correct behaviour, just not what this is testing.
 #[test]
 #[cfg(feature = "ole")]
 fn a_truncated_deflate_stream_still_yields_what_it_decoded() {

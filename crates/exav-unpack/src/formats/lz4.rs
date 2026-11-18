@@ -1,4 +1,4 @@
-//! LZ4 — the frame format (`.lz4`).
+//! LZ4: the frame format (`.lz4`).
 //!
 //! 7-Zip ZS, PeaZip and every Unix box with `lz4(1)` open these, and the codec
 //! turns up inside other containers often enough that a standalone frame is an
@@ -106,8 +106,8 @@ pub(crate) fn block(src: &[u8], out: &mut Vec<u8>, cap: usize) -> Result<(), &'s
         if out.len() + len > cap {
             return Err("LZ4 frame exceeds the size budget");
         }
-        // Overlapping matches are legal and common — a run of one byte is
-        // encoded as offset 1 — so this copies byte by byte on purpose.
+        // Overlapping matches are legal and common (a run of one byte is
+        // encoded as offset 1), so this copies byte by byte on purpose.
         let start = out.len() - offset;
         for k in 0..len {
             let b = out[start + k];
@@ -115,6 +115,187 @@ pub(crate) fn block(src: &[u8], out: &mut Vec<u8>, cap: usize) -> Result<(), &'s
         }
     }
     Ok(())
+}
+
+/// Where [`BlockReader`] is in a block.
+enum Seq {
+    /// At the token of a sequence.
+    Token,
+    /// In the literals of a sequence: how many are left, and the token whose
+    /// low nibble is the length of the match that follows them, unless they
+    /// are the block's last.
+    Literals(usize, u8),
+    /// In a match: how many bytes are left to copy, and from how far back.
+    Match(usize, usize),
+    Done,
+}
+
+/// One LZ4 block (no frame) read as it is decoded, for a block whose output
+/// is too long to hold: what is held is the block's input, the last 64 KiB of
+/// output, which a match can reach, and what the caller has not read yet. The
+/// block ends after `want` bytes, as a partial decode of a block does, and the
+/// rest of its input is left unread. Its bytes and its errors are those of
+/// [`block`]: a bad offset is `InvalidData`, input that ends before `want`
+/// bytes were made is `UnexpectedEof`, and the bytes before an error are read
+/// before it.
+#[cfg_attr(not(feature = "erofs"), allow(dead_code))]
+pub(crate) struct BlockReader {
+    src: Vec<u8>,
+    at: usize,
+    /// The output kept: the last [`HISTORY`] bytes, then those not yet read.
+    out: Vec<u8>,
+    read: usize,
+    /// How many bytes of output were dropped from `out`.
+    dropped: u64,
+    /// How many more bytes the block gives.
+    left: u64,
+    seq: Seq,
+    /// The error that ends the block, to come after the bytes before it.
+    failed: Option<std::io::Error>,
+}
+
+#[cfg_attr(not(feature = "erofs"), allow(dead_code))]
+impl BlockReader {
+    pub(crate) fn new(src: Vec<u8>, want: u64) -> Self {
+        BlockReader {
+            src,
+            at: 0,
+            out: Vec::new(),
+            read: 0,
+            dropped: 0,
+            left: want,
+            seq: if want == 0 { Seq::Done } else { Seq::Token },
+            failed: None,
+        }
+    }
+
+    /// A length: `n`, and the bytes of an extension where it is 15.
+    fn length(&mut self, n: usize) -> Result<usize, std::io::Error> {
+        let mut len = n;
+        if n == 15 {
+            loop {
+                let b = *self.src.get(self.at).ok_or_else(truncated)?;
+                self.at += 1;
+                len = len.saturating_add(b as usize);
+                if b != 255 {
+                    break;
+                }
+            }
+        }
+        Ok(len)
+    }
+
+    /// Decode a piece of the block onto `out`: at most `room` bytes of
+    /// literals or of a match.
+    fn step(&mut self, room: usize) -> Result<(), std::io::Error> {
+        let left = usize::try_from(self.left).unwrap_or(usize::MAX);
+        match self.seq {
+            Seq::Done => {}
+            Seq::Token => {
+                let token = *self.src.get(self.at).ok_or_else(truncated)?;
+                self.at += 1;
+                let lit = self.length((token >> 4) as usize)?;
+                if self.at.checked_add(lit).is_none_or(|e| e > self.src.len()) {
+                    return Err(invalid("LZ4 literals run past the block"));
+                }
+                self.seq = Seq::Literals(lit, token);
+            }
+            Seq::Literals(n, token) => {
+                let take = n.min(room).min(left);
+                self.out
+                    .extend_from_slice(&self.src[self.at..self.at + take]);
+                self.at += take;
+                self.left -= take as u64;
+                let n = n - take;
+                if self.left == 0 {
+                    self.seq = Seq::Done;
+                } else if n > 0 {
+                    self.seq = Seq::Literals(n, token);
+                } else if self.at >= self.src.len() {
+                    // The block's last sequence is literals only, and the
+                    // block is short of what was wanted.
+                    return Err(truncated());
+                } else {
+                    let bytes = self.src.get(self.at..self.at + 2).ok_or_else(truncated)?;
+                    let offset = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+                    self.at += 2;
+                    let made = self.dropped + self.out.len() as u64;
+                    if offset == 0 || offset as u64 > made {
+                        return Err(invalid("LZ4 match points before the start of the block"));
+                    }
+                    // The minimum match is 4 bytes, so the length is biased by it.
+                    let len = self.length((token & 0x0F) as usize)?.saturating_add(4);
+                    self.seq = Seq::Match(len, offset);
+                }
+            }
+            Seq::Match(n, offset) => {
+                let take = n.min(room).min(left);
+                // The copy may overlap what it writes. The last 64 KiB are
+                // kept, so `offset` is in `out`.
+                let start = self.out.len() - offset;
+                if offset >= take {
+                    self.out.extend_from_within(start..start + take);
+                } else {
+                    for k in 0..take {
+                        let b = self.out[start + k];
+                        self.out.push(b);
+                    }
+                }
+                self.left -= take as u64;
+                let n = n - take;
+                self.seq = if self.left == 0 {
+                    Seq::Done
+                } else if n > 0 {
+                    Seq::Match(n, offset)
+                } else {
+                    Seq::Token
+                };
+            }
+        }
+        Ok(())
+    }
+}
+
+fn truncated() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "LZ4 block ends before its output does",
+    )
+}
+
+fn invalid(why: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, why)
+}
+
+impl std::io::Read for BlockReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.out.len() - self.read < buf.len()
+            && self.failed.is_none()
+            && !matches!(self.seq, Seq::Done)
+        {
+            let want = buf.len() - (self.out.len() - self.read);
+            if let Err(e) = self.step(want.max(4096)) {
+                self.failed = Some(e);
+            }
+        }
+        let n = buf.len().min(self.out.len() - self.read);
+        if n == 0 {
+            return self.failed.take().map_or(Ok(0), Err);
+        }
+        buf[..n].copy_from_slice(&self.out[self.read..self.read + n]);
+        self.read += n;
+        // Keep only what a match can still reach.
+        if self.read > 2 * HISTORY {
+            let drop = self.read - HISTORY;
+            self.out.drain(..drop);
+            self.read -= drop;
+            self.dropped += drop as u64;
+        }
+        Ok(n)
+    }
 }
 
 /// Read the frame header, returning where the block data starts and whether each
@@ -153,11 +334,11 @@ const MAX_BLOCK_READ: usize = 16 * 1024 * 1024;
 
 /// Walk an `.lz4` file: one member, decoded as it is read. The decoder holds
 /// one block and the 64 KiB a match can reach back into.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut crate::Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, crate::LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, crate::LimitHit> {
     use crate::stream::{emit_stream, single_meta};
     budget.count_entry()?;
     match content_reader(src) {
@@ -385,5 +566,190 @@ mod tests {
             super::content_reader(&src).err(),
             Some("LZ4 input could not be read")
         );
+    }
+
+    use super::{BlockReader, HISTORY, block};
+    use std::io::Read;
+
+    /// An LZ4 block of `data`, by a greedy match finder: the kinds of sequence
+    /// a real encoder makes (long literals, long matches, overlapping ones).
+    fn encode(data: &[u8]) -> Vec<u8> {
+        fn sequence(out: &mut Vec<u8>, lits: &[u8], m: Option<(usize, usize)>) {
+            let ext = |out: &mut Vec<u8>, mut n: usize| {
+                while n >= 255 {
+                    out.push(255);
+                    n -= 255;
+                }
+                out.push(n as u8);
+            };
+            let mlen = m.map_or(0, |(_, l)| l - 4);
+            out.push((lits.len().min(15) as u8) << 4 | mlen.min(15) as u8);
+            if lits.len() >= 15 {
+                ext(out, lits.len() - 15);
+            }
+            out.extend_from_slice(lits);
+            if let Some((offset, _)) = m {
+                out.extend_from_slice(&(offset as u16).to_le_bytes());
+                if mlen >= 15 {
+                    ext(out, mlen - 15);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let mut table = std::collections::HashMap::new();
+        let (mut i, mut anchor) = (0, 0);
+        while i + 9 <= data.len() {
+            let key = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+            let prev = table.insert(key, i);
+            match prev.filter(|&p| i - p <= 65535 && data[p..p + 4] == data[i..i + 4]) {
+                Some(p) => {
+                    let mut len = 4;
+                    while i + len < data.len() - 5 && data[p + len] == data[i + len] {
+                        len += 1;
+                    }
+                    sequence(&mut out, &data[anchor..i], Some((i - p, len)));
+                    i += len;
+                    anchor = i;
+                }
+                None => i += 1,
+            }
+        }
+        sequence(&mut out, &data[anchor..], None);
+        out
+    }
+
+    /// Text with phrases that come back near and far, and runs.
+    fn sample(n: usize) -> Vec<u8> {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut out: Vec<u8> = Vec::new();
+        while out.len() < n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            match (x % 5, out.len()) {
+                (0, len) if len > 100 => {
+                    let back = 1 + (x >> 8) as usize % len.min(65535);
+                    for _ in 0..(4 + (x >> 40) as usize % 400) {
+                        out.push(out[out.len() - back]);
+                    }
+                }
+                (1, _) => out.extend(std::iter::repeat_n(
+                    (x >> 20) as u8,
+                    1 + (x >> 30) as usize % 700,
+                )),
+                (2, _) => out.push((x >> 24) as u8),
+                _ => out.extend_from_slice(b"the quick brown fox jumps "),
+            }
+        }
+        out.truncate(n);
+        out
+    }
+
+    fn read_all(mut r: impl Read, chunk: usize) -> (Vec<u8>, bool) {
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; chunk];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => return (out, true),
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(_) => return (out, false),
+            }
+        }
+    }
+
+    /// Read as it goes, a block gives what [`block`] gives, whatever the size
+    /// of the reads, and a block cut at `want` gives that many bytes.
+    #[test]
+    fn a_block_read_as_it_goes_is_the_block_decoded() {
+        for n in [1000, 70_000, 400_000] {
+            let data = sample(n);
+            let enc = encode(&data);
+            let mut whole = Vec::new();
+            block(&enc, &mut whole, usize::MAX).unwrap();
+            assert!(whole == data, "{n}: the encoder");
+            for chunk in [1, 7, 4096, 100_000] {
+                let (got, ok) = read_all(BlockReader::new(enc.clone(), n as u64), chunk);
+                assert!(ok && got == data, "{n} bytes, reads of {chunk}");
+            }
+            for want in [1, n / 3, n - 1] {
+                let (got, ok) = read_all(BlockReader::new(enc.clone(), want as u64), 999);
+                assert!(ok && got == data[..want], "{n} bytes, cut at {want}");
+            }
+        }
+    }
+
+    /// A damaged block gives the bytes [`block`] had made when it failed, and
+    /// then fails, and one that ends early is the error and not a short block.
+    #[test]
+    fn a_damaged_block_gives_what_came_before_the_damage() {
+        let data = sample(50_000);
+        let enc = encode(&data);
+        let mut x = 12345u32;
+        let mut next = || {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            (x >> 8) as usize
+        };
+        for round in 0..400 {
+            let mut bad = enc.clone();
+            match round % 3 {
+                0 => bad.truncate(next() % bad.len()),
+                1 => {
+                    for _ in 0..1 + next() % 3 {
+                        let at = next() % bad.len();
+                        bad[at] ^= 1 << (next() % 8);
+                    }
+                }
+                _ => {
+                    let at = next() % bad.len();
+                    bad[at..].fill(0xFF);
+                }
+            }
+            let mut want = Vec::new();
+            let whole = block(&bad, &mut want, usize::MAX);
+            // Asked for more than the block makes, the reader makes the same
+            // bytes and fails, unless the block was well formed.
+            let (got, ok) = read_all(BlockReader::new(bad.clone(), want.len() as u64 + 1), 333);
+            assert!(got == want, "round {round}: the bytes before the end");
+            assert!(
+                !ok,
+                "round {round}: asked for a byte more than the block has"
+            );
+            if whole.is_ok() {
+                let (got, ok) = read_all(BlockReader::new(bad, want.len() as u64), 333);
+                assert!(ok && got == want, "round {round}: a block that decodes");
+            }
+        }
+    }
+
+    /// What is held is the input, the 64 KiB a match reaches, and what has not
+    /// been read: a block that is 16 MiB of one byte is read through a
+    /// window.
+    #[test]
+    fn a_long_block_is_read_through_a_window() {
+        let n = 16 << 20;
+        let mut data = vec![7u8; n];
+        data[..9].copy_from_slice(b"beginning");
+        data[n - 3..].copy_from_slice(b"end");
+        let enc = encode(&data);
+        assert!(enc.len() < 100_000, "{}", enc.len());
+        let mut r = BlockReader::new(enc, n as u64);
+        let mut buf = vec![0u8; 4096];
+        let (mut total, mut most) = (0usize, 0usize);
+        let mut tail = Vec::new();
+        loop {
+            let got = r.read(&mut buf).unwrap();
+            if got == 0 {
+                break;
+            }
+            total += got;
+            most = most.max(r.out.capacity());
+            tail.extend_from_slice(&buf[..got]);
+            tail.drain(..tail.len().saturating_sub(3));
+        }
+        assert_eq!(total, n);
+        assert_eq!(tail, b"end");
+        // The window and what is read at once, with the slack of a growing
+        // vector, and not the 16 MiB of the block.
+        assert!(most <= 6 * HISTORY, "the window held {most} bytes");
     }
 }

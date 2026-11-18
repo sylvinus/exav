@@ -37,6 +37,11 @@ const M_DEFLATE: u8 = 15;
 /// than once (a copy sits in the overlay near EOF); we take the first candidate
 /// whose first block is well-formed. Returns the `l_info` start offset.
 pub(crate) fn find_packheader(data: &[u8]) -> Option<usize> {
+    find_packheader_in(data, data.len())
+}
+
+/// [`find_packheader`] in `data`, the start of an object of `len` bytes.
+pub(crate) fn find_packheader_in(data: &[u8], len: usize) -> Option<usize> {
     let mut search = 0usize;
     while let Some(rel) = memchr::memmem::find(&data[search..], b"UPX!") {
         let magic = search + rel;
@@ -59,7 +64,7 @@ pub(crate) fn find_packheader(data: &[u8]) -> Option<usize> {
             || sz_cpr == 0
             || filesize == 0
             || sz_unc > (256 << 20)
-            || (bi + 12).saturating_add(sz_cpr as usize) > data.len()
+            || (bi + 12).saturating_add(sz_cpr as usize) > len
         {
             continue;
         }
@@ -91,11 +96,7 @@ fn looks_upx(data: &[u8]) -> bool {
 /// reader, which needs the header to find the compressed blocks, but it does not
 /// defeat the stub, which still has to decompress the image to run it. Only
 /// when that comes back empty too is the file reported unopened.
-fn report_packed<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+fn report_packed(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     #[cfg(feature = "pe-emu")]
     {
         match super::pepack::emulated_unpack(data, budget, visit, "UPX")? {
@@ -142,7 +143,9 @@ fn adler32(data: &[u8]) -> u32 {
 /// A decode is accepted only when it yields exactly `u_len` bytes, and one
 /// that also reproduces the recorded Adler-32 (`u_adler`) wins over one that
 /// does not ([`packheader_image`]).
-pub(crate) fn has_packheader_layout(data: &[u8]) -> bool {
+///
+/// `data` is the start of an object of `len` bytes.
+pub(crate) fn has_packheader_layout_in(data: &[u8], len: usize) -> bool {
     let mut search = 0usize;
     while let Some(rel) = memchr::memmem::find(&data[search..], b"UPX!") {
         let m = search + rel;
@@ -155,7 +158,7 @@ pub(crate) fn has_packheader_layout(data: &[u8]) -> bool {
         let c_len = u32_le(data, m + 20) as usize;
         if u_len != 0
             && c_len != 0
-            && c_len <= data.len() - (m + 32)
+            && c_len <= len.saturating_sub(m + 32)
             && matches!(method, M_NRV2B | M_NRV2D | M_NRV2E)
         {
             return true;
@@ -350,11 +353,7 @@ fn first_section_rva(data: &[u8]) -> Option<u32> {
     Some(u32_le(data, st + 12))
 }
 
-pub(crate) fn extract_upx<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_upx(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     let Some(li) = find_packheader(data) else {
         // No `l_info` chain. Try the PackHeader layout before giving up; if that
         // fails too and the image still advertises UPX, the payload is there and
@@ -565,7 +564,7 @@ impl<'a> Br<'a> {
     fn bit(&mut self) -> Result<u32, LimitHit> {
         if self.bc == 0 {
             if self.ip + 4 > self.src.len() {
-                return Err(LimitHit::new(NRV_UNDERRUN.into()));
+                return Err(LimitHit::corrupt(NRV_UNDERRUN.into()));
             }
             self.bb = u32::from_le_bytes([
                 self.src[self.ip],
@@ -584,7 +583,7 @@ impl<'a> Br<'a> {
         let b = *self
             .src
             .get(self.ip)
-            .ok_or_else(|| LimitHit::new(NRV_UNDERRUN.into()))?;
+            .ok_or_else(|| LimitHit::corrupt(NRV_UNDERRUN.into()))?;
         self.ip += 1;
         Ok(b as usize)
     }
@@ -600,7 +599,7 @@ fn copy_match(
     dst_len: usize,
 ) -> Result<bool, LimitHit> {
     if off == 0 || off > out.len() {
-        return Err(LimitHit::new("upx nrv: bad back-reference".into()));
+        return Err(LimitHit::corrupt("upx nrv: bad back-reference".into()));
     }
     let start = out.len() - off;
     for k in 0..count {
@@ -899,6 +898,24 @@ mod tests {
                 assert_eq!(got.unwrap() as u64, m);
             }
         }
+    }
+
+    /// A packed stream that runs out of input, or points before its own start,
+    /// is damage, not a limit.
+    #[test]
+    fn a_damaged_nrv_stream_is_damage_not_a_limit() {
+        let mut out = Vec::new();
+        for src in [&[][..], &[0xff; 3][..]] {
+            let e = nrv2b_decompress(src, 100, &mut out).expect_err("no input");
+            assert!(e.is_corrupt(), "{}", e.reason);
+        }
+        let e = copy_match(&mut vec![1, 2, 3], 4, 2, 100).expect_err("before the start");
+        assert!(e.is_corrupt(), "{}", e.reason);
+        // The byte read of a stream whose bit buffer is full but whose literal
+        // is missing: one word of 1 bits (literal flags), no byte after.
+        let e = nrv2b_decompress(&[0xff, 0xff, 0xff, 0xff], 100, &mut out)
+            .expect_err("no literal byte");
+        assert!(e.is_corrupt(), "{}", e.reason);
     }
 
     #[test]

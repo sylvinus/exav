@@ -7,7 +7,7 @@
  * controllers, for a host drawing every piece itself.
  */
 export { ViewerProvider, useViewer, type ViewerProviderProps } from "./context.js";
-export { ViewerBody, type ViewerBodyProps } from "./ViewerBody.js";
+export { ViewerBody, type ViewerBodyHandle, type ViewerBodyProps } from "./ViewerBody.js";
 export { ViewerDialog, type ViewerDialogItem, type ViewerDialogProps } from "./ViewerDialog.js";
 export { useFullscreen, usePanel, useSession, useStore, type PanelInfo } from "./hooks.js";
 export { reactOverlay } from "./overlay.js";

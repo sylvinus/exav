@@ -23,7 +23,7 @@ use std::io::Write;
 const MACRO_SIG_BODY: &[u8] = b"Attribute VB_Name = \"exavProbeModule\"";
 
 /// Carried by the builtin baseline, so a scanner with no database still detects
-/// it — which is what lets the depth test below use `Scanner::builtin()`.
+/// it, which is what lets the depth test below use `Scanner::builtin()`.
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()
 }
@@ -40,7 +40,7 @@ fn scanner() -> Scanner {
 }
 
 /// An OLE2 document carrying the macro text in a stream. The stream itself is
-/// plain text, so content detection alone would type it as text — which is
+/// plain text, so content detection alone would type it as text, which is
 /// precisely why the container's type has to be forced onto it.
 fn ole_with_macro() -> Vec<u8> {
     let cursor = std::io::Cursor::new(Vec::<u8>::new());
@@ -83,7 +83,7 @@ fn allmatch_is_a_superset_of_a_normal_scan() {
     );
 }
 
-/// A PE header claiming 40 sections it does not have — `pe::looks_broken`.
+/// A PE header claiming 40 sections it does not have (`pe::looks_broken`).
 fn broken_pe() -> Vec<u8> {
     let mut out = b"MZ".to_vec();
     out.extend(std::iter::repeat_n(0u8, 58));
@@ -102,8 +102,8 @@ fn broken_pe() -> Vec<u8> {
 #[test]
 fn allmatch_runs_the_same_heuristics_as_a_normal_scan() {
     // The superset invariant is not only about signatures. Every heuristic the
-    // walk runs — broken executables, broken media, partition intersection, the
-    // PDF obfuscated-name check, DLP, phishing, Authenticode — has to run under
+    // walk runs (broken executables, broken media, partition intersection, the
+    // PDF obfuscated-name check, DLP, phishing, Authenticode) has to run under
     // `--all-matches` too, and each is a separate place a second traversal could
     // silently omit one. Sharing one walk is what makes that structural; this
     // pins it against a representative pair.
@@ -164,7 +164,7 @@ fn allmatch_reports_structured_data_findings() {
 /// end, so nothing short of reaching the end finds it.
 ///
 /// Committed as fixtures rather than built in the test because only gzip has a
-/// pure-Rust encoder in the dependency graph — `xz2` and `bzip2` are bindings to
+/// pure-Rust encoder in the dependency graph: `xz2` and `bzip2` are bindings to
 /// C libraries, and exav does not take those, not even for tests. They are tiny
 /// (124 B to 6 KiB) precisely because the body compresses so well, which is the
 /// property under test.
@@ -181,12 +181,23 @@ fn compressor_fixture(name: &str) -> Vec<u8> {
 fn every_single_stream_compressor_streams_its_content() {
     // gzip, bzip2 and xz are the same shape: one stream whose output can be
     // orders of magnitude larger than the file. Each has to be walked as a
-    // stream, or content past the per-member cap is never reached — and then
+    // stream, or content past the per-member cap is never reached, and then
     // which compressor a payload happens to be wrapped in decides whether it is
     // found, which is not a property a scanner may have.
     let db = Scanner::builtin();
+    // A member over the object limit is spilled; with no spill only its first
+    // bytes are examined and the limit is reported.
+    let spill = || -> Option<std::sync::Arc<dyn exav_core::unpack::spill::Spill>> {
+        Some(std::sync::Arc::new(
+            exav_core::unpack::spill::MemSpill::new(),
+        ))
+    };
     let mut opts = ScanOptions::default();
     opts.limits.max_buffer_bytes = 1024 * 1024;
+    opts.spill = spill();
+    // The fixtures decompress 1000 times over and more, which is what the
+    // ratio limit is for: it is lifted, the cap under test is the buffer's.
+    opts.limits.max_compression_ratio = u64::MAX;
 
     for name in ["p.gz", "p.bz2", "p.xz"] {
         let blob = compressor_fixture(name);
@@ -200,6 +211,17 @@ fn every_single_stream_compressor_streams_its_content() {
             matches!(v, exav_core::Verdict::Infected { .. }),
             "{name} did not reach content past the per-member cap: {v:?}"
         );
+        // With the ratio limit as it is by default, the stream is a bomb by
+        // its ratio: reported, never scanned clean.
+        let mut by_default = ScanOptions::default();
+        by_default.limits.max_buffer_bytes = 1024 * 1024;
+        by_default.spill = spill();
+        match analyze(&db, &blob, &by_default).verdict {
+            exav_core::Verdict::LimitsExceeded { reason } => {
+                assert!(reason.contains("compression ratio"), "{name}: {reason}");
+            }
+            other => panic!("{name}: expected the ratio limit, got {other:?}"),
+        }
     }
 }
 
@@ -244,9 +266,15 @@ fn nesting_depth_does_not_change_what_a_scan_finds() {
     let inner = zip_with_oversized_member(eicar());
     let nested = tar_wrapping("inner.zip", &inner);
     // A cap far below the member's decompressed size, so buffering cannot reach
-    // the payload at its end.
+    // the payload at its end. The ratio limit is lifted: the member inflates
+    // 1000 times over, and the cap under test is the buffer's.
     let mut opts = ScanOptions::default();
     opts.limits.max_buffer_bytes = 1024 * 1024;
+    opts.limits.max_compression_ratio = u64::MAX;
+    // Past the cap the member is spilled, at each depth.
+    opts.spill = Some(std::sync::Arc::new(
+        exav_core::unpack::spill::MemSpill::new(),
+    ));
 
     let flat = analyze(&db, &inner, &opts).verdict;
     let deep = analyze(&db, &nested, &opts).verdict;
@@ -283,7 +311,7 @@ fn a_streamed_container_gets_the_whole_object_checks_too() {
     // Some checks need the whole object rather than one member: overlapping ZIP
     // records, overlapping MBR partitions, broken media and executable headers.
     // A walk that holds one member at a time has to read the object again to
-    // run them, and a partition map is a container that takes that walk — so
+    // run them, and a partition map is a container that takes that walk, so
     // this is the case where the two ways in could disagree.
     //
     // What a scan does must not depend on how the bytes arrived.
@@ -321,7 +349,7 @@ fn zip_of_members(n: usize) -> Vec<u8> {
         // Distinct bodies so nothing can be deduplicated by content, and large
         // enough that re-scanning the archive once per member dominates the
         // timing. At 4 KiB the quadratic term is only a few hundred milliseconds
-        // against this suite's EICAR-only database — small enough that the
+        // against this suite's EICAR-only database: small enough that the
         // assertion below would not fire.
         members.push((
             format!("member{i:04}.bin"),
@@ -395,7 +423,7 @@ fn allmatch_does_not_re_carve_a_container_into_itself() {
     //
     // Every ZIP member's local file header is an embedded-archive offset. A walk
     // that carves those *and* extracts the container re-extracts the archive
-    // from each member in turn — O(members^2) — and finds nothing extraction
+    // from each member in turn (O(members^2)) and finds nothing extraction
     // has not already reached. A container's contents come from opening it.
     //
     // Asserted as a RATIO against the first-match walk over the identical input,
@@ -441,7 +469,7 @@ fn allmatch_does_not_re_carve_a_container_into_itself() {
 /// the member's bytes with a first-match sink rather than the caller's, the
 /// second signature in the same member is found by neither: the walk moves on to
 /// the next member believing this one is accounted for. The buffered walk hands
-/// its own sink down, so it reports both — the same bytes then answer
+/// its own sink down, so it reports both: the same bytes then answer
 /// differently depending on the container they sit in, which is the divergence
 /// `--all-matches` exists to not have.
 #[test]
@@ -491,7 +519,7 @@ fn allmatch_reports_every_signature_inside_a_single_streamed_member() {
     // ZIP is a streamable format, so this member arrives as a reader. Deflated,
     // not Stored: a stored member's bytes appear verbatim in the container, so
     // the top-level raw scan would find both signatures without the walk ever
-    // being involved — and the test would pass no matter what the walk did.
+    // being involved, and the test would pass no matter what the walk did.
     let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     z.start_file(
         "payload.txt",
@@ -515,7 +543,7 @@ fn allmatch_reports_every_signature_inside_a_single_streamed_member() {
 /// A YARA-only detection has to survive `--all-matches`.
 ///
 /// The two cores run their passes independently, so a matcher wired into one
-/// and not the other does not fail loudly — it returns an empty detection list
+/// and not the other does not fail loudly: it returns an empty detection list
 /// with a `Complete` outcome, which renders as OK. A file whose only detection
 /// is a YARA rule then reports clean under `--all-matches` while a normal scan
 /// calls it infected.

@@ -452,6 +452,9 @@ pub fn drawable(
         }
         ty::GROUP => {
             let Some(d) = m.msg(1) else { return Ok(None) };
+            if !r.groups.insert(id) {
+                return Ok(None);
+            }
             let (xf, w, h) = xfrm(d);
             let mut kids = vec![];
             for c in m.references(2).take(10_000) {

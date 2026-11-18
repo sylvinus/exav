@@ -21,6 +21,18 @@ const BYTES_PER_PIXEL: u64 = 12 + 4 * MAX_EXTRA_CHANNELS as u64 + 4;
 /// more is refused as too large, and each costs a float a pixel.
 const MAX_EXTRA_CHANNELS: usize = 2;
 
+/// Whether the decoder reads the headers of `data`, a bare codestream: it
+/// does, or it stops at a limit or at the end of the data before it has read
+/// them all.
+#[cfg(feature = "qr")]
+pub(super) fn has_header(data: &[u8]) -> bool {
+    use zenjxl_decoder::api::read_header_with;
+    match read_header_with(data, JxlDecoderLimits::restrictive()) {
+        Ok(_) | Err(JxlError::LimitExceeded { .. } | JxlError::OutOfBounds(_)) => true,
+        Err(_) => false,
+    }
+}
+
 pub(super) fn decode(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
     let limit = max_alloc.min(DECODE_MAX);
     let mut limits = JxlDecoderLimits::restrictive();

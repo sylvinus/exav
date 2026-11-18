@@ -236,6 +236,7 @@ pub(crate) fn read(bytes: &[u8], limits: &Limits) -> Result<Drawing, Error> {
         dwg::Error::NotDwg => Error::NotDwg,
         dwg::Error::UnsupportedVersion(v) => Error::Unsupported(v),
         dwg::Error::Damaged(why) => Error::Damaged(why),
+        dwg::Error::Encrypted => Error::Encrypted,
         dwg::Error::LimitExceeded(why) => Error::LimitExceeded(why),
     })?;
     let version = file.version();
@@ -281,6 +282,19 @@ pub(crate) fn read(bytes: &[u8], limits: &Limits) -> Result<Drawing, Error> {
     drawing.blocks = blocks::read(&mut ctx, &vars);
     objects::read(&mut ctx, &vars, &mut drawing);
     objects::link(&mut drawing);
+    // Every object's, whether or not the model holds it. One per entity at
+    // the most is the room the limits give.
+    let links = file.hyperlinks(limits.max_entities);
+    if links.cut {
+        ctx.warn(
+            WarningKind::LimitReached,
+            format!(
+                "hyperlinks past the first {} were dropped",
+                links.links.len()
+            ),
+        );
+    }
+    drawing.hyperlinks = links.links;
 
     // The header names its current entries by handle.
     let named = |h: u64, fallback: &str| -> String {

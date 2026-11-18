@@ -3,7 +3,7 @@
 //! A packer stub runs against a flat 4 GiB address space of which it touches a
 //! few megabytes: its own image, a stack, a scratch allocation or two. Backing
 //! that with a page table rather than one big buffer is what keeps a hostile
-//! `SizeOfImage` (up to 4 GiB) from being a memory bomb — pages are allocated
+//! `SizeOfImage` (up to 4 GiB) from being a memory bomb: pages are allocated
 //! only when they are first touched, and the page count is capped.
 //!
 //! Two properties matter beyond plain load/store:
@@ -78,7 +78,7 @@ pub struct Mem {
     /// "how many new pages":
     ///
     /// * A stub still unpacking sweeps across its destination, so it lights up
-    ///   many bits — including in a second pass over pages it has already
+    ///   many bits, including in a second pass over pages it has already
     ///   written, which relocation and import fixups do and which a
     ///   count-new-pages measure would read as no progress at all.
     /// * A stub spinning in an anti-emulation loop writes the same one or two
@@ -356,8 +356,8 @@ impl Mem {
     /// short buffer reports an incomplete instruction, which the emulator treats
     /// as running off the end of mapped code rather than as a hard fault.
     pub fn read_code(&mut self, addr: u32, out: &mut [u8]) -> usize {
-        // Instruction fetch is the emulator's hottest path — once per executed
-        // instruction — so it copies whole page runs rather than walking byte by
+        // Instruction fetch is the emulator's hottest path (once per executed
+        // instruction), so it copies whole page runs rather than walking byte by
         // byte through the page lookup.
         let mut n = 0;
         while n < out.len() {

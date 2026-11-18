@@ -510,13 +510,12 @@ fn parse_ref(w: &str) -> Option<Ref> {
     if row_abs {
         i += 1;
     }
-    let row: u32 = std::str::from_utf8(&b[i..]).ok()?.parse().ok()?;
-    (row >= 1 && row - 1 <= MAX_ROW && col <= MAX_COL).then_some((
-        col,
-        col_abs,
-        Some(row - 1),
-        row_abs,
-    ))
+    let row = std::str::from_utf8(&b[i..])
+        .ok()?
+        .parse::<u32>()
+        .ok()?
+        .checked_sub(1)?;
+    (row <= MAX_ROW && col <= MAX_COL).then_some((col, col_abs, Some(row), row_abs))
 }
 
 fn ref_text(a: Ref, b: Ref, t: usize, host: usize, tables: &[TableDims]) -> Option<String> {

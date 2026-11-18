@@ -1,8 +1,8 @@
 //! Parser for the `.cbc` bytecode signature format.
 //!
 //! Parses the header metadata, the triggering logical signature, the API
-//! declarations, and the functions — including the full instruction stream
-//! (see [`super::instr`]). Everything is fallible and bounded — a malformed
+//! declarations, and the functions, including the full instruction stream
+//! (see [`super::instr`]). Everything is fallible and bounded: a malformed
 //! program yields an `Err`, never a panic. *Lowering* the decoded instructions
 //! to the executable VM IR is staged separately; until that lands a program is
 //! marked [`Bytecode::executable`] = false and is never run.
@@ -69,7 +69,7 @@ pub struct Bytecode {
 }
 
 impl Bytecode {
-    /// True if every API this program uses is one exav implements — a
+    /// True if every API this program uses is one exav implements: a
     /// prerequisite (necessary, not sufficient) for ever executing it.
     pub fn apis_supported(&self) -> bool {
         self.apis.iter().all(|(_, a)| super::exec::api_supported(a))

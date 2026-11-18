@@ -8,6 +8,7 @@
 //! the byte budget the caller gives.
 
 use super::Error;
+use super::file::Problems;
 
 /// Spec 4.1: the sequence the file header at 0x80 is XORed with.
 const MAGIC: [u8; 0x6C] = {
@@ -306,11 +307,11 @@ impl<'a> Container<'a> {
     pub(super) fn open(
         data: &'a [u8],
         budget: u64,
-        problems: &mut Vec<String>,
+        problems: &mut Problems,
     ) -> Result<Container<'a>, Error> {
         let fh = file_header(data).ok_or(Error::NotDwg)?;
         if !fh.crc_ok {
-            problems.push("the file header's CRC does not match".into());
+            problems.mismatch("the file header's CRC does not match");
         }
         let mut c = Container {
             data,
@@ -352,7 +353,7 @@ impl<'a> Container<'a> {
         address: u64,
         kind: u32,
         what: &str,
-        problems: &mut Vec<String>,
+        problems: &mut Problems,
     ) -> Result<Vec<u8>, Error> {
         let damaged = || Error::Damaged(format!("the {what} is unreadable"));
         let at = usize::try_from(address).map_err(|_| damaged())?;
@@ -377,7 +378,7 @@ impl<'a> Container<'a> {
         zeroed.copy_from_slice(head);
         zeroed[16..20].fill(0);
         if checksum(checksum(0, &zeroed), body) != stored {
-            problems.push(format!("the {what} fails its checksum"));
+            problems.mismatch(format!("the {what} fails its checksum"));
         }
         if !self.take_budget(u64::from(size)) {
             return Err(Error::LimitExceeded(format!(
@@ -418,8 +419,9 @@ impl<'a> Container<'a> {
 
     /// Spec 4.5: a header of five longs, then each section's description
     /// and its pages.
-    fn read_section_map(&mut self, map: &[u8], problems: &mut Vec<String>) {
+    fn read_section_map(&mut self, map: &[u8], problems: &mut Problems) {
         let Some(count) = le32(map, 0) else {
+            problems.lost("the section map is cut short");
             return;
         };
         let mut at = 20usize;
@@ -431,11 +433,11 @@ impl<'a> Container<'a> {
                 le32(map, at + 20),
                 le32(map, at + 28),
             ) else {
-                problems.push("the section map is cut short".into());
+                problems.lost("the section map is cut short");
                 return;
             };
             let Some(raw_name) = map.get(at + 32..at + 96) else {
-                problems.push("the section map is cut short".into());
+                problems.lost("the section map is cut short");
                 return;
             };
             let end = raw_name.iter().position(|b| *b == 0).unwrap_or(64);
@@ -444,7 +446,7 @@ impl<'a> Container<'a> {
             // A page reference takes 16 bytes: the count cannot be more.
             let fits = (map.len().saturating_sub(at) / 16) as u64;
             if u64::from(pages) > fits {
-                problems.push("the section map is cut short".into());
+                problems.lost("the section map is cut short");
                 return;
             }
             let mut refs = Vec::with_capacity(pages as usize);
@@ -476,7 +478,7 @@ impl<'a> Container<'a> {
     pub(super) fn section(
         &mut self,
         name: &str,
-        problems: &mut Vec<String>,
+        problems: &mut Problems,
     ) -> Result<Option<Vec<u8>>, Error> {
         let Some(s) = self.section_info(name).cloned() else {
             return Ok(None);
@@ -487,7 +489,7 @@ impl<'a> Container<'a> {
         let page = s.page_size.min(MAX_PAGE);
         let most = (s.pages.len() as u64 + 1).saturating_mul(page);
         if s.size > most {
-            problems.push(format!(
+            problems.lost(format!(
                 "section {name} declares {} bytes, more than its pages hold",
                 s.size
             ));
@@ -505,26 +507,37 @@ impl<'a> Container<'a> {
         let mut out: Vec<u8> = Vec::new();
         for r in &s.pages {
             if out.len() >= size && size > 0 {
-                problems.push(format!("section {name} has pages past its end"));
+                problems.lost(format!("section {name} has pages past its end"));
                 break;
             }
             let Some(start) = usize::try_from(r.start).ok().filter(|v| *v <= size) else {
-                problems.push(format!("a page of {name} starts past the section's end"));
+                problems.lost(format!("a page of {name} starts past the section's end"));
                 break;
             };
             if start < out.len() {
-                problems.push(format!("the pages of {name} overlap"));
+                problems.lost(format!("the pages of {name} overlap"));
                 break;
             }
             // Pages of zeros are not written (spec 4.5).
             out.resize(start, 0);
             match self.data_page(&s, r, problems)? {
                 Some(mut page) => {
+                    // A page holds the section's page size (the last one
+                    // often more than what is left). A shorter one leaves a
+                    // gap that the section is zero-filled across.
+                    let want =
+                        u64::try_from(size - start).map_or(s.page_size, |n| n.min(s.page_size));
+                    if (page.len() as u64) < want {
+                        problems.lost(format!(
+                            "a page of {name} holds {} bytes, not {want}",
+                            page.len()
+                        ));
+                    }
                     page.truncate(size - start);
                     out.extend_from_slice(&page);
                 }
                 None => {
-                    problems.push(format!("a page of section {name} is unreadable"));
+                    problems.lost(format!("a page of section {name} is unreadable"));
                     break;
                 }
             }
@@ -543,7 +556,7 @@ impl<'a> Container<'a> {
         &mut self,
         s: &Section,
         r: &PageRef,
-        problems: &mut Vec<String>,
+        problems: &mut Problems,
     ) -> Result<Option<Vec<u8>>, Error> {
         let Some((address, body, mut head)) = self.page_body(r) else {
             return Ok(None);
@@ -556,7 +569,7 @@ impl<'a> Container<'a> {
         let head_sum = le32(&head, 0x18).unwrap_or(0);
         head[0x18..0x1C].fill(0);
         if checksum(0, body) != data_sum || checksum(data_sum, &head) != head_sum {
-            problems.push(format!("the page at {address:#X} fails its checksum"));
+            problems.mismatch(format!("the page at {address:#X} fails its checksum"));
         }
         let out = if s.compressed {
             let most = s.page_size.min(MAX_PAGE).min(self.budget) as usize;

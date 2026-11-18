@@ -5,7 +5,7 @@ cannot be built in a test.
 
 ## `.xor` files are masked
 
-Fixtures that a scanner detects — several here carry the EICAR test string —
+Fixtures that a scanner detects (several here carry the EICAR test string)
 are committed XORed with `0x5A` under a `.xor` suffix, so this repository is not
 quarantined on `git clone` or stripped by an AV-scanned CI runner.
 

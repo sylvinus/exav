@@ -13,14 +13,9 @@ export interface RangedEntry {
 
 /** What the renderer uses of an archive: @exav/unpack-wasm's `Archive` has it too. */
 export interface RangedArchive {
-  list(): Promise<{ index: number; name: string; uncompressedSize: number; encrypted: boolean }[]>;
+  list(): Promise<{ index: number; name: string; uncompressedSize: number; encrypted: boolean; synthetic: boolean }[]>;
   extract(index: number): Promise<RangedEntry>;
   close(): Promise<void>;
-}
-
-/** A ZIP: local headers start with "PK\x03\x04", an empty one with its end record. */
-export function isZip(head: Uint8Array): boolean {
-  return head.length >= 4 && head[0] === 0x50 && head[1] === 0x4b && ((head[2] === 3 && head[3] === 4) || (head[2] === 5 && head[3] === 6));
 }
 
 /**

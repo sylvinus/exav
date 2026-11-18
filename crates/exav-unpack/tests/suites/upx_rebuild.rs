@@ -6,13 +6,13 @@
 //!
 //! 1. **Routing.** `is_upx` gated on the `l_info`/`p_info`/`b_info` chain. This
 //!    PE instead carries a bare 32-byte `PackHeader`, whose `c_len` /
-//!    `u_file_size` fields land exactly where a `b_info`'s sizes are expected —
+//!    `u_file_size` fields land exactly where a `b_info`'s sizes are expected,
 //!    so validation failed, the file matched no unpacker at all, and it was
 //!    reported clean.
 //!
 //! 2. **The rebuild.** Decompressing is not enough. A large family of ClamAV
 //!    signatures for packed malware is an MD5 over the PE **ClamAV itself
-//!    rebuilds**, so a raw decompressed run — correct though it is — matches
+//!    rebuilds**, so a raw decompressed run (correct though it is) matches
 //!    nothing. The rebuild has to reproduce that layout exactly: the file
 //!    flattened so each file offset equals its RVA, `FileAlignment` raised to
 //!    `SectionAlignment`, each section's size rounded up, and `TimeDateStamp`
@@ -27,7 +27,7 @@
 use exav_unpack::{Budget, Format, Limits, extract};
 
 /// Assemble a minimal UPX-packed PE whose payload is a stored (uncompressed)
-/// run — enough to drive routing and the rebuild without depending on the NRV
+/// run: enough to drive routing and the rebuild without depending on the NRV
 /// decompressors, which have their own tests.
 fn packed_pe() -> Vec<u8> {
     // The inner image: one section's worth of content, then the original header
@@ -68,7 +68,7 @@ fn packed_pe() -> Vec<u8> {
     out[st + 12..st + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // first RVA
 
     // PackHeader: method 2 (NRV2B) would need a real stream, so use the stored
-    // marker the decoder rejects — this test pins routing + rebuild, and the
+    // marker the decoder rejects: this test pins routing + rebuild, and the
     // decompressors are covered elsewhere.
     let ph = out.len();
     out.extend_from_slice(b"UPX!");
@@ -86,7 +86,7 @@ fn packed_pe() -> Vec<u8> {
 
 /// A PackHeader-layout image must reach the unpacker rather than falling
 /// through every branch to a clean verdict. Whether the payload decodes is a
-/// separate question — what must never happen is silence.
+/// separate question: what must never happen is silence.
 #[test]
 fn packheader_layout_is_routed_not_ignored() {
     let blob = packed_pe();

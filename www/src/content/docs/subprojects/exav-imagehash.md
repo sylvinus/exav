@@ -18,6 +18,9 @@ It is in each [release](/scanner/getting-started/installation/#prebuilt-binaries
 cargo install exav-imagehash
 ```
 
+`--profile fast-build` is a shorter build that needs less memory, for a larger
+and slower binary (see [Installation](/scanner/getting-started/installation/#from-cratesio)).
+
 ```bash
 exav-imagehash logo.png                           # ClamAV's hash
 exav-imagehash --preset imagehash logo.png        # imagehash's

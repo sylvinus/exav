@@ -70,12 +70,12 @@ describe.runIf(fs.existsSync(path.join(root, "dist", "frame", "files.json")))("t
     expect([...all].filter((f) => !listed.has(f))).toEqual([]);
   });
 
-  it("have every engine's files for every format, and the core's alone for none", () => {
+  it("have every engine's files for every format, and the core's and the detection's alone for one whose engine has none", () => {
     for (const f of BUILTIN_ORDER) {
       const { files } = frameSubset(built, [f]);
       for (const c of built.core) expect(files.has(c), `${f}: ${c}`).toBe(true);
     }
-    expect(frameSubset(built, ["video"]).files.size).toBe(built.core.length);
+    expect(frameSubset(built, ["video"]).files).toEqual(new Set([...built.core, ...built.engines.sniff!]));
   });
 
   it("hold, with the engines each needs, every file their own code names", () => {

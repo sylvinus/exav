@@ -21,15 +21,17 @@ from the current source:
 <!-- sizes:wasm -->
 | Module | Opens | Size | Brotli | Gzip |
 | --- | --- | --- | --- | --- |
-| `exav_viewer_image` | TIFF, BMP, ICO, PNM, QOI, DDS, farbfeld, HDR, JPEG 2000, JBIG2, JPEG XL, camera RAW | 2,082,327 | 599,290 | 768,562 |
-| `exav_viewer_dwg` | DWG, DXF | 921,111 | 369,630 | 461,103 |
-| `exav_viewer_model` | IFC, STL, OBJ, PLY, glTF | 415,447 | 156,293 | 189,171 |
-| `exav_viewer_text` | Markdown | 189,431 | 69,646 | 83,509 |
-| `exav_viewer_sheets` | XLS, ODS, FODS, Numbers, SpreadsheetML 2003, HTML tables, SYLK, to XLSX | 1,215,153 | 487,591 | 596,288 |
-| `exav_viewer_slides` | PPT, ODP, FODP, Keynote, ODG, Visio (VSDX), to PPTX | 1,019,003 | 435,522 | 525,127 |
-| `exav_viewer_docs` | DOC, ODT, FODT, RTF, to DOCX | 1,020,818 | 416,529 | 512,002 |
+| `exav_viewer_image` | TIFF, BMP, ICO, PNM, QOI, DDS, farbfeld, HDR, JPEG 2000, JBIG2, JPEG XL, camera RAW | 2,073,734 | 598,898 | 768,083 |
+| `exav_viewer_dwg` | DWG, DXF | 928,993 | 372,242 | 463,779 |
+| `exav_viewer_model` | IFC, STL, OBJ, PLY, glTF | 429,005 | 160,582 | 194,763 |
+| `exav_viewer_text` | Every text file (its encoding, and whether it is text), Markdown, JSON, XML and diffs | 219,621 | 79,748 | 96,917 |
+| `exav_viewer_sheets` | XLS, ODS, FODS, Numbers, SpreadsheetML 2003, HTML tables, SYLK, to XLSX | 1,222,089 | 489,133 | 598,777 |
+| `exav_viewer_slides` | PPT, ODP, FODP, Keynote, ODG, Visio (VSDX), to PPTX | 1,021,841 | 437,345 | 526,948 |
+| `exav_viewer_docs` | DOC, ODT, FODT, RTF, to DOCX | 1,028,254 | 419,879 | 515,186 |
+| `exav_viewer_table` | CSV, TSV, to XLSX | 253,488 | 104,787 | 120,814 |
+| `exav_viewer_sniff` | What a file is, from its first bytes (exav's own detection), a DOCX, XLSX or PPTX's ZIP directory (exav-unpack's ZIP reader), and which Office formats a compound file or a ZIP is | 161,752 | 77,053 | 86,567 |
 | `openjpeg_nowasm_fallback.js` | JPEG 2000 images in PDFs (pdf.js's JPXDecode), the module in base64 | 269,813 | 83,250 | 100,297 |
-| `jbig2_nowasm_fallback.js` | JBIG2 and CCITT fax images in PDFs, the module in base64 | 317,903 | 69,613 | 87,921 |
+| `jbig2_nowasm_fallback.js` | JBIG2 and CCITT fax images in PDFs, the module in base64 | 317,903 | 69,655 | 87,924 |
 <!-- /sizes:wasm -->
 
 Sizes are in bytes, of the files in the package's `wasm/`; a server that
@@ -84,10 +86,10 @@ format. The table is written from the build (`npm run sizes`):
 <!-- sizes:peers -->
 | Peer | Range | Tested with | Needed for | Size | Brotli | Gzip |
 | --- | --- | --- | --- | --- | --- | --- |
-| `pdfjs-dist` | `>=5.0.0 <7` | 6.4.299 | PDF | 3,699,311 | 1,786,844 | 2,083,171 |
-| `@silurus/ooxml` | `>=0.87.0 <1` | 0.89.3 | Word, Excel, PowerPoint, CSV, and the formats converted to them: XLS, ODS, Numbers, PPT, ODP, Keynote, ODG, Visio, DOC, ODT, RTF | 15,566,588 | 3,980,443 | 5,180,257 |
-| `three` | `>=0.170.0 <1` | 0.186.1 | IFC, STL, OBJ, PLY, glTF | 754,038 | 157,003 | 193,013 |
-| `@exav/unpack-wasm` | `>=0.0.3` | 0.0.3 | Archives | 2,986,252 | 806,421 | 1,168,146 |
+| `pdfjs-dist` | `>=6.4.299 <7` | 6.4.299 | PDF | 3,699,311 | 1,786,847 | 2,083,188 |
+| `@silurus/ooxml` | `>=0.87.0 <1` | 0.89.3 | Word, Excel, PowerPoint, CSV, and the formats converted to them: XLS, ODS, Numbers, PPT, ODP, Keynote, ODG, Visio, DOC, ODT, RTF | 15,566,588 | 3,980,378 | 5,180,287 |
+| `three` | `>=0.170.0 <1` | 0.186.1 | IFC, STL, OBJ, PLY, glTF | 754,038 | 157,011 | 193,026 |
+| `@exav/unpack-wasm` | `>=0.0.3` | 0.0.3 | Archives | 2,287,940 | 800,266 | 1,024,226 |
 | `react`, `react-dom` | `^19.0.0` |  | The React components (`@exav/viewer/react`); the host's own React, not measured |  |  |  |
 <!-- /sizes:peers -->
 
@@ -209,22 +211,22 @@ they share, the Office viewers' common code above all):
 <!-- sizes:frame -->
 | A frame for | `formats` | Size | Brotli | Gzip |
 | --- | --- | --- | --- | --- |
-| The frame itself, in every one |  | 151,790 | 44,316 | 51,129 |
-| PDF | `pdf` | 4,462,648 | 1,991,537 | 2,331,430 |
-| Images: PNG, JPEG, WebP, GIF, SVG and the formats of the image module | `image` | 2,250,383 | 649,816 | 826,592 |
-| DWG, DXF | `dwg` | 2,885,763 | 2,166,151 | 2,264,334 |
-| IFC | `ifc` | 1,366,935 | 372,899 | 451,004 |
-| STL, OBJ, PLY, glTF | `stl` | 1,363,777 | 371,774 | 449,793 |
-| Word | `docx` | 7,493,323 | 1,881,588 | 2,419,599 |
-| Excel, CSV | `xlsx` | 5,547,202 | 1,395,134 | 1,786,733 |
-| PowerPoint | `pptx` | 5,746,511 | 1,415,073 | 1,837,894 |
-| XLS, ODS, Numbers | `xls` | 6,770,821 | 1,885,914 | 2,386,546 |
-| PPT, ODP, Keynote, ODG, Visio | `ppt` | 6,774,169 | 1,853,818 | 2,366,590 |
-| DOC, ODT, RTF | `rtf` | 8,522,717 | 2,301,325 | 2,935,153 |
-| Markdown, text | `text` | 355,429 | 119,385 | 140,646 |
-| Archives | `archive` | 3,174,207 | 861,590 | 1,232,226 |
-| Video, audio | `video` | 151,790 | 44,316 | 51,129 |
-| Every format |  | 32,643,982 | 11,289,223 | 13,838,144 |
+| The frame itself, in every one |  | 171,161 | 51,124 | 58,676 |
+| PDF | `pdf` | 4,654,436 | 2,078,683 | 2,429,158 |
+| Images: PNG, JPEG, WebP, GIF, SVG and the formats of the image module | `image` | 2,431,001 | 735,697 | 922,905 |
+| DWG, DXF | `dwg` | 3,082,665 | 2,254,960 | 2,363,719 |
+| IFC | `ifc` | 1,568,412 | 462,937 | 552,808 |
+| STL, OBJ, PLY, glTF | `stl` | 1,566,439 | 462,292 | 552,138 |
+| Word | `docx` | 7,685,062 | 1,968,473 | 2,517,067 |
+| Excel, CSV | `xlsx` | 5,995,811 | 1,588,141 | 2,006,626 |
+| PowerPoint | `pptx` | 5,938,278 | 1,501,873 | 1,935,361 |
+| XLS, ODS, Numbers | `xls` | 7,226,629 | 2,080,536 | 2,609,026 |
+| PPT, ODP, Keynote, ODG, Visio | `ppt` | 6,969,037 | 1,942,509 | 2,465,976 |
+| DOC, ODT, RTF | `rtf` | 8,722,155 | 2,391,645 | 3,035,904 |
+| Markdown, text | `text` | 575,506 | 215,546 | 250,625 |
+| Archives | `archive` | 2,664,596 | 941,379 | 1,184,729 |
+| Video, audio | `video` | 340,757 | 130,495 | 147,817 |
+| Every format |  | 32,457,899 | 11,499,936 | 13,943,385 |
 <!-- /sizes:frame -->
 
 The core is the page, its policy and the code that decides which engine
@@ -242,7 +244,10 @@ fetches it:
 
 - a PDF or an archive is read by ranges: the host asks the server for the
   parts the frame needs (pdf.js's pages on screen, a ZIP's central
-  directory and the members opened) and passes them over. The server must
+  directory and the members opened) and passes them over. A ZIP's
+  directory is read by @exav/unpack-wasm's ZIP reader, which says which
+  bytes of the end it needs and where the members' local headers are, so
+  that those are asked for together. The server must
   answer range requests (`206`, `Content-Range`; across origins,
   `Access-Control-Expose-Headers: Content-Range`); one that does not gets a
   whole download, and the viewer says so (the `source_read_whole` warning).
@@ -351,6 +356,9 @@ const plugins = [pdf(), image({ wasmDecoders: true })];
 A file of a format no plugin claims is reported by the detector as `null`:
 the host offers a download instead. `viewer.detect(info)` answers from the
 name and type alone, synchronously, to decide before opening anything.
+`mount` then reads the first 64 KiB of the file (`sniffBytes`; one range
+request for a file given by an address) and opens it as exav's detection
+says: a PDF named `.png` is a PDF.
 
 `@exav/viewer/all` imports every plugin, so every peer dependency must be
 installed. It leaves out the converted Office formats, which a host names to
@@ -560,9 +568,10 @@ failed is tried again on the next call.
 
 ## Content-Security-Policy
 
-In the sandboxed mode, the host page runs no engine: its policy needs only
-`frame-src` for the frame's origin, and the frame has its own
-([Security](/viewer/security/#serving-the-frame)). In the
+In the sandboxed mode, the host page runs no engine: its policy needs
+`frame-src` and `child-src` naming the frame's origin alone, which is also
+what keeps the frame from sending anything elsewhere, and the frame has its
+own ([Security](/viewer/security/#serving-the-frame)). In the
 page, every format needs:
 
 ```

@@ -1,4 +1,4 @@
-//! `exav-grep` — grep that can see inside archives.
+//! `exav-grep`: grep that can see inside archives.
 //!
 //! Familiar flags, but every ZIP/RAR/7z/tar/ISO/OLE/PDF/email it meets is
 //! descended into, recursively, in bounded memory. Matches are reported with the nesting
@@ -8,18 +8,19 @@
 //!   0  matches found
 //!   1  no matches
 //!   2  a usage/IO error
-//!   3  **no matches, but some members could not be read** — the search was
+//!   3  **no matches, but some members could not be read**: the search was
 //!      incomplete, so "no matches" does not mean "not present"
 
 #![forbid(unsafe_code)]
+
+mod cli;
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use exav_grep::{Event, Matcher, Options, Searcher};
-use exav_unpack::Limits;
+use exav_grep::{Event, Matcher, Searcher};
 
 #[derive(Parser)]
 #[command(
@@ -56,9 +57,8 @@ struct Cli {
     #[arg(short = 'l', long)]
     files_with_matches: bool,
 
-    /// Recurse into directories.
-    #[arg(short = 'r', long)]
-    recursive: bool,
+    #[command(flatten)]
+    read: cli::ReadArgs,
 
     /// Lines of context after each match.
     #[arg(short = 'A', long, value_name = "N", default_value_t = 0)]
@@ -80,25 +80,27 @@ struct Cli {
     #[arg(long = "passwords", value_name = "PASSWORD")]
     passwords: Vec<String>,
 
-    /// Most bytes held in memory at once for one file or member (default
-    /// 256M). A member up to it is held, so a container in it can be opened;
-    /// a longer one is searched as it is read, and a container in it is
-    /// reported unreadable.
-    #[arg(long = "max-object-bytes", value_name = "BYTES")]
-    max_object_bytes: Option<u64>,
-
-    /// Max members to visit inside each input file. The budget is per file, not
-    /// a total across the tree — a directory of N archives may yield N times
-    /// this many members.
-    #[arg(long = "max-members", value_name = "N")]
+    /// Max members to visit inside each input file; `off` or `0` sets no limit. The
+    /// budget is per file, not a total across the tree: a directory of N
+    /// archives may yield N times this many members.
+    #[arg(
+        long = "max-members",
+        env = "EXAV_MAX_MEMBERS",
+        value_name = "N|off",
+        value_parser = count_or_off
+    )]
     max_members: Option<u64>,
 
-    /// Max nesting depth of archives within archives.
-    ///
-    /// Not directory depth, which `find`/`du`/`tree` spell `--max-depth`; named
-    /// for what it bounds, and matching `exav --max-unpack-depth`.
-    #[arg(long = "max-unpack-depth", value_name = "N")]
-    max_depth: Option<u32>,
+    /// Leave out a member that decodes to more than N times its size, once it
+    /// is past --max-object-bytes; the other members are still searched and the
+    /// file is reported as not fully read. `off` or `0` sets no limit.
+    #[arg(
+        long = "max-compression-ratio",
+        env = "EXAV_MAX_COMPRESSION_RATIO",
+        value_name = "N|off",
+        value_parser = count_or_off
+    )]
+    max_compression_ratio: Option<u64>,
 
     /// Don't report members that could not be read. Off by default, because
     /// hiding them turns "I couldn't look" into an indistinguishable "no match".
@@ -113,6 +115,27 @@ struct Cli {
     #[cfg(feature = "text")]
     #[arg(long)]
     text: bool,
+
+    /// Search the payloads of the QR codes in images as well as their bytes,
+    /// one to a line, under `image.png!qr`.
+    #[cfg(feature = "qr")]
+    #[arg(long)]
+    qr: bool,
+
+    #[command(flatten)]
+    qr_limits: cli::QrArgs,
+}
+
+/// A count given as a number or `off`; `off` and `0` are no limit, as in exav.
+fn count_or_off(v: &str) -> Result<u64, String> {
+    match v.trim() {
+        n if n.eq_ignore_ascii_case("off") => Ok(u64::MAX),
+        n => match n.parse() {
+            Ok(0) => Ok(u64::MAX),
+            Ok(n) => Ok(n),
+            Err(_) => Err(format!("expected a number or `off`, got `{n}`")),
+        },
+    }
 }
 
 fn main() -> ExitCode {
@@ -130,76 +153,54 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut limits = Limits::default();
-    if let Some(b) = cli.max_object_bytes {
-        limits.max_buffer_bytes = b;
+    let mut opts = match cli.read.options() {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("exav-grep: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = cli.qr_limits.apply(&mut opts) {
+        eprintln!("exav-grep: {e}");
+        return ExitCode::from(2);
     }
     if let Some(n) = cli.max_members {
-        limits.max_members = n;
+        opts.limits.max_members = n;
     }
-    if let Some(d) = cli.max_depth {
-        limits.max_recursion = d;
+    if let Some(n) = cli.max_compression_ratio {
+        opts.limits.max_compression_ratio = n;
     }
-
     let ctx = cli.context.unwrap_or(0);
-    let opts = Options {
-        limits,
-        passwords: cli.passwords.clone(),
-        before_context: cli.before_context.max(ctx),
-        after_context: cli.after_context.max(ctx),
-        max_count: cli.max_count,
-        binary_as_matches: true,
-        #[cfg(feature = "text")]
-        text: cli.text,
-        #[cfg(not(feature = "text"))]
-        text: false,
-    };
+    opts.passwords = cli.passwords.clone();
+    opts.before_context = cli.before_context.max(ctx);
+    opts.after_context = cli.after_context.max(ctx);
+    opts.max_count = cli.max_count;
+    opts.binary_as_matches = true;
+    #[cfg(feature = "text")]
+    {
+        opts.text = cli.text;
+    }
+    #[cfg(feature = "qr")]
+    {
+        opts.qr = cli.qr;
+    }
 
     let mut searcher = Searcher::new(matcher, opts);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut seen_paths: Vec<String> = Vec::new();
-    let mut io_error = false;
     // Set when a result could not be written. Kept apart from a scan error so
     // the summary below is still attempted, but it reaches the exit code the
     // same way: output that did not arrive is not a clean run.
     let mut write_failed = false;
-    // Paths the filesystem walk could not reach. Counted like an unreadable
-    // member, because it is the same fact one level up: a subtree nobody could
-    // open is not a subtree with nothing in it, and exit 1 would say it was.
-    let mut walk_unreadable = 0u64;
 
-    for p in &cli.paths {
-        let files: Vec<PathBuf> = if p.is_dir() {
-            if !cli.recursive {
-                eprintln!("exav-grep: {}: is a directory (use -r)", p.display());
-                io_error = true;
-                continue;
-            }
-            let mut files = Vec::new();
-            for entry in walkdir::WalkDir::new(p) {
-                match entry {
-                    Ok(e) if e.file_type().is_file() => files.push(e.into_path()),
-                    Ok(_) => {}
-                    Err(e) => {
-                        walk_unreadable += 1;
-                        if !cli.quiet_unreadable {
-                            let at = e
-                                .path()
-                                .map(|q| q.display().to_string())
-                                .unwrap_or_else(|| p.display().to_string());
-                            eprintln!("exav-grep: {at}: unreadable: {e}");
-                        }
-                    }
-                }
-            }
-            files
-        } else {
-            vec![p.clone()]
-        };
-
-        for f in files {
-            let r = searcher.search_path(&f, &mut |ev| {
+    let walked = cli::each_file(
+        "exav-grep",
+        &cli.paths,
+        cli.read.recursive,
+        cli.quiet_unreadable,
+        |f| {
+            searcher.search_path(f, &mut |ev| {
                 let line = match &ev {
                     Event::Unreadable { .. } => {
                         if !cli.quiet_unreadable {
@@ -236,20 +237,9 @@ fn main() -> ExitCode {
                         false
                     }
                 }
-            });
-            match r {
-                // The sink asked to stop — a closed pipe, or `--max-count`
-                // satisfied. Carrying on writes into a pipe nobody is reading
-                // for the rest of the tree.
-                Ok(false) => break,
-                Ok(true) => {}
-                Err(e) => {
-                    eprintln!("exav-grep: {}: {e}", f.display());
-                    io_error = true;
-                }
-            }
-        }
-    }
+            })
+        },
+    );
 
     // These are the whole answer under `-l`/`-c`, so a write that fails here
     // loses everything the run found. Silently discarding the error left the
@@ -265,20 +255,11 @@ fn main() -> ExitCode {
         write_failed = true;
     }
 
-    if write_failed {
-        eprintln!("exav-grep: could not write results");
-        return ExitCode::from(2);
-    }
-    if io_error {
-        return ExitCode::from(2);
-    }
-    if searcher.matched_count() > 0 {
-        ExitCode::SUCCESS
-    } else if searcher.unreadable_count() > 0 || walk_unreadable > 0 {
-        // Distinct from "no matches": part of the input was never examined, so
-        // the caller must not read this as "not present".
-        ExitCode::from(3)
-    } else {
-        ExitCode::from(1)
-    }
+    cli::exit_code(
+        "exav-grep",
+        &walked,
+        write_failed,
+        searcher.matched_count(),
+        searcher.unreadable_count(),
+    )
 }

@@ -138,7 +138,7 @@ fn fields(rest: &str) -> Vec<String> {
 }
 
 /// One of the formats an `F` record gives a cell, row or column.
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 struct Fmt {
     numfmt: Option<String>,
     align: Option<&'static str>,
@@ -594,17 +594,17 @@ pub(crate) fn read(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
             ci.hidden = w == 0.0;
         });
     }
-    let mut cache: Vec<(Fmt, u32)> = vec![];
+    let mut cache: HashMap<Fmt, u32> = HashMap::new();
     let mut style_id = |wb: &mut Workbook, fmt: &Fmt| -> u32 {
         if fmt.is_empty() {
             return 0;
         }
-        if let Some((_, s)) = cache.iter().find(|(f, _)| f == fmt) {
-            return *s;
+        if let Some(&s) = cache.get(fmt) {
+            return s;
         }
         let s = wb.styles.add(style_of(&fmt.over(&default_fmt)));
         if cache.len() < 4096 {
-            cache.push((fmt.clone(), s));
+            cache.insert(fmt.clone(), s);
         }
         s
     };

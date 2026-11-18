@@ -47,17 +47,20 @@ fn find_firstheader(data: &[u8]) -> Option<usize> {
     memchr::memmem::find(data, &NSIS_SIG)?.checked_sub(4)
 }
 
-/// True if `data` is a PE stub carrying the NSIS firstheader signature.
+/// True if `p` is a PE stub carrying the NSIS firstheader signature: in its
+/// start, or in the bytes after its image, where the installer's data is.
 pub(crate) fn is_nsis(p: &crate::Probe) -> bool {
-    // As `find_firstheader` finds it.
-    p.head.starts_with(b"MZ") && p.find(&NSIS_SIG).and_then(|at| at.checked_sub(4)).is_some()
+    if !p.head.starts_with(b"MZ") {
+        return false;
+    }
+    // As `find_firstheader` finds it, past the 4 bytes of flags before it.
+    let in_start = memchr::memmem::find(p.searched_start(), &NSIS_SIG).is_some_and(|at| at >= 4);
+    in_start
+        || p.after_image()
+            .is_some_and(|(_, after)| memchr::memmem::find(&after, &NSIS_SIG).is_some())
 }
 
-pub(crate) fn extract_nsis<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_nsis(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     let Some(fh) = find_firstheader(data) else {
         return Ok(None);
     };
@@ -143,7 +146,8 @@ pub(crate) fn extract_nsis<R>(
                     clamped as u64,
                     false,
                     "NSIS block codec",
-                ),
+                )
+                .of_kind(crate::tree::ReasonKind::Unsupported),
                 budget,
             ),
         };
@@ -391,6 +395,23 @@ mod tests {
             entries
                 .iter()
                 .all(|e| e.unsupported.is_some() || !e.data.is_empty())
+        );
+    }
+
+    /// A block neither codec reads anything out of is reported as a codec not
+    /// decoded, not as damage. Too short for LZMA, and a reserved DEFLATE
+    /// block type, so no byte comes out of either.
+    #[test]
+    fn a_block_no_codec_reads_is_reported_as_unsupported() {
+        let blob = synthetic_nsis(&[0x07, 0, 0, 0]);
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Nsis, &blob, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(entries[0].data.is_empty(), "{entries:?}");
+        assert_eq!(entries[0].unsupported, Some("NSIS block codec"));
+        assert_eq!(
+            entries[0].reason_kind,
+            Some(crate::tree::ReasonKind::Unsupported)
         );
     }
 

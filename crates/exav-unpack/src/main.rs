@@ -2,9 +2,11 @@
 //!
 //! The command line is a subset of Info-ZIP `unzip` 6.00's: every option it
 //! takes means what it means to `unzip`, and an `unzip` option it does not take
-//! is refused (exit 10) rather than ignored. It adds long options only
-//! (`--volume`, the `--max-*` limits, `--help`, `--version`), and reads every
-//! archive format the `exav-unpack` library reads, not only ZIP.
+//! is refused (exit 10) rather than ignored. It adds `-r` (`unzip` has no
+//! option of that name), which also opens the archives found inside the
+//! archive, and long options (`--volume`, the `--max-*` limits, the
+//! `--object-cache-*` sizes, `--help`, `--version`). It reads every archive
+//! format the `exav-unpack` library reads, not only ZIP.
 //!
 //! Where it differs from `unzip` on purpose:
 //! - no password prompt (not implemented yet): an encrypted member with no
@@ -14,9 +16,11 @@
 //! - every member is `extracting:`, whatever its compression;
 //! - a split archive is read from any of its parts.
 //!
-//! The archive is read from disk as it is needed and each member written as
-//! it is decoded: neither is held in memory whole, except where a format's
-//! decoder needs it.
+//! An archive longer than the object cache or `--max-object-bytes` is read from
+//! disk as it is needed (a shorter one is read whole), and each member is
+//! written as it is decoded: neither is held in memory whole, except where a
+//! format's decoder needs it, or, with `-r`, a member that is an archive and is
+//! opened.
 
 #![forbid(unsafe_code)]
 
@@ -46,8 +50,17 @@ fn stdout_closed(e: &std::io::Error) -> ! {
 }
 
 use chrono::{Local, LocalResult, TimeZone};
-use exav_unpack::source::BlockCache;
-use exav_unpack::{Budget, ByteSource, Format, Limits, Member, MemberMeta, Mtime, detect, walk};
+use exav_unpack::source::{BlockCache, open_source};
+#[cfg(not(target_family = "wasm"))]
+use exav_unpack::spill::DirSpill;
+use exav_unpack::spill::Spill;
+use exav_unpack::tree::{
+    Content, Cx, End, Ended, Flow, Hold, Large, Name, Node, Origin, Path as Located, Reason,
+    ReasonKind, Reasons, Root, Typed, Typing, Visitor, Walk, Walker, shown_text, type_object,
+};
+use exav_unpack::volume::{ByteSpan, Parts, SetKind, SetPlan, join, plan};
+use exav_unpack::{Budget, ByteSource, Limits, Member, MemberMeta, Mtime, walk};
+use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -73,12 +86,50 @@ modifiers:
   -D  do not restore directory times (-DD: no times at all)
 
 exav-unpack only:
+  -r, --recursive    also open the archives found inside the archive: a member
+                     that is one is replaced by its own members, named
+                     archive!member in listings and nested as directories
   --volume FILE      another part of a split archive (repeat for each part)
-  --max-size SIZE    stop past SIZE decoded bytes in all (default 64G)
-  --max-memory SIZE  largest member or container held in memory whole (1G)
-  --max-members N    stop past N members (default 1000000)
+  --max-extracted-bytes SIZE|off
+                     stop past SIZE decoded bytes in all (default 64G);
+                     --max-size is the older name
+  --max-object-bytes SIZE|off
+                     largest member or container held in memory whole (1G);
+                     --max-memory is the older name. With -r, a member that is
+                     decoded as it is read is held whole, whatever this is,
+                     when it ends or fails within 4 MiB + 1 KiB: the start
+                     that is read to tell what it is
+  --max-members N|off
+                     stop past N members (default 1000000)
+  --max-compression-ratio N|off
+                     leave out a member that decodes to more than N times its
+                     size, once it is past --max-object-bytes (default 1000);
+                     the other members are still read, and the run ends with
+                     the limit
+  --max-unpack-depth N
+                     deepest nesting -r opens (default 16); 0 opens no
+                     archive, and -r takes the one named as one file
+  --spill-dir DIR|off
+                     with -r, the directory of the anonymous temporary file a
+                     container inside a member over --max-object-bytes is
+                     written to so that it can be opened (default: the system
+                     temporary directory); off writes nothing, and such a
+                     container is reported unreadable
+  --max-total-spill-bytes SIZE|off
+                     most the spill files open at once may hold (default 2G);
+                     a container that would pass it is reported unreadable
+  --object-cache-bytes SIZE
+                     memory of the cache over the archive on disk, shared by
+                     the parts of a split archive; an archive that fits in it
+                     and in --max-object-bytes is read whole (default 32M)
+  --object-cache-block-bytes SIZE
+                     what that cache reads at a time (default 1M)
   --help, --version
-SIZE takes a K, M, G or T suffix (powers of 1024).";
+SIZE takes a K, M, G or T suffix (powers of 1024). A limit that takes off takes
+0 as off too. The two cache sizes also take off, which is 0: a cache never
+holds less than two blocks. Each limit above is also read from the environment,
+as EXAV_ and its name in capitals with underscores (EXAV_MAX_OBJECT_BYTES,
+EXAV_SPILL_DIR); the option wins over the variable.";
 
 /// unzip's exit statuses, as far as they apply.
 mod status {
@@ -122,8 +173,41 @@ struct Opts {
     /// `-D` count: 1 keeps directory times off, 2 all times.
     no_times: u8,
     volumes: Vec<PathBuf>,
+    /// `-r`: the archives inside the archive are opened too.
+    recursive: bool,
     limits: Limits,
+    /// The block cache of the archive: what it holds, and what it reads at a
+    /// time.
+    cache_bytes: u64,
+    cache_block: u64,
+    /// With `-r`, where a container inside a member over `--max-object-bytes`
+    /// is written to be opened; `None` writes nothing.
+    spill_dir: Option<PathBuf>,
+    /// The most the spill files open at once may hold; `None` is no ceiling.
+    max_spill: Option<u64>,
 }
+
+/// The defaults of the scanner's `--object-cache-bytes` and
+/// `--object-cache-block-bytes`.
+const CACHE_BYTES: u64 = exav_unpack::source::CACHE_BYTES as u64;
+const CACHE_BLOCK: u64 = 1 << 20;
+
+/// The default of `--max-total-spill-bytes`, as exav-grep has it.
+const MAX_SPILL: u64 = 2 << 30;
+
+/// The environment variables the options fall back to, with the option each
+/// stands for. They are named as the scanner names them.
+const ENV: &[(&str, &str)] = &[
+    ("EXAV_MAX_EXTRACTED_BYTES", "max-extracted-bytes"),
+    ("EXAV_MAX_OBJECT_BYTES", "max-object-bytes"),
+    ("EXAV_MAX_MEMBERS", "max-members"),
+    ("EXAV_MAX_COMPRESSION_RATIO", "max-compression-ratio"),
+    ("EXAV_MAX_UNPACK_DEPTH", "max-unpack-depth"),
+    ("EXAV_OBJECT_CACHE_BYTES", "object-cache-bytes"),
+    ("EXAV_OBJECT_CACHE_BLOCK_BYTES", "object-cache-block-bytes"),
+    ("EXAV_SPILL_DIR", "spill-dir"),
+    ("EXAV_MAX_TOTAL_SPILL_BYTES", "max-total-spill-bytes"),
+];
 
 enum Parsed {
     Usage(u8),
@@ -186,12 +270,20 @@ const UNSUPPORTED: &[(char, &str)] = &[
 ];
 
 fn parse(args: &[String]) -> Result<Parsed, String> {
+    parse_with(args, &|name| std::env::var(name).ok())
+}
+
+/// [`parse`], reading the environment through `env`. A variable that is set
+/// is read as the option is, an empty one included, as the scanner reads
+/// its own. The command line wins over the environment.
+fn parse_with(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Parsed, String> {
     if args.is_empty() {
         return Ok(Parsed::Usage(status::OK));
     }
     // An extractor writes to disk rather than holding what it decodes, so its
-    // totals can be far above the scanner's. The compression-ratio cap still
-    // stops a bomb long before them.
+    // totals can be far above the scanner's. The compression-ratio limit
+    // still leaves out a member that passes `max_buffer_bytes` at the ratio,
+    // long before them.
     let mut limits = Limits::default();
     limits.max_extracted_bytes = 64 << 30;
     limits.max_scanned_bytes = 64 << 30;
@@ -210,8 +302,18 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
         nocase: false,
         no_times: 0,
         volumes: Vec::new(),
+        recursive: false,
         limits,
+        cache_bytes: CACHE_BYTES,
+        cache_block: CACHE_BLOCK,
+        spill_dir: Some(std::env::temp_dir()),
+        max_spill: Some(MAX_SPILL),
     };
+    for (var, option) in ENV {
+        if let Some(value) = env(var) {
+            set_limit(&mut o, option, &value, var)?;
+        }
+    }
     let (mut modes, mut verbose, mut archive, mut excluding) = (Vec::new(), false, None, false);
     let mut i = 0;
     let next = |i: &mut usize, what: &str| -> Result<String, String> {
@@ -234,17 +336,19 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                 "help" => return Ok(Parsed::Usage(status::OK)),
                 "version" => return Ok(Parsed::Version),
                 "volume" => o.volumes.push(PathBuf::from(value(&mut i)?)),
-                "max-size" => {
-                    let n = size(&value(&mut i)?)?;
-                    o.limits.max_extracted_bytes = n;
-                    o.limits.max_scanned_bytes = n;
-                }
-                "max-memory" => o.limits.max_buffer_bytes = size(&value(&mut i)?)?,
-                "max-members" => {
-                    o.limits.max_members = value(&mut i)?
-                        .parse()
-                        .map_err(|_| format!("{a} takes a number"))?
-                }
+                "recursive" => o.recursive = true,
+                // The older names are kept.
+                "max-size" => set_limit(&mut o, "max-extracted-bytes", &value(&mut i)?, a)?,
+                "max-memory" => set_limit(&mut o, "max-object-bytes", &value(&mut i)?, a)?,
+                "max-extracted-bytes"
+                | "max-object-bytes"
+                | "max-unpack-depth"
+                | "object-cache-bytes"
+                | "object-cache-block-bytes"
+                | "max-members"
+                | "max-compression-ratio"
+                | "spill-dir"
+                | "max-total-spill-bytes" => set_limit(&mut o, name, &value(&mut i)?, a)?,
                 _ => return Err(format!("unknown option `{a}`")),
             }
             i += 1;
@@ -286,6 +390,7 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                 }
             };
             match c {
+                'r' => o.recursive = true,
                 'l' => modes.push(Mode::List),
                 't' => modes.push(Mode::Test),
                 'p' => modes.push(Mode::Pipe),
@@ -353,6 +458,74 @@ fn size(s: &str) -> Result<u64, String> {
     };
     let n: u64 = digits.parse().map_err(|_| bad())?;
     n.checked_mul(1 << shift).ok_or_else(bad)
+}
+
+/// [`size`], or `off`, which is 0, as the scanner's size options take it.
+fn cache_size(s: &str) -> Result<u64, String> {
+    match s.trim().eq_ignore_ascii_case("off") {
+        true => Ok(0),
+        false => size(s.trim()),
+    }
+}
+
+/// [`size`], or `off`, which is no limit (the largest number).
+fn size_or_off(s: &str) -> Result<u64, String> {
+    match s.trim().eq_ignore_ascii_case("off") {
+        true => Ok(u64::MAX),
+        // As in exav: a limit every object is over is none.
+        false => size(s.trim()).map(|n| if n == 0 { u64::MAX } else { n }),
+    }
+}
+
+/// Set the option `name` (without its dashes) to `value`, which came from the
+/// flag or the variable `shown`. The one place a limit is read, so that a flag
+/// and its variable take the same values.
+fn set_limit(o: &mut Opts, name: &str, value: &str, shown: &str) -> Result<(), String> {
+    let at = |e: String| format!("{shown}: {e}");
+    let number = |what: &str| -> Result<u64, String> {
+        match value.trim().eq_ignore_ascii_case("off") {
+            true => Ok(u64::MAX),
+            false => match value.trim().parse() {
+                Ok(0) => Ok(u64::MAX),
+                Ok(n) => Ok(n),
+                Err(_) => Err(format!("{shown} takes a number{what}")),
+            },
+        }
+    };
+    match name {
+        "max-extracted-bytes" => {
+            let n = size_or_off(value).map_err(at)?;
+            o.limits.max_extracted_bytes = n;
+            o.limits.max_scanned_bytes = n;
+        }
+        "max-object-bytes" => o.limits.max_buffer_bytes = size_or_off(value).map_err(at)?,
+        // No `off`: every level of nesting costs stack.
+        "max-unpack-depth" => {
+            o.limits.max_recursion = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("{shown} takes a number"))?
+        }
+        "max-members" => o.limits.max_members = number(" or `off`")?,
+        "max-compression-ratio" => o.limits.max_compression_ratio = number(" or `off`")?,
+        "object-cache-bytes" => o.cache_bytes = cache_size(value).map_err(at)?,
+        "object-cache-block-bytes" => o.cache_block = cache_size(value).map_err(at)?,
+        "spill-dir" => {
+            o.spill_dir = match value {
+                "off" => None,
+                dir => Some(PathBuf::from(dir)),
+            }
+        }
+        // `off` and 0 are no ceiling, as exav-grep has it.
+        "max-total-spill-bytes" => {
+            o.max_spill = match size_or_off(value).map_err(at)? {
+                0 | u64::MAX => None,
+                n => Some(n),
+            }
+        }
+        _ => unreachable!("{name} is not a limit"),
+    }
+    Ok(())
 }
 
 /// How the archives went, for unzip's closing tally.
@@ -595,19 +768,27 @@ impl<'a> Archive<'a> {
         if messages && !(o.mode == Mode::Test && o.quiet > 0) {
             println!("Archive:  {}", self.path.display());
         }
-        let src = match open(self.path, &o.volumes, o.limits.max_buffer_bytes) {
+        let src = match o.open(self.path, &open_file) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("exav-unpack:  cannot read {}: {e}", self.path.display());
                 return status::NO_ARCHIVE;
             }
         };
-        let Some(fmt) = detect(&*src).or_else(|| packed(&*src, o.limits.max_buffer_bytes)) else {
-            eprintln!(
-                "exav-unpack:  {} is not an archive exav-unpack reads.",
-                self.path.display()
-            );
-            return status::NO_ARCHIVE;
+        let fmt = match type_object(&Typing::WALK, &*src, o.limits.max_buffer_bytes) {
+            Typed::Container(fmt) => fmt,
+            Typed::Plain => {
+                eprintln!(
+                    "exav-unpack:  {} is not an archive exav-unpack reads.",
+                    self.path.display()
+                );
+                return status::NO_ARCHIVE;
+            }
+            Typed::Unchecked(why) => {
+                let why = shown_text(&why.text);
+                eprintln!("exav-unpack:  {}: {why}.", self.path.display());
+                return status::NO_ARCHIVE;
+            }
         };
         if o.mode == Mode::List && o.quiet < 2 {
             println!("  Length      Date    Time    Name");
@@ -622,22 +803,98 @@ impl<'a> Archive<'a> {
         }
         let mut budget = Budget::with_passwords(o.limits.clone(), o.passwords.clone());
         budget.set_visit_directories(true);
-        let stopped = walk(fmt, &*src, &mut budget, &mut |meta, content, _| {
-            self.member(&root, meta, content).err()
-        });
-        match stopped {
-            Ok(None) => {}
-            Ok(Some(fatal)) => {
-                eprintln!("exav-unpack:  {fatal}");
-                self.raise(status::DISK_FULL);
+        let fatal = match o.recursive {
+            true => self.run_nested(&root, &*src, &mut budget),
+            false => {
+                let mut fatal = None;
+                let stopped = walk::<()>(fmt, &*src, &mut budget, &mut |meta, content, _| {
+                    let label = Label::stored(&meta.name);
+                    // A member the end of the archive cuts is reported, as
+                    // unzip and tar report one.
+                    let failed = content
+                        .is_some()
+                        .then(|| exav_unpack::tree::range_cut(meta, src.len()))
+                        .flatten();
+                    let item = Item {
+                        label,
+                        meta,
+                        failed,
+                    };
+                    match self.member(&root, &item, content) {
+                        Ok(()) => None,
+                        Err(why) => {
+                            fatal = Some(why);
+                            Some(())
+                        }
+                    }
+                });
+                if let Err(hit) = stopped {
+                    self.fail("", &hit.to_string());
+                }
+                fatal
             }
-            Err(hit) => {
-                eprintln!("  error:  {hit}");
-                self.raise(status::ERROR);
-            }
+        };
+        if let Some(fatal) = fatal {
+            eprintln!("exav-unpack:  {fatal}");
+            self.raise(status::DISK_FULL);
         }
         self.finish(&root, messages);
         self.status
+    }
+
+    /// `-r`: the walk goes down into the archives the members are, and what
+    /// comes out of them is handled as a member of a single archive is.
+    /// `Some` is what stopped it.
+    fn run_nested(
+        &mut self,
+        root: &Path,
+        src: &dyn ByteSource,
+        budget: &mut Budget,
+    ) -> Option<String> {
+        let o = self.o;
+        // A spill directory is a file system's: none on WASI, where a member
+        // over the limit is reported as without one.
+        #[cfg(not(target_family = "wasm"))]
+        let spill = o
+            .spill_dir
+            .clone()
+            .map(|dir| Box::new(DirSpill::new(dir).total(o.max_spill)) as Box<dyn Spill>);
+        #[cfg(target_family = "wasm")]
+        let spill: Option<Box<dyn Spill>> = None;
+        let walker = Walker::new(
+            Walk {
+                hold: Hold {
+                    limit: o.limits.max_buffer_bytes,
+                    spill: spill.as_deref(),
+                    cache: cache_sizes(1, o.cache_bytes, o.cache_block),
+                    // A member over the limit that is not an archive is
+                    // written as it is decoded; one that is a container is
+                    // written to the spill to be opened, and with no spill it
+                    // is reported.
+                    large: Large::StreamLeaves,
+                },
+                sets: true,
+                second_readings: false,
+            },
+            &Typing::WALK,
+        );
+        let name = self.path.display().to_string();
+        let mut nested = Nested {
+            archive: self,
+            root,
+        };
+        let done = walker.run(
+            Root {
+                name: &name,
+                source: src,
+            },
+            budget,
+            &mut nested,
+        );
+        match done.ended {
+            Ended::Stopped(fatal) => Some(fatal),
+            Ended::Complete | Ended::Limit(_) => None,
+        }
     }
 
     /// The links, directory times, the listing's totals, the test's verdict
@@ -749,17 +1006,19 @@ impl<'a> Archive<'a> {
     fn member(
         &mut self,
         root: &Path,
-        meta: &MemberMeta,
+        item: &Item<'_>,
         content: Option<Member<'_>>,
     ) -> Result<(), String> {
         let o = self.o;
-        let name = meta.name.as_str();
-        if !self.wanted(name) {
+        let meta = item.meta;
+        let name = item.label.shown.as_ref();
+        if !self.wanted(&item.label.raw) {
             return Ok(());
         }
         let kind = meta.mode.map(|m| m & 0o170000);
+        let raw = item.label.raw.as_ref();
         let dir = kind == Some(0o040000)
-            || ((name.ends_with('/') || name.ends_with('\\')) && meta.size.unwrap_or(0) == 0);
+            || ((raw.ends_with('/') || raw.ends_with('\\')) && meta.size.unwrap_or(0) == 0);
         let link = kind == Some(0o120000);
         let messages = o.quiet == 0;
         match o.mode {
@@ -788,7 +1047,7 @@ impl<'a> Archive<'a> {
             match o.mode {
                 Mode::Test if messages => println!("    testing: {name:<22}   OK"),
                 Mode::Extract if !o.junk => {
-                    let Some(path) = target(root, name) else {
+                    let Some(path) = target(root, &item.label.rel) else {
                         return self.unsafe_name(name);
                     };
                     let shown = format!("{}/", shown(o, &path));
@@ -811,15 +1070,28 @@ impl<'a> Archive<'a> {
         // Not decodable: say why, as unzip's `skipping:` does, or as its test
         // reports damage.
         let Some(content) = content else {
-            let why = meta.unsupported.unwrap_or("no content");
-            let unsupported = ["unsupported", "method", "codec"]
-                .iter()
-                .any(|w| why.contains(w));
-            let (why, s) = match (meta.encrypted, o.passwords.is_empty()) {
-                (true, true) => ("unable to get password", status::NO_PASSWORD),
-                (true, false) => ("incorrect password", status::BAD_PASSWORD),
-                _ if unsupported => (why, status::UNSUPPORTED),
-                _ => (why, status::ERROR),
+            // By the kind of the reason the reader gave, never by its words.
+            let (kind, text) = match Reason::of_member(meta) {
+                Some(r) => (r.kind, r.text),
+                None if meta.encrypted => (ReasonKind::Password, String::new()),
+                // A stream that failed to decode gives its error to the walk,
+                // not to its member.
+                None => (
+                    ReasonKind::Damaged,
+                    item.failed
+                        .clone()
+                        .unwrap_or_else(|| "no content".to_string()),
+                ),
+            };
+            let (why, s) = match (kind, o.passwords.is_empty()) {
+                (ReasonKind::Password, true) => {
+                    ("unable to get password".to_string(), status::NO_PASSWORD)
+                }
+                (ReasonKind::Password, false) => {
+                    ("incorrect password".to_string(), status::BAD_PASSWORD)
+                }
+                (ReasonKind::Unsupported, _) => (text, status::UNSUPPORTED),
+                _ => (text, status::ERROR),
             };
             match s {
                 // Settled in `finish`, once it is known what else came out.
@@ -829,6 +1101,7 @@ impl<'a> Archive<'a> {
                     self.raise(s);
                 }
             }
+            let why = shown_text(&why);
             match (o.mode, s) {
                 (Mode::Test, status::ERROR) => {
                     println!("    testing: {name:<22}  ");
@@ -842,7 +1115,10 @@ impl<'a> Archive<'a> {
         match o.mode {
             Mode::Test => {
                 let got = self.decode(content, &mut io::sink());
-                let damage = got.err().or_else(|| meta.unsupported.map(str::to_string));
+                let damage = got
+                    .err()
+                    .or_else(|| item.failed.clone())
+                    .or_else(|| meta.unsupported.map(str::to_string));
                 match damage {
                     None => {
                         if messages {
@@ -852,7 +1128,7 @@ impl<'a> Archive<'a> {
                     }
                     Some(e) => {
                         println!("    testing: {name:<22}  ");
-                        println!("  error:  {e}");
+                        println!("  error:  {}", shown_text(&e));
                         self.tested_bad = true;
                         self.raise(status::ERROR);
                     }
@@ -869,17 +1145,32 @@ impl<'a> Archive<'a> {
                     let _ = writeln!(out);
                 }
                 drop(out);
-                match got.and_then(|_| meta.unsupported.map_or(Ok(()), |u| Err(u.to_string()))) {
+                let late = item.failed.clone();
+                let unsupported = meta.unsupported.map(str::to_string);
+                match got.and_then(|_| late.or(unsupported).map_or(Ok(()), Err)) {
                     Ok(()) => self.ok += 1,
                     Err(e) => {
-                        eprintln!("  error:  {e}");
+                        eprintln!("  error:  {}", shown_text(&e));
                         self.raise(status::ERROR);
                     }
                 }
                 Ok(())
             }
-            _ => self.extract(root, meta, content, link),
+            _ => self.extract(root, item, content, link),
         }
+    }
+
+    /// Report what went wrong at `at`, a member of an archive inside the
+    /// archive, or the archive itself when it is empty. A test then does not
+    /// end with "No errors detected".
+    fn fail(&mut self, at: &str, why: &str) {
+        let why = shown_text(why);
+        match at.is_empty() {
+            true => eprintln!("  error:  {why}"),
+            false => eprintln!("  error:  {at}: {why}"),
+        }
+        self.tested_bad = true;
+        self.raise(status::ERROR);
     }
 
     fn unsafe_name(&mut self, name: &str) -> Result<(), String> {
@@ -906,15 +1197,17 @@ impl<'a> Archive<'a> {
     fn extract(
         &mut self,
         root: &Path,
-        meta: &MemberMeta,
+        item: &Item<'_>,
         content: Member<'_>,
         link: bool,
     ) -> Result<(), String> {
         let o = self.o;
-        let name = meta.name.as_str();
+        let meta = item.meta;
+        let name = item.label.shown.as_ref();
+        let whole = item.label.rel.as_ref();
         let rel = match o.junk {
-            true => name.rsplit(['/', '\\']).next().unwrap_or(name),
-            false => name,
+            true => whole.rsplit(['/', '\\']).next().unwrap_or(whole),
+            false => whole,
         };
         let Some(mut path) = target(root, rel) else {
             return self.unsafe_name(name);
@@ -990,7 +1283,10 @@ impl<'a> Archive<'a> {
             Member::Stream(r) => copy(r, &mut file, &mut self.buf).map(|_| ()),
         };
         let error = match got {
-            Ok(()) => meta.unsupported.map(str::to_string),
+            Ok(()) => item
+                .failed
+                .clone()
+                .or_else(|| meta.unsupported.map(str::to_string)),
             Err(Copy::Write(e)) => return Err(format!("cannot write {shown}: {e}")),
             Err(Copy::Read(e)) => Some(e.to_string()),
         };
@@ -1002,7 +1298,7 @@ impl<'a> Archive<'a> {
                 self.ok += 1;
             }
             Some(e) => {
-                eprintln!("\n  error:  {e}");
+                eprintln!("\n  error:  {}", shown_text(&e));
                 self.raise(status::ERROR);
             }
         }
@@ -1335,17 +1631,17 @@ fn directories(root: &Path, path: &Path, last: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// How the parts of a split archive make one.
-#[derive(Clone, Copy, PartialEq)]
-enum Set {
+/// The files an archive is made of, found from its name or given.
+#[derive(Debug, PartialEq)]
+enum Layout {
     /// One file.
-    One,
+    One(PathBuf),
     /// A finished file cut into parts (`x.7z.001`, ...): end to end.
-    Bytes,
-    /// `x.z01`, ..., `x.zip`: end to end, the directory rebased.
-    Zip,
-    /// `x.part1.rar`, ... or `x.rar`, `x.r00`, ...: each member's parts joined.
-    Rar,
+    Bytes(Vec<PathBuf>),
+    /// Volumes of a format that reads them together (`x.z01`, ..., `x.zip`;
+    /// `x.part1.rar`, ...; cabinets), in the order found or given: which of
+    /// them make a set is for [`plan`].
+    Volumes(Vec<PathBuf>),
 }
 
 fn volume_of(p: &Path) -> Option<exav_unpack::volume::VolumeName> {
@@ -1354,12 +1650,11 @@ fn volume_of(p: &Path) -> Option<exav_unpack::volume::VolumeName> {
         .and_then(exav_unpack::volume::parse)
 }
 
-/// The files of the archive at `path`, in order, and how they make one:
-/// `volumes` with it when given, else the parts its name says are next to it.
-/// Siblings are named from the pattern, never from anything a file holds, and
-/// read in order until one is missing: nothing in the naming records how many
-/// parts a set has.
-fn parts(path: &Path, volumes: &[PathBuf]) -> io::Result<(Vec<PathBuf>, Set)> {
+/// The files of the archive at `path`: `volumes` with it when given, else the
+/// parts its name says are next to it. Siblings are named from the pattern,
+/// never from anything a file holds, and looked for in order until one is
+/// missing: nothing in the naming records how many parts a set has.
+fn parts(path: &Path, volumes: &[PathBuf]) -> io::Result<Layout> {
     use exav_unpack::volume::Scheme;
     let dir = path
         .parent()
@@ -1377,34 +1672,17 @@ fn parts(path: &Path, volumes: &[PathBuf]) -> io::Result<(Vec<PathBuf>, Set)> {
         let mut all: Vec<PathBuf> = std::iter::once(path.to_path_buf())
             .chain(volumes.iter().cloned())
             .collect();
-        let schemes: Vec<_> = all.iter().map(|p| volume_of(p).map(|v| v.scheme)).collect();
-        let kind = if schemes.iter().any(|s| matches!(s, Some(Scheme::ZipSplit))) {
-            Set::Zip
-        } else if schemes
-            .iter()
-            .all(|s| matches!(s, Some(Scheme::RarPart { .. } | Scheme::RarOld)))
-        {
-            Set::Rar
-        } else {
-            match File::open(path).and_then(|mut f| {
-                let mut head = [0u8; 4];
-                f.read_exact(&mut head).map(|_| head)
-            }) {
-                Ok(h) if &h == b"Rar!" => Set::Rar,
-                _ => Set::Bytes,
-            }
-        };
         // In the order of their volume numbers when their names all have
         // them (a ZIP's `.zip` last), else as given.
         let key = |p: &PathBuf| match volume_of(p) {
             Some(v) => Some(v.index),
-            None if kind == Set::Zip && is_zip(p) => Some(usize::MAX),
+            None if is_zip(p) => Some(usize::MAX),
             None => None,
         };
         if all.iter().all(|p| key(p).is_some()) {
             all.sort_by_key(key);
         }
-        return Ok((all, kind));
+        return Ok(Layout::Volumes(all));
     }
     let missing = |what: String| {
         io::Error::other(format!(
@@ -1419,7 +1697,7 @@ fn parts(path: &Path, volumes: &[PathBuf]) -> io::Result<(Vec<PathBuf>, Set)> {
                     "first part ({})",
                     v.name_at(0).unwrap_or_default()
                 ))),
-                false => Ok((all, Set::Bytes)),
+                false => Ok(Layout::Bytes(all)),
             }
         }
         Some(v) if v.scheme == Scheme::ZipSplit => {
@@ -1428,7 +1706,7 @@ fn parts(path: &Path, volumes: &[PathBuf]) -> io::Result<(Vec<PathBuf>, Set)> {
             match last.is_file() && !all.is_empty() {
                 true => {
                     all.push(last);
-                    Ok((all, Set::Zip))
+                    Ok(Layout::Volumes(all))
                 }
                 false => Err(missing(format!("last part ({})", last.display()))),
             }
@@ -1440,8 +1718,8 @@ fn parts(path: &Path, volumes: &[PathBuf]) -> io::Result<(Vec<PathBuf>, Set)> {
                     "first part ({})",
                     v.name_at(0).unwrap_or_default()
                 ))),
-                1 => Ok((all, Set::One)),
-                _ => Ok((all, Set::Rar)),
+                1 => Ok(Layout::One(all[0].clone())),
+                _ => Ok(Layout::Volumes(all)),
             }
         }
         _ if is_zip(path) => {
@@ -1454,117 +1732,331 @@ fn parts(path: &Path, volumes: &[PathBuf]) -> io::Result<(Vec<PathBuf>, Set)> {
                 Some(v) if dir.join(format!("{stem}.z01")).is_file() => {
                     let mut all = siblings(&v, 0);
                     all.push(path.to_path_buf());
-                    Ok((all, Set::Zip))
+                    Ok(Layout::Volumes(all))
                 }
-                _ => Ok((vec![path.to_path_buf()], Set::One)),
+                _ => Ok(Layout::One(path.to_path_buf())),
             }
         }
-        _ => Ok((vec![path.to_path_buf()], Set::One)),
+        _ => Ok(Layout::One(path.to_path_buf())),
     }
 }
 
-/// The archive at `path`, with the other parts of its set, read from disk as
-/// it is needed; a RAR set is joined in memory, up to `max` bytes.
-fn open(path: &Path, volumes: &[PathBuf], max: u64) -> io::Result<Box<dyn ByteSource>> {
-    let (files, kind) = parts(path, volumes)?;
-    let cached = |p: &PathBuf| -> io::Result<Box<dyn ByteSource>> {
-        Ok(Box::new(BlockCache::new(File::open(p)?)?))
-    };
-    match kind {
-        Set::One => cached(&files[0]),
-        Set::Bytes => {
-            let mut parts = Vec::new();
-            for p in &files {
-                let f = File::open(p)?;
-                let len = f.metadata()?.len();
-                parts.push((f, len));
-            }
-            Ok(Box::new(BlockCache::new(Joined::new(parts))?))
-        }
-        Set::Zip => {
-            let parts = files.iter().map(cached).collect::<io::Result<Vec<_>>>()?;
-            Ok(Box::new(
-                exav_unpack::span::ZipSpan::new(parts).map_err(io::Error::other)?,
-            ))
-        }
-        Set::Rar => {
-            let total: u64 = files
-                .iter()
-                .map(|p| fs::metadata(p).map_or(0, |m| m.len()))
-                .sum();
-            if total > max {
-                return Err(io::Error::other(format!(
-                    "a RAR set of {total} bytes is joined in memory, past --max-memory {max}"
-                )));
-            }
-            let data = files.iter().map(fs::read).collect::<io::Result<Vec<_>>>()?;
-            let refs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
-            let joined = exav_unpack::join_rar_volumes(&refs).map_err(io::Error::other)?;
-            Ok(Box::new(joined))
-        }
-    }
+/// A file the archive is read from. The trait of the spill files, so that the
+/// block cache over either is compiled once.
+use exav_unpack::spill::SpillReader as ReadSeek;
+
+/// How a file of an archive is opened.
+type Opener<'a> = &'a dyn Fn(&Path) -> io::Result<Box<dyn ReadSeek>>;
+
+/// How one of several files that are open together is read: behind its cache.
+type Cached<'a> = &'a dyn Fn(&Path, usize) -> io::Result<Box<dyn ByteSource>>;
+
+fn open_file(path: &Path) -> io::Result<Box<dyn ReadSeek>> {
+    Ok(Box::new(File::open(path)?))
 }
 
-/// The format of a packed executable, which `detect` does not report: read
-/// whole, so only up to `max` bytes.
-fn packed(src: &dyn ByteSource, max: u64) -> Option<Format> {
-    if src.len() as u64 > max {
-        return None;
+/// The block and the capacity, in bytes, of the cache of each of `parts` files
+/// that share `bytes`, read `block` at a time. The parts of a set take a share
+/// each, with room for two blocks at least, so smaller blocks when there are
+/// many; a cache is never below a byte a block.
+fn cache_sizes(parts: usize, bytes: u64, block: u64) -> (usize, usize) {
+    let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+    let block = usize::try_from(block).unwrap_or(usize::MAX).max(1);
+    if parts <= 1 {
+        return (block, bytes);
     }
-    let data = src.window(0, src.len());
-    if exav_unpack::is_upx(&data) {
-        Some(Format::Upx)
-    } else if exav_unpack::is_pepack(&data) {
-        Some(Format::PePacked)
-    } else {
-        None
-    }
+    let share = bytes / parts;
+    (block.min((share / 2).max(4096)), share)
 }
 
-/// The parts of a byte-split set, read as one file.
-struct Joined {
-    parts: Vec<(File, u64)>,
-    len: u64,
-    pos: u64,
-}
-
-impl Joined {
-    fn new(parts: Vec<(File, u64)>) -> Self {
-        let len = parts.iter().map(|p| p.1).sum();
-        Joined { parts, len, pos: 0 }
-    }
-}
-
-impl Read for Joined {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut base = 0;
-        for (f, len) in &mut self.parts {
-            if self.pos < base + *len {
-                let off = self.pos - base;
-                f.seek(SeekFrom::Start(off))?;
-                let want = buf
-                    .len()
-                    .min(usize::try_from(*len - off).unwrap_or(usize::MAX));
-                let n = f.read(&mut buf[..want])?;
-                self.pos += n as u64;
-                return Ok(n);
-            }
-            base += *len;
-        }
-        Ok(0)
-    }
-}
-
-impl Seek for Joined {
-    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
-        let new = match to {
-            SeekFrom::Start(n) => Some(n),
-            SeekFrom::End(d) => self.len.checked_add_signed(d),
-            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+impl Opts {
+    /// The archive at `path`, with the other parts of its set. A single file
+    /// that fits in the object cache and in `--max-object-bytes` is read whole;
+    /// any other is read from disk as it is needed, through block caches sized
+    /// by `--object-cache-*`, the parts of a set sharing the cache. The table
+    /// that joins a RAR set may take up to `--max-object-bytes` bytes.
+    fn open(&self, path: &Path, opener: Opener) -> io::Result<Box<dyn ByteSource>> {
+        let layout = parts(path, &self.volumes)?;
+        // Each of `of` files that are open together, behind its cache.
+        let cached = |p: &Path, of: usize| -> io::Result<Box<dyn ByteSource>> {
+            let (block, share) = cache_sizes(of, self.cache_bytes, self.cache_block);
+            Ok(Box::new(BlockCache::with_sizes(opener(p)?, block, share)?))
         };
-        self.pos = new
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before the start"))?;
-        Ok(self.pos)
+        match layout {
+            Layout::One(p) => {
+                let mut file = opener(&p)?;
+                let len = file.seek(SeekFrom::End(0))?;
+                file.seek(SeekFrom::Start(0))?;
+                let cache = cache_sizes(1, self.cache_bytes, self.cache_block);
+                // Held only if the cache could hold it and `--max-object-bytes`
+                // allows it: a format read whole checks its size against that
+                // limit only for a source that is not in memory.
+                let hold = self.cache_bytes.min(self.limits.max_buffer_bytes);
+                open_source(file, len, hold, cache)
+            }
+            Layout::Bytes(files) => self.bytes_of(&files, &cached),
+            Layout::Volumes(files) => {
+                // A name is a label; the planner never opens one.
+                let mut labelled: Vec<(String, &Path)> = Vec::new();
+                for p in &files {
+                    let label = p.file_name().map_or_else(
+                        || p.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    );
+                    if labelled.iter().any(|(l, _)| *l == label) {
+                        return Err(io::Error::other(format!(
+                            "two parts of the archive are both called {label}"
+                        )));
+                    }
+                    labelled.push((label, p));
+                }
+                let names: Vec<String> = labelled.iter().map(|(l, _)| l.clone()).collect();
+                let mut open = |label: &str, of: usize| -> io::Result<Box<dyn ByteSource>> {
+                    let (_, p) = labelled
+                        .iter()
+                        .find(|(l, _)| l == label)
+                        .ok_or_else(|| io::Error::other(format!("no part called {label}")))?;
+                    cached(p, of)
+                };
+                let mut found = Parts::Files(&mut open);
+                let mut sets = plan(&names, &mut found);
+                // Parts named as no set of volumes: a RAR volume by its first
+                // bytes, else a file cut into pieces.
+                if sets.is_empty() {
+                    let mut head = [0u8; 4];
+                    let rar = File::open(path)
+                        .and_then(|mut f| f.read_exact(&mut head))
+                        .is_ok()
+                        && &head == b"Rar!";
+                    if !rar {
+                        return self.bytes_of(&files, &cached);
+                    }
+                    sets.push(SetPlan {
+                        name: names[0].clone(),
+                        kind: SetKind::Rar,
+                        parts: names.clone(),
+                        broken: None,
+                    });
+                }
+                let first = &names[0];
+                let set = sets
+                    .iter()
+                    .find(|s| s.parts.contains(first))
+                    .unwrap_or(&sets[0]);
+                let table = usize::try_from(self.limits.max_buffer_bytes).unwrap_or(usize::MAX);
+                join(set, &mut found, table, &mut 0).map_err(io::Error::other)
+            }
+        }
+    }
+
+    /// The parts of a file that was cut into pieces, end to end.
+    fn bytes_of(&self, files: &[PathBuf], cached: Cached) -> io::Result<Box<dyn ByteSource>> {
+        let parts = files
+            .iter()
+            .map(|p| cached(p, files.len()))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Box::new(ByteSpan::new(parts).map_err(io::Error::other)?))
+    }
+}
+
+/// How a member is called.
+struct Label<'a> {
+    /// What the patterns of the command line are matched against: the name the
+    /// archive wrote, and for a member of an archive in the archive (`-r`) the
+    /// names down to it, joined by `!`.
+    raw: Cow<'a, str>,
+    /// What is printed: `raw` with the characters that end a line, move the
+    /// cursor or reorder text replaced, and each name cut at a length.
+    shown: Cow<'a, str>,
+    /// Where it goes under the extraction directory: the names joined by `/`.
+    rel: Cow<'a, str>,
+}
+
+impl<'a> Label<'a> {
+    /// A member of the archive itself.
+    fn stored(name: &'a str) -> Self {
+        Label {
+            raw: Cow::Borrowed(name),
+            shown: Name::stored(name).shown(),
+            rel: Cow::Borrowed(name),
+        }
+    }
+
+    /// The node at `path`, below the archive: the names after the first.
+    fn nested(path: &Located<'_>) -> Label<'static> {
+        let segments = path.segments();
+        let names = segments.get(1..).unwrap_or_default();
+        let join = |of: &dyn Fn(&Name<'_>) -> String, with: &str| {
+            names.iter().map(of).collect::<Vec<_>>().join(with)
+        };
+        Label {
+            raw: Cow::Owned(join(&|n| n.raw.to_string(), "!")),
+            shown: Cow::Owned(join(&|n| n.shown().into_owned(), "!")),
+            rel: Cow::Owned(join(&|n| n.raw.to_string(), "/")),
+        }
+    }
+}
+
+/// A member, and what is known of it besides its bytes.
+struct Item<'a> {
+    label: Label<'a>,
+    meta: &'a MemberMeta,
+    /// Why the bytes are not all there, when the walk knew before it handed
+    /// them over.
+    failed: Option<String>,
+}
+
+/// A source read as a stream.
+struct Windows<'a> {
+    src: &'a dyn ByteSource,
+    at: usize,
+}
+
+impl Read for Windows<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let want = buf.len().min(self.src.len().saturating_sub(self.at));
+        if want == 0 {
+            return Ok(0);
+        }
+        let got = self.src.window(self.at, want);
+        if got.is_empty() {
+            return Err(io::Error::other(
+                self.src
+                    .read_error()
+                    .unwrap_or_else(|| "the source gave nothing".to_string()),
+            ));
+        }
+        buf[..got.len()].copy_from_slice(&got);
+        self.at += got.len();
+        Ok(got.len())
+    }
+}
+
+/// The walk of `-r`: each node below the archive that is not an archive, or is
+/// one that gave no member, is handled as a member of a single archive is.
+struct Nested<'a, 'o> {
+    archive: &'a mut Archive<'o>,
+    root: &'a Path,
+}
+
+impl Nested<'_, '_> {
+    /// Handle `node` as a member. The walk stops with what ends the run.
+    fn emit(&mut self, node: &Node<'_>) -> Flow<String> {
+        self.emit_as(node, Label::nested(&node.path))
+    }
+
+    /// [`Self::emit`] under `label`.
+    fn emit_as(&mut self, node: &Node<'_>, label: Label<'_>) -> Flow<String> {
+        if let Some(why) = node.capped {
+            self.archive.fail(&label.shown, why);
+            return Flow::Leaf;
+        }
+        let made;
+        let meta = match node.meta {
+            Some(meta) => meta,
+            None => {
+                made = MemberMeta {
+                    name: node.path.name().raw.to_string(),
+                    comp_size: node.size,
+                    size: Some(node.size),
+                    ..MemberMeta::default()
+                };
+                &made
+            }
+        };
+        let failed = match &node.end {
+            End::Complete => None,
+            End::Cut(e) | End::Damaged(e) => Some(e.clone()),
+        };
+        let item = Item {
+            label,
+            meta,
+            failed,
+        };
+        let mut windows;
+        let mut chain;
+        let content = match &node.content {
+            Content::None => None,
+            Content::Source(src) => {
+                windows = Windows { src: *src, at: 0 };
+                Some(Member::Stream(&mut windows))
+            }
+            Content::Stream(cell) => match cell.take() {
+                Some(taken) => {
+                    chain = taken;
+                    Some(Member::Stream(&mut chain))
+                }
+                None => None,
+            },
+        };
+        match self.archive.member(self.root, &item, content) {
+            Ok(()) => Flow::Leaf,
+            Err(fatal) => Flow::Stop(fatal),
+        }
+    }
+}
+
+impl Visitor<String> for Nested<'_, '_> {
+    fn visit(&mut self, node: &Node<'_>, cx: &mut Cx<'_>, _: &mut Reasons) -> Flow<String> {
+        if node.origin == Origin::Root {
+            // A depth of 0 opens no archive, this one included: it is the
+            // one file, under its own name.
+            if cx.budget().limits().max_recursion > 0 {
+                return Flow::Descend;
+            }
+            let path = self.archive.path;
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            return self.emit_as(node, Label::stored(&name));
+        }
+        match node.format() {
+            Typed::Container(_) if node.source().is_some() && node.capped.is_none() => {
+                match cx.depth_hit(node.depth) {
+                    None => return Flow::Descend,
+                    // Not opened: it is one more file, and a limit was reached.
+                    Some(hit) => {
+                        let label = Label::nested(&node.path);
+                        self.archive.fail(&label.shown, &hit.reason);
+                    }
+                }
+            }
+            Typed::Unchecked(why) => {
+                let label = Label::nested(&node.path);
+                eprintln!("caution: {}: {}", label.shown, shown_text(&why.text));
+                self.archive.raise(status::WARNING);
+            }
+            _ => {}
+        }
+        self.emit(node)
+    }
+
+    /// An archive nothing came out of is one more file.
+    fn leave(
+        &mut self,
+        node: &Node<'_>,
+        members: u64,
+        _: &mut Cx<'_>,
+        _: &mut Reasons,
+    ) -> Flow<String> {
+        match (node.origin == Origin::Root, members) {
+            (false, 0) => self.emit(node),
+            _ => Flow::Leaf,
+        }
+    }
+
+    fn reason(&mut self, at: &Located<'_>, reason: &Reason) {
+        match reason.kind {
+            // The copy that met it says so.
+            ReasonKind::ReadFailed => {}
+            ReasonKind::NotChecked => {
+                let label = Label::nested(at);
+                eprintln!("caution: {}: {}", label.shown, shown_text(&reason.text));
+                self.archive.raise(status::WARNING);
+            }
+            _ => {
+                let label = Label::nested(at);
+                self.archive.fail(&label.shown, &reason.text);
+            }
+        }
     }
 }
 
@@ -1603,5 +2095,408 @@ mod tests {
         assert!(escapes(root, Path::new("/r/a/l"), "../../b"));
         assert!(escapes(root, Path::new("/r/l"), "../l"));
         assert!(escapes(root, Path::new("/r/l"), "/etc/passwd"));
+    }
+
+    /// The options of a run with an environment of no variables.
+    fn parsed(args: &[&str]) -> Result<Box<Opts>, String> {
+        parsed_in(&[], args)
+    }
+
+    /// The options of a run with `vars` in its environment.
+    fn parsed_in(vars: &[(&str, &str)], args: &[&str]) -> Result<Box<Opts>, String> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let env = |name: &str| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        };
+        match parse_with(&args, &env)? {
+            Parsed::Run(o) => Ok(o),
+            _ => Err("not a run".to_string()),
+        }
+    }
+
+    /// Every limit has its variable, with the values its option takes and the
+    /// `off` the scanner's flag of that name takes.
+    #[test]
+    fn the_limits_are_read_from_the_environment() {
+        let get = |vars: &[(&str, &str)]| parsed_in(vars, &["a.zip"]).unwrap();
+        let o = get(&[]);
+        let (extracted, object, members) = (
+            o.limits.max_extracted_bytes,
+            o.limits.max_buffer_bytes,
+            o.limits.max_members,
+        );
+        assert_eq!((extracted, object, members), (64 << 30, 1 << 30, 1_000_000));
+        assert_eq!(o.limits.max_recursion, Limits::default().max_recursion);
+        assert_eq!(
+            o.limits.max_compression_ratio,
+            Limits::default().max_compression_ratio
+        );
+
+        let o = get(&[("EXAV_MAX_EXTRACTED_BYTES", "2M")]);
+        assert_eq!(
+            (o.limits.max_extracted_bytes, o.limits.max_scanned_bytes),
+            (2 << 20, 2 << 20)
+        );
+        assert_eq!(
+            get(&[("EXAV_MAX_OBJECT_BYTES", "3K")])
+                .limits
+                .max_buffer_bytes,
+            3 << 10
+        );
+        assert_eq!(get(&[("EXAV_MAX_MEMBERS", "7")]).limits.max_members, 7);
+        assert_eq!(
+            get(&[("EXAV_MAX_COMPRESSION_RATIO", "7")])
+                .limits
+                .max_compression_ratio,
+            7
+        );
+        assert_eq!(
+            get(&[("EXAV_MAX_UNPACK_DEPTH", "3")]).limits.max_recursion,
+            3
+        );
+        let o = get(&[
+            ("EXAV_OBJECT_CACHE_BYTES", "4M"),
+            ("EXAV_OBJECT_CACHE_BLOCK_BYTES", "64K"),
+        ]);
+        assert_eq!((o.cache_bytes, o.cache_block), (4 << 20, 64 << 10));
+        let o = get(&[
+            ("EXAV_SPILL_DIR", "/spill"),
+            ("EXAV_MAX_TOTAL_SPILL_BYTES", "5M"),
+        ]);
+        assert_eq!(o.spill_dir, Some(PathBuf::from("/spill")));
+        assert_eq!(o.max_spill, Some(5 << 20));
+
+        // `off`: no limit, where the scanner's flag takes it.
+        let o = get(&[
+            ("EXAV_MAX_EXTRACTED_BYTES", "off"),
+            ("EXAV_MAX_OBJECT_BYTES", "OFF"),
+            ("EXAV_MAX_MEMBERS", "off"),
+            ("EXAV_MAX_COMPRESSION_RATIO", "off"),
+            ("EXAV_OBJECT_CACHE_BYTES", "off"),
+            ("EXAV_OBJECT_CACHE_BLOCK_BYTES", "off"),
+            ("EXAV_SPILL_DIR", "off"),
+            ("EXAV_MAX_TOTAL_SPILL_BYTES", "off"),
+        ]);
+        assert_eq!(
+            (
+                o.limits.max_extracted_bytes,
+                o.limits.max_scanned_bytes,
+                o.limits.max_buffer_bytes,
+                o.limits.max_members,
+                o.limits.max_compression_ratio
+            ),
+            (u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX)
+        );
+        assert_eq!((o.cache_bytes, o.cache_block), (0, 0));
+        assert_eq!((o.spill_dir, o.max_spill), (None, None));
+        // The depth has none.
+        let e = parsed_in(&[("EXAV_MAX_UNPACK_DEPTH", "off")], &["a.zip"]).err();
+        assert!(e.is_some_and(|e| e.contains("EXAV_MAX_UNPACK_DEPTH")));
+
+        // A bad value names the variable.
+        for (var, bad) in [
+            ("EXAV_MAX_EXTRACTED_BYTES", "x"),
+            ("EXAV_MAX_OBJECT_BYTES", "1MB"),
+            ("EXAV_MAX_MEMBERS", "-1"),
+            ("EXAV_MAX_COMPRESSION_RATIO", "-1"),
+            ("EXAV_OBJECT_CACHE_BYTES", "big"),
+            ("EXAV_OBJECT_CACHE_BLOCK_BYTES", "1.5M"),
+            ("EXAV_MAX_TOTAL_SPILL_BYTES", "lots"),
+        ] {
+            let e = parsed_in(&[(var, bad)], &["a.zip"])
+                .err()
+                .unwrap_or_default();
+            assert!(e.contains(var), "{var}={bad}: {e}");
+        }
+        // An empty one is a value that is none, as it is for the scanner.
+        for var in ["EXAV_MAX_OBJECT_BYTES", "EXAV_MAX_UNPACK_DEPTH"] {
+            let e = parsed_in(&[(var, "")], &["a.zip"])
+                .err()
+                .unwrap_or_default();
+            assert!(e.contains(var), "{var}: {e}");
+        }
+    }
+
+    /// The command line wins over the environment, whichever name it uses.
+    #[test]
+    fn the_command_line_wins_over_the_environment() {
+        let vars = [
+            ("EXAV_MAX_EXTRACTED_BYTES", "1K"),
+            ("EXAV_MAX_OBJECT_BYTES", "1K"),
+            ("EXAV_MAX_MEMBERS", "1"),
+            ("EXAV_MAX_COMPRESSION_RATIO", "1"),
+            ("EXAV_MAX_UNPACK_DEPTH", "1"),
+            ("EXAV_OBJECT_CACHE_BYTES", "1K"),
+            ("EXAV_OBJECT_CACHE_BLOCK_BYTES", "1K"),
+            ("EXAV_SPILL_DIR", "/env"),
+            ("EXAV_MAX_TOTAL_SPILL_BYTES", "1K"),
+        ];
+        let o = parsed_in(
+            &vars,
+            &[
+                "--max-extracted-bytes=9M",
+                "--max-object-bytes",
+                "8M",
+                "--max-members",
+                "70",
+                "--max-compression-ratio",
+                "300",
+                "--max-unpack-depth",
+                "5",
+                "--object-cache-bytes",
+                "6M",
+                "--object-cache-block-bytes",
+                "64K",
+                "--spill-dir",
+                "/flag",
+                "--max-total-spill-bytes",
+                "off",
+                "a.zip",
+            ],
+        )
+        .unwrap();
+        assert_eq!(o.limits.max_extracted_bytes, 9 << 20);
+        assert_eq!(o.limits.max_buffer_bytes, 8 << 20);
+        assert_eq!(o.limits.max_members, 70);
+        assert_eq!(o.limits.max_compression_ratio, 300);
+        assert_eq!(o.limits.max_recursion, 5);
+        assert_eq!((o.cache_bytes, o.cache_block), (6 << 20, 64 << 10));
+        assert_eq!(o.spill_dir, Some(PathBuf::from("/flag")));
+        assert_eq!(o.max_spill, None);
+        // The older names are options too: they win as the new ones do.
+        let o = parsed_in(&vars, &["--max-size", "9M", "--max-memory", "8M", "a.zip"]).unwrap();
+        assert_eq!(o.limits.max_extracted_bytes, 9 << 20);
+        assert_eq!(o.limits.max_buffer_bytes, 8 << 20);
+        // An option that is bad is refused whatever the variable says.
+        assert!(parsed_in(&vars, &["--max-object-bytes", "x", "a.zip"]).is_err());
+        // The spill defaults are exav-grep's.
+        let o = parsed(&["a.zip"]).unwrap();
+        assert_eq!(o.spill_dir, Some(std::env::temp_dir()));
+        assert_eq!(o.max_spill, Some(2 << 30));
+        let o = parsed(&[
+            "--spill-dir",
+            "off",
+            "--max-total-spill-bytes",
+            "0",
+            "a.zip",
+        ])
+        .unwrap();
+        assert_eq!((o.spill_dir, o.max_spill), (None, None));
+    }
+
+    /// `0` is no limit, as `off` is, for every limit that takes `off`.
+    #[test]
+    fn zero_is_no_limit() {
+        let o = parsed(&[
+            "--max-extracted-bytes",
+            "0",
+            "--max-object-bytes",
+            "0K",
+            "--max-members",
+            "0",
+            "--max-compression-ratio",
+            "0",
+            "a.zip",
+        ])
+        .unwrap();
+        let l = &o.limits;
+        assert_eq!(
+            [
+                l.max_extracted_bytes,
+                l.max_scanned_bytes,
+                l.max_buffer_bytes
+            ],
+            [u64::MAX; 3]
+        );
+        assert_eq!([l.max_members, l.max_compression_ratio], [u64::MAX; 2]);
+    }
+
+    /// The scanner's names and defaults, and its `off`, which is 0.
+    #[test]
+    fn the_cache_options_are_read_and_default_to_the_scanners() {
+        let o = parsed(&["a.zip"]).unwrap();
+        assert_eq!((o.cache_bytes, o.cache_block), (32 << 20, 1 << 20));
+        let o = parsed(&[
+            "--object-cache-bytes",
+            "4M",
+            "--object-cache-block-bytes=64K",
+            "a.zip",
+        ])
+        .unwrap();
+        assert_eq!((o.cache_bytes, o.cache_block), (4 << 20, 64 << 10));
+        for off in ["off", "OFF", "0"] {
+            let o = parsed(&[
+                "--object-cache-bytes",
+                off,
+                "--object-cache-block-bytes",
+                off,
+                "a.zip",
+            ])
+            .unwrap();
+            assert_eq!((o.cache_bytes, o.cache_block), (0, 0), "{off}");
+        }
+        for flag in ["--object-cache-bytes", "--object-cache-block-bytes"] {
+            for bad in ["1MB", "big", "", "-1", "1.5M"] {
+                assert!(parsed(&[flag, bad, "a.zip"]).is_err(), "{flag} {bad}");
+            }
+            let e = parsed(&["a.zip", flag]).err().unwrap_or_default();
+            assert!(e.contains("needs a value"), "{flag}: {e}");
+        }
+        // The limits take it too, as no limit.
+        let o = parsed(&["--max-memory", "off", "a.zip"]).unwrap();
+        assert_eq!(o.limits.max_buffer_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn the_parts_of_a_set_share_the_cache() {
+        let (block, cap) = (1 << 20, 32 << 20);
+        // One file or one source: as it is given.
+        assert_eq!(cache_sizes(1, cap, block), (1 << 20, 32 << 20));
+        assert_eq!(cache_sizes(0, cap, block), (1 << 20, 32 << 20));
+        // A set: a share each, the block the same while two fit a share.
+        assert_eq!(cache_sizes(4, cap, block), (1 << 20, 8 << 20));
+        // Many parts: two blocks at least in a share, so the block shrinks.
+        let (b, share) = cache_sizes(100, cap, block);
+        assert_eq!(share, (32 << 20) / 100);
+        assert_eq!(b, share / 2);
+        // And not below 4 KiB.
+        assert_eq!(cache_sizes(100_000, cap, block).0, 4096);
+        // `off`: a byte a block, and a cache of nothing for the cache to round
+        // up to two blocks.
+        assert_eq!(cache_sizes(1, 0, 0), (1, 0));
+        assert_eq!(cache_sizes(3, 0, 0), (1, 0));
+        // Nothing overflows.
+        assert_eq!(cache_sizes(2, u64::MAX, u64::MAX).1, usize::MAX / 2);
+    }
+
+    /// A file that keeps the sizes of the reads made of it.
+    struct Counting {
+        inner: io::Cursor<Vec<u8>>,
+        reads: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    }
+
+    impl Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.reads.borrow_mut().push(n);
+            Ok(n)
+        }
+    }
+
+    impl Seek for Counting {
+        fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    /// The options reach the cache the archive is read through: what it reads
+    /// at a time, and how much of it it keeps.
+    #[test]
+    fn the_cache_options_size_the_reads_of_the_archive() {
+        let dir = std::env::temp_dir().join(format!("exav-unpack-main-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plain.bin");
+        let data: Vec<u8> = (0..(1u32 << 20)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let p = path.to_str().unwrap();
+
+        // The sizes of the reads of the file, and the bytes read, when
+        // `rounds` passes are made over the blocks of 64 KiB.
+        let run = |flags: &[&str], rounds: usize| -> (Vec<usize>, bool, usize) {
+            let reads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let opener = |_: &Path| -> io::Result<Box<dyn ReadSeek>> {
+                Ok(Box::new(Counting {
+                    inner: io::Cursor::new(data.clone()),
+                    reads: std::rc::Rc::clone(&reads),
+                }))
+            };
+            let args: Vec<&str> = flags.iter().copied().chain([p]).collect();
+            let src = parsed(&args).unwrap().open(&path, &opener).unwrap();
+            // What the open itself read.
+            let opened = reads.borrow().iter().sum::<usize>();
+            let mut same = true;
+            for _ in 0..rounds {
+                for k in 0..16 {
+                    let w = src.window(k * 65536, 4);
+                    same &= w[..] == data[k * 65536..k * 65536 + 4];
+                }
+            }
+            let reads = reads.borrow().clone();
+            (reads, same, opened)
+        };
+
+        // A file the cache can hold is read whole, when it is opened, and not
+        // again whatever is asked of it after.
+        let (reads, same, opened) = run(&["--object-cache-block-bytes", "64K"], 3);
+        assert!(same);
+        assert_eq!(
+            (reads.iter().sum::<usize>(), opened),
+            (data.len(), data.len())
+        );
+        // The size of the cache is the most a file read whole may be.
+        let (reads, same, opened) = run(&["--object-cache-bytes", "1M"], 3);
+        assert!(same);
+        assert_eq!(
+            (reads.iter().sum::<usize>(), opened),
+            (data.len(), data.len())
+        );
+        // Nor is a file held past `--max-object-bytes`, whatever the cache.
+        let (_, same, opened) = run(&["--max-object-bytes", "512K"], 1);
+        assert!(same);
+        assert!(opened < data.len(), "{opened}");
+        // A file longer than the cache is read where it lies, a block at a
+        // time, as it is asked for, and the cache of 4 blocks cannot keep the
+        // 16 of the passes.
+        let one_short = (1 << 20) - 1;
+        let long = ["--object-cache-block-bytes", "64K", "--object-cache-bytes"];
+        let (reads, same, opened) = run(&[long[0], long[1], long[2], &one_short.to_string()], 1);
+        assert!(same);
+        assert_eq!(reads, vec![65536; 16]);
+        assert!(opened < data.len(), "{opened}");
+        let (reads, same, _) = run(&[long[0], long[1], long[2], "256K"], 3);
+        assert!(same);
+        assert!(reads.len() > 16, "{} reads", reads.len());
+        assert!(reads.iter().all(|&n| n <= 65536), "{reads:?}");
+        // `off`: a cache of two blocks, so that the passes read again.
+        let (reads, same, _) = run(&[long[0], long[1], long[2], "off"], 3);
+        assert!(same);
+        assert!(reads.len() > 2 * 16, "{} reads", reads.len());
+        assert!(reads.iter().all(|&n| n <= 65536 || n == 0), "{reads:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The parts of a set read through one cache between them: three parts of
+    /// a RAR set under 12 KiB are read 4 KiB at a time, where one under the
+    /// same would read 6 KiB.
+    #[test]
+    fn the_parts_of_a_set_are_read_through_their_share() {
+        let dir = std::env::temp_dir().join(format!("exav-unpack-main-set-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Parts that are RAR volumes by name and by their first bytes, and
+        // nothing else: the set is refused, after its parts were read.
+        let mut data = b"Rar!\x1a\x07\x00".to_vec();
+        data.resize(100_000, 0xAA);
+        let names: Vec<PathBuf> = (1..=3)
+            .map(|k| dir.join(format!("set.part{k}.rar")))
+            .collect();
+        for p in &names {
+            std::fs::write(p, &data).unwrap();
+        }
+        let reads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let opener = |_: &Path| -> io::Result<Box<dyn ReadSeek>> {
+            Ok(Box::new(Counting {
+                inner: io::Cursor::new(data.clone()),
+                reads: std::rc::Rc::clone(&reads),
+            }))
+        };
+        let first = names[0].to_str().unwrap();
+        let o = parsed(&["--object-cache-bytes", "12K", first]).unwrap();
+        let _ = o.open(&names[0], &opener);
+        let reads = reads.borrow().clone();
+        assert!(!reads.is_empty());
+        assert!(reads.iter().all(|&n| n <= 4096), "{reads:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1109,3 +1109,26 @@ fn a_file_cut_anywhere_or_changed_anywhere_is_read_soundly() {
     );
     sweep(&glb(&json, &data), |b| read(b, 1000).ok());
 }
+
+#[test]
+fn is_glb_names_the_version_the_reader_reads_and_no_other_bytes() {
+    use exav_render::gltf::is_glb;
+    let data = cube_data("u16");
+    let json = cube_doc("u16", "");
+    let file = glb(&json, &data);
+    assert!(is_glb(&file));
+    // The header is enough.
+    assert!(is_glb(&file[..8]));
+    assert!(!is_glb(b""));
+    assert!(!is_glb(b"glTF"));
+    assert!(!is_glb(&file[..7]));
+    let mut v1 = file.clone();
+    v1[4] = 1;
+    assert!(!is_glb(&v1));
+    let mut big_endian = file.clone();
+    big_endian[4..8].copy_from_slice(&2u32.to_be_bytes());
+    assert!(!is_glb(&big_endian));
+    // A document is not a container.
+    assert!(!is_glb(json.as_bytes()));
+    assert!(!is_glb(b" glTF\x02\0\0\0"));
+}

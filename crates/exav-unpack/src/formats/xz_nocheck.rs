@@ -82,8 +82,8 @@ enum Mode {
     Done,
 }
 
-pub(crate) struct NoCheck<R> {
-    inner: R,
+pub(crate) struct NoCheck<'a> {
+    inner: Box<dyn Read + 'a>,
     mode: Mode,
     /// Bytes of check field to leave out of each block.
     strip: usize,
@@ -91,10 +91,10 @@ pub(crate) struct NoCheck<R> {
     at: usize,
 }
 
-impl<R: Read> NoCheck<R> {
-    pub(crate) fn new(inner: R) -> Self {
+impl<'a> NoCheck<'a> {
+    pub(crate) fn new(inner: impl Read + 'a) -> Self {
         NoCheck {
-            inner,
+            inner: Box::new(inner),
             mode: Mode::Header,
             strip: 0,
             out: Vec::new(),
@@ -350,7 +350,7 @@ impl<R: Read> NoCheck<R> {
     }
 }
 
-impl<R: Read> Read for NoCheck<R> {
+impl Read for NoCheck<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             if self.at < self.out.len() {

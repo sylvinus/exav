@@ -1,7 +1,7 @@
-//! UDF — the filesystem on DVDs, Blu-rays, and any `.iso` a modern tool writes.
+//! UDF: the filesystem on DVDs, Blu-rays, and any `.iso` a modern tool writes.
 //!
 //! Windows and macOS both mount a UDF image on double-click, and 7-Zip opens
-//! one, so it is as plausible a delivery container as ISO 9660 — which it has
+//! one, so it is as plausible a delivery container as ISO 9660, which it has
 //! largely replaced. Most `.iso` files carry **both** filesystems ("UDF bridge")
 //! over the same extents, but a UDF-only image is perfectly ordinary, and there
 //! the ISO 9660 walk finds nothing at all.
@@ -27,13 +27,11 @@
 //!
 //! Called from the ISO extractor rather than dispatched on its own, so that a
 //! bridge image is walked through both filesystems with a shared set of already
-//! emitted extents — the two trees name the same blocks, so files are not
+//! emitted extents: the two trees name the same blocks, so files are not
 //! scanned twice.
 //!
-//! One walk serves both the in-memory image ([`extract_udf`]) and a seekable
-//! source ([`stream_udf`]): it reads the image through [`Image`] and hands each
-//! file over as the runs of bytes it occupies, which the two drivers either
-//! copy out or stream.
+//! The walk ([`stream_udf`]) reads the image through [`Image`] and hands each
+//! file over as the runs of bytes it occupies, which the driver streams.
 
 // Every sum and product on a header's number is checked or saturating here; a
 // plain one fails the build, so the next edit cannot add the unchecked kind.
@@ -85,14 +83,16 @@ const EXTENT_RECORDED: u32 = 0;
 /// The descriptor points at a continuation of the descriptor list.
 const EXTENT_CONTINUATION: u32 = 3;
 
-/// Bounds on the walk. Each is reported when hit: a cap that stops quietly
-/// leaves the rest of the image unenumerated while the file still reads clean.
-const MAX_DIRS: usize = 4096;
-const MAX_EXTENTS: usize = 8192;
-/// Allocation-descriptor bytes read for one entry, continuations included. A
-/// real list fits in a block; this is room for `MAX_EXTENTS` long ones several
-/// times over.
-const MAX_AD_BYTES: u64 = 1 << 20;
+/// What a walk may hold and read, from the scan's limits.
+#[derive(Clone, Copy)]
+struct Bounds {
+    /// Bytes held at once: one directory, or the allocation descriptors read
+    /// for one file entry.
+    held: u64,
+    /// Allocation descriptors read for one file entry, continuations
+    /// included. A real list fits in a block.
+    descriptors: u64,
+}
 
 /// Bytes of a Logical Volume Descriptor the walk reads: the fixed part and the
 /// most partition maps it looks at (64, of at most 255 bytes each).
@@ -234,6 +234,7 @@ struct Volume {
     maps: Vec<Map>,
     /// Where the File Set Descriptor is.
     fsd: Addr,
+    bounds: Bounds,
 }
 
 impl Volume {
@@ -284,7 +285,7 @@ const FILE_TYPE_METADATA_MIRROR: u8 = 251;
 /// Read the Anchor, the Main Volume Descriptor Sequence, the partitions it
 /// names and how each is addressed. `Stop::Bad` carries a reason to report
 /// rather than a reason to stay quiet.
-fn volume(img: &mut dyn Image) -> Result<Volume, Stop> {
+fn volume(img: &mut dyn Image, bounds: Bounds) -> Result<Volume, Stop> {
     let sectors = img.len() / SECTOR;
     let mut anchor = None;
     for s in [
@@ -393,6 +394,7 @@ fn volume(img: &mut dyn Image) -> Result<Volume, Stop> {
         block_size,
         maps,
         fsd,
+        bounds,
     };
     for (index, number, files) in metadata {
         let physical = vol
@@ -461,8 +463,9 @@ struct Extent {
 /// Read a File Entry's allocation descriptors, following continuations.
 /// `part` is the partition the entry is recorded in, which a short_ad's
 /// position refers to; a long_ad names its own. `None` when the descriptors use
-/// a form exav does not read. The flag is false when a cap, or a continuation
-/// in a partition the walk cannot follow, stopped the list before its end.
+/// a form exav does not read. The flag is false when the bounds of the walk, a
+/// continuation that loops, or one in a partition the walk cannot follow,
+/// stopped the list before its end.
 fn extents(
     img: &mut dyn Image,
     vol: &Volume,
@@ -478,18 +481,22 @@ fn extents(
     };
     let mut out = Vec::new();
     let (mut area, mut len) = (ad_area, ad_len);
-    let mut ad_bytes = MAX_AD_BYTES;
-    // Bounded because a malformed continuation can point back at itself.
-    for _ in 0..MAX_EXTENTS {
-        let span = len.min(ad_bytes);
-        ad_bytes = ad_bytes.saturating_sub(span);
+    // Bytes of descriptors still to read: no more than the walk may count or
+    // hold.
+    let mut left = vol
+        .bounds
+        .descriptors
+        .saturating_mul(size)
+        .min(vol.bounds.held);
+    // A continuation can point back at a list already read.
+    let mut lists = HashSet::from([area]);
+    loop {
+        let span = len.min(left);
+        left = left.saturating_sub(span);
         let ads = img.read(area, crate::bytes::to_usize(span))?;
         let mut consumed = 0u64;
         let mut next: Option<(Addr, u64)> = None;
         while consumed.saturating_add(size) <= span {
-            if out.len() == MAX_EXTENTS {
-                return Ok(Some((out, false)));
-            }
             let o = crate::bytes::to_usize(consumed);
             consumed = consumed.saturating_add(size);
             let raw_len = le_u32(&ads, o);
@@ -521,11 +528,13 @@ fn extents(
                 };
                 area = off.saturating_add(24);
                 len = l.saturating_sub(24);
+                if !lists.insert(area) {
+                    return Ok(Some((out, false)));
+                }
             }
             None => return Ok(Some((out, span == len))),
         }
     }
-    Ok(Some((out, false)))
 }
 
 /// A stretch of a file's bytes: `len` bytes at image offset `at`, or `len`
@@ -742,10 +751,14 @@ enum Item {
         size: u64,
         reason: &'static str,
     },
+    /// A directory about to be read, `bytes` long. Counted as a member, and
+    /// its bytes against the scan budget: directories may overlap on the
+    /// image, so how many are read is no measure of its size.
+    Directory { bytes: u64 },
 }
 
 /// Receives each [`Item`] with the image it lies in; `Some` stops the walk.
-type Emit<'e, T> = &'e mut dyn FnMut(&mut dyn Image, Item) -> Result<Option<T>, LimitHit>;
+type Emit<'e> = &'e mut dyn FnMut(&mut dyn Image, Item) -> Result<Option<()>, LimitHit>;
 
 /// A file or directory found in the tree.
 struct Node {
@@ -754,13 +767,14 @@ struct Node {
 }
 
 /// Walk the UDF tree, handing every file, and everything that could not be
-/// read, to `sink`. `max_dir` bounds the bytes of one directory held at once.
-fn walk<T>(
+/// read, to `sink`. `bounds` holds what one directory or one list of
+/// allocation descriptors may take.
+fn walk(
     img: &mut dyn Image,
-    max_dir: u64,
+    bounds: Bounds,
     seen_extents: &mut HashSet<(u64, u64)>,
-    sink: Emit<'_, T>,
-) -> Result<Option<T>, LimitHit> {
+    sink: Emit<'_>,
+) -> Result<Option<()>, LimitHit> {
     macro_rules! emit {
         ($item:expr_2021) => {
             if let Some(t) = sink(&mut *img, $item)? {
@@ -771,7 +785,7 @@ fn walk<T>(
     let unreadable =
         |path: String, size: u64, reason: &'static str| Item::Unreadable { path, size, reason };
 
-    let vol = match volume(img) {
+    let vol = match volume(img, bounds) {
         Ok(v) => v,
         Err(Stop::Io(e)) => return Err(e),
         // The image says it is UDF; failing to read its structures leaves
@@ -805,21 +819,11 @@ fn walk<T>(
         name: String::new(),
         icb: root,
     }];
-    let mut walked = 0usize;
     let mut visited_icbs: HashSet<Addr> = HashSet::new();
 
     while let Some(dir) = queue.pop() {
-        walked = walked.saturating_add(1);
-        if walked > MAX_DIRS {
-            emit!(unreadable(
-                format!("<udf-directories-beyond-{MAX_DIRS}>"),
-                0,
-                "too many UDF directories to walk them all",
-            ));
-            break;
-        }
         // A directory tree that loops back on itself would otherwise be walked
-        // until the cap, hiding the rest of the image behind the budget.
+        // until the member limit, hiding the rest of the image behind it.
         if !visited_icbs.insert(dir.icb) {
             continue;
         }
@@ -831,15 +835,17 @@ fn walk<T>(
             None => None,
         };
         let body = match dir_layout {
-            Some(l) if l.size <= max_dir => {
+            Some(l) if l.size <= bounds.held => {
                 if !l.complete {
                     emit!(unreadable(
                         dir.name.clone(),
                         0,
-                        "UDF directory has more extents than exav follows; \
-                         the entries past them were not examined",
+                        "UDF directory whose allocation descriptors were not all followed \
+                         (past --max-members, in a loop, or in a partition exav cannot \
+                         read); the entries past them were not examined",
                     ));
                 }
+                emit!(Item::Directory { bytes: l.size });
                 read_runs(img, &l.runs)?
             }
             Some(_) => {
@@ -882,7 +888,7 @@ fn walk<T>(
             let fe_head = img.read(fe, FE_READ)?.into_owned();
             let tag = le_u16(&fe_head, 0);
             if tag != TAG_FILE_ENTRY && tag != TAG_EXTENDED_FILE_ENTRY {
-                // The entry names an ICB that is not a file entry — a strategy
+                // The entry names an ICB that is not a file entry, a strategy
                 // exav does not follow. The bytes are in the image; exav just
                 // cannot find them.
                 emit!(unreadable(
@@ -930,8 +936,9 @@ fn walk<T>(
                 emit!(unreadable(
                     path,
                     declared,
-                    "UDF file has more extents than exav follows; the rest of it \
-                     was not examined",
+                    "UDF file whose allocation descriptors were not all followed (past \
+                     --max-members, in a loop, or in a partition exav cannot read); the \
+                     rest of it was not examined",
                 ));
             }
         }
@@ -941,12 +948,12 @@ fn walk<T>(
 
 /// The UDF tree of a seekable image, each file streamed from its runs. A no-op
 /// when the image carries no UDF recognition sequence.
-pub(crate) fn stream_udf<R: Read + Seek, T>(
+pub(crate) fn stream_udf<R: Read + Seek>(
     source: &mut R,
     budget: &mut Budget,
-    visit: Visit<T>,
+    visit: Visit<()>,
     seen_extents: &mut HashSet<(u64, u64)>,
-) -> Result<Option<T>, LimitHit> {
+) -> Result<Option<()>, LimitHit> {
     let head = crate::read_at(source, 0, RECOGNITION_END)?;
     if !has_udf(&head) {
         return Ok(None);
@@ -954,11 +961,18 @@ pub(crate) fn stream_udf<R: Read + Seek, T>(
     let len = source
         .seek(SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("udf: {e}")))?;
-    let max_dir = budget.limits.max_buffer_bytes;
+    let bounds = Bounds {
+        held: budget.limits.max_buffer_bytes,
+        descriptors: budget.limits.max_members,
+    };
     let mut img = Seekable { src: source, len };
-    walk(&mut img, max_dir, seen_extents, &mut |img, item| {
+    walk(&mut img, bounds, seen_extents, &mut |img, item| {
         budget.count_entry()?;
         match item {
+            Item::Directory { bytes } => {
+                budget.charge_scan(bytes)?;
+                Ok(None)
+            }
             Item::Unreadable { path, size, reason } => {
                 let meta = MemberMeta {
                     name: path,

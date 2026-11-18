@@ -148,7 +148,6 @@ const archive = await Archive.open(file, {
   maxScannedBytes: 1024 * 1024 * 1024, // cumulative bytes fed to the matcher
   maxMembers: 5000,
   maxRecursion: 4,                     // archives inside archives
-  maxCompressionRatio: 200,            // decompression ratio
   allowedFormats: ["Zip", "Tar"],      // open only these; anything else is reported
 });
 ```
@@ -157,10 +156,12 @@ Two of the defaults are lower than the Rust library's on purpose:
 `maxExtractedBytes` is 128 MiB against 1 GiB, and `maxBufferBytes` 32 MiB
 against 256 MiB. wasm32 caps the address space at 4 GiB and a tab often gets
 far less; running out is not an error you can catch: the module aborts and
-your `await` never resolves. `maxMembers` (100000), `maxRecursion` (16) and
-`maxCompressionRatio` (1000) keep the library's values, since they bound counts
-and shapes rather than bytes. Raise them if the page can afford it: a desktop
-app in a Web Worker is not a phone browser.
+your `await` never resolves. `maxMembers` (100000) and `maxRecursion` (16)
+keep the library's values, since they bound counts and shapes rather than
+bytes. Raise them if the page can afford it: a desktop app in a Web Worker is
+not a phone browser. There is no compression-ratio limit to set: the library
+asks the ratio only of a member past `maxBufferBytes`, and a member is held
+whole here, so such a member is over the buffer limit first.
 
 `allowedFormats` narrows what one call may open, named as `detectFormat`
 names them; an unknown name is ignored. An excluded format at the top level

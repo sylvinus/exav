@@ -1,8 +1,8 @@
 //! EGG decoded against real archives, with the format's own CRC-32 as oracle.
 //!
 //! Every EGG block records a CRC-32 of its *decompressed* bytes, written by
-//! ESTsoft's compressor. A decoder that produces plausible-but-wrong output —
-//! the failure mode this project cares about, because it is silent — cannot
+//! ESTsoft's compressor. A decoder that produces plausible-but-wrong output
+//! (the failure mode this project cares about, because it is silent) cannot
 //! match it. The extractor scans a block that fails its CRC all the same, so
 //! `members` checks every decoded member against the CRC-32s the blocks
 //! record: a decoded member here means "these bytes reproduce the checksum the

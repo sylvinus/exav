@@ -2,7 +2,8 @@
 //!
 //! An object is either held in memory, where every consumer reads the slice
 //! directly, or read from a seekable source through a [`BlockCache`]: fixed
-//! blocks, the least recently used evicted past a byte budget. The cache bounds
+//! blocks held up to a byte budget, a sequential pass streamed through without
+//! evicting the rest, the least recently used evicted otherwise. The cache bounds
 //! the memory an object costs, not how far a consumer may look: any offset can
 //! be read, and a block evicted is read again from the source when needed.
 //!
@@ -11,16 +12,20 @@
 //! `dyn ByteSource` they reach the source through the cache.
 
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
+
+use crate::stream::Disk;
 
 /// Bytes a [`BlockCache`] reads at a time. The HTTP range reader fetches the
 /// same size, so a block is one request.
 pub const BLOCK_SIZE: usize = 64 * 1024;
 
-/// Bytes a [`BlockCache`] holds by default.
-pub const CACHE_BYTES: usize = 8 * 1024 * 1024;
+/// Bytes a [`BlockCache`] holds by default, and the default of
+/// `--object-cache-bytes` in every exav command and of the scanner's
+/// `object_cache_bytes`.
+pub const CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Bytes handed to a chunk visitor at a time when the source is not in memory.
 /// Small in tests, so a small object crosses many seams.
@@ -229,18 +234,175 @@ impl ByteSource for &[u8] {
     }
 }
 
-/// Blocks held, by index, with the tick each was last used at.
-type Blocks = HashMap<usize, (Box<[u8]>, u64)>;
+/// No slot: the end of the list.
+const NIL: usize = usize::MAX;
+
+/// Blocks of a sequential run held at once, once the cache is full: one for
+/// the block a pass is in, one for a read that spans into the next.
+const RUN_BLOCKS: usize = 2;
+
+/// The two lists of [`Blocks`].
+const MAIN: usize = 0;
+const RUN: usize = 1;
+
+/// A held block, the list it is in, and its neighbours there.
+struct Slot {
+    idx: usize,
+    data: Box<[u8]>,
+    list: usize,
+    /// Toward the end inserted or used last.
+    hotter: usize,
+    /// Toward the end evicted first.
+    colder: usize,
+}
+
+/// A list of slots: its two ends and its length.
+#[derive(Clone, Copy)]
+struct Ends {
+    hottest: usize,
+    coldest: usize,
+    len: usize,
+}
+
+/// The blocks held: a map from block index to slot, and the slots in two
+/// lists, so a hit, an insertion and an eviction are each a constant number
+/// of steps.
+///
+/// A miss on the block after the one read last, once the cache is full, is a
+/// sequential pass that will not come back to the block before it has read
+/// every other. It goes in a list of its own of [`RUN_BLOCKS`], first in first
+/// out, so a pass streams through it and leaves the rest of the cache (what an
+/// earlier pass left, the places scattered reads come back to) in place. Every
+/// other block is in the main list, the least recently used evicted first.
+/// Over passes on an object larger than the cache this keeps what plain LRU
+/// evicts just before the next pass needs it.
+struct Blocks {
+    map: HashMap<usize, usize>,
+    slots: Vec<Slot>,
+    lists: [Ends; 2],
+    /// The block read last, held or not.
+    last: Option<usize>,
+}
+
+impl Blocks {
+    fn new() -> Self {
+        let empty = Ends {
+            hottest: NIL,
+            coldest: NIL,
+            len: 0,
+        };
+        Blocks {
+            map: HashMap::new(),
+            slots: Vec::new(),
+            lists: [empty; 2],
+            last: None,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn unlink(&mut self, s: usize) {
+        let (hotter, colder, l) = (
+            self.slots[s].hotter,
+            self.slots[s].colder,
+            self.slots[s].list,
+        );
+        match hotter {
+            NIL => self.lists[l].hottest = colder,
+            h => self.slots[h].colder = colder,
+        }
+        match colder {
+            NIL => self.lists[l].coldest = hotter,
+            c => self.slots[c].hotter = hotter,
+        }
+        self.lists[l].len -= 1;
+    }
+
+    fn link_hot(&mut self, s: usize, l: usize) {
+        let hottest = self.lists[l].hottest;
+        let slot = &mut self.slots[s];
+        (slot.list, slot.hotter, slot.colder) = (l, NIL, hottest);
+        match hottest {
+            NIL => self.lists[l].coldest = s,
+            h => self.slots[h].hotter = s,
+        }
+        self.lists[l].hottest = s;
+        self.lists[l].len += 1;
+    }
+
+    /// Block `idx`'s bytes, if held. A block of the main list becomes its
+    /// most recently used.
+    fn get(&mut self, idx: usize) -> Option<&[u8]> {
+        let s = *self.map.get(&idx)?;
+        self.last = Some(idx);
+        if self.slots[s].list == MAIN && self.lists[MAIN].hottest != s {
+            self.unlink(s);
+            self.link_hot(s, MAIN);
+        }
+        Some(&self.slots[s].data)
+    }
+
+    /// Hold block `idx`, just read from the source, in a cache of at most
+    /// `max` blocks.
+    fn insert(&mut self, idx: usize, data: Box<[u8]>, max: usize) {
+        let run = self.last.is_some_and(|l| idx.checked_sub(1) == Some(l));
+        self.last = Some(idx);
+        let full = self.len() >= max;
+        let list = match run && full {
+            true => RUN,
+            false => MAIN,
+        };
+        // The list that gives up a block: a run's own once it has its
+        // blocks, else the main list while it has any.
+        let from = match (
+            list,
+            self.lists[RUN].len >= RUN_BLOCKS,
+            self.lists[MAIN].len,
+        ) {
+            (RUN, true, _) | (_, _, 0) => RUN,
+            _ => MAIN,
+        };
+        let s = if full && self.lists[from].coldest != NIL {
+            let s = self.lists[from].coldest;
+            self.unlink(s);
+            self.map.remove(&self.slots[s].idx);
+            self.slots[s].idx = idx;
+            self.slots[s].data = data;
+            s
+        } else {
+            self.slots.push(Slot {
+                idx,
+                data,
+                list,
+                hotter: NIL,
+                colder: NIL,
+            });
+            self.slots.len() - 1
+        };
+        self.map.insert(idx, s);
+        self.link_hot(s, list);
+    }
+}
+
+/// The longest source this build can address: `usize::MAX` bytes.
+pub const ADDRESSABLE: u64 = usize::MAX as u64;
 
 /// A seekable source read through fixed blocks, of which at most
 /// `capacity` bytes are held.
 pub struct BlockCache<R> {
     src: RefCell<R>,
+    cache: Cache,
+}
+
+/// What a [`BlockCache`] is but for its source, so that the reads of blocks
+/// are compiled once for every kind of source.
+struct Cache {
     len: usize,
     block: usize,
     blocks: RefCell<Blocks>,
     max_blocks: usize,
-    tick: Cell<u64>,
     error: RefCell<Option<String>>,
 }
 
@@ -250,27 +412,57 @@ impl<R: Read + Seek> BlockCache<R> {
         Self::with_sizes(src, BLOCK_SIZE, CACHE_BYTES)
     }
 
-    pub fn with_sizes(mut src: R, block: usize, capacity: usize) -> std::io::Result<Self> {
+    /// As [`Self::new`], with the block and cache sizes. A source longer than
+    /// this build can address (`usize::MAX` bytes, 4 GiB on a 32-bit target) is
+    /// an error, never a source cut short.
+    pub fn with_sizes(src: R, block: usize, capacity: usize) -> std::io::Result<Self> {
+        Self::with_limit(src, block, capacity, ADDRESSABLE)
+    }
+
+    /// [`Self::with_sizes`] for a build that addresses `max_len` bytes.
+    fn with_limit(
+        mut src: R,
+        block: usize,
+        capacity: usize,
+        max_len: u64,
+    ) -> std::io::Result<Self> {
         let len = src.seek(SeekFrom::End(0))?;
+        let too_long = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("the source is {len} bytes, past the {max_len} this build can address"),
+            )
+        };
+        if len > max_len {
+            return Err(too_long());
+        }
+        let len = usize::try_from(len).map_err(|_| too_long())?;
         let block = block.max(1);
         Ok(BlockCache {
             src: RefCell::new(src),
-            len: usize::try_from(len).unwrap_or(usize::MAX),
-            block,
-            blocks: RefCell::new(HashMap::new()),
-            max_blocks: (capacity / block).max(2),
-            tick: Cell::new(0),
-            error: RefCell::new(None),
+            cache: Cache {
+                len,
+                block,
+                blocks: RefCell::new(Blocks::new()),
+                max_blocks: (capacity / block).max(2),
+                error: RefCell::new(None),
+            },
         })
     }
+}
 
+impl Cache {
     /// Copy block `idx`'s bytes from `skip` into `out`, up to `want` bytes.
-    fn copy_block(&self, idx: usize, skip: usize, want: usize, out: &mut Vec<u8>) -> bool {
-        let tick = self.tick.get() + 1;
-        self.tick.set(tick);
+    fn copy_block(
+        &self,
+        src: &mut dyn Disk,
+        idx: usize,
+        skip: usize,
+        want: usize,
+        out: &mut Vec<u8>,
+    ) -> bool {
         let mut blocks = self.blocks.borrow_mut();
-        if let Some((data, used)) = blocks.get_mut(&idx) {
-            *used = tick;
+        if let Some(data) = blocks.get(idx) {
             let end = (skip + want).min(data.len());
             if skip < end {
                 out.extend_from_slice(&data[skip..end]);
@@ -283,12 +475,9 @@ impl<R: Read + Seek> BlockCache<R> {
         let start = idx * self.block;
         let size = self.block.min(self.len.saturating_sub(start));
         let mut data = vec![0u8; size];
-        let got = {
-            let mut src = self.src.borrow_mut();
-            match src.seek(SeekFrom::Start(start as u64)) {
-                Ok(_) => read_full(&mut *src, &mut data),
-                Err(e) => Err(e),
-            }
+        let got = match src.seek(SeekFrom::Start(start as u64)) {
+            Ok(_) => read_full(src, &mut data),
+            Err(e) => Err(e),
         };
         match got {
             Ok(n) if n == size => {}
@@ -310,21 +499,13 @@ impl<R: Read + Seek> BlockCache<R> {
             out.extend_from_slice(&data[skip..end]);
         }
         let whole = end == skip + want;
-        if blocks.len() >= self.max_blocks
-            && let Some(&old) = blocks
-                .iter()
-                .min_by_key(|(_, (_, used))| *used)
-                .map(|(k, _)| k)
-        {
-            blocks.remove(&old);
-        }
-        blocks.insert(idx, (data.into_boxed_slice(), tick));
+        blocks.insert(idx, data.into_boxed_slice(), self.max_blocks);
         whole
     }
 }
 
 /// Read until `buf` is full or the source ends.
-fn read_full<R: Read + ?Sized>(src: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+fn read_full(src: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
         match src.read(&mut buf[n..]) {
@@ -337,12 +518,8 @@ fn read_full<R: Read + ?Sized>(src: &mut R, buf: &mut [u8]) -> std::io::Result<u
     Ok(n)
 }
 
-impl<R: Read + Seek> ByteSource for BlockCache<R> {
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn window(&self, off: usize, len: usize) -> Cow<'_, [u8]> {
+impl Cache {
+    fn window(&self, src: &mut dyn Disk, off: usize, len: usize) -> Cow<'static, [u8]> {
         let end = off.saturating_add(len).min(self.len);
         if off >= end {
             return Cow::Owned(Vec::new());
@@ -353,21 +530,86 @@ impl<R: Read + Seek> ByteSource for BlockCache<R> {
             let idx = at / self.block;
             let skip = at - idx * self.block;
             let want = (self.block - skip).min(end - at);
-            if !self.copy_block(idx, skip, want, &mut out) {
+            if !self.copy_block(src, idx, skip, want, &mut out) {
                 break;
             }
             at += want;
         }
         Cow::Owned(out)
     }
+}
+
+impl<R: Read + Seek> ByteSource for BlockCache<R> {
+    fn len(&self) -> usize {
+        self.cache.len
+    }
+
+    fn window(&self, off: usize, len: usize) -> Cow<'_, [u8]> {
+        self.cache.window(&mut *self.src.borrow_mut(), off, len)
+    }
 
     fn read_error(&self) -> Option<String> {
-        self.error.borrow().clone()
+        self.cache.error.borrow().clone()
     }
 
     fn identity(&self) -> (usize, usize) {
-        (self as *const Self as usize, self.len)
+        (self as *const Self as usize, self.cache.len)
     }
+}
+
+/// Up to this size, a read into memory doubles its buffer; past it, it adds a
+/// quarter.
+const HOLD_STEP: usize = 64 * 1024;
+
+/// Append to `buf` what `r` gives, up to `max` bytes. The bytes read before an
+/// error are kept.
+///
+/// The memory is asked for as the data arrives, from 64 bytes, doubled up to
+/// 64 KiB, then a quarter more each time, never past `max`.
+/// `read_to_end` doubles all the way: a buffer that fills to `max` has asked
+/// for twice that, and where the allocator copies on growth the last step
+/// holds both copies at once.
+pub fn read_capped(r: &mut dyn Read, buf: &mut Vec<u8>, max: u64) -> std::io::Result<usize> {
+    let start = buf.len();
+    let end = start.saturating_add(usize::try_from(max).unwrap_or(usize::MAX));
+    while buf.len() < end {
+        if buf.len() == buf.capacity() {
+            let step = match buf.len() {
+                n if n < HOLD_STEP => n.max(64),
+                n => n / 4,
+            };
+            let step = step.min(end - buf.len());
+            buf.try_reserve_exact(step)
+                .map_err(|_| std::io::Error::other("not enough memory to hold the object"))?;
+        }
+        let before = buf.len();
+        let room = buf.capacity().min(end) - before;
+        (&mut *r).take(room as u64).read_to_end(buf)?;
+        if buf.len() - before < room {
+            break;
+        }
+    }
+    Ok(buf.len() - start)
+}
+
+/// A reader as the source of a walk: read into memory when it is at most
+/// `hold` bytes long, else read where it lies through a block cache of
+/// `cache` (block size, capacity in bytes). `len` is its length; a reader that
+/// is longer than that is held up to `hold` bytes and one byte more.
+pub fn open_source<R: Read + Seek + 'static>(
+    mut reader: R,
+    len: u64,
+    hold: u64,
+    cache: (usize, usize),
+) -> std::io::Result<Box<dyn ByteSource>> {
+    if len <= hold {
+        let mut data = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+        (&mut reader)
+            .take(hold.saturating_add(1))
+            .read_to_end(&mut data)?;
+        return Ok(Box::new(data));
+    }
+    Ok(Box::new(BlockCache::with_sizes(reader, cache.0, cache.1)?))
 }
 
 /// `[base, base + len)` of another source, as an object of its own: a region
@@ -657,6 +899,45 @@ mod tests {
         (0..n).map(|i| (i * 7 % 251) as u8).collect()
     }
 
+    /// A source longer than the build addresses is an error. It used to be
+    /// cut at the largest length, with the bytes past it never read and
+    /// nothing said.
+    #[test]
+    fn a_source_longer_than_the_build_addresses_is_an_error_not_a_cut() {
+        let d = data(5000);
+        let len = |max| BlockCache::with_limit(Cursor::new(d.clone()), 64, 256, max);
+        assert_eq!(len(5000).unwrap().len(), 5000);
+        assert_eq!(len(u64::MAX).unwrap().len(), 5000);
+        let e = len(4999).err().expect("past the limit");
+        assert!(e.to_string().contains("5000"), "{e}");
+        assert!(e.to_string().contains("4999"), "{e}");
+        assert!(len(0).is_err());
+    }
+
+    /// The same on a 32-bit target, where the limit is `usize::MAX`: a source
+    /// of 5 GiB, which is not held, only measured.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn a_source_past_4_gib_is_an_error_on_a_32_bit_target() {
+        struct Huge;
+        impl Read for Huge {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(0);
+                Ok(buf.len())
+            }
+        }
+        impl Seek for Huge {
+            fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+                match to {
+                    SeekFrom::End(0) => Ok(5 << 30),
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+        assert!(BlockCache::new(Huge).is_err());
+        assert!(BlockCache::with_sizes(Huge, 4096, 1 << 20).is_err());
+    }
+
     /// A seek past the largest offset is an error; it used to wrap to a small
     /// one, which passes any check made against the end of the object.
     #[test]
@@ -687,8 +968,118 @@ mod tests {
         ] {
             assert_eq!(c.window(off, len), d.window(off, len), "({off}, {len})");
         }
-        assert!(c.blocks.borrow().len() <= 4);
+        assert!(c.cache.blocks.borrow().len() <= 4);
         assert_eq!(c.read_error(), None);
+    }
+
+    /// A cursor that counts the reads made of it.
+    struct Counted(Cursor<Vec<u8>>, std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl Read for Counted {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            self.1.set(self.1.get() + 1);
+            self.0.read(b)
+        }
+    }
+
+    impl Seek for Counted {
+        fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(p)
+        }
+    }
+
+    /// A cache of 8 blocks of 64 bytes over 64 blocks, and its read counter.
+    fn counted() -> (BlockCache<Counted>, std::rc::Rc<std::cell::Cell<usize>>) {
+        let reads = std::rc::Rc::default();
+        let src = Counted(Cursor::new(data(64 * 64)), std::rc::Rc::clone(&reads));
+        (BlockCache::with_sizes(src, 64, 8 * 64).unwrap(), reads)
+    }
+
+    /// The blocks read from the source by `f`.
+    fn reads_by(
+        c: &BlockCache<Counted>,
+        reads: &std::cell::Cell<usize>,
+        f: impl Fn(&BlockCache<Counted>),
+    ) -> usize {
+        let before = reads.get();
+        f(c);
+        reads.get() - before
+    }
+
+    fn pass(c: &BlockCache<Counted>) {
+        for b in 0..64 {
+            c.window(b * 64, 64);
+        }
+    }
+
+    /// A pass over an object larger than the cache streams through it: the
+    /// blocks the first pass left are there for the next. Least recently used
+    /// alone evicts each just before the next pass needs it, and every pass
+    /// reads every block.
+    #[test]
+    fn passes_keep_what_the_first_pass_left() {
+        let (c, reads) = counted();
+        assert_eq!(reads_by(&c, &reads, pass), 64);
+        for _ in 0..3 {
+            let n = reads_by(&c, &reads, pass);
+            // Six blocks kept, the two others streamed through.
+            assert!(n <= 59, "a later pass read {n} of the 64 blocks");
+        }
+        assert!(c.cache.blocks.borrow().len() <= 8);
+    }
+
+    /// Blocks a scattered read comes back to survive a pass over the object.
+    #[test]
+    fn a_pass_does_not_evict_the_scattered_reads() {
+        let (c, reads) = counted();
+        pass(&c);
+        let scattered = |c: &BlockCache<Counted>| {
+            for b in [40, 50, 60] {
+                c.window(b * 64 + 3, 10);
+            }
+        };
+        scattered(&c);
+        pass(&c);
+        assert_eq!(reads_by(&c, &reads, scattered), 0);
+    }
+
+    /// Two passes at once, through different parts of the object and in
+    /// windows that span two blocks, read each block once.
+    #[test]
+    fn two_passes_at_once_read_each_block_once() {
+        let (c, reads) = counted();
+        pass(&c);
+        let n = reads_by(&c, &reads, |c| {
+            for b in 0..31 {
+                c.window(b * 64 + 40, 64);
+                c.window((b + 32) * 64 + 40, 64);
+            }
+        });
+        // The blocks of both halves, less what the first pass left.
+        assert!(n <= 64, "{n} reads");
+    }
+
+    /// Reads at any offset, through a cache of a few small blocks, return what
+    /// the slice holds, and the cache never holds more than its blocks.
+    #[test]
+    fn random_reads_agree_with_the_slice() {
+        let d = data(5000);
+        let c = BlockCache::with_sizes(Cursor::new(d.clone()), 16, 5 * 16).unwrap();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for i in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Runs of consecutive blocks among the scattered reads.
+            let off = match i % 3 {
+                0 => (state % 5100) as usize,
+                _ => (i * 16) % 5000,
+            };
+            let len = (state >> 20) as usize % 70;
+            assert_eq!(c.window(off, len), d.window(off, len), "({off}, {len})");
+            let b = c.cache.blocks.borrow();
+            assert!(b.len() <= 5 && b.slots.len() <= 5);
+        }
     }
 
     #[test]
@@ -734,5 +1125,52 @@ mod tests {
         assert_eq!(l.window(0, 5000).into_owned(), d.to_ascii_lowercase());
         assert_eq!(c.materialize(4999), None);
         assert_eq!(c.materialize(5000).as_deref(), Some(&d[..]));
+    }
+
+    /// A read into memory asks for about what it reads: a few bytes for a
+    /// small member, the limit and no more for one that reaches it.
+    #[test]
+    fn a_capped_read_asks_for_about_what_it_reads() {
+        let mut small = Vec::new();
+        read_capped(&mut &b"abcd"[..], &mut small, 256 << 20).unwrap();
+        assert_eq!(small, b"abcd");
+        assert!(small.capacity() <= 64, "{}", small.capacity());
+        let d = vec![7u8; (1 << 20) + 1];
+        let mut big = Vec::new();
+        read_capped(&mut &d[..], &mut big, 1 << 20).unwrap();
+        assert_eq!(big.len(), 1 << 20);
+        assert_eq!(big.capacity(), 1 << 20);
+    }
+
+    #[test]
+    fn a_reader_is_held_up_to_the_limit_and_read_in_place_past_it() {
+        let d = data(1000);
+        // At the limit: held, and its bytes are in memory.
+        let held = open_source(Cursor::new(d.clone()), 1000, 1000, (64, 256)).unwrap();
+        assert_eq!(held.as_slice(), Some(&d[..]));
+        // One byte past it: read where it lies, whole through the cache.
+        let cached = open_source(Cursor::new(d.clone()), 1000, 999, (64, 256)).unwrap();
+        assert_eq!(cached.as_slice(), None);
+        assert_eq!(cached.len(), 1000);
+        assert_eq!(cached.window(100, 50), d.window(100, 50));
+        // An empty one is held.
+        let empty = open_source(Cursor::new(Vec::new()), 0, 0, (64, 256)).unwrap();
+        assert_eq!(empty.as_slice(), Some(&[][..]));
+        // A reader longer than it said is held up to the limit and a byte more.
+        let long = open_source(Cursor::new(d.clone()), 10, 20, (64, 256)).unwrap();
+        assert_eq!(long.as_slice(), Some(&d[..21]));
+        // A cache that cannot be made (the source cannot be measured) is an error.
+        struct Unseekable;
+        impl Read for Unseekable {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl Seek for Unseekable {
+            fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+                Err(std::io::Error::other("no"))
+            }
+        }
+        assert!(open_source(Unseekable, 100, 10, (64, 256)).is_err());
     }
 }

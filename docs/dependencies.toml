@@ -1,7 +1,7 @@
 # What the dependency review reads by hand (docs/DEPENDENCIES.md, "Lifecycle").
 # `scripts/deps-review.py` checks it against the manifests and upstream.
 #
-# - [[pin]]      a `=` requirement: why, and what lets it go.
+# - [[pin]]      a `=` requirement or an upper bound: why, and what lets it go.
 # - [[patch]]    a `[patch]` entry.
 # - [[vendored]] source copied or ported into the tree: where from, which
 #                version, and what lets it go back to a dependency (or be dropped).
@@ -9,7 +9,10 @@
 # `track` says where the script looks for upstream's newest release: "crates",
 # "github" (owner/repo), "pypi", or "none" (a port of a file with no releases).
 # `version = "unrecorded"` is a finding: say which upstream version or commit the
-# copy was taken from the next time the file is touched.
+# copy was taken from the next time the file is touched. `reviewed` names a later
+# upstream release read against the copy with nothing to take from it, so the
+# script flags only a release after it; `version` stays the one the copy came
+# from, as NOTICE says.
 
 # ---------------------------------------------------------------- pins
 
@@ -42,6 +45,11 @@ until = "as zune-jpeg."
 crate = "fax"
 why = "libclamav's version, for CCITT strips of a TIFF (decoder parity, see image)."
 until = "as image."
+
+[[pin]]
+crate = "zip"
+why = "Below 9.1: from 9.1.0 it depends on `getrandom` whatever its features (salts for the AES archives it writes; exav writes none), and from 9.4.2 on `zeroize` and `constant_time_eq`."
+until = "exav-unpack's PKZIP 1.x methods and the converters' package reading and writing move to exav's own ZIP code (next cycle), or zip makes those crates optional."
 
 [[pin]]
 crate = "weezl"
@@ -108,14 +116,14 @@ until = "never pinned apart from the CLI: bump both together."
 [[patch]]
 crate = "zenjxl-decoder"
 where = "crates/exav-viewer/vendor/zenjxl-decoder"
-why = "Instant::now() panics on wasm32-unknown-unknown and the decoder calls it for every frame. crates/exav-viewer/vendor/zenjxl-decoder/EXAV.md lists the differences."
-until = "upstream reads its clock only when phase timing is asked for, or takes the patch."
+why = "Instant::now() panics on wasm32-unknown-unknown and the decoder calls it for every frame; and a section's buffer was sized by the length the file declares, about 1 GiB for a file of 34 bytes (upstream's fix ported). crates/exav-viewer/vendor/zenjxl-decoder/EXAV.md lists the differences."
+until = "a release reads its clock only when phase timing is asked for and sizes section buffers by the input. Upstream's main branch does both (commits 814994a and 5f1b834, for the unreleased 0.4.0)."
 
 [[patch]]
 crate = "zenjxl-decoder-macros"
 where = "crates/exav-viewer/vendor/zenjxl-decoder-macros"
 why = "Its proc-macro-error2 is unmaintained (RUSTSEC-2026-0173) and cargo reports it as future-incompatible. abort! is a local panicking macro; EXAV.md beside it."
-until = "upstream drops proc-macro-error2."
+until = "upstream drops proc-macro-error2. Its main branch has (commit 6571342, for the unreleased 0.4.0)."
 
 # ---------------------------------------------------------------- vendored
 
@@ -125,8 +133,8 @@ upstream = "fancy-regex"
 track = "crates"
 version = "0.19.2"
 kind = "adapted copy"
-why = "Backtracking engine for PCRE lookaround, backreferences and atomic groups. Carries two upstream pull requests unreleased when taken (278 and 292, both in 0.20.0) and, of exav's three fixes, only the size analysis overflow is still missing from 0.20.0 (README)."
-return_when = "a release has saturating size arithmetic in analyze.rs and compile.rs; the README lists the steps back, checked by cargo test -p exav-core pcre against the crate."
+why = "Backtracking engine for PCRE lookaround, backreferences and atomic groups. Carries two upstream pull requests unreleased when taken (278 and 292, both in 0.20.0), seven fixes from 0.20.1 and 0.20.2 ported by hand, exav's own optimizer guard, size analysis fix and work accounting (README)."
+return_when = "a release has saturating size arithmetic in analyze.rs and compile.rs and the optimizer guard, and the work accounting can live outside the engine; the README lists the steps back, checked by cargo test -p exav-core pcre against the crate."
 
 [[vendored]]
 path = "crates/exav-render/src/image_codecs/jpeg.rs"
@@ -178,24 +186,31 @@ path = "crates/exav-unpack/src/formats/ppmd7"
 upstream = "ppmd-rust"
 track = "crates"
 version = "1.4.0"
+# To 1.5.2: the PPMd7a coder, a safe rewrite and encoder fixes; no model fix.
+reviewed = "1.5.2"
 kind = "adapted copy"
 why = "PPMd var.H generalised over a range-decoder trait (7-Zip's and RAR's coders)."
-return_when = "upstream makes its range-decoder trait public (pub(crate) in 1.5.2) so RAR's coder can drive the model. 1.5.2 is forbid(unsafe_code), so the copy can then go; ppmd-rust is already a dev-dependency oracle."
+return_when = "Ppmd7aDecoder (1.5.0) is RAR's coder, and can start its range decoder again on new input with the model kept, which RAR needs for a PPMd block without the reset flag. 1.5.2 is forbid(unsafe_code); ppmd-rust is already a dev-dependency oracle."
 
 [[vendored]]
 path = "crates/exav-unpack/src/formats/ppmd8"
 upstream = "ppmd-rust"
 track = "crates"
 version = "1.5.0"
+# To 1.5.2: the 1.4.1 and 1.5.1 fixes are in (ppmd8/model.rs).
+reviewed = "1.5.2"
 kind = "port"
 why = "PPMd var.I rev.1 (ZIP method 98) with the sub-allocator rewritten over a bounds-checked byte arena."
-return_when = "now: ppmd-rust 1.5.2 is forbid(unsafe_code), which was the reason for the arena rewrite. Compare its Ppmd8Decoder with this copy on the ZIP method-98 fixtures and the fuzz target, and drop the copy if they agree."
+return_when = "the next early pass: ppmd-rust 1.5.2 is forbid(unsafe_code), which was the reason for the arena rewrite, and its Ppmd8Decoder agrees with this copy on the corpus and on mutated streams; a late pass does not un-vendor. The wrapper must keep reporting a stream cut short (Ppmd8Decoder reads the end of its input as the end of the data)."
 
 [[vendored]]
 path = "crates/exav-unpack/src/formats/udif.rs"
 upstream = "dmg-core"
 track = "crates"
 version = "0.1.2"
+# To 0.1.5: sparse images and a vfs feature (not taken), the mish run count
+# overflow (checked here already).
+reviewed = "0.1.5"
 kind = "adapted copy"
 why = "UDIF block reader, with lzma-rust2 for XZ instead of lzma-rs."
 return_when = "upstream uses lzma-rust2, or it is not worth following."
@@ -204,16 +219,18 @@ return_when = "upstream uses lzma-rust2, or it is not worth following."
 path = "crates/exav-unpack/src/formats/cab_parse"
 upstream = "cab"
 track = "crates"
-version = "unrecorded"
+version = "0.6.0"
 kind = "adapted copy"
-why = "CAB reader without write support, with bounds checks added for two panics on malformed cabinets (rust-cab on GitHub)."
-return_when = "upstream fixes the panics."
+why = "CAB reader without write support, with bounds checks added for two panics on malformed cabinets (rust-cab on GitHub), and without byteorder."
+return_when = "upstream fixes the panics. Two are fixed on its main branch (PR 42) and the third is its open issue 43; no release since 0.6.0."
 
 [[vendored]]
 path = "crates/exav-unpack/src/formats/arj_parse"
 upstream = "unarc-rs"
 track = "crates"
-version = "unrecorded"
+# 0.6.0 and 0.6.1 differ only in formatting in the ARJ and ZOO code; 0.6.1 was
+# the release when the copy was taken.
+version = "0.6.1"
 kind = "adapted copy"
 why = "ARJ reader. Depending on unarc-rs brings a second `zip` with default features, which unifies in codecs that bypass the per-member budget."
 return_when = "unarc-rs no longer depends on zip's default codecs."
@@ -222,7 +239,7 @@ return_when = "unarc-rs no longer depends on zip's default codecs."
 path = "crates/exav-unpack/src/formats/zoo_parse.rs"
 upstream = "unarc-rs"
 track = "crates"
-version = "unrecorded"
+version = "0.6.1"
 kind = "adapted copy"
 why = "ZOO structures, as arj_parse."
 return_when = "as arj_parse."
@@ -240,7 +257,11 @@ return_when = "never while upstream stays unreleased since 2021."
 path = "crates/exav-unpack/src/formats/azo.rs"
 upstream = "akolman/EggDotNet"
 track = "github"
-version = "unrecorded"
+# The ports below name no commit: the release current when each entered the
+# tree.
+version = "v0.1.0-beta"
+# To 0.4.0-beta: no change to the decoder since v0.1.0-beta.
+reviewed = "0.4.0-beta"
 kind = "port"
 why = "AZO, the codec of EGG and ALZ; the only permissively licensed implementation."
 return_when = "never: a port from C#."
@@ -249,25 +270,33 @@ return_when = "never: a port from C#."
 path = "crates/exav-unpack/src/formats/rar5_unpack.rs"
 upstream = "libarchive/libarchive"
 track = "github"
-version = "unrecorded"
+version = "v3.8.8"
+# To v3.8.11: the decompression core only refuses output past the declared
+# size, which exav scans on purpose (docs/QUIRKS.md); the rest is header parsing.
+reviewed = "v3.8.11"
 kind = "port"
-why = "RAR5 decompression core, from archive_read_support_format_rar5.c."
+why = "RAR5 decompression core, from archive_read_support_format_rar5.c. Changed from upstream: a streaming member reader that reads one block of input at a time and hands each decode step's output over, and a window sized by the caller's limit."
 return_when = "never: a port from C."
 
 [[vendored]]
 path = "crates/exav-unpack/src/formats/rar3_unpack.rs"
 upstream = "nwaples/rardecode"
 track = "github"
-version = "unrecorded"
+version = "v2.2.5"
+# To v2.4.6: the window overflow and static data fixes are in; its RAR 2.0 and
+# RAR5 decoders are not in this copy.
+reviewed = "v2.4.6"
 kind = "port"
-why = "RAR3 and RAR4 decompression core, from the Go package."
+why = "RAR3 and RAR4 decompression core, from the Go package. Changed from upstream: a streaming member reader whose input is a bounded lookahead shared by the bit reader and the PPMd range decoder."
 return_when = "never: a port from Go."
 
 [[vendored]]
 path = "crates/exav-unpack/src/formats/lzfse.rs"
 upstream = "lzfse/lzfse"
 track = "github"
-version = "unrecorded"
+# Its decoder files last changed in 2016, before this tag (2017-03-08), and
+# master has not touched them since.
+version = "lzfse-1.0"
 kind = "port"
 why = "LZFSE and LZVN decoder of Apple's reference implementation, decoding a whole buffer into a capped one."
 return_when = "never: a port from C."
@@ -300,10 +329,41 @@ why = "Table of contents of InstallShield .z archives."
 return_when = "never: upstream unreleased since 2020."
 
 [[vendored]]
+path = "crates/exav-unpack/src/formats/ishield_cab.rs"
+upstream = "twogood/unshield"
+track = "github"
+version = "1.6.2"
+kind = "port"
+why = "InstallShield InstallScript cabinets (ISc(), from the C library: headers, descriptor, file table, deflated chunks, the old compression of version 4 and older, obfuscation. Changed from upstream: members streamed within exav's bounds, a linked record followed to a target flagged unused, the other cabinets of a set reported."
+return_when = "never: a port from C."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/ishield_msi.rs"
+upstream = "lifenjoiner/ISx"
+track = "github"
+version = "0.3.11"
+kind = "port"
+why = "The files of an InstallShield setup executable (2009 and later): the record layouts and the coding of their names and data, from ISx.c (commit 3c4177d). Changed from upstream: files streamed or read in place within exav's bounds."
+return_when = "never: a port from C."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/inno.rs"
+upstream = "dscharrer/innoextract"
+track = "github"
+# 1.9 is the last release; the layouts of the Inno versions after 6.1 are on
+# its main branch.
+version = "1.9"
+kind = "port"
+why = "Inno Setup installers, from the C++ tool: loader table, setup header and data entries by version, setup-1 chunks and the x86 filters. Changed from upstream: members streamed within exav's bounds; LZMA through lzma-rust2."
+return_when = "never: a port from C++."
+
+[[vendored]]
 path = "crates/exav-core/src/yara"
 upstream = "yara-x"
 track = "crates"
-version = "1.19"
+# 1.19 to 1.23 compared: the one fix to what exav took is in (math.abs of the
+# smallest integer is undefined).
+version = "1.23"
 kind = "derived"
 why = "The native YARA engine; the pe, elf, dotnet, math, hash and string modules and the compiler's base64 handling derive from yara-x's (per-file headers). yara-x-parser is a regular dependency."
 return_when = "never: yara-x's runtime would bring a WASM runtime and a JIT (docs/DEPENDENCIES.md)."
@@ -312,19 +372,31 @@ return_when = "never: yara-x's runtime would bring a WASM runtime and a JIT (doc
 path = "crates/exav-x86/src/generated.rs"
 upstream = "iced-x86"
 track = "crates"
-version = "1.21"
+# 1.22 gives the same tables (regenerated, no change).
+version = "1.22"
 kind = "generated tables"
 why = "Opcode tables emitted by crates/exav-x86/tools/gen-tables from iced-x86's decoder; iced-x86 stays a dev-dependency oracle."
 return_when = "never: regenerate if iced-x86 gains encodings."
 
+[[vendored]]
+path = "crates/exav-qr"
+upstream = "rqrr"
+track = "crates"
+version = "0.11.0"
+kind = "adapted copy"
+why = "QR code detection and decoding for exav-render's `qr` feature (off by default), a port of quirc. Changed from upstream: its lru cache and its g2p fields (GF(16), GF(256)) are code of this crate, which takes lru, hashbrown, foldhash and g2p's proc macro out of the tree and leaves the crate `forbid(unsafe_code)`; its search counts its steps and its memory in its own loops and stops at a deadline, a memory budget and caps on finder patterns and candidate grids (src/limits.rs); the helpers that write images to a path are removed; clippy and rustfmt fixes. The `img` feature (`ImageBuffer` for the `image` crate's grey images) is removed: the crate has no dependency, and `image` (png) is a dev-dependency for the capstone tests."
+return_when = "a release of rqrr without `unsafe` in its dependencies (lru and g2p replaced or free of it); the header of each changed file says what was changed."
+
 # ---------------------------------------------------------------- reviews
 #
 # One entry per workspace at the end of a late pass, from the last block
-# scripts/deps-review.py prints. `crates` and `unsafe` are for the shipped
-# default build (the CLI for the root workspace, the union of the wasm modules
-# for the viewer); `*_all` with every feature on. `unsafe` counts the keyword in
-# each crate's src/ with comments stripped, so it includes code a feature turns
-# off: read it as surface, and compare it with the last entry, not with zero.
+# scripts/deps-review.py prints, and one at the end of an early pass, marked
+# `pass = "early"`, for the late pass to compare with. `crates` and `unsafe`
+# are for the shipped default build (the CLI for the root workspace, the union
+# of the wasm modules for the viewer); `*_all` with every feature on. `unsafe`
+# counts the keyword in each crate's src/ with comments stripped, so it
+# includes code a feature turns off: read it as surface, and compare it with
+# the last entry, not with zero.
 # The fuzz workspace is not shipped and is not recorded.
 
 [[review]]
@@ -385,4 +457,89 @@ crates = 69
 unsafe = 3848
 crates_all = 69
 unsafe_all = 3848
+twice = 3
+
+# Early pass of 0.0.4: tar and ZOO's LZD are read in-tree and cab_parse reads
+# without byteorder, which takes tar, filetime, byteorder and salzweg out of
+# the default trees. rqrr (QR codes, `qr` feature) brings five crates into the
+# root's every-feature tree, and the viewer's `sniff` module (exav-unpack's ZIP
+# reader) three into the viewer's.
+
+[[review]]
+workspace = "root"
+date = "2026-11-02"
+release = "0.0.4"
+pass = "early"
+crates = 129
+unsafe = 4585
+crates_all = 183
+unsafe_all = 7448
+twice = 6
+
+[[review]]
+workspace = "unpack-wasm"
+date = "2026-11-02"
+release = "0.0.4"
+pass = "early"
+crates = 68
+unsafe = 2718
+crates_all = 69
+unsafe_all = 2718
+twice = 0
+
+[[review]]
+workspace = "viewer"
+date = "2026-11-02"
+release = "0.0.4"
+pass = "early"
+crates = 72
+unsafe = 3859
+crates_all = 72
+unsafe_all = 3859
+twice = 3
+
+# Late pass (the 0.0.4 work ships as 0.0.3): cargo update in the four
+# workspaces, zip capped below 9.1 (the pin above), encoding_rs required at 0.8.44. The
+# root's default tree has 10 more `unsafe` keywords, from crc32fast 1.5.5 (its
+# AVX2 and AVX-512 paths) and itoa 1.0.19. The viewer's `sniff` module turns on
+# exav-unpack's `chm` feature, which brings lzxd: one crate more there.
+
+[[review]]
+workspace = "root"
+date = "2026-11-14"
+release = "0.0.3"
+crates = 129
+unsafe = 4595
+crates_all = 178
+unsafe_all = 7352
+twice = 6
+
+[[review]]
+workspace = "fuzz"
+date = "2026-11-14"
+release = "0.0.3"
+crates = 167
+unsafe = 7545
+crates_all = 167
+unsafe_all = 7545
+twice = 6
+
+[[review]]
+workspace = "unpack-wasm"
+date = "2026-11-14"
+release = "0.0.3"
+crates = 67
+unsafe = 2703
+crates_all = 68
+unsafe_all = 2703
+twice = 0
+
+[[review]]
+workspace = "viewer"
+date = "2026-11-14"
+release = "0.0.3"
+crates = 73
+unsafe = 3863
+crates_all = 73
+unsafe_all = 3863
 twice = 3

@@ -1,4 +1,4 @@
-//! UDF — the filesystem on DVDs, Blu-rays and most `.iso` files written today.
+//! UDF: the filesystem on DVDs, Blu-rays and most `.iso` files written today.
 //!
 //! Two shapes matter. A **UDF-only** image carries no ISO 9660 tree at all, so
 //! without UDF support every file in it is invisible while Windows and macOS
@@ -6,8 +6,8 @@
 //! over the same extents, where the risk is the opposite one: walking both trees
 //! naively scans every file twice.
 //!
-//! The expected digests are `7zz x` output on the same fixtures — 7-Zip's, not
-//! this crate's. A filesystem walker validated against its own writer can agree
+//! The expected digests are `7zz x` output on the same fixtures (7-Zip's, not
+//! this crate's). A filesystem walker validated against its own writer can agree
 //! on a shared misreading of the spec.
 //!
 //! Regenerate with:
@@ -177,7 +177,7 @@ fn assert_every_file(e: &[Entry]) {
             ),
             ("readme.txt".to_string(), README_SHA256.to_string()),
         ],
-        "names and contents must match `7zz x` — including the nested paths and \
+        "names and contents must match `7zz x`, including the nested paths and \
          the file that spans several blocks"
     );
 }
@@ -207,8 +207,8 @@ fn a_bridge_image_scans_each_file_once() {
 
 #[test]
 fn a_udf_volume_that_cannot_be_read_says_so() {
-    // Blanking every anchor volume descriptor — sector 256 and the two copies
-    // at the end of the volume — leaves an image that announces UDF in its
+    // Blanking every anchor volume descriptor (sector 256 and the two copies
+    // at the end of the volume) leaves an image that announces UDF in its
     // recognition sequence and then gives no way in. Every file is still there;
     // exav simply cannot reach them, which is exactly the case that must never
     // pass as clean.
@@ -225,5 +225,148 @@ fn a_udf_volume_that_cannot_be_read_says_so() {
         e.iter()
             .map(|x| (&x.name, x.unsupported))
             .collect::<Vec<_>>()
+    );
+}
+
+/// The image of `udf_only` has 3 directories and 3 files. The sector of its
+/// File Entry for `nested/big.bin` (20,000 bytes in one extent), where the
+/// partition starts, and where the file entries of the directories are.
+const BIG_ENTRY_SECTOR: usize = 266;
+const PARTITION_START: usize = 257;
+
+/// `udf_only` with the allocation descriptors of `big.bin` declared `bytes`
+/// long: its one extent, then zero-length ones.
+fn with_descriptor_bytes(bytes: u32) -> Vec<u8> {
+    let mut blob = fixture("udf_only.iso.gz");
+    let l_ad = BIG_ENTRY_SECTOR * 2048 + 172;
+    assert_eq!(blob[l_ad..l_ad + 4], 8u32.to_le_bytes(), "the entry moved");
+    blob[l_ad..l_ad + 4].copy_from_slice(&bytes.to_le_bytes());
+    blob
+}
+
+fn walked_under(
+    blob: &[u8],
+    limits: Limits,
+) -> (Vec<Entry>, Result<Option<()>, exav_unpack::LimitHit>) {
+    super::fs_tree::walked(Format::Iso, blob, limits)
+}
+
+/// Each directory read is one member against `max_members`, as each file is,
+/// and its bytes are charged to the scan: directories can overlap on an image,
+/// so how many of them are read is no measure of its size.
+#[test]
+fn the_directories_of_the_tree_are_counted_and_charged() {
+    let blob = fixture("udf_only.iso.gz");
+    let counted = |max_members: u64| {
+        let mut limits = Limits::default();
+        limits.max_members = max_members;
+        walked_under(&blob, limits)
+    };
+    // Three directories and three files.
+    let (e, end) = counted(6);
+    end.unwrap();
+    assert_eq!(e.len(), 3);
+    let (_, end) = counted(5);
+    let hit = end.expect_err("the directories were not counted");
+    assert_eq!(hit.kind, exav_unpack::LimitKind::MaxFiles, "{hit}");
+    let (e, end) = counted(u64::MAX);
+    end.unwrap();
+    assert_eq!(e.len(), 3);
+
+    // The root directory is 140 bytes: a scan budget below it stops the walk
+    // before any member.
+    let mut limits = Limits::default();
+    limits.max_scanned_bytes = 100;
+    let (e, end) = walked_under(&blob, limits);
+    let hit = end.expect_err("the bytes of the directories were not charged");
+    assert_eq!(hit.kind, exav_unpack::LimitKind::MaxScanSize, "{hit}");
+    assert!(e.is_empty());
+}
+
+/// The descriptors of one file entry are read up to `max_members` of them, and
+/// up to the buffer limit in bytes. A list longer than that is cut where it
+/// is and reported, the file as far as it was followed still given.
+#[test]
+fn a_list_of_allocation_descriptors_is_bounded_by_the_member_limit_and_the_buffer_limit() {
+    // 200 short descriptors of 8 bytes: 1,600 bytes.
+    let blob = with_descriptor_bytes(1600);
+    let under = |max_members: u64, held: u64| {
+        let mut limits = Limits::default();
+        limits.max_members = max_members;
+        limits.max_buffer_bytes = held;
+        let (e, end) = walked_under(&blob, limits);
+        end.unwrap();
+        let big = e
+            .iter()
+            .find(|x| x.name == "nested/big.bin")
+            .unwrap()
+            .data
+            .len();
+        let cut = e
+            .iter()
+            .filter(|x| {
+                x.unsupported
+                    .is_some_and(|r| r.contains("allocation descriptors"))
+            })
+            .count();
+        (big, cut)
+    };
+    let big = 20_000;
+    // Exactly the descriptors there are: nothing is cut.
+    assert_eq!(under(200, 1 << 30), (big, 0));
+    assert_eq!(under(u64::MAX, u64::MAX), (big, 0));
+    // One too few.
+    assert_eq!(under(199, 1 << 30), (big, 1));
+    // The buffer limit holds the same bytes.
+    assert_eq!(under(u64::MAX, 1600), (big, 0));
+    assert_eq!(under(u64::MAX, 1599), (big, 1));
+}
+
+/// A continuation that points back at a list already read ends the list,
+/// reported, whatever the limits: with none, it would be followed for ever.
+#[test]
+fn a_continuation_that_loops_ends_the_list_with_a_report() {
+    let mut blob = fixture("udf_only.iso.gz");
+    // The entry's one descriptor becomes a continuation to a block that has
+    // the extent, then a continuation to itself. The list of a continuation
+    // starts 24 bytes into its block.
+    let block = 12;
+    let at = (PARTITION_START + block) * 2048;
+    assert!(
+        blob[at..at + 2048].iter().all(|&b| b == 0),
+        "the block is used"
+    );
+    let entry = BIG_ENTRY_SECTOR * 2048;
+    let extent: [u8; 8] = blob[entry + 176..entry + 184].try_into().unwrap();
+    let continuation = |lbn: u32| {
+        let mut ad = (40u32 | 3 << 30).to_le_bytes().to_vec();
+        ad.extend_from_slice(&lbn.to_le_bytes());
+        ad
+    };
+    blob[entry + 176..entry + 184].copy_from_slice(&continuation(block as u32));
+    blob[at..at + 2].copy_from_slice(&258u16.to_le_bytes());
+    blob[at + 24..at + 32].copy_from_slice(&extent);
+    blob[at + 32..at + 40].copy_from_slice(&continuation(block as u32));
+
+    let mut limits = Limits::default();
+    limits.max_members = u64::MAX;
+    limits.max_buffer_bytes = u64::MAX;
+    let (tx, rx) = std::sync::mpsc::channel();
+    // A walk that does not end is the failure: the test must not hang on it.
+    std::thread::spawn(move || {
+        let (e, end) = walked_under(&blob, limits);
+        let _ = tx.send((e, end.map(|_| ()).map_err(|h| h.reason)));
+    });
+    let (e, end) = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the walk of a looping continuation did not end");
+    end.unwrap();
+    let big = e.iter().find(|x| x.name == "nested/big.bin").unwrap();
+    assert_eq!(big.data.len(), 20_000);
+    assert!(
+        e.iter().any(|x| x
+            .unsupported
+            .is_some_and(|r| r.contains("allocation descriptors"))),
+        "the loop was not reported"
     );
 }

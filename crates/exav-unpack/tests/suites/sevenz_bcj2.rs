@@ -1,11 +1,11 @@
-//! 7z BCJ2 — the four-input x86 branch converter.
+//! 7z BCJ2: the four-input x86 branch converter.
 //!
 //! 7-Zip picks BCJ2 automatically for executables at `-mx=9`, so "a 7z of an
 //! .exe at maximum compression" is an entirely ordinary thing for an attacker to
 //! produce.
 //!
 //! The fixtures were produced by **official 7-Zip 25.01**, and the expected
-//! digests below are `7zz x` output — not this crate's. A decoder validated
+//! digests below are `7zz x` output, not this crate's. A decoder validated
 //! against an encoder written beside it can agree on a shared misreading; these
 //! digests come from the reference implementation, so a mismatch is exav's.
 //!
@@ -72,7 +72,7 @@ fn bcj2_members_match_7zip_byte_for_byte() {
     assert_eq!(
         sha256_hex(&sample.data),
         SAMPLE_SHA256,
-        "the x86 binary must decode identically to `7zz x` — a BCJ2 filter that \
+        "the x86 binary must decode identically to `7zz x`: a BCJ2 filter that \
          is subtly wrong still produces plausible-looking output"
     );
 
@@ -96,6 +96,94 @@ fn a_second_bcj2_archive_also_decodes() {
             .map(|x| (&x.name, x.unsupported, x.data.len()))
             .collect::<Vec<_>>()
     );
+}
+
+/// `bcj2_window.7z`: an x86-like `code.bin` of 300,013 bytes and
+/// `eicar.txt` in one BCJ2 folder whose LZMA coders have a 64 KiB dictionary,
+/// made with p7zip 16.02:
+/// ```sh
+/// 7z a -t7z -m0=BCJ2 -m1=LZMA:d=64k -m2=LZMA:d=64k -m3=LZMA:d=64k \
+///   -mb0:1 -mb0s1:2 -mb0s2:3 bcj2_window.7z code.bin eicar.txt
+/// ```
+/// and `sha256sum` of what `7z x` gives.
+const WINDOW_CODE_SHA256: &str = "5842d1aabbc4c4bb4ecac596b66d92c1cbcdbb0fdd9f9d3b35956a8cc47ecc38";
+
+/// A BCJ2 folder whose output is larger than the buffer limit, off a source
+/// that is not in memory, is decoded as it is read: its four streams each
+/// from their place in the archive, the members as 7-Zip gives them, the last
+/// one included. Only the LZMA windows are held.
+#[test]
+fn a_bcj2_folder_past_the_buffer_limit_is_decoded_as_it_is_read() {
+    use exav_unpack::Member;
+    let blob = fixture("bcj2_window.7z");
+    let cache = exav_unpack::source::BlockCache::with_sizes(
+        std::io::Cursor::new(blob.clone()),
+        4096,
+        64 * 1024,
+    )
+    .unwrap();
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 128 * 1024;
+    let mut b = Budget::new(limits);
+    let mut got = Vec::new();
+    exav_unpack::walk(Format::SevenZip, &cache, &mut b, &mut |meta, content, _| {
+        assert!(
+            meta.unsupported.is_none(),
+            "{}: {:?}",
+            meta.name,
+            meta.unsupported
+        );
+        let mut data = Vec::new();
+        match content {
+            Some(Member::Stream(r)) => {
+                r.read_to_end(&mut data).unwrap();
+            }
+            Some(Member::Bytes(d)) => data = d,
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+        got.push((meta.name.clone(), sha256_hex(&data)));
+        None::<()>
+    })
+    .unwrap();
+    let digest = |n: &str| {
+        got.iter()
+            .find(|(name, _)| name.ends_with(n))
+            .map(|(_, d)| d.as_str())
+            .unwrap_or_else(|| panic!("no {n}: {got:?}"))
+    };
+    assert_eq!(digest("code.bin"), WINDOW_CODE_SHA256);
+    assert_eq!(digest("eicar.txt"), EICAR_SHA256);
+}
+
+/// The same folder under a buffer limit smaller than its 64 KiB dictionaries:
+/// the windows cannot be held, so the folder is a limit reached and its
+/// members are left out. Decoded with smaller windows, a valid stream fails at
+/// the first match that reaches further back, and reads as damaged.
+#[test]
+fn a_folder_whose_dictionary_is_over_the_buffer_limit_is_a_limit() {
+    let blob = fixture("bcj2_window.7z");
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 32 * 1024;
+    let mut b = Budget::new(limits);
+    let mut seen = Vec::new();
+    let walked = exav_unpack::walk(
+        Format::SevenZip,
+        &blob.as_slice(),
+        &mut b,
+        &mut |meta, content, _| {
+            seen.push((meta.name.clone(), content.is_some()));
+            None::<()>
+        },
+    );
+    let hit = walked.expect_err("the folder is refused");
+    assert!(!hit.is_corrupt(), "{}", hit.reason);
+    let said = &hit.reason;
+    assert!(
+        said.contains("LZMA dictionary is over the buffer limit"),
+        "{said}"
+    );
+    assert!(seen.iter().all(|(_, decoded)| !decoded), "{seen:?}");
 }
 
 #[test]

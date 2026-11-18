@@ -286,6 +286,95 @@ fn a_link_that_says_one_site_and_goes_to_another_is_phishing_in_markdown_too() {
     ));
 }
 
+/// The drawings of exav-unpack's `fixtures/dwg/links/` (`make.py` there), one
+/// to a version: a LINE whose hyperlink says https://www.paypal.com/login and
+/// goes to https://evil.example/steal, three others whose links are what they
+/// say, one to a view of the drawing, and an entity whose extended data is
+/// another application's, with a string that looks like a link.
+fn links_dwg(version: &str) -> Vec<u8> {
+    use std::io::Read;
+    let p = format!(
+        "{}/../exav-unpack/tests/fixtures/dwg/links/{version}.dwg.gz",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let gz = exav_core::unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+    let mut dwg = Vec::new();
+    flate2::read::GzDecoder::new(&gz[..])
+        .read_to_end(&mut dwg)
+        .expect("gzip");
+    dwg
+}
+
+const DWG_VERSIONS: [&str; 8] = [
+    "R13", "R14", "R2000", "R2004", "R2007", "R2010", "R2013", "R2018",
+];
+
+#[test]
+fn a_dwg_hyperlink_that_says_one_site_and_goes_to_another_is_phishing() {
+    for v in DWG_VERSIONS {
+        let dwg = links_dwg(v);
+        match phishing("plan.dwg", &dwg, true) {
+            Verdict::Infected { signature, .. } => {
+                assert_eq!(signature, "Heuristics.Phishing.Email.SpoofedDomain", "{v}")
+            }
+            other => panic!("{v}: {other:?}"),
+        }
+        // Off unless asked for, as for the other documents.
+        assert!(
+            matches!(phishing("plan.dwg", &dwg, false), Verdict::Clean),
+            "{v}"
+        );
+    }
+}
+
+/// What a hyperlink says and where it goes are in the drawing's text view,
+/// for a signature to match, in every version.
+#[test]
+fn the_hyperlinks_of_a_dwg_are_matched_as_text() {
+    for v in DWG_VERSIONS {
+        let dwg = links_dwg(v);
+        let name = Some("plan.dwg");
+        assert!(found(7, "https://evil.example/steal", name, &dwg), "{v}");
+        assert!(found(7, "https://www.paypal.com/login", name, &dwg), "{v}");
+        assert!(found(7, "detail text display", name, &dwg), "{v}");
+        // Whatever the file is called: it is known by its bytes.
+        assert!(
+            found(7, "https://example.org/docs/a%20b", None, &dwg),
+            "{v}"
+        );
+        // Not a string of extended data that is another application's.
+        assert!(
+            !found(7, "https://other.example/not-a-link", name, &dwg),
+            "{v}"
+        );
+    }
+}
+
+#[test]
+fn a_link_is_judged_when_the_database_has_only_hash_signatures() {
+    // Nothing for a text view to be matched against but the EICAR signature
+    // every database holds, and the phishing check still has its say.
+    let mut l = loader::Builder::new();
+    l.add_named_bytes(
+        "t.hdb",
+        b"00112233445566778899aabbccddeeff:1234:Test.Hash\n",
+        true,
+    );
+    let db = l.build().unwrap();
+    let md = b"Sign in at [https://www.paypal.com/login](https://evil.example/steal) today\n";
+    let mut o = ScanOptions::default();
+    o.filename = Some("mail.md".to_string());
+    o.alert_phishing = true;
+    match analyze(&db, md, &o).verdict {
+        Verdict::Infected { signature, .. } => {
+            assert_eq!(signature, "Heuristics.Phishing.Email.SpoofedDomain")
+        }
+        v => panic!("{v:?}"),
+    }
+    o.alert_phishing = false;
+    assert!(matches!(analyze(&db, md, &o).verdict, Verdict::Clean));
+}
+
 #[test]
 fn an_html_link_whose_target_is_written_in_entities_is_judged_as_it_reads() {
     // The raw anchor reader sees `https&#58;//...`; the page reads `https://...`.
@@ -307,6 +396,36 @@ fn the_parts_of_an_office_file_are_matched_by_their_path() {
         Verdict::Infected { .. }
     ));
     assert!(matches!(verdict(&sig, None, &other, false), Verdict::Clean));
+    // An OpenDocument file is read by its members' paths too, whatever it is
+    // called and with or without a `mimetype` member.
+    let odf = zip_with(
+        "content.xml",
+        b"<office:document-content><office:body><office:text><text:p>Please download the attachment</text:p></office:text></office:body></office:document-content>",
+    );
+    for name in [None, Some("x.zip")] {
+        assert!(matches!(
+            verdict(&sig, name, &odf, false),
+            Verdict::Infected { .. }
+        ));
+    }
+}
+
+/// A part is read by its path after a member with the same bytes under a name
+/// that has no text was scanned clean: a clean member is remembered by what
+/// its scan reads, and the text view reads the name.
+#[test]
+fn a_part_after_its_copy_under_another_name_is_read() {
+    let mut part = String::from(
+        "<w:document><w:body><w:p><w:r><w:t>Please down</w:t></w:r><w:r><w:t>load the</w:t></w:r><w:r><w:t xml:space=\"preserve\"> attachment</w:t></w:r></w:p></w:body></w:document>",
+    );
+    // Past the size from which a clean member is remembered.
+    part.push_str(&" ".repeat(128 * 1024));
+    let sig = scanner(7, "please download the attachment");
+    let docx = package(&[("word/other.xml", &part), ("word/document.xml", &part)]);
+    assert!(matches!(
+        verdict(&sig, None, &docx, false),
+        Verdict::Infected { .. }
+    ));
 }
 
 #[test]
@@ -324,14 +443,14 @@ fn an_object_not_held_in_memory_is_not_reported_clean_when_it_has_text() {
     page.resize(16 * 1024, b' ');
     let verdict = |max: u64| {
         let mut o = ScanOptions::default();
-        o.deep_analysis_max = max;
+        o.limits.max_buffer_bytes = max;
         o.filename = Some("page.html".to_string());
         analyze(&db, &page, &o).verdict
     };
     assert!(matches!(verdict(1 << 20), Verdict::Clean));
     // `analyze` holds the bytes whatever the limit; a larger input is read through a cache.
     let mut o = ScanOptions::default();
-    o.deep_analysis_max = 4096;
+    o.limits.max_buffer_bytes = 4096;
     o.filename = Some("page.html".to_string());
     let v = exav_core::scan_seekable(
         &db,
@@ -342,4 +461,185 @@ fn an_object_not_held_in_memory_is_not_reported_clean_when_it_has_text() {
     .expect("scan")
     .verdict;
     assert!(!matches!(v, Verdict::Clean), "{v:?}");
+}
+
+/// A deflated ZIP of `members`, as an office application writes a package.
+fn package(members: &[(&str, &str)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, data) in members {
+        w.start_file(*name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        w.write_all(data.as_bytes()).unwrap();
+    }
+    w.finish().unwrap().into_inner()
+}
+
+fn docx_linking(label: &str, target: &str) -> Vec<u8> {
+    docx_linking_after(&[], label, target)
+}
+
+/// As [`docx_linking`], with `first` as the members that come first.
+fn docx_linking_after(first: &[(&str, &str)], label: &str, target: &str) -> Vec<u8> {
+    let doc = format!(
+        r#"<w:document xmlns:w="w" xmlns:r="r"><w:body><w:p><w:r><w:t>Your account: </w:t></w:r><w:hyperlink r:id="rId9"><w:r><w:t>{label}</w:t></w:r></w:hyperlink></w:p></w:body></w:document>"#
+    );
+    let rels = format!(
+        r#"<Relationships><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="{target}" TargetMode="External"/></Relationships>"#
+    );
+    let mut members = first.to_vec();
+    members.extend([
+        ("[Content_Types].xml", "<Types/>"),
+        ("word/document.xml", &doc),
+        ("word/_rels/document.xml.rels", &rels),
+    ]);
+    package(&members)
+}
+
+/// A package is read as one by its members, whatever it is called and in
+/// whatever order a writer put them: here the document properties come first.
+#[test]
+fn a_docx_whose_first_member_is_not_a_part_is_read_under_any_name() {
+    let spoof = docx_linking_after(
+        &[("docProps/app.xml", "<Properties/>")],
+        "https://www.paypal.com/signin",
+        "https://evil.example/steal",
+    );
+    for name in [Some("x.zip"), Some("invoice.bin"), None] {
+        let mut o = ScanOptions::default();
+        o.filename = name.map(str::to_string);
+        o.alert_phishing = true;
+        match analyze(&scanner(7, "never present"), &spoof, &o).verdict {
+            Verdict::Infected { signature, .. } => {
+                assert_eq!(
+                    signature, "Heuristics.Phishing.Email.SpoofedDomain",
+                    "{name:?}"
+                )
+            }
+            v => panic!("{name:?}: {v:?}"),
+        }
+        assert!(
+            found(
+                7,
+                "www.paypal.com/signin (https://evil.example/steal)",
+                name,
+                &spoof
+            ),
+            "{name:?}"
+        );
+    }
+}
+
+#[test]
+fn a_docx_link_whose_label_names_another_site_than_its_rels_target_is_phishing() {
+    let spoof = docx_linking(
+        "https://www.paypal.com/signin",
+        "https://evil.example/steal",
+    );
+    match phishing("invoice.docx", &spoof, true) {
+        Verdict::Infected { signature, .. } => {
+            assert_eq!(signature, "Heuristics.Phishing.Email.SpoofedDomain")
+        }
+        v => panic!("{v:?}"),
+    }
+    assert!(matches!(
+        phishing("invoice.docx", &spoof, false),
+        Verdict::Clean
+    ));
+    let honest = docx_linking("www.paypal.com", "https://www.paypal.com/signin");
+    assert!(matches!(
+        phishing("invoice.docx", &honest, true),
+        Verdict::Clean
+    ));
+    // The label and its target are one line of the text view.
+    assert!(found(
+        7,
+        "www.paypal.com/signin (https://evil.example/steal)",
+        Some("invoice.docx"),
+        &spoof
+    ));
+}
+
+#[test]
+fn a_pdf_link_annotations_target_is_judged() {
+    let pdf = b"%PDF-1.4\n\
+        1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+        2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
+        3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [4 0 R] >> endobj\n\
+        4 0 obj << /Type /Annot /Subtype /Link /Rect [0 0 100 20] /A << /S /URI /URI (https://www.paypal.com@evil.example/login) >> >> endobj\n\
+        trailer << /Root 1 0 R >>\n%%EOF\n";
+    match phishing("statement.pdf", pdf, true) {
+        Verdict::Infected { signature, .. } => {
+            assert_eq!(signature, "Heuristics.Phishing.Email.Cloaked.Username")
+        }
+        v => panic!("{v:?}"),
+    }
+    assert!(matches!(
+        phishing("statement.pdf", pdf, false),
+        Verdict::Clean
+    ));
+}
+
+#[test]
+fn an_emails_headers_are_matched_decoded() {
+    let msg = b"From: =?UTF-8?B?U2VjdXJpdHkgVGVhbQ==?= <x@evil.example>\r\n\
+                To: you@corp.example\r\n\
+                Subject: =?UTF-8?Q?Urgent=3A_verify_your_account?=\r\n\
+                MIME-Version: 1.0\r\n\
+                Content-Type: text/plain\r\n\r\nHello\r\n";
+    assert!(found(7, "subject: urgent: verify your account", None, msg));
+    assert!(found(
+        7,
+        "from: security team <x@evil.example>",
+        Some("m.eml"),
+        msg
+    ));
+}
+
+#[test]
+fn an_ifc_models_names_and_property_values_are_matched() {
+    let ifc = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+               #1=IFCWALL('2O2Fr$t4X7Zf8NOew3FLOH',$,'Outer wall',$,$,$,$,$,$);\n\
+               #2=IFCPROPERTYSINGLEVALUE('Note',$,IFCTEXT('Call +1 555 0100 to pay'),$);\n\
+               #3=IFCCARTESIANPOINT((0.,0.,0.));\n\
+               #4=IFCPROPERTYSINGLEVALUE('Pay',$,IFCLABEL('caf\\X2\\00E9\\X0\\ invoice'),$);\n\
+               ENDSEC;\nEND-ISO-10303-21;\n";
+    // A name and its value are one line; the escapes of STEP are decoded.
+    assert!(found(
+        7,
+        "note call +1 555 0100 to pay",
+        Some("m.ifc"),
+        ifc.as_bytes()
+    ));
+    assert!(found(7, "pay café invoice", None, ifc.as_bytes()));
+}
+
+#[test]
+fn the_speaker_notes_of_a_presentation_are_matched() {
+    // Split across runs, so that only the text a reader sees holds the phrase.
+    let notes = r#"<p:notes xmlns:p="p" xmlns:a="a"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Tell them to wi</a:t></a:r><a:r><a:t>re the funds</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"#;
+    let pptx = package(&[
+        ("[Content_Types].xml", "<Types/>"),
+        ("ppt/notesSlides/notesSlide1.xml", notes),
+    ]);
+    assert!(found(
+        7,
+        "tell them to wire the funds",
+        Some("deck.pptx"),
+        &pptx
+    ));
+    let content = r#"<office:document-content xmlns:office="o" xmlns:draw="d" xmlns:presentation="p" xmlns:text="t"><office:body><office:presentation><draw:page><presentation:notes><draw:frame><draw:text-box><text:p>Tell them to wi<text:span>re the funds</text:span></text:p></draw:text-box></draw:frame></presentation:notes></draw:page></office:presentation></office:body></office:document-content>"#;
+    let odp = package(&[
+        (
+            "mimetype",
+            "application/vnd.oasis.opendocument.presentation",
+        ),
+        ("content.xml", content),
+    ]);
+    assert!(found(
+        7,
+        "tell them to wire the funds",
+        Some("deck.odp"),
+        &odp
+    ));
 }

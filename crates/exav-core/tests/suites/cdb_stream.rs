@@ -1,7 +1,7 @@
 //! Regression: `.cdb` container-metadata signatures that match on a member's
 //! FILENAME (e.g. ClamAV's `Archive.Filetype.DualExtJS`, which flags a
 //! double-extension `*.pdf.js` inside a ZIP) must fire on the STREAMED container
-//! path — the path ZIP/OOXML actually take via the daemon and CLI. This path had
+//! path, the path ZIP/OOXML actually take via the daemon and CLI. This path had
 //! no CDB matching, so these detections were silently missed. It also exercises
 //! the 1-based `FilePos` semantics (ClamAV counts members from 1).
 

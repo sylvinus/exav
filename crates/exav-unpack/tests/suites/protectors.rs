@@ -1,14 +1,14 @@
 //! Virtualizing protectors must be recognised and reported, never passed over.
 //!
 //! VMProtect, Themida/WinLicense and Enigma are the three most common packers in
-//! current sample sets — more common than every packer any engine unpacks, by an
+//! current sample sets, more common than every packer any engine unpacks, by an
 //! order of magnitude. None of them can be unpacked: the protected functions are
 //! translated into a private bytecode when the file is *built*, so unlike a
 //! compressor there is no original code sitting in memory at runtime to recover.
 //! No engine unpacks them, and a better emulator would not change that.
 //!
 //! What exav can do is say so. Silence on the most prevalent packers in the wild
-//! is the one outcome worse than not unpacking them — it reads identically to
+//! is the one outcome worse than not unpacking them: it reads identically to
 //! "we looked and found nothing".
 
 use exav_unpack::{Budget, Format, Limits, extract};
@@ -71,7 +71,7 @@ fn pe_with_sections(names: &[&[u8]]) -> Vec<u8> {
 }
 
 /// Ask the PE-packer extractor directly. `detect()` does not route a bare PE
-/// here — a PE is not a container by magic — so the scanner reaches this path
+/// here (a PE is not a container by magic), so the scanner reaches this path
 /// through its own content-aware routing. A library caller has to name it.
 fn reported_reason(pe: &[u8]) -> Option<&'static str> {
     let mut b = Budget::new(Limits::default());
@@ -95,7 +95,7 @@ fn every_virtualizing_protector_is_recognised() {
         let pe = pe_with_sections(&sections);
         let reason = reported_reason(&pe).unwrap_or_else(|| {
             panic!(
-                "{name}: went unreported — a silent pass on the \
+                "{name}: went unreported, a silent pass on the \
                                        most prevalent packers in the wild"
             )
         });

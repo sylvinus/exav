@@ -168,6 +168,16 @@ fn formulas() {
     assert!(wb.warnings.iter().any(|w| w.starts_with("1 formulas")));
 }
 
+/// Row 0 is no reference: rows are counted from 1 (the fuzzer's
+/// sheets_numbers/crash-8a886319, an overflow).
+#[test]
+fn a_reference_to_row_0_is_none() {
+    assert_eq!(parse_ref("A1"), Some((0, false, Some(0), false)));
+    assert_eq!(parse_ref("$B$2"), Some((1, true, Some(1), true)));
+    assert_eq!(parse_ref("A0"), None);
+    assert_eq!(parse_ref("$A$0"), None);
+}
+
 #[test]
 fn sizes_and_panes() {
     let wb = read_str(&budget_doc());

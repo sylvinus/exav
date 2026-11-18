@@ -931,13 +931,11 @@ impl Parser<'_> {
         if self.fields.is_empty() {
             return;
         }
-        let n = self.fields.len();
         let mut out = vec![];
-        for i in 0..n {
-            if self.fields[i].broken {
+        for f in &mut self.fields {
+            if f.broken {
                 continue;
             }
-            let f = &mut self.fields[i];
             out.push(Inline::FieldChar(FieldCharKind::Begin));
             out.push(Inline::InstrText(f.instr.clone()));
             if f.in_result {
@@ -1153,5 +1151,27 @@ mod tests {
     fn bookmark_names() {
         assert_eq!(bm_name("a b-c"), "a_b_c");
         assert_eq!(bm_name("1x"), "_1x");
+    }
+
+    #[test]
+    fn list_definitions_are_counted_in_the_memory() {
+        use crate::formats::office::docs::limits::{LIST_BYTES, Limits};
+        // Lists of a few bytes each, given nine levels, and a list of many
+        // levels.
+        let mut rtf = b"{\\rtf1{\\*\\listtable".to_vec();
+        for _ in 0..10_000 {
+            rtf.extend(b"{\\list}");
+        }
+        rtf.extend(b"}x}");
+        let mut b = Budget::new(Limits::default());
+        read(&rtf, &mut b).unwrap();
+        assert!(b.used() >= 10_000 * LIST_BYTES, "{}", b.used());
+        let mut rtf = b"{\\rtf1{\\*\\listtable{\\list".to_vec();
+        for _ in 0..1000 {
+            rtf.extend(b"{\\listlevel}");
+        }
+        rtf.extend(b"}}x}");
+        let doc = read(&rtf, &mut Budget::new(Limits::default())).unwrap();
+        assert_eq!(doc.numbering.abstracts[0].levels.len(), 9);
     }
 }

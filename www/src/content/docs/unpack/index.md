@@ -42,10 +42,12 @@ and optionally which formats may be opened. It is reserved before a member is
 decoded, not checked after, so a member that claims 1 GB from 4 KB is refused
 before anything is allocated.
 
-**A bomb stops the walk, and says so.** A compression ratio past the cap (1000
-by default), too many members or too much output ends the walk with a
-`LimitHit` that names the limit. Nothing is cut short quietly: the caller can
-tell a walk that finished from one that was stopped.
+**A bomb is stopped, and says so.** Too many members or too much output ends
+the walk with a `LimitHit` that names the limit. A compression ratio past the
+cap (1000 by default, asked only of a member past the object limit) leaves that
+member out and the walk goes on; it ends with the `LimitHit` once the other
+members are visited. Nothing is cut short quietly: the caller can tell a walk
+that finished from one that was stopped.
 
 **Partial results are reported as partial.** Content that is present but was
 not decoded (an unsupported codec, an encrypted member with no working
@@ -70,13 +72,12 @@ The defaults differ by where the code runs:
 
 | Limit | Rust crate | Command | `@exav/unpack-wasm` |
 |---|---|---|---|
-| Total bytes decoded | 1 GiB | 64 GiB (`--max-size`) | 128 MiB |
-| Largest object held in memory | 256 MiB | 1 GiB (`--max-memory`) | 32 MiB |
+| Total bytes decoded | 1 GiB | 64 GiB (`--max-extracted-bytes`) | 128 MiB |
+| Largest object held in memory | 256 MiB | 1 GiB (`--max-object-bytes`) | 32 MiB |
 | Members | 100,000 | 1,000,000 (`--max-members`) | 100,000 |
 
 The command writes what it decodes to disk rather than holding it, so its
-totals can be far higher; the compression-ratio cap still stops a bomb long
-before them. A browser tab gets far less than wasm32's 4 GiB address space, and
+totals can be far higher. A browser tab gets far less than wasm32's 4 GiB address space, and
 running out aborts the module, so the WebAssembly package starts lower.
 
 [How it works](/unpack/how-it-works/) covers the shape of the unpacker,

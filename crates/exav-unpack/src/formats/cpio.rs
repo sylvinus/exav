@@ -26,14 +26,14 @@ fn read_name<R: Read + Seek>(source: &mut R, off: u64, namesize: u64) -> Result<
 }
 
 /// Walk a cpio archive, each member streamed from where it lies.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let mut source = crate::source::Reader::new(src);
     let members = stream_offsets(&mut source)?;
-    crate::stream::stream_stored(&mut source, budget, visit, members)
+    crate::stream::stream_stored_ranges(src, budget, visit, members)
 }
 
 /// Parse member offsets from a seekable source (reader-based streaming): walk the
@@ -55,7 +55,7 @@ pub(crate) fn stream_offsets<R: Read + Seek>(source: &mut R) -> Result<Vec<Regio
     } else if magic[0..2] == [0x71, 0xc7] {
         stream_walk(source, 26, Fields::Bin { swap: true })
     } else {
-        Err(LimitHit::new("cpio: unknown format".to_string()))
+        Err(LimitHit::corrupt("cpio: unknown format".to_string()))
     }
 }
 

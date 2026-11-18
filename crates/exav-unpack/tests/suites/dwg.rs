@@ -16,6 +16,10 @@ use std::io::Read;
 use exav_unpack::dwg::{Dwg, PreviewKind, Version, looks_like_dwg};
 use exav_unpack::{Budget, Entry, Format, Limits, detect, extract};
 
+#[path = "../dwg_build/mod.rs"]
+mod dwg_build;
+use dwg_build::{Drawing, OLE2, Section};
+
 /// Every version the converter writes, as the fixture directories name them.
 const VERSIONS: [&str; 8] = [
     "R13", "R14", "R2000", "R2004", "R2007", "R2010", "R2013", "R2018",
@@ -554,4 +558,453 @@ fn damaged_files_do_not_panic() {
             walk(&b);
         }
     }
+}
+
+/// The names of a drawing's members.
+fn names(data: &[u8]) -> Vec<String> {
+    members(data).into_iter().map(|e| e.name).collect()
+}
+
+/// A part of the drawing that could not be read ends the scan as not
+/// examined: the file opens, says what it left out, and the container gives
+/// an unsupported `dwg-damaged` member. The drawings are built here
+/// (`dwg_build`): a LINE and nothing else, so the member list of one that
+/// reads whole is empty.
+#[test]
+fn a_built_drawing_reads_whole_and_has_no_members() {
+    let built = Drawing::standard().build();
+    assert_eq!(detect(&built.bytes), Some(Format::Dwg));
+    let dwg = Dwg::open(&built.bytes).expect("opens");
+    assert_eq!(dwg.version(), Version::R2004);
+    assert_eq!(dwg.object_map(), [(1, 0)]);
+    assert!(dwg.problems().is_empty(), "{:?}", dwg.problems());
+    assert!(dwg.left_out().is_empty());
+    assert!(!dwg.vba_encrypted());
+    assert!(members(&built.bytes).is_empty());
+}
+
+/// The reason of the one member a damaged built drawing gives, with the
+/// notes `Dwg::left_out` holds.
+fn damaged(data: &[u8]) -> (Vec<Entry>, Vec<String>) {
+    let notes = Dwg::open(data)
+        .map(|d| d.left_out().to_vec())
+        .unwrap_or_default();
+    (members(data), notes)
+}
+
+#[test]
+fn a_data_page_that_cannot_be_read_is_reported() {
+    // The sections the objects are read from give `dwg-damaged`, the ones
+    // without which nothing opens `dwg-objects`.
+    for (section, member) in [
+        ("AcDb:AcDbObjects", "dwg-damaged"),
+        ("AcDb:Classes", "dwg-damaged"),
+        ("AcDb:Header", "dwg-objects"),
+        ("AcDb:Handles", "dwg-objects"),
+    ] {
+        let mut built = Drawing::standard().build();
+        let at = built
+            .pages
+            .iter()
+            .find(|(s, _)| s == section)
+            .expect("its page")
+            .1;
+        built.bytes[at] ^= 0xFF;
+        let (m, notes) = damaged(&built.bytes);
+        let got: Vec<(&str, Option<&str>)> =
+            m.iter().map(|e| (e.name.as_str(), e.unsupported)).collect();
+        assert_eq!(got.len(), 1, "{section}: {got:?}");
+        assert_eq!(got[0].0, member, "{section}");
+        assert!(got[0].1.is_some(), "{section}: not marked unsupported");
+        if member == "dwg-damaged" {
+            let want = format!("a page of section {section} is unreadable");
+            assert!(notes.contains(&want), "{section}: {notes:?}");
+        }
+    }
+}
+
+#[test]
+fn a_page_shorter_than_its_section_is_reported() {
+    let mut d = Drawing::standard();
+    d.section("AcDb:AcDbObjects").size = 100;
+    let (m, notes) = damaged(&d.build().bytes);
+    assert_eq!(names_of(&m), ["dwg-damaged"]);
+    assert_eq!(notes, ["a page of AcDb:AcDbObjects holds 4 bytes, not 100"]);
+}
+
+fn names_of(m: &[Entry]) -> Vec<&str> {
+    m.iter().map(|e| e.name.as_str()).collect()
+}
+
+#[test]
+fn a_section_larger_than_its_pages_is_reported() {
+    let mut d = Drawing::standard();
+    d.section("AcDb:Classes").size = 3 * 0x7400;
+    let (m, notes) = damaged(&d.build().bytes);
+    assert_eq!(names_of(&m), ["dwg-damaged"]);
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.starts_with("section AcDb:Classes declares 89088 bytes, more than")),
+        "{notes:?}"
+    );
+}
+
+/// A full page of the objects section, the LINE at its start.
+fn full_page() -> Vec<u8> {
+    let mut page = vec![0u8; 0x7400];
+    page[..4].copy_from_slice(&[0x02, 0x00, 0x44, 0xC0]);
+    page
+}
+
+#[test]
+fn overlapping_pages_are_reported() {
+    let mut d = Drawing::standard();
+    let s = d.section("AcDb:AcDbObjects");
+    s.size = 0x10000;
+    s.pages = vec![(0, full_page()), (0x7000, vec![0; 4])];
+    let (m, notes) = damaged(&d.build().bytes);
+    assert_eq!(names_of(&m), ["dwg-damaged"]);
+    assert_eq!(notes, ["the pages of AcDb:AcDbObjects overlap"]);
+}
+
+#[test]
+fn a_page_starting_past_its_section_is_reported() {
+    let mut d = Drawing::standard();
+    let s = d.section("AcDb:AcDbObjects");
+    s.size = 0x10000;
+    s.pages = vec![(0, full_page()), (0x20000, vec![0; 4])];
+    let (m, notes) = damaged(&d.build().bytes);
+    assert_eq!(names_of(&m), ["dwg-damaged"]);
+    assert_eq!(
+        notes,
+        ["a page of AcDb:AcDbObjects starts past the section's end"]
+    );
+}
+
+#[test]
+fn pages_past_the_end_of_their_section_are_reported() {
+    let mut d = Drawing::standard();
+    let s = d.section("AcDb:AcDbObjects");
+    s.pages.push((4, vec![0; 4]));
+    let (m, notes) = damaged(&d.build().bytes);
+    assert_eq!(names_of(&m), ["dwg-damaged"]);
+    assert_eq!(notes, ["section AcDb:AcDbObjects has pages past its end"]);
+}
+
+#[test]
+fn a_section_map_cut_short_is_reported() {
+    // Says five sections, holds four: whatever the fifth is was not read.
+    let mut d = Drawing::standard();
+    d.declared_sections = Some(5);
+    let (m, notes) = damaged(&d.build().bytes);
+    assert_eq!(names_of(&m), ["dwg-damaged"]);
+    assert_eq!(notes, ["the section map is cut short"]);
+}
+
+#[test]
+fn a_section_map_listing_fewer_pages_than_it_says_is_reported() {
+    // The last section says 5000 pages and has one: the map ends first.
+    let mut d = Drawing::standard();
+    d.section("AcDb:Classes").declared_pages = Some(5000);
+    let (m, notes) = damaged(&d.build().bytes);
+    assert_eq!(names_of(&m), ["dwg-damaged"]);
+    assert!(
+        notes.contains(&"the section map is cut short".to_string()),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn a_drawing_without_classes_is_reported() {
+    let mut d = Drawing::standard();
+    d.sections.retain(|s| s.name != "AcDb:Classes");
+    let (m, notes) = damaged(&d.build().bytes);
+    assert_eq!(names_of(&m), ["dwg-damaged"]);
+    assert_eq!(notes, ["no AcDb:Classes section"]);
+}
+
+#[test]
+fn an_object_whose_type_cannot_be_read_is_reported() {
+    // A second entry, at the objects' last byte: a size needs two.
+    let mut d = Drawing::standard();
+    d.section("AcDb:Handles").pages[0].1 =
+        vec![0x00, 0x06, 0x01, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02];
+    d.section("AcDb:Handles").size = 10;
+    let built = d.build();
+    let dwg = Dwg::open(&built.bytes).expect("opens");
+    assert_eq!(dwg.object_map(), [(1, 0), (2, 3)]);
+    assert!(dwg.left_out().is_empty(), "read whole as far as it goes");
+    assert_eq!(names(&built.bytes), ["dwg-damaged"]);
+}
+
+#[test]
+fn a_vba_project_object_running_past_the_data_is_reported() {
+    // A record of a size of 100 bytes and the type 0x51, in 4 bytes.
+    let mut d = Drawing::standard();
+    d.section("AcDb:AcDbObjects").pages[0].1 = vec![0x64, 0x00, 0x54, 0x40];
+    assert_eq!(names(&d.build().bytes), ["dwg-damaged"]);
+}
+
+/// Every converted drawing from R2004 on, with a run of its bytes zeroed at
+/// each step across its pages: the drawing that opens either holds what it
+/// held, or says so in its notes; a note of data left out gives the
+/// `dwg-damaged` member; one that does not open gives `dwg-objects`.
+#[test]
+fn a_damaged_converted_drawing_never_reads_differently_without_a_note() {
+    for v in ["R2004", "R2007", "R2010", "R2013", "R2018"] {
+        let path = format!(
+            "{}/tests/fixtures/dwg/ole/{v}.dwg.gz",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let data = gunzip(&exav_unpack::read_fixture(&path).expect("fixture"));
+        let whole = Dwg::open(&data).expect("opens");
+        let (mut unreadable, mut wrong_length, mut refused) = (0, 0, 0);
+        for at in (0x480..data.len() - 0x400).step_by(0x40) {
+            let mut d = data.clone();
+            d[at..at + 0x20].fill(0);
+            let dwg = match Dwg::open(&d) {
+                Ok(dwg) => dwg,
+                Err(_) => {
+                    assert_eq!(names(&d), ["dwg-objects"], "{v} at {at:#x}");
+                    refused += 1;
+                    continue;
+                }
+            };
+            if !dwg.left_out().is_empty() {
+                assert!(
+                    names(&d).contains(&"dwg-damaged".to_string()),
+                    "{v} at {at:#x}: {:?}",
+                    dwg.left_out()
+                );
+                unreadable += dwg
+                    .left_out()
+                    .iter()
+                    .filter(|n| n.contains("is unreadable"))
+                    .count();
+                wrong_length += dwg
+                    .left_out()
+                    .iter()
+                    .filter(|n| n.contains("expands to"))
+                    .count();
+            } else if dwg.objects() != whole.objects()
+                || dwg.object_map() != whole.object_map()
+                || dwg.classes() != whole.classes()
+            {
+                assert!(
+                    !dwg.problems().is_empty(),
+                    "{v} at {at:#x}: read differently, with no note"
+                );
+            }
+        }
+        assert!(refused > 0, "{v}: no run made the drawing unreadable");
+        assert!(unreadable > 0, "{v}: no run made a page unreadable");
+        if v == "R2007" {
+            assert!(wrong_length > 0, "{v}: no run made a page the wrong length");
+        }
+    }
+}
+
+/// R13 to R2000: the file header's second locator is the object map; made
+/// 4 bytes smaller, the map loses the empty section (and its CRC) that ends
+/// it and keeps every entry.
+#[test]
+fn an_object_map_cut_short_in_a_file_header_is_reported() {
+    for v in ["R13", "R14", "R2000"] {
+        let path = format!(
+            "{}/tests/fixtures/dwg/ole/{v}.dwg.gz",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let pristine = gunzip(&exav_unpack::read_fixture(&path).expect("fixture"));
+        let mut data = pristine.clone();
+        let whole = Dwg::open(&pristine).expect("opens");
+        let k = whole
+            .locators()
+            .iter()
+            .position(|l| l.number == 2)
+            .expect("the object map's locator");
+        let size = whole.locators()[k].size;
+        // The locator is a number, an offset and a size, from 0x19.
+        let at = 0x19 + 9 * k + 5;
+        data[at..at + 4].copy_from_slice(&(size - 4).to_le_bytes());
+        let dwg = Dwg::open(&data).expect("opens");
+        assert_eq!(dwg.object_map(), whole.object_map(), "{v}");
+        assert_eq!(dwg.left_out(), ["the object map has no end"], "{v}");
+        assert!(names(&data).contains(&"dwg-damaged".to_string()), "{v}");
+    }
+}
+
+/// A drawing of `fixtures/dwg/links/` (make.py there), gunzipped.
+fn links_fixture(version: &str) -> Vec<u8> {
+    let path = format!(
+        "{}/tests/fixtures/dwg/links/{version}.dwg.gz",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    gunzip(&exav_unpack::read_fixture(&path).expect("fixture"))
+}
+
+fn link(url: &str, texts: &[&str]) -> exav_unpack::dwg::Hyperlink {
+    exav_unpack::dwg::Hyperlink {
+        url: url.to_string(),
+        texts: texts.iter().map(|t| t.to_string()).collect(),
+    }
+}
+
+/// Seven entities of the drawing carry `PE_URL` extended data, one of them
+/// the same as another's, and one more the extended data of another
+/// application with a string that looks like a link: each distinct link of
+/// the first application once, in the order of the object map.
+#[test]
+fn the_hyperlinks_of_a_drawing_are_read_in_every_version() {
+    for v in VERSIONS {
+        let data = links_fixture(v);
+        let dwg = Dwg::open(&data).expect("opens");
+        let got = dwg.hyperlinks(100);
+        assert!(!got.cut, "{v}");
+        assert_eq!(
+            got.links,
+            [
+                link(
+                    "https://evil.example/steal",
+                    &["https://www.paypal.com/login"]
+                ),
+                link("", &["Detail text display", "Detail 1"]),
+                link("https://example.org/docs/a%20b", &["Docs"]),
+                link("https://example.org/caf\u{e9}", &["Caf\u{e9}"]),
+                link("https://example.org/same", &["https://example.org/same"]),
+            ],
+            "{v}"
+        );
+        // Reading them leaves the drawing whole.
+        assert!(dwg.left_out().is_empty(), "{v}");
+        assert!(members(&data).is_empty(), "{v}");
+    }
+}
+
+#[test]
+fn the_hyperlinks_of_a_drawing_stop_at_the_count_asked_for() {
+    let data = links_fixture("R2018");
+    let dwg = Dwg::open(&data).expect("opens");
+    let got = dwg.hyperlinks(2);
+    assert!(got.cut);
+    assert_eq!(got.links.len(), 2);
+    assert_eq!(got.links[0].url, "https://evil.example/steal");
+    assert!(!dwg.hyperlinks(5).cut);
+}
+
+/// The converted drawings of `fixtures/dwg/ole/` have no hyperlink.
+#[test]
+fn a_drawing_without_hyperlinks_has_none() {
+    for v in VERSIONS {
+        let path = format!(
+            "{}/tests/fixtures/dwg/ole/{v}.dwg.gz",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let data = gunzip(&exav_unpack::read_fixture(&path).expect("fixture"));
+        let got = Dwg::open(&data).expect("opens").hyperlinks(100);
+        assert!(got.links.is_empty() && !got.cut, "{v}");
+    }
+}
+
+/// A checksum or CRC that does not match, over data the reader used as it
+/// read it, is said in the notes and is not data left out: the drawing gives
+/// the members it has, and no `dwg-damaged`.
+fn noted_only(bytes: &[u8], note: &str) {
+    let dwg = Dwg::open(bytes).expect("opens");
+    assert_eq!(dwg.problems(), [note]);
+    assert!(dwg.left_out().is_empty());
+    assert_eq!(dwg.object_map(), [(1, 0)]);
+    assert!(members(bytes).is_empty());
+}
+
+#[test]
+fn a_file_header_crc_that_does_not_match_is_noted_not_left_out() {
+    // The CRC is the last four bytes of the 0x6C-byte block at 0x80.
+    let mut built = Drawing::standard().build();
+    built.bytes[0x80 + 0x68] ^= 0x01;
+    noted_only(&built.bytes, "the file header's CRC does not match");
+}
+
+#[test]
+fn a_system_page_checksum_that_does_not_match_is_noted_not_left_out() {
+    // The page map is the first page, at 0x100; its checksum is at 16.
+    let mut built = Drawing::standard().build();
+    built.bytes[0x100 + 16] ^= 0x01;
+    noted_only(&built.bytes, "the section page map fails its checksum");
+}
+
+#[test]
+fn a_data_page_checksum_that_does_not_match_is_noted_not_left_out() {
+    // The last byte of the object's record, after the type: not read.
+    let mut built = Drawing::standard().build();
+    let at = built
+        .pages
+        .iter()
+        .find(|(s, _)| s == "AcDb:AcDbObjects")
+        .expect("its page")
+        .1;
+    built.bytes[at + 0x20 + 3] ^= 0x01;
+    let dwg = Dwg::open(&built.bytes).expect("opens");
+    assert_eq!(
+        dwg.problems(),
+        [format!("the page at {at:#X} fails its checksum")]
+    );
+    assert!(dwg.left_out().is_empty());
+    assert!(members(&built.bytes).is_empty());
+}
+
+/// The project section (spec 15): a header of 16 bytes, then the compound
+/// file.
+fn vba_section(encrypted: u32) -> Section {
+    let mut project = vec![0u8; 16];
+    project.extend_from_slice(&OLE2);
+    project.extend_from_slice(b"the project");
+    let mut s = Section::new("AcDb:VBAProject", &project);
+    s.encrypted = encrypted;
+    s
+}
+
+#[test]
+fn a_vba_project_section_is_a_member() {
+    let mut d = Drawing::standard();
+    d.sections.push(vba_section(0));
+    let m = members(&d.build().bytes);
+    assert_eq!(names_of(&m), ["vbaproject.ole"]);
+    assert!(m[0].unsupported.is_none() && !m[0].encrypted);
+    assert_eq!(&m[0].data[..8], &OLE2);
+}
+
+/// A drawing whose header section is encrypted (a password on the drawing)
+/// is reported encrypted, not damaged.
+#[test]
+fn a_drawing_whose_sections_are_encrypted_is_reported_encrypted() {
+    let mut d = Drawing::standard();
+    for s in d.sections.iter_mut().filter(|s| s.name == "AcDb:Header") {
+        s.encrypted = 1;
+    }
+    let built = d.build();
+    assert!(matches!(
+        Dwg::open(&built.bytes),
+        Err(exav_unpack::dwg::Error::Encrypted)
+    ));
+    let m = members(&built.bytes);
+    assert_eq!(names_of(&m), ["dwg-objects"]);
+    assert!(m[0].encrypted, "marked encrypted");
+    assert!(m[0].unsupported.is_some() && m[0].data.is_empty());
+}
+
+#[test]
+fn an_encrypted_vba_project_section_is_reported_encrypted() {
+    let mut d = Drawing::standard();
+    d.sections.push(vba_section(1));
+    let built = d.build();
+    let dwg = Dwg::open(&built.bytes).expect("opens");
+    assert!(dwg.vba_encrypted());
+    assert!(dwg.vba_project().is_none());
+    assert!(dwg.left_out().is_empty());
+    let m = members(&built.bytes);
+    assert_eq!(names_of(&m), ["vbaproject.ole"]);
+    assert!(m[0].encrypted, "marked encrypted");
+    assert!(m[0].unsupported.is_some(), "and not read");
+    assert!(m[0].data.is_empty());
 }

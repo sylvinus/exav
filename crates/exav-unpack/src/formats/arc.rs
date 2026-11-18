@@ -1,4 +1,4 @@
-//! ARC — the SEA archive format, and the PKARC/PAK variants that extend it.
+//! ARC: the SEA archive format, and the PKARC/PAK variants that extend it.
 //!
 //! It predates ZIP, and it is still opened by The Unarchiver, by 7-Zip's `arc`
 //! handler and by Microsoft's RecursiveExtractor, which is reason enough: exav's
@@ -24,7 +24,7 @@
 //! (`Budget::set_verify_checksums`) it is reported instead. The tests compare
 //! decoded members with the files that went in.
 
-use crate::{Budget, Entry, LimitHit, Sink};
+use crate::{Budget, Entry, Sink};
 
 /// Every header starts with this marker.
 const MARKER: u8 = 0x1A;
@@ -81,7 +81,7 @@ fn crc16(data: &[u8]) -> u16 {
 /// Is there a plausible member header at `off`?
 ///
 /// `1A` plus a method byte is two bytes of signature, which is far too little on
-/// its own — the lesson the DMG detector learned the hard way. The name carries
+/// its own: the lesson the DMG detector learned the hard way. The name carries
 /// the rest of the weight: it must be printable ASCII terminated by a NUL inside
 /// the thirteen-byte field.
 ///
@@ -299,11 +299,7 @@ fn method_name(method: u8) -> &'static str {
     }
 }
 
-pub(crate) fn extract_arc<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_arc(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     if !is_arc(data) {
         return Ok(None);
     }
@@ -379,10 +375,9 @@ pub(crate) fn extract_arc<R>(
         let cap = budget.reserve()? as usize;
         if orig_size > cap {
             if let Some(r) = visit(
-                Entry::unsupported(
+                Entry::over_limit(
                     name,
                     comp_size as u64,
-                    false,
                     "ARC member exceeds the per-member size budget",
                 ),
                 budget,
@@ -402,10 +397,10 @@ pub(crate) fn extract_arc<R>(
                     // A stored body is as long as the member's packed size,
                     // whatever its original size says.
                     if b.len() > cap {
-                        Entry::unsupported(
+                        budget.commit(b.len() as u64);
+                        Entry::over_limit(
                             name,
                             comp_size as u64,
-                            false,
                             "ARC member exceeds the per-member size budget",
                         )
                     } else {
@@ -419,7 +414,8 @@ pub(crate) fn extract_arc<R>(
                     false,
                     "ARC member did not match its recorded CRC after decoding",
                 ),
-                None => Entry::unsupported(name, comp_size as u64, false, method_name(method)),
+                None => Entry::unsupported(name, comp_size as u64, false, method_name(method))
+                    .of_kind(crate::tree::ReasonKind::Unsupported),
             };
             if let Some(r) = visit(entry, budget) {
                 return Ok(Some(r));
@@ -428,7 +424,7 @@ pub(crate) fn extract_arc<R>(
 
         let next = body_start.saturating_add(comp_size);
         if next <= pos {
-            break; // no progress — malformed
+            break; // no progress: malformed
         }
         pos = next;
     }

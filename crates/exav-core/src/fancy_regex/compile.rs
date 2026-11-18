@@ -44,7 +44,7 @@ use crate::fancy_regex::seek::build_seek_pattern;
 use crate::fancy_regex::to_hir::{expr_to_hir, HirCtx};
 #[cfg(true)]
 use crate::fancy_regex::vm::{CachePoolFn, ReverseBackwardsDelegate};
-use crate::fancy_regex::vm::{CaptureGroupRange, CaseiLiteral, CharClassMatcher, Delegate, Insn, Prog, Seek};
+use crate::fancy_regex::vm::{CaptureGroupRange, CaseiLiteral, CharClassMatcher, Delegate, Extent, Insn, Prog, Seek};
 use crate::fancy_regex::LookAround::*;
 use crate::fancy_regex::{
     Absent, BacktrackingControlVerb, BytesMode, CompileError, Error, Expr, LookAround, Result,
@@ -130,6 +130,24 @@ struct Compiler<'a> {
     /// fragment, and building a `meta::Regex` dominates compile time, so
     /// identical fragments share one engine (cloning it is a cheap Arc copy).
     delegate_memo: Map<(String, bool), RaRegex>,
+    /// For each group whose body refers to the group itself, the first of the two
+    /// slots that hold its previous capture while the group runs again.
+    previous_capture_slots: Map<usize, usize>,
+    /// The groups being compiled whose body refers to the group itself.
+    open_self_referencing_groups: Vec<usize>,
+}
+
+/// Whether `body` reads a capture group set inside it, so an iteration can match
+/// differently from an earlier one at the same position.
+fn reads_own_captures(body: &Info<'_>) -> bool {
+    let own = body.start_group()..body.end_group();
+    body.expr.has_descendant_or_self(|expr| match *expr {
+        Expr::Backref { group, .. }
+        | Expr::BackrefWithRelativeRecursionLevel { group, .. }
+        | Expr::BackrefExistsCondition { group, .. } => own.contains(&group),
+        Expr::SubroutineCall(_) => true,
+        _ => false,
+    })
 }
 
 impl<'a> Compiler<'a> {
@@ -143,6 +161,64 @@ impl<'a> Compiler<'a> {
             self.b.add(Insn::Lit(s));
         } else {
             self.b.add(Insn::LitBytes(bytes.to_vec()));
+        }
+    }
+
+    fn compile_group(&mut self, group: usize, body: &Info<'_>, hard: bool) -> Result<()> {
+        let self_referencing = self.refers_to_group(body.expr, group, &mut Vec::new());
+        if self_referencing {
+            let previous = *self.previous_capture_slots.entry(group).or_insert_with(|| {
+                let slot = self.b.newsave();
+                self.b.newsave();
+                slot
+            });
+            self.b
+                .add(Insn::SaveCaptureGroupStartKeepPrevious { group, previous });
+            self.open_self_referencing_groups.push(group);
+        } else {
+            self.b.add(Insn::SaveCaptureGroupStart(group));
+        }
+        self.visit(body, hard)?;
+        if self_referencing {
+            self.open_self_referencing_groups.pop();
+        }
+        self.b.add(Insn::Save(group * 2 + 1));
+        Ok(())
+    }
+
+    /// Whether `expr` has a backref or a condition that refers to `group`, also
+    /// through the groups it calls.
+    fn refers_to_group(&self, expr: &Expr, group: usize, called: &mut Vec<usize>) -> bool {
+        match *expr {
+            Expr::Backref { group: g, .. } | Expr::BackrefExistsCondition { group: g, .. }
+                if g == group =>
+            {
+                return true;
+            }
+            Expr::SubroutineCall(target) if !called.contains(&target) => {
+                called.push(target);
+                let info = if target == 0 {
+                    Some(self.root_info)
+                } else {
+                    self.group_info_map.get(&target).copied()
+                };
+                if info.map_or(false, |info| self.refers_to_group(info.expr, group, called)) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        expr.children_iter()
+            .any(|child| self.refers_to_group(child, group, called))
+    }
+
+    /// The first of the slots a backref to `group` reads. Inside the group itself,
+    /// that is the previous capture, as the current one is not finished yet.
+    fn capture_slot(&self, group: usize) -> usize {
+        if self.open_self_referencing_groups.contains(&group) {
+            self.previous_capture_slots[&group]
+        } else {
+            group * 2
         }
     }
 
@@ -189,10 +265,7 @@ impl<'a> Compiler<'a> {
                 self.compile_alt(count, |compiler, i| compiler.visit(&info.children[i], hard))?;
             }
             Expr::Group(_) => {
-                let group = info.start_group();
-                self.b.add(Insn::SaveCaptureGroupStart(group));
-                self.visit(&info.children[0], hard)?;
-                self.b.add(Insn::Save(group * 2 + 1));
+                self.compile_group(info.start_group(), &info.children[0], hard)?;
             }
             Expr::Repeat { lo, hi, greedy, .. } => {
                 self.compile_repeat(info, lo, hi, greedy, hard)?;
@@ -202,7 +275,7 @@ impl<'a> Compiler<'a> {
             }
             Expr::Backref { group, casei } => {
                 self.b.add(Insn::Backref {
-                    slot: group * 2,
+                    slot: self.capture_slot(group),
                     casei,
                     // use the pre-computed effective unicode flag (unicode && !Ascii bytes mode)
                     unicode: self.options.unicode,
@@ -212,7 +285,8 @@ impl<'a> Compiler<'a> {
                 group,
                 relative_recursion_level: None,
             } => {
-                self.b.add(Insn::BackrefExistsCondition(group));
+                self.b
+                    .add(Insn::BackrefExistsCondition(self.capture_slot(group)));
             }
             Expr::BackrefExistsCondition {
                 relative_recursion_level: Some(_),
@@ -305,9 +379,7 @@ impl<'a> Compiler<'a> {
                                 )),
                             )));
                         }
-                        self.b.add(Insn::SaveCaptureGroupStart(target_group));
-                        self.visit(&target_info.children[0], hard)?;
-                        self.b.add(Insn::Save(target_group * 2 + 1));
+                        self.compile_group(target_group, &target_info.children[0], hard)?;
                     }
 
                     // Pop the recursion stack
@@ -451,6 +523,10 @@ impl<'a> Compiler<'a> {
 
         // add the false branch, update the split target
         self.b.set_split_target(split_pc, self.b.pc(), true);
+        // The condition failed. Backtracking to the split does not undo `BeginAtomic`,
+        // so end the atomic group here too, or an enclosing atomic group would later
+        // read this group's entry on the explicit stack. There are no branches to cut.
+        self.b.add(Insn::EndAtomic);
         false_branch(self)?;
 
         // update the jump target for jumping over the false branch
@@ -478,6 +554,7 @@ impl<'a> Compiler<'a> {
             next: usize::MAX,
             repeat,
             check,
+            reads_own_captures: false,
         });
 
         // Compile the body as: (?((?!inner))\O|)
@@ -566,6 +643,7 @@ impl<'a> Compiler<'a> {
             // Use RepeatEpsilon instructions to prevent empty repeat
             let repeat = self.b.newsave();
             let check = self.b.newsave();
+            let reads_own_captures = reads_own_captures(child);
             self.b.add(Insn::Save0(repeat));
             let pc = self.b.pc();
             if greedy {
@@ -574,6 +652,7 @@ impl<'a> Compiler<'a> {
                     next: usize::MAX,
                     repeat,
                     check,
+                    reads_own_captures,
                 });
             } else {
                 self.b.add(Insn::RepeatEpsilonNg {
@@ -581,6 +660,7 @@ impl<'a> Compiler<'a> {
                     next: usize::MAX,
                     repeat,
                     check,
+                    reads_own_captures,
                 });
             }
             self.visit(child, hard)?;
@@ -674,7 +754,16 @@ impl<'a> Compiler<'a> {
     fn compile_positive_lookaround(&mut self, inner: &Info<'_>, la: LookAround) -> Result<()> {
         let save = self.b.newsave();
         self.b.add(Insn::Save(save));
+        // A lookahead is atomic: once it has matched, a later failure must not backtrack
+        // into it. Only the VM backtracks, so a delegated (easy) lookahead needs no cut.
+        let atomic = la == LookAhead && inner.hard;
+        if atomic {
+            self.b.add(Insn::BeginAtomic);
+        }
         self.compile_lookaround_inner(inner, la)?;
+        if atomic {
+            self.b.add(Insn::EndAtomic);
+        }
         self.b.add(Insn::Restore(save));
         Ok(())
     }
@@ -799,10 +888,18 @@ impl<'a> Compiler<'a> {
         // Use reverse matching for variable-sized lookbehinds without fancy features
         use regex_automata::hybrid::dfa;
         use regex_automata::nfa::thompson;
+        use regex_automata::util::syntax::Config as SyntaxConfig;
+        // This builder parses the pattern itself instead of going through
+        // `options_to_rabuilder`, so the Unicode and bytes-mode settings have to
+        // be applied to its syntax config too, as for the forward engine below.
+        let syntax = SyntaxConfig::new()
+            .utf8(matches!(self.options.bytes_mode, BytesMode::Unicode))
+            .unicode(self.options.unicode);
         // Build a reverse DFA for the pattern
         let dfa = match dfa::DFA::builder()
             .configure(dfa::Config::new().unicode_word_boundary(true))
             .thompson(thompson::Config::new().reverse(true))
+            .syntax(syntax)
             .build(pattern)
         {
             Ok(dfa) => Arc::new(dfa),
@@ -979,6 +1076,7 @@ impl<'a> Compiler<'a> {
                 inner: compiled,
                 pattern: pattern.to_string(),
                 capture_groups: None,
+                extent: extent_of(pattern, &self.options),
             }));
         }
 
@@ -1293,6 +1391,8 @@ pub fn compile(info: &Info<'_>, options: CompileOptions) -> Result<Prog> {
         subroutine_recursion_stack: Vec::new(),
         root_info: info,
         delegate_memo: Map::new(),
+        previous_capture_slots: Map::new(),
+        open_self_referencing_groups: Vec::new(),
     };
 
     let mut seek_pattern = String::new();
@@ -1475,10 +1575,21 @@ impl DelegateBuilder {
 
         Ok(Delegate {
             inner: compiled,
+            extent: extent_of(&self.re, options),
             pattern: self.re.clone(),
             capture_groups,
         })
     }
+}
+
+/// The DFA that measures how far searches of the delegate `pattern` read,
+/// built with the syntax [`options_to_rabuilder`] gives the delegate itself.
+fn extent_of(pattern: &str, options: &CompileOptions) -> Option<Extent> {
+    Extent::new(
+        pattern,
+        matches!(options.bytes_mode, BytesMode::Unicode),
+        options.unicode,
+    )
 }
 
 #[cfg(test)]
@@ -1619,16 +1730,17 @@ mod tests {
     fn conditional_expression_can_be_compiled() {
         let prog = compile_prog(r"(?(ab)c|d)");
 
-        assert_eq!(prog.len(), 8, "prog: {:?}", prog);
+        assert_eq!(prog.len(), 9, "prog: {:?}", prog);
 
         assert_matches!(prog[0], BeginAtomic);
         assert_matches!(prog[1], Split(2, 6));
         assert_matches!(prog[2], Lit(ref l) if l == "ab");
         assert_matches!(prog[3], EndAtomic);
         assert_matches!(prog[4], Lit(ref l) if l == "c");
-        assert_matches!(prog[5], Jmp(7));
-        assert_matches!(prog[6], Lit(ref l) if l == "d");
-        assert_matches!(prog[7], End);
+        assert_matches!(prog[5], Jmp(8));
+        assert_matches!(prog[6], EndAtomic);
+        assert_matches!(prog[7], Lit(ref l) if l == "d");
+        assert_matches!(prog[8], End);
     }
 
     #[test]
@@ -1941,7 +2053,7 @@ mod tests {
         // Use explicit_capture_group_0=false so that (\w) = group 1 and \1 refers to it
         let prog = compile_prog_no_explicit_group0(r"(\w)(?~\1)");
 
-        assert_eq!(prog.len(), 20, "prog: {:?}", prog);
+        assert_eq!(prog.len(), 21, "prog: {:?}", prog);
 
         assert_matches!(prog[0], SplitUnanchored(3, 1));
         assert_matches!(prog[1], Any);
@@ -1955,9 +2067,10 @@ mod tests {
             prog[8],
             RepeatEpsilonGr {
                 lo: 0,
-                next: 18,
+                next: 19,
                 repeat: 4,
-                check: 5
+                check: 5,
+                reads_own_captures: false
             }
         );
         assert_matches!(prog[9], BeginAtomic);
@@ -1974,10 +2087,11 @@ mod tests {
         assert_matches!(prog[13], FailNegativeLookAround);
         assert_matches!(prog[14], EndAtomic);
         assert_matches!(prog[15], Any);
-        assert_matches!(prog[16], Jmp(17));
-        assert_matches!(prog[17], Jmp(8));
-        assert_matches!(prog[18], Save(1));
-        assert_matches!(prog[19], End);
+        assert_matches!(prog[16], Jmp(18));
+        assert_matches!(prog[17], EndAtomic);
+        assert_matches!(prog[18], Jmp(8));
+        assert_matches!(prog[19], Save(1));
+        assert_matches!(prog[20], End);
     }
 
     #[test]
@@ -2220,16 +2334,17 @@ mod tests {
     fn continue_from_prev_match_inside_conditional_can_be_compiled() {
         let prog = compile_prog(r"(?(\G)\s\d|$)");
 
-        assert_eq!(prog.len(), 8, "prog: {:?}", prog);
+        assert_eq!(prog.len(), 9, "prog: {:?}", prog);
 
         assert_matches!(prog[0], BeginAtomic);
         assert_matches!(prog[1], Split(2, 6));
         assert_matches!(prog[2], ContinueFromPreviousMatchEnd { at_start: false });
         assert_matches!(prog[3], EndAtomic);
         assert_delegate_insn(&prog[4], r"\s\d", None);
-        assert_matches!(prog[5], Jmp(7));
-        assert_delegate_insn(&prog[6], r"$", None);
-        assert_matches!(prog[7], End);
+        assert_matches!(prog[5], Jmp(8));
+        assert_matches!(prog[6], EndAtomic);
+        assert_delegate_insn(&prog[7], r"$", None);
+        assert_matches!(prog[8], End);
     }
 
     fn compile_prog(re: &str) -> Vec<Insn> {

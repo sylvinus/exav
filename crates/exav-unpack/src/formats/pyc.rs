@@ -2,7 +2,7 @@
 //!
 //! A `.pyc` file is a short, version-specific header followed by a *marshalled*
 //! code object. That marshalled body holds the module's string constants
-//! (`co_consts`) and the raw bytecode — which is exactly where an embedded
+//! (`co_consts`) and the raw bytecode, which is exactly where an embedded
 //! signature (e.g. a malicious string literal) lives. This handler does **not**
 //! decode the marshal format; it simply surfaces the body bytes (everything past
 //! the fixed header) as a single member so signatures match inside `.pyc` files.
@@ -11,38 +11,65 @@
 //!
 //! The pre-body header length depends on the Python version:
 //!
-//! * Python 3.7+  — 16 bytes: `magic`, `bit_field`, `mtime`, `source_size`
-//! * Python 3.3–3.6 — 12 bytes: `magic`, `mtime`, `source_size`
-//! * Python ≤ 3.2 — 8 bytes: `magic`, `mtime`
+//! * Python 3.7+, 16 bytes: `magic`, `bit_field`, `mtime`, `source_size`
+//! * Python 3.3–3.6, 12 bytes: `magic`, `mtime`, `source_size`
+//! * Python ≤ 3.2, 8 bytes: `magic`, `mtime`
 //!
 //! Rather than parse the version out of the magic, we strip the largest common
 //! header (16 bytes, the 3.7+ case). For older files a few extra header bytes
-//! remain at the front of the body, which is harmless for substring scanning —
+//! remain at the front of the body, which is harmless for substring scanning:
 //! the marshalled `co_consts`/bytecode we care about always sit further in.
 //!
-//! Detection (in `lib.rs`, feature-gated) is deliberately conservative — the
-//! `\r\n` at offset 2 is a weak magic — so this runs only after every strong
-//! binary magic has been ruled out.
+//! Detection (in `lib.rs`, feature-gated) is [`is_pyc`]: `\r\n` at offset 2 is
+//! a weak magic, so the two bytes before it must be a number CPython has
+//! written.
 
 use crate::*;
+
+/// The magic numbers of CPython's `.pyc` files, as the little-endian number
+/// in the first two bytes. Source: the table "Known values" in CPython's
+/// `Lib/importlib/_bootstrap_external.py` (up to 3.13) and
+/// `Include/internal/pycore_magic_number.h` (from 3.14). Python 1.5 to 2.2
+/// have one number per release, 2.3 to 2.7 run from 62011 to 62211, and 3.0
+/// on from 3000: 3.15 is at 3650 to 3666 and, since 3.11, release 3.n starts
+/// at 2900 + 50n, so up to 3.21 they stay below 4000.
+const MAGICS: [std::ops::RangeInclusive<u16>; 7] = [
+    20121..=20121,
+    50428..=50428,
+    50823..=50823,
+    60202..=60202,
+    60717..=60717,
+    62011..=62211,
+    3000..=3999,
+];
+
+/// Whether `data` opens like a `.pyc`: a number CPython has written, `\r\n`,
+/// and the rest of the 16-byte header.
+pub(crate) fn is_pyc(data: &[u8]) -> bool {
+    data.len() >= PYC_HEADER_LEN
+        && data[2..4] == *b"\r\n"
+        && MAGICS
+            .iter()
+            .any(|m| m.contains(&u16::from_le_bytes([data[0], data[1]])))
+}
 
 /// Smallest safe header to strip before the marshalled body: the Python 3.7+
 /// 16-byte header (`magic`, `bit_field`, `mtime`, `source_size`).
 const PYC_HEADER_LEN: usize = 16;
 
 /// Walk a `.pyc`: its code object, streamed from where it lies.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let mut source = crate::source::Reader::new(src);
     let members = stream_offsets(&mut source)?;
-    crate::stream::stream_stored(&mut source, budget, visit, members)
+    crate::stream::stream_stored_ranges(src, budget, visit, crate::stream::Region::list(members))
 }
 
 /// Reader-based streaming: the single `pyc-code` member is the whole file past
-/// the fixed header — streamed via seek+take with no buffering.
+/// the fixed header, streamed via seek+take with no buffering.
 pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
     source: &mut R,
 ) -> Result<Vec<(String, u64, u64)>, LimitHit> {

@@ -16,6 +16,7 @@
 //! the byte budget the caller gives.
 
 use super::Error;
+use super::file::Problems;
 use super::r2004::Inflate;
 
 /// Spec 5.13: a codeword of 255 bytes, 239 of them data in system pages,
@@ -572,11 +573,11 @@ impl<'a> Container<'a> {
     pub(super) fn open(
         data: &'a [u8],
         budget: u64,
-        problems: &mut Vec<String>,
+        problems: &mut Problems,
     ) -> Result<Container<'a>, Error> {
         let fh = find_file_header(data).ok_or(Error::NotDwg)?;
         if !fh.crc_ok {
-            problems.push("the file header's CRC does not match".into());
+            problems.mismatch("the file header's CRC does not match");
         }
         let mut c = Container {
             data,
@@ -617,7 +618,7 @@ impl<'a> Container<'a> {
         addresses: [u64; 2],
         p: SystemPage,
         what: &str,
-        problems: &mut Vec<String>,
+        problems: &mut Problems,
     ) -> Result<Vec<u8>, Error> {
         let damaged = || Error::Damaged(format!("the {what} is unreadable"));
         if p.size > MAX_PAGE || p.compressed_size > MAX_PAGE {
@@ -666,7 +667,7 @@ impl<'a> Container<'a> {
             }
         }
         let out = first.ok_or_else(damaged)?;
-        problems.push(format!("the {what} fails its CRC"));
+        problems.mismatch(format!("the {what} fails its CRC"));
         Ok(out)
     }
 
@@ -692,7 +693,7 @@ impl<'a> Container<'a> {
     /// The section map (spec 5.2): each section's eight longs, its name
     /// (UTF-16; the length counts bytes, the terminator included, not
     /// characters as the spec has it), then its pages' seven longs each.
-    fn read_section_map(&mut self, map: &[u8], problems: &mut Vec<String>) {
+    fn read_section_map(&mut self, map: &[u8], problems: &mut Problems) {
         let mut at = 0usize;
         while at + 64 <= map.len() {
             let f = |k: usize| le64(map, at + k * 8).unwrap_or(0);
@@ -703,7 +704,7 @@ impl<'a> Container<'a> {
                 .ok()
                 .and_then(|n| map.get(at..at.checked_add(n)?))
             else {
-                problems.push("the section map is cut short".into());
+                problems.lost("the section map is cut short");
                 return;
             };
             at += raw_name.len();
@@ -716,7 +717,7 @@ impl<'a> Container<'a> {
                 .collect();
             // A page takes 56 bytes: the count cannot be more.
             if count > ((map.len() - at) / 56) as u64 {
-                problems.push("the section map is cut short".into());
+                problems.lost("the section map is cut short");
                 return;
             }
             let mut pages = Vec::with_capacity(count as usize);
@@ -740,6 +741,10 @@ impl<'a> Container<'a> {
                 pages,
             });
         }
+        // Less than a section's head is left over: a map cut short.
+        if at < map.len() {
+            problems.lost("the section map is cut short");
+        }
     }
 
     pub(super) fn section_info(&self, name: &str) -> Option<&Section> {
@@ -753,7 +758,7 @@ impl<'a> Container<'a> {
     pub(super) fn section(
         &mut self,
         name: &str,
-        problems: &mut Vec<String>,
+        problems: &mut Problems,
     ) -> Result<Option<Vec<u8>>, Error> {
         let Some(s) = self.section_info(name).cloned() else {
             return Ok(None);
@@ -765,7 +770,7 @@ impl<'a> Container<'a> {
         let largest = s.pages.iter().map(|p| p.size).fold(s.max_size, u64::max);
         let most = (s.pages.len() as u64 + 1).saturating_mul(largest.min(MAX_PAGE));
         if s.size > most {
-            problems.push(format!(
+            problems.lost(format!(
                 "section {name} declares {} bytes, more than its pages hold",
                 s.size
             ));
@@ -783,15 +788,15 @@ impl<'a> Container<'a> {
         let mut out: Vec<u8> = Vec::new();
         for r in &s.pages {
             if out.len() >= size && size > 0 {
-                problems.push(format!("section {name} has pages past its end"));
+                problems.lost(format!("section {name} has pages past its end"));
                 break;
             }
             let Some(start) = usize::try_from(r.offset).ok().filter(|v| *v <= size) else {
-                problems.push(format!("a page of {name} starts past the section's end"));
+                problems.lost(format!("a page of {name} starts past the section's end"));
                 break;
             };
             if start < out.len() {
-                problems.push(format!("the pages of {name} overlap"));
+                problems.lost(format!("the pages of {name} overlap"));
                 break;
             }
             out.resize(start, 0);
@@ -801,7 +806,7 @@ impl<'a> Container<'a> {
                     out.extend_from_slice(&page);
                 }
                 None => {
-                    problems.push(format!("a page of section {name} is unreadable"));
+                    problems.lost(format!("a page of section {name} is unreadable"));
                     break;
                 }
             }
@@ -821,7 +826,7 @@ impl<'a> Container<'a> {
         &mut self,
         s: &Section,
         r: &PageRef,
-        problems: &mut Vec<String>,
+        problems: &mut Problems,
     ) -> Result<Option<Vec<u8>>, Error> {
         let over = || Error::LimitExceeded("the pages of a section".into());
         let Some(page) = self.page(r.id) else {
@@ -863,8 +868,17 @@ impl<'a> Container<'a> {
         } else {
             body.get(..size).unwrap_or(&body).to_vec()
         };
-        if out.len() != size || u64::from(checksum(&out)) != r.checksum {
-            problems.push(format!(
+        // A page of the wrong length leaves a gap the section is zero-filled
+        // across; one of the right length whose checksum does not match is
+        // used as read.
+        if out.len() != size {
+            problems.lost(format!(
+                "the page at {:#X} expands to {} bytes, not {size}",
+                page.address,
+                out.len()
+            ));
+        } else if u64::from(checksum(&out)) != r.checksum {
+            problems.mismatch(format!(
                 "the page at {:#X} fails its checksum",
                 page.address
             ));
@@ -1036,5 +1050,270 @@ mod tests {
         assert_eq!(checksum(&[]), 0x0026_9EC3);
         // Seed 0x33AEB7; in order the bytes would give 0xBB41AEC1.
         assert_eq!(checksum(&[1, 2, 3, 4]), 0xBB49_AEC1);
+    }
+
+    /// A container of one section, `S`, whose pages are stored as is
+    /// (encoding 1): page `k` (from 1) is `pages[k - 1]`, a start in the
+    /// section and a length, at `0x100 * k` in `data`.
+    fn stored<'a>(data: &'a [u8], size: u64, pages: &[(u64, usize)]) -> Container<'a> {
+        let refs = pages
+            .iter()
+            .enumerate()
+            .map(|(i, &(offset, len))| {
+                let at = 0x100 * (i + 1);
+                PageRef {
+                    offset,
+                    id: i as u64 + 1,
+                    size: len as u64,
+                    compressed_size: len as u64,
+                    checksum: u64::from(checksum(&data[at..at + len])),
+                }
+            })
+            .collect();
+        Container {
+            data,
+            pages: (1..=pages.len() as u64)
+                .map(|id| Page {
+                    id,
+                    address: 0x100 * id,
+                })
+                .collect(),
+            sections: vec![Section {
+                name: "S".into(),
+                size,
+                max_size: 0x7400,
+                encrypted: 0,
+                encoding: 1,
+                pages: refs,
+            }],
+            budget: 1 << 20,
+        }
+    }
+
+    fn read_s(c: &mut Container<'_>) -> (Vec<u8>, Problems) {
+        let mut problems = Problems::default();
+        let out = c.section("S", &mut problems).unwrap().unwrap();
+        (out, problems)
+    }
+
+    #[test]
+    fn stored_pages_make_their_section_without_a_note() {
+        let data = vec![0xAB; 0x1000];
+        let (out, p) = read_s(&mut stored(&data, 32, &[(0, 16), (16, 16)]));
+        assert_eq!(out, [0xAB; 32]);
+        assert_eq!(p.notes, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_section_larger_than_its_pages_is_left_out() {
+        let data = vec![0xAB; 0x1000];
+        let (out, p) = read_s(&mut stored(&data, 0x20000, &[(0, 16)]));
+        assert!(out.is_empty());
+        assert_eq!(
+            p.lost,
+            ["section S declares 131072 bytes, more than its pages hold"]
+        );
+    }
+
+    #[test]
+    fn pages_past_the_end_of_their_section_are_left_out() {
+        let data = vec![0xAB; 0x1000];
+        let (_, p) = read_s(&mut stored(&data, 16, &[(0, 16), (16, 16)]));
+        assert_eq!(p.lost, ["section S has pages past its end"]);
+    }
+
+    #[test]
+    fn a_page_starting_past_its_section_is_left_out() {
+        let data = vec![0xAB; 0x1000];
+        let (_, p) = read_s(&mut stored(&data, 32, &[(0, 16), (64, 16)]));
+        assert_eq!(p.lost, ["a page of S starts past the section's end"]);
+    }
+
+    #[test]
+    fn overlapping_pages_are_left_out() {
+        let data = vec![0xAB; 0x1000];
+        let (_, p) = read_s(&mut stored(&data, 64, &[(0, 32), (16, 16)]));
+        assert_eq!(p.lost, ["the pages of S overlap"]);
+    }
+
+    #[test]
+    fn a_page_the_page_map_lacks_is_left_out() {
+        let data = vec![0xAB; 0x1000];
+        let mut c = stored(&data, 32, &[(0, 16), (16, 16)]);
+        c.pages.clear();
+        let (out, p) = read_s(&mut c);
+        assert_eq!(out, [0; 32], "zero-filled to the section's size");
+        assert_eq!(p.lost, ["a page of section S is unreadable"]);
+    }
+
+    /// A literal run of 8 bytes in a page that says it expands to 20: the
+    /// section would be zero-filled across the 12 missing.
+    #[test]
+    fn a_page_that_expands_to_the_wrong_length_is_left_out() {
+        let mut data = vec![0u8; 0x1000];
+        data[0x100] = 0x00;
+        data[0x101..0x109].copy_from_slice(b"abcdefgh");
+        let mut c = stored(&data, 20, &[(0, 9)]);
+        c.sections[0].pages[0].size = 20;
+        let (out, p) = read_s(&mut c);
+        assert_eq!(&out[..8], b"abcdefgh");
+        assert_eq!(p.lost, ["the page at 0x100 expands to 8 bytes, not 20"]);
+    }
+
+    /// The length is right and the checksum is not: the page is used as
+    /// read, and the note is not data left out.
+    #[test]
+    fn a_page_with_a_wrong_checksum_is_noted_not_left_out() {
+        let data = vec![0xAB; 0x1000];
+        let mut c = stored(&data, 16, &[(0, 16)]);
+        c.sections[0].pages[0].checksum += 1;
+        let (out, p) = read_s(&mut c);
+        assert_eq!(out, [0xAB; 16]);
+        assert_eq!(p.notes, ["the page at 0x100 fails its checksum"]);
+        assert!(p.lost.is_empty());
+    }
+
+    /// The converter's R2007 drawing (`fixtures/dwg/R2007.dwg.gz`).
+    fn r2007_drawing() -> Vec<u8> {
+        use std::io::Read;
+        let gz = include_bytes!("../../../tests/fixtures/dwg/R2007.dwg.gz");
+        let mut data = Vec::new();
+        flate2::read::GzDecoder::new(&gz[..])
+            .read_to_end(&mut data)
+            .expect("a gzip fixture");
+        data
+    }
+
+    /// `data`'s file header with its fields (spec 5.2) changed by `edit`,
+    /// then the header's own CRC made right when `refresh_crc`, stored as a
+    /// block that is not compressed in both copies of the page.
+    fn with_header_fields(
+        mut data: Vec<u8>,
+        edit: impl Fn(&mut [u8]),
+        refresh_crc: bool,
+    ) -> Vec<u8> {
+        let page = data[FILE_HEADER_AT..FILE_HEADER_AT + FILE_HEADER_PAGE].to_vec();
+        let d = deinterleave(
+            &page,
+            FILE_HEADER_BLOCKS,
+            SYSTEM_K,
+            0,
+            FILE_HEADER_BLOCKS * SYSTEM_K,
+        )
+        .expect("the page");
+        let n = le32(&d, 0x18).expect("a length") as usize;
+        let mut fields = decompress(&d[0x20..0x20 + n], HEADER_FIELDS).expect("the fields");
+        edit(&mut fields);
+        if refresh_crc {
+            fields[0x108..0x110].fill(0);
+            let crc = crc_normal(seed2(0, fields.len()), &fields);
+            fields[0x108..0x110].copy_from_slice(&crc.to_le_bytes());
+        }
+        // The block: 0x18 bytes, the length (negative: stored), 4 bytes.
+        let mut block = d[..0x18].to_vec();
+        block.extend_from_slice(&(-(HEADER_FIELDS as i32)).to_le_bytes());
+        block.extend_from_slice(&d[0x1C..0x20]);
+        block.extend_from_slice(&fields);
+        block.resize(FILE_HEADER_BLOCKS * SYSTEM_K, 0);
+        let mut new_page = page;
+        for (t, b) in block.iter().enumerate() {
+            new_page[t / SYSTEM_K + FILE_HEADER_BLOCKS * (t % SYSTEM_K)] = *b;
+        }
+        let tail = data.len() - FILE_HEADER_PAGE;
+        data[FILE_HEADER_AT..FILE_HEADER_AT + FILE_HEADER_PAGE].copy_from_slice(&new_page);
+        data[tail..].copy_from_slice(&new_page);
+        data
+    }
+
+    #[test]
+    fn a_rewritten_header_that_is_right_has_no_note() {
+        let data = with_header_fields(r2007_drawing(), |_| {}, true);
+        let dwg = super::super::Dwg::open(&data).expect("opens");
+        assert_eq!(dwg.problems(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_file_header_crc_that_does_not_match_is_noted_not_left_out() {
+        let whole = r2007_drawing();
+        let maps = super::super::Dwg::open(&whole).expect("opens");
+        let data = with_header_fields(whole.clone(), |f| f[0x108] ^= 1, false);
+        let dwg = super::super::Dwg::open(&data).expect("opens");
+        assert_eq!(dwg.problems(), ["the file header's CRC does not match"]);
+        assert!(dwg.left_out().is_empty());
+        assert_eq!(dwg.object_map(), maps.object_map());
+    }
+
+    #[test]
+    fn a_system_page_crc_that_does_not_match_is_noted_not_left_out() {
+        let whole = r2007_drawing();
+        let maps = super::super::Dwg::open(&whole).expect("opens");
+        // The page map's CRC of its expanded data (offset 0x80), the header's
+        // own CRC made right after.
+        let data = with_header_fields(whole.clone(), |f| f[0x80] ^= 1, true);
+        let dwg = super::super::Dwg::open(&data).expect("opens");
+        assert_eq!(dwg.problems(), ["the section page map fails its CRC"]);
+        assert!(dwg.left_out().is_empty());
+        assert_eq!(dwg.object_map(), maps.object_map());
+    }
+
+    /// A section of no pages named `S`, as the section map writes it.
+    fn section_map(name_len: u64) -> Vec<u8> {
+        let mut map = Vec::new();
+        for v in [32u64, 0x7400, 0, 0, name_len, 0, 1, 0] {
+            map.extend_from_slice(&v.to_le_bytes());
+        }
+        map.extend_from_slice(&[b'S', 0, 0, 0]);
+        map
+    }
+
+    fn empty() -> Container<'static> {
+        Container {
+            data: &[],
+            pages: Vec::new(),
+            sections: Vec::new(),
+            budget: 0,
+        }
+    }
+
+    #[test]
+    fn a_section_map_of_whole_sections_has_no_note() {
+        let mut problems = Problems::default();
+        let mut c = empty();
+        c.read_section_map(&section_map(4), &mut problems);
+        assert_eq!(c.sections.len(), 1);
+        assert_eq!(problems.notes, Vec::<String>::new());
+    }
+
+    /// Bytes left over, less than a section takes.
+    #[test]
+    fn a_section_map_with_bytes_left_over_is_left_out() {
+        let mut map = section_map(4);
+        map.extend_from_slice(&[0; 10]);
+        let mut problems = Problems::default();
+        let mut c = empty();
+        c.read_section_map(&map, &mut problems);
+        assert_eq!(c.sections.len(), 1);
+        assert_eq!(problems.lost, ["the section map is cut short"]);
+    }
+
+    #[test]
+    fn a_section_name_running_past_the_section_map_is_left_out() {
+        let mut problems = Problems::default();
+        let mut c = empty();
+        c.read_section_map(&section_map(1000), &mut problems);
+        assert!(c.sections.is_empty());
+        assert_eq!(problems.lost, ["the section map is cut short"]);
+    }
+
+    #[test]
+    fn a_section_map_with_more_pages_than_it_holds_is_left_out() {
+        let mut map = section_map(4);
+        // The page count, the last of the section's eight longs.
+        map[56..64].copy_from_slice(&5u64.to_le_bytes());
+        let mut problems = Problems::default();
+        let mut c = empty();
+        c.read_section_map(&map, &mut problems);
+        assert!(c.sections.is_empty());
+        assert_eq!(problems.lost, ["the section map is cut short"]);
     }
 }

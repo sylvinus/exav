@@ -6,12 +6,16 @@ use crate::source::{ByteSource, Reader};
 use crate::stream::{Visit, stream_single};
 use crate::{Budget, LimitHit};
 
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
-    stream_single(&mut Reader::new(src), budget, visit, "gzip-content", |r| {
-        Ok(Box::new(crate::inflate::Gunzip::new(BufReader::new(r))) as Box<dyn Read + '_>)
-    })
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    stream_single(
+        &mut Reader::new(src),
+        budget,
+        visit,
+        "gzip-content",
+        &mut |r| Ok(Box::new(crate::inflate::Gunzip::new(BufReader::new(r))) as Box<dyn Read + '_>),
+    )
 }

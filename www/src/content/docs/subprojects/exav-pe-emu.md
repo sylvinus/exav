@@ -44,6 +44,10 @@ It prints what the stub did for each input, and also writes any other PE image
 found in memory the stub allocated (`<input>.allocation-N`). Exit status: `0` if
 every input gave back an image, `1` if any did not, `2` on a usage or I/O error.
 
+`cargo install exav-pe-emu --profile fast-build` is a shorter build that needs
+less memory, for a larger and slower binary (see
+[Installation](/scanner/getting-started/installation/#from-cratesio)).
+
 ## Why run the stub
 
 A packed executable is not the program that runs. A decoder per packer is a race

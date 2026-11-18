@@ -2,7 +2,7 @@
 //!
 //! The technique tests pin *behaviour* with synthetic stubs; this one measures
 //! *coverage* against binaries produced by the actual packers. The samples are
-//! ordinary Windows utilities packed with each tool — not malware — fetched by
+//! ordinary Windows utilities packed with each tool (not malware), fetched by
 //! `scripts/fetch-packed-pe.py` into `corpus/packers/`, which is gitignored.
 //!
 //! The whole suite is skipped when that directory is absent, so a clean
@@ -62,7 +62,7 @@ fn corpus() -> Option<PathBuf> {
 ///
 /// Size is the check that matters, not merely "a member came back". A packed
 /// file decompresses to *more* than it occupies on disk, so a recovered image
-/// smaller than the input is a run that stopped part-way — which is exactly how
+/// smaller than the input is a run that stopped part-way, which is exactly how
 /// a too-eager entry-point heuristic fails: it reports success while handing
 /// back a half-decompressed image.
 fn largest_recovered(file: &[u8]) -> usize {
@@ -80,7 +80,7 @@ fn largest_recovered(file: &[u8]) -> usize {
 #[ignore = "minutes of emulation; run explicitly after touching the emulator"]
 fn real_packed_samples_still_unpack() {
     let Some(root) = corpus() else {
-        eprintln!("corpus/packers absent — run scripts/fetch-packed-pe.py to enable this test");
+        eprintln!("corpus/packers absent: run scripts/fetch-packed-pe.py to enable this test");
         return;
     };
     let mut total = 0usize;

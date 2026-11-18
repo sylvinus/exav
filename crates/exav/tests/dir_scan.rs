@@ -2,7 +2,7 @@
 //! immediate files.
 //!
 //! Recursion is the default because a directory scanned one level deep reads, in
-//! the output, exactly like one that was scanned in full and was clean — the
+//! the output, exactly like one that was scanned in full and was clean: the
 //! files never opened are indistinguishable from the files that were fine. That
 //! is the one place exav's default differs from `clamscan DIR`, which needs `-r`
 //! to descend. The counting and exit codes below were checked against ClamAV
@@ -57,8 +57,8 @@ fn scan(db: &TempDir, dir: &TempDir, args: &[&str]) -> (i32, String) {
 
 #[test]
 fn a_named_directory_is_scanned_all_the_way_down() {
-    // Naming a directory means the directory. Scanning only its top level —
-    // which is what `clamscan` does, and what exav used to — reports a subset as
+    // Naming a directory means the directory. Scanning only its top level
+    // (which is what `clamscan` does, and what exav used to) reports a subset as
     // though it were the whole thing: the files never opened are, in the output,
     // indistinguishable from the ones that were fine.
     let (db, dir) = tree();
@@ -125,7 +125,7 @@ fn no_recursive_stops_at_the_top_level() {
     );
 }
 
-/// The filters apply to the immediate files too — the walk is the same walk,
+/// The filters apply to the immediate files too: the walk is the same walk,
 /// and a directory scanned under `--exclude` that ignored it would scan more
 /// than was asked for.
 #[test]
@@ -133,8 +133,10 @@ fn exclude_applies_at_the_top_level_too() {
     let (db, dir) = tree();
     std::fs::write(dir.path().join("bad.txt"), eicar()).unwrap();
     // `--no-recursive` so the fixture's own infected file below is out of the
-    // way and this test is about the filter and nothing else.
-    let (code, stdout) = scan(&db, &dir, &["--no-recursive", "--exclude", "bad"]);
+    // way and this test is about the filter and nothing else. The pattern is
+    // matched against the whole path, and the temporary directory's name has
+    // random hex digits, which `bad` alone matched now and then.
+    let (code, stdout) = scan(&db, &dir, &["--no-recursive", "--exclude", r"/bad\.txt$"]);
     assert!(!stdout.contains("bad.txt"), "{stdout}");
     assert!(stdout.contains("clean.txt: OK"), "{stdout}");
     assert_eq!(code, 0, "{stdout}");

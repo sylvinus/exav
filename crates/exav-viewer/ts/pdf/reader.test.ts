@@ -36,6 +36,7 @@ function fakeDoc(pages: number, log: string[] = [], links: PdfLink[] = []): Load
     textLayer: () => ({ done: Promise.resolve(), cancel: () => {} }),
     links: async () => links,
     destination: async () => null,
+    findText: async () => null,
     destroy: () => void log.push("destroy"),
   };
 }
@@ -258,5 +259,75 @@ describe("replacing the document", () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(reader.outline.get()).toEqual([{ title: "Intro", page: 1, depth: 0, offset: null }]);
     expect(host.querySelector<HTMLAnchorElement>(".exav-viewer-pdf-link")?.href).toBe("https://example.test/new");
+  });
+});
+
+describe("highlights", () => {
+  const shown = (id: string, page: number, rects: { x: number; y: number; width: number; height: number }[], more: object = {}) => ({ id, state: "shown" as const, page, rects, ...more });
+
+  it("draws each highlight over its page, in fractions of it, under the text layer, named for assistive technology", () => {
+    const { reader, host } = make(fakeDoc(3));
+    reader.highlight([shown("a", 2, [{ x: 0.1, y: 0.2, width: 0.3, height: 0.05 }], { label: "Price", color: "#ff0000" }), shown("b", 2, [{ x: 0.5, y: 0.5, width: 0.1, height: 0.1 }])], "a");
+    const page = host.querySelectorAll(".exav-viewer-pdf-page")[1]!;
+    const groups = page.querySelectorAll<HTMLElement>(".exav-viewer-highlight");
+    expect(groups).toHaveLength(2);
+    const [a, b] = [...groups];
+    expect(a!.getAttribute("role")).toBe("img");
+    expect(a!.getAttribute("aria-label")).toBe("Price");
+    expect(a!.classList.contains("exav-viewer-highlight-current")).toBe(true);
+    expect(a!.style.getPropertyValue("--exav-viewer-highlight")).toBe("#ff0000");
+    expect(b!.getAttribute("aria-hidden")).toBe("true");
+    const box = a!.querySelector<HTMLElement>(".exav-viewer-highlight-box")!;
+    expect([box.style.left, box.style.top, box.style.width, box.style.height]).toEqual(["10%", "20%", "30%", "5%"]);
+    // After the drawing: the text layer, added later, lies above it.
+    expect(page.querySelector(".exav-viewer-pdf-detail")!.nextElementSibling!.className).toBe("exav-viewer-highlights");
+    expect(host.querySelectorAll(".exav-viewer-pdf-page")[0]!.querySelector(".exav-viewer-highlights")).toBeNull();
+  });
+
+  it("draws only what is shown, and redraws in place of what was", () => {
+    const { reader, host } = make(fakeDoc(2));
+    reader.highlight([shown("a", 1, [{ x: 0, y: 0, width: 0.1, height: 0.1 }]), { id: "b", state: "pending", page: null, rects: [] }], null);
+    expect(host.querySelectorAll(".exav-viewer-highlight")).toHaveLength(1);
+    reader.highlight([shown("c", 2, [{ x: 0, y: 0, width: 0.1, height: 0.1 }])], null);
+    expect([...host.querySelectorAll<HTMLElement>(".exav-viewer-highlight")].map((g) => g.dataset.highlight)).toEqual(["c"]);
+  });
+
+  it("keeps them over the new pages of a replaced document", () => {
+    const { reader, host } = make(fakeDoc(2));
+    reader.highlight([shown("a", 2, [{ x: 0, y: 0, width: 0.1, height: 0.1 }])], null);
+    reader.replace(fakeDoc(2), sizes(2));
+    expect(host.querySelectorAll(".exav-viewer-pdf-page")[1]!.querySelector(".exav-viewer-highlight")).not.toBeNull();
+  });
+
+  it("brings a highlight to the middle of the view", () => {
+    const { reader, host, scroller } = make(fakeDoc(3));
+    const scrollTo = vi.fn();
+    scroller.scrollTo = scrollTo as typeof scroller.scrollTo;
+    scroller.getBoundingClientRect = () => ({ top: 0, left: 0, right: 800, bottom: 600, width: 800, height: 600 }) as DOMRect;
+    // The third page 2000px down, 1000 by 1000.
+    const page = host.querySelectorAll<HTMLElement>(".exav-viewer-pdf-page")[2]!;
+    page.getBoundingClientRect = () => ({ top: 2000, left: 0, right: 1000, bottom: 3000, width: 1000, height: 1000 }) as DOMRect;
+    reader.reveal(3, { x: 0.5, y: 0.5, width: 0.1, height: 0.1 }, true);
+    // Its middle (2550, 550) at the middle of the 800 by 600 view.
+    expect(scrollTo).toHaveBeenLastCalledWith({ top: 2550 - 300, left: 550 - 400, behavior: "smooth" });
+    // Taller than the view: its top, a little below the view's.
+    reader.reveal(3, { x: 0, y: 0.1, width: 1, height: 0.8 }, false);
+    expect(scrollTo).toHaveBeenLastCalledWith({ top: 2100 - 12, left: 0, behavior: "auto" });
+  });
+
+  it("brings it back into view when the pages are laid out at another width, until the user moves the view", () => {
+    const { reader, scroller } = make(fakeDoc(3));
+    const scrollTo = vi.fn();
+    scroller.scrollTo = scrollTo as typeof scroller.scrollTo;
+    const width = (w: number) => Object.defineProperty(scroller, "clientWidth", { value: w, configurable: true });
+    reader.reveal(3, { x: 0.5, y: 0.5, width: 0.1, height: 0.1 }, false);
+    expect(scrollTo).toHaveBeenCalledTimes(1);
+    width(600);
+    reader.resize();
+    expect(scrollTo).toHaveBeenCalledTimes(2);
+    scroller.dispatchEvent(new WheelEvent("wheel"));
+    width(700);
+    reader.resize();
+    expect(scrollTo).toHaveBeenCalledTimes(2);
   });
 });

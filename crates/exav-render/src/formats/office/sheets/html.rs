@@ -958,7 +958,7 @@ const CELL_ENDERS: &[&str] = &["td", "th", "tr", "tbody", "thead", "tfoot"];
 
 struct Open {
     table: Table,
-    /// Cells taken by row spans: (row, col) to the row they free after.
+    /// The (row, col) cells covered by the spans of earlier cells.
     taken: HashSet<(u32, u32)>,
     row: Option<u32>,
     next_row: u32,

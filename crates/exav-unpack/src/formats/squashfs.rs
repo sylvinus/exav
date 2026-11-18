@@ -30,13 +30,13 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek};
+use std::io::Read;
 use std::rc::Rc;
 
 use super::vol::{
     Attrs, Emit, Fill, Found, Got, Step, Vol, be16, be32, be64, give, le16, le32, le64, read_file,
 };
-use crate::source::{ByteSource, Reader};
+use crate::source::ByteSource;
 use crate::stream::Visit;
 use crate::{Budget, Entry, LimitHit, Mtime};
 
@@ -464,6 +464,11 @@ struct Blocks<'a> {
     tail: bool,
 }
 
+const NO_BLOCK: &str =
+    "SquashFS file with a block that is not in the image or could not be decompressed";
+const NO_FRAGMENT_BLOCK: &str =
+    "SquashFS file whose fragment is not in the image, could not be decompressed or is too short";
+
 impl Fill for Blocks<'_> {
     fn fill(&mut self, v: &mut Vol, out: &mut Vec<u8>) -> Step {
         if self.i < self.n {
@@ -482,7 +487,7 @@ impl Fill for Blocks<'_> {
                         b.resize(want, 0);
                         out.extend_from_slice(&b);
                     }
-                    None => return Step::Broken,
+                    None => return Step::Broken(NO_BLOCK),
                 }
                 self.at = self.at.saturating_add(stored);
             }
@@ -506,7 +511,7 @@ impl Fill for Blocks<'_> {
                 self.tail = true;
                 Step::More
             }
-            None => Step::Broken,
+            None => Step::Broken(NO_FRAGMENT_BLOCK),
         }
     }
 }
@@ -548,30 +553,24 @@ fn open(v: &mut Vol) -> Option<Squash> {
 }
 
 /// Walk a SquashFS image given whole as a source.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
-    super::volumes::entries(budget, visit, "", |budget, sink| {
-        walk_volume(Reader::new(src), src.len() as u64, budget, sink)
-    })
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    super::volumes::walk_source(src, budget, visit, walk_volume)
 }
 
 /// Walk the SquashFS image `disk`, which is `len` bytes long, handing each
 /// file to `visit`.
-pub(crate) fn walk_volume<D: Read + Seek, R>(
-    mut disk: D,
+pub(crate) fn walk_volume(
+    disk: &mut dyn super::vol::Disk,
     len: u64,
     budget: &mut Budget,
-    visit: Emit<R>,
-) -> Result<Option<R>, LimitHit> {
+    visit: Emit,
+) -> crate::Extracted {
     let max = crate::bytes::to_usize(budget.limits().max_buffer_bytes);
-    let mut v = Vol {
-        disk: &mut disk,
-        len,
-        max,
-    };
+    let mut v = Vol { disk, len, max };
     let head = match v.at(0, 96) {
         Some(h) if is_squashfs(&h) => h,
         _ => return Ok(None),
@@ -890,10 +889,10 @@ mod tests {
         let mut out = Vec::new();
         let mut budget = Budget::new(limits);
         let len = img.len() as u64;
-        let end = walk_volume(Cursor::new(img), len, &mut budget, &mut |e, _| {
+        let end = walk_volume(&mut Cursor::new(img), len, &mut budget, &mut |e, _| {
             let e = e.whole();
             out.push((e.name, e.data, e.unsupported));
-            None::<()>
+            None
         });
         (out, end.map(|_| ()))
     }
@@ -1006,7 +1005,7 @@ mod tests {
         img[at..at + 4].copy_from_slice(&7u32.to_le_bytes());
         let (e, end) = walked(&img, Limits::default());
         end.unwrap();
-        assert_eq!(e[0].2, Some("file could not be read from the volume"));
+        assert_eq!(e[0].2, Some(NO_FRAGMENT_BLOCK));
         assert_eq!(e[0].1.len(), BS);
 
         // A block that runs past the image.
@@ -1014,7 +1013,7 @@ mod tests {
         let at = inode_table_of(&img) + 2 + 16 + 16;
         img[at..at + 4].copy_from_slice(&(0x00FF_FFFFu32 | 0x0100_0000).to_le_bytes());
         let (e, _) = walked(&img, Limits::default());
-        assert_eq!(e[0].2, Some("file could not be read from the volume"));
+        assert_eq!(e[0].2, Some(NO_BLOCK));
     }
 
     fn inode_table_of(img: &[u8]) -> usize {
@@ -1083,8 +1082,9 @@ mod tests {
                     max_buffer_bytes: 100,
                     ..Limits::default()
                 });
-                let (e, end) =
-                    collected(|emit| walk_volume(Cursor::new(&img[..]), len, &mut budget, emit));
+                let (e, end) = collected(|emit| {
+                    walk_volume(&mut Cursor::new(&img[..]), len, &mut budget, emit)
+                });
                 end.unwrap_or_else(|h| panic!("be {be} tails {tails}: {h:?}"));
                 let mut got: Vec<(String, Vec<u8>)> = e
                     .iter()

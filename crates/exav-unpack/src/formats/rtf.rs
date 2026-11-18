@@ -199,11 +199,7 @@ fn decode_object(lex: &mut Lexer<'_>) -> (Vec<u8>, usize) {
     }
 }
 
-pub(crate) fn extract_rtf<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_rtf(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     if !data.starts_with(b"{\\rtf") {
         return Ok(None);
     }
@@ -245,7 +241,9 @@ pub(crate) fn extract_rtf<R>(
         budget.count_entry()?;
         let cap = budget.reserve()?;
         if bytes.len() as u64 > cap {
-            return Err(LimitHit::new("rtf object exceeds budget".to_string()));
+            let spent = bytes.len() as u64;
+            budget.over_cap(cap, spent, format_args!("rtf object {index}"))?;
+            continue;
         }
         budget.commit(bytes.len() as u64);
         if let Some(r) = visit(Entry::new(format!("rtf-object-{index}"), bytes), budget) {
@@ -339,7 +337,7 @@ mod tests {
         // Hex digits are case-insensitive by definition, so a signature written
         // against a destination's hex TEXT must match whichever case the writer
         // used. Without this, catching the uppercase variant relied on exav
-        // lowercasing any pure-ASCII file it types as text — a rule that changes
+        // lowercasing any pure-ASCII file it types as text, a rule that changes
         // matching for EVERY signature on a whole class of files, and that flips
         // on a single NUL byte.
         let payload = b"MALWARETEST-upper";

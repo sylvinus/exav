@@ -1,4 +1,4 @@
-//! StuffIt / StuffIt X — recognised, not decoded.
+//! StuffIt / StuffIt X: recognised, not decoded.
 //!
 //! The Mac archive format. It matters for the same reason ACE does: the
 //! *recipient* can open it. StuffIt Expander was bundled on macOS for years and
@@ -8,7 +8,7 @@
 //! exav has no StuffIt decoder, and this module does not pretend otherwise. What
 //! it does is make the gap **visible**. Without it a `.sit` was an unrecognised
 //! blob: its members are compressed, a raw scan of the container matches
-//! nothing, and the file came back **`OK`** — a clean verdict over content that
+//! nothing, and the file came back **`OK`**: a clean verdict over content that
 //! was never examined, which is the one outcome this scanner must never produce.
 //! With it the file is reported `UNSCANNABLE`.
 //!
@@ -18,17 +18,13 @@
 //! observation has nothing trustworthy to check it against. A decoder that is
 //! subtly wrong emits plausible bytes rather than errors.
 
-use crate::{Budget, Entry, Format, LimitHit, Sink};
+use crate::{Budget, Entry, Format, Sink};
 
 fn is_stuffit(d: &[u8]) -> bool {
     super::sniff::is(d, Format::StuffIt)
 }
 
-pub(crate) fn extract_stuffit<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+pub(crate) fn extract_stuffit(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     if !is_stuffit(data) {
         return Ok(None);
     }
@@ -54,7 +50,7 @@ mod tests {
     fn a_recognised_archive_is_reported_never_clean() {
         let mut b = Budget::new(crate::Limits::default());
         let mut seen = Vec::new();
-        let _ = extract_stuffit::<()>(b"SIT!padding here", &mut b, &mut |e, _| {
+        let _ = extract_stuffit(b"SIT!padding here", &mut b, &mut |e, _| {
             seen.push(e);
             None
         });

@@ -17,8 +17,11 @@ Unix `compress`, CAB, 7z, RAR (RAR3 LZ+PPMd, RAR5 LZ), ARJ, LHA, ZOO, ARC, EGG,
 ALZ, ISO 9660 and UDF, ar, cpio, xar, WIM, OLE2, PDF, MIME email and TNEF, Apple
 DMG (UDIF + HFS+/APFS), virtual disks (VHD, VHDX, QCOW2, VMDK), and the
 filesystems of disks and partitions (NTFS, FAT, exFAT, ext2/3/4, HFS+, APFS,
-SquashFS, cramfs, romfs, EROFS), UPX and other PE packers, and more. The full list
-is at [exav.org](https://exav.org/unpack/formats/).
+SquashFS, cramfs, romfs, EROFS), Inno Setup installers (read as the zlib-licensed
+innoextract reads them) and InstallShield cabinets (a port of the MIT
+`unshield` C library), both attributed in `NOTICE`, AppleSingle and AppleDouble,
+UPX and other PE packers, and more. The full list is at
+[exav.org](https://exav.org/unpack/formats/).
 
 A virtual disk, or a raw disk image, larger than the buffer limit is not held:
 its tables are read as the walk reaches them, an unallocated range costs

@@ -6,38 +6,7 @@ use std::time::Duration;
 /// without an explicit address. Matches `Port 1344` in `c-icap.conf`.
 pub(super) const DEFAULT_PORT: u16 = 1344;
 
-/// When a block carries the c-icap `X-Infection-Found` header.
-///
-/// c-icap's vocabulary has one header for "this object is not OK", and a whole
-/// class of ICAP clients decides clean-or-not from that header alone rather than
-/// from the response body — a health-check script, a mail gateway, the shell
-/// wrapper a content scanner shells out to. Those clients read a `200` carrying
-/// a block page and no `X-Infection-Found` as **clean**, which is the one answer
-/// exav must never give for an object it did not fully examine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum InfectionHeader {
-    /// Every block carries it. A signature match is reported under its own
-    /// name; a partial verdict under a `Heuristics.Exav.*` name that says
-    /// which condition blocked it, alongside the `X-Exav-Category` /
-    /// `X-Exav-Reason` pair that spells it out for a client that reads them.
-    #[default]
-    Blocks,
-    /// Only a signature match carries it, so the header means a database
-    /// detection and nothing else. A client that keys on it alone then treats
-    /// an unscannable object as clean, which is why this is not the default.
-    Detections,
-}
-
-impl InfectionHeader {
-    /// Parse the flag value.
-    pub(crate) fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "blocks" => Ok(Self::Blocks),
-            "detections" => Ok(Self::Detections),
-            other => Err(format!("expected `blocks` or `detections`, got `{other}`")),
-        }
-    }
-}
+use crate::endpoint::InfectionHeader;
 
 /// Everything an operator can tune about the ICAP listener.
 ///
@@ -60,9 +29,10 @@ pub(crate) struct IcapConfig {
     /// much of a body a client should send before pausing for a verdict. `None`
     /// leaves the header out.
     pub preview_size: Option<usize>,
-    /// Value of the `Transfer-Preview` header in an `OPTIONS` response. `*`
-    /// asks the client to preview every object.
-    pub transfer_preview: String,
+    /// Whether an `OPTIONS` response carries `Transfer-Preview: *`, asking the
+    /// client to preview every object. Without it RFC 3507 has the client send
+    /// every object whole.
+    pub transfer_preview: bool,
     /// Concurrent connections accepted, and the value advertised as
     /// `Max-Connections`. c-icap `MaxServers` x `ThreadsPerChild`.
     pub max_connections: usize,
@@ -75,6 +45,17 @@ pub(crate) struct IcapConfig {
     /// How long a connection may sit without sending anything. c-icap
     /// `KeepAliveTimeout`.
     pub idle_timeout: Duration,
+    /// How long a connection stays open, from accept; `None` for no limit. Once
+    /// it has passed no new request is read, and one that began is answered.
+    pub session: Option<Duration>,
+    /// The most the writes of one request's answer (its `100 Continue` and its
+    /// response) may wait for the client, in all; `None` for no limit beyond
+    /// `idle_timeout` on each write.
+    pub reply: Option<Duration>,
+    /// The most time one request may take to arrive in full, from its first
+    /// byte to the end of its body; `None` for no limit. `idle_timeout` bounds
+    /// each read, this bounds all of them.
+    pub request_read: Option<Duration>,
     /// How much of an over-limit body is read and thrown away so that the
     /// stream reaches the next request boundary.
     ///
@@ -94,8 +75,8 @@ pub(crate) struct IcapConfig {
     pub infection_header: InfectionHeader,
     /// What becomes of an object exav could not fully examine.
     ///
-    /// Not an ICAP setting — `--partial-as` answers the same question for the
-    /// CLI's exit code and the daemon's reply — but the listener needs it in
+    /// Not an ICAP setting (`--partial-as` answers the same question for the
+    /// CLI's exit code and the daemon's reply), but the listener needs it in
     /// hand to shape a response, and to say at startup that it is running that
     /// way.
     ///
@@ -119,11 +100,14 @@ impl Default for IcapConfig {
                 "virus_scan".to_string(),
             ],
             preview_size: Some(4096),
-            transfer_preview: "*".to_string(),
+            transfer_preview: true,
             max_connections: 100,
             options_ttl: Some(3600),
             keepalive_requests: 100,
             idle_timeout: Duration::from_secs(600),
+            session: None,
+            reply: None,
+            request_read: Some(crate::daemon::DEFAULT_COMMAND_READ),
             max_drain_bytes: crate::daemon::MAX_DRAIN_BYTES,
             max_header_bytes: 64 * 1024,
             service_label: format!("exav/{} ICAP service", super::VERSION),

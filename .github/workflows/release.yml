@@ -1,11 +1,10 @@
 # Tag-driven binary releases. Push a tag like `v0.1.0` and this cross-compiles
-# the `exav` CLI and the standalone `exav-unpack`, `exav-grep`, `exav-pe-emu`
-# and `exav-imagehash` for each target, archives each with LICENSE and NOTICE, and
-# attaches them to the
-# GitHub Release for that tag. Static musl Linux builds run on any distro (no
-# glibc).
+# the `exav` CLI and the standalone `exav-unpack`, `exav-grep`, `exav-pe-emu`,
+# `exav-imagehash` and `exav-qr` for each target, archives each with LICENSE
+# and NOTICE, and attaches them to the GitHub Release for that tag. Static musl
+# Linux builds run on any distro (no glibc).
 # The `wasm` job adds the two WebAssembly artifacts: the unpacker npm tarball
-# (`@exav/unpack-wasm`, standard preset — exactly what `npm publish` ships via
+# (`@exav/unpack-wasm`, standard preset: exactly what `npm publish` ships via
 # `prepublishOnly`) and the engine as a WASI module (`exav-core --features
 # wasi-bin`, same command CI's `wasm` job builds).
 #
@@ -24,7 +23,7 @@ permissions:
 jobs:
   # `upload-rust-binary-action` uploads into a Release but never creates one,
   # so without this every asset job fails with `release not found` (retry loop,
-  # then exit 1). This creates it from the tag if missing — a no-op re-run.
+  # then exit 1). This creates it from the tag if missing; on a re-run it does nothing.
   create-release:
     runs-on: ubuntu-latest
     steps:
@@ -107,6 +106,16 @@ jobs:
           include: LICENSE,NOTICE
           token: ${{ secrets.GITHUB_TOKEN }}
           checksum: sha256
+      # In the exav-grep package, behind its `qr` feature.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: exav-qr
+          features: qr
+          target: ${{ matrix.target }}
+          archive: exav-qr-$tag-$target
+          include: LICENSE,NOTICE
+          token: ${{ secrets.GITHUB_TOKEN }}
+          checksum: sha256
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: exav-pe-emu
@@ -133,7 +142,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown,wasm32-wasip1
-      # Prebuilt wasm-pack — compiling it from source costs ~6 minutes, and
+      # Prebuilt wasm-pack: compiling it from source costs ~6 minutes, and
       # this is the same trusted author as the other taiki-e actions here.
       - uses: taiki-e/install-action@v2
         with:

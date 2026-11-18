@@ -1,5 +1,5 @@
 //! Encrypted PDFs that use the EMPTY user password (the overwhelming majority of
-//! "encrypted" malicious PDFs — they encrypt only to obstruct scanners, and open
+//! "encrypted" malicious PDFs: they encrypt only to obstruct scanners, and open
 //! with no prompt) must be transparently decrypted and scanned, across every
 //! standard-security revision: R3/R4 (RC4) and R6 (AES-256). No password supplied.
 use exav_unpack::{Budget, Format, Limits, extract};
@@ -99,7 +99,7 @@ fn rc4_40_decrypts_with_the_object_and_generation_key() {
 }
 
 /// A truncated/corrupt FlateDecode stream must still yield the bytes inflated
-/// before the error — a payload in the recoverable prefix must not be discarded.
+/// before the error: a payload in the recoverable prefix must not be discarded.
 #[test]
 fn truncated_flate_stream_is_salvaged() {
     assert!(

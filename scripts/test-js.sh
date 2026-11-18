@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Run the JavaScript test suites of `crates/exav-unpack-wasm` — the WASM bindings
+# Run the JavaScript test suites of `crates/exav-unpack-wasm`: the WASM bindings
 # that ship to npm and run in a browser.
 #
 # WHY: the Rust side is covered by `cargo test`, but the bindings layer is not
-# Rust. Everything between `wasm-bindgen` and the caller — the `Archive` class,
+# Rust. Everything between `wasm-bindgen` and the caller (the `Archive` class,
 # the streaming `ReadableStream` extraction, the custom-reader protocol, the
-# `File`/drag-and-drop paths, and every error case — only executes in a JS
+# `File`/drag-and-drop paths, and every error case) only executes in a JS
 # engine. `cargo test` covers the Rust side and cannot reach any of it, so
 # without this script the published package's public API goes unverified.
 #
 # Two passes:
-#   1. vitest    — pure-JS helper units, no browser, no wasm. Fast.
-#   2. playwright — the real `pkg/` wasm loaded in headless Chromium, which is
+#   1. vitest: pure-JS helper units, no browser, no wasm. Fast.
+#   2. playwright: the real `pkg/` wasm loaded in headless Chromium, which is
 #                   the environment the package actually ships into.
 #
 # The e2e pass rebuilds `pkg/` from the current Rust source first: testing a
@@ -56,7 +56,7 @@ fi
 # suite needs it: several cases assert that a decoder panic or a budget
 # exhaustion takes down the archive rather than the page, and the only way to
 # provoke either on demand is the fault-injection feature. Built without it
-# those tests do not skip — they fail, on a build that is working correctly.
+# those tests do not skip: they fail, on a build that is working correctly.
 wasm-pack build --release --target web -- --features testing-faults
 
 echo "== vitest (on the built pkg/) =="

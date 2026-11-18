@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 
-import { decompressedName, folderOf, memberPath, STREAM_MEMBER } from "./names.js";
+import { decompressedName, folderOf, memberPath, safeFileName } from "./names.js";
+
+describe("a member's name as a download name", () => {
+  it("has no control or bidirectional character, so it reads as it is stored", () => {
+    for (const c of ["\u{202e}", "\u{202d}", "\u{2067}", "\u{2069}", "\u{200e}", "\u{61c}", "\u{2029}", "\u{0}", "\u{9b}"]) {
+      expect(safeFileName(`docs/invoice${c}fdp.exe`), JSON.stringify(c)).toBe("invoice_fdp.exe");
+    }
+    expect(safeFileName("../../ميزانية.xlsx")).toBe("ميزانية.xlsx");
+  });
+});
 
 describe("what a compressed stream's file is called", () => {
   // The names gunzip, bunzip2, unxz and unzstd give what they decompress.
@@ -41,14 +50,5 @@ describe("what a compressed stream's file is called", () => {
   it("falls back when the name says nothing", () => {
     expect(decompressedName("download", "gzip-content")).toBe("gzip-content");
     expect(decompressedName(".gz", "gzip-content")).toBe("gzip-content");
-  });
-
-  it("is told by the library's name for it, and only that", () => {
-    for (const n of ["gzip-content", "bzip2-content", "xz-content", "zstd-content", "lzip-content", "lzma-content", "lz4-content", "lzw-content"]) {
-      expect(STREAM_MEMBER.test(n), n).toBe(true);
-    }
-    for (const n of ["content", "gzip-content.txt", "docs/gzip-content", "zip-content"]) {
-      expect(STREAM_MEMBER.test(n), n).toBe(false);
-    }
   });
 });

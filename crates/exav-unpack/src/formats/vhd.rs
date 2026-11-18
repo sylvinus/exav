@@ -12,9 +12,9 @@
 //!
 //! Two of the three disk types are read:
 //!
-//! * **Fixed** (`disk_type == 2`) — the file *is* the raw disk, followed by a
+//! * **Fixed** (`disk_type == 2`): the file *is* the raw disk, followed by a
 //!   512-byte footer.
-//! * **Dynamic** (`disk_type == 3`) — a Block Allocation Table maps each block
+//! * **Dynamic** (`disk_type == 3`): a Block Allocation Table maps each block
 //!   of the virtual disk to a location in the file, or marks it unallocated.
 //!   Unallocated blocks read as zeroes, exactly as they do when Windows mounts
 //!   the image. The table is read from the source as blocks are reached, never
@@ -22,7 +22,7 @@
 //!
 //! **Differencing** (`disk_type == 4`) images are *not* read: they hold
 //! only the delta against a parent `.vhd` that is not in this file, so the disk
-//! cannot be assembled from what we have. That is reported, never passed over —
+//! cannot be assembled from what we have. That is reported, never passed over:
 //! see [`walk`].
 //!
 //! The disk is a [`VDisk`]: one member when it fits the buffer limit, else its
@@ -190,11 +190,11 @@ impl Layout for Dynamic<'_> {
 }
 
 /// Walk a VHD's disk.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let Some(f) = footer(src) else {
         return Ok(None);
     };
@@ -211,7 +211,11 @@ pub(crate) fn walk<T>(
             if size == 0 {
                 return Ok(None);
             }
-            vdisk::walk(VDisk::new(src, Flat { size }, allowance), budget, visit)
+            vdisk::walk(
+                VDisk::new(src, Box::new(Flat { size }), allowance),
+                budget,
+                visit,
+            )
         }
         DISK_TYPE_DYNAMIC => dynamic(src, &f, current_size, budget, visit),
         DISK_TYPE_DIFFERENCING => {
@@ -240,13 +244,13 @@ pub(crate) fn walk<T>(
 }
 
 /// Read a dynamic VHD through its Block Allocation Table.
-fn dynamic<T>(
+fn dynamic(
     src: &dyn ByteSource,
     f: &[u8],
     current_size: u64,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let file_len = src.len() as u64;
     let Some(hdr) = bytes_at(src, be_u64(f, 16), 1024) else {
         return report(
@@ -317,7 +321,7 @@ fn dynamic<T>(
         );
     }
     let allowance = budget.remaining_scan();
-    vdisk::walk(VDisk::new(src, layout, allowance), budget, visit)
+    vdisk::walk(VDisk::new(src, Box::new(layout), allowance), budget, visit)
 }
 
 // The tests lay out their inputs by index arithmetic on small constants.

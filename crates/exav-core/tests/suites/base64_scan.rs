@@ -1,11 +1,11 @@
 //! End-to-end test for the base64-embedded-executable scan: a text/script
 //! carrier that stashes a PE as a base64 string (the PowerShell reflective-loader
-//! pattern) is detected when — and only when — `decode_base64` is on.
+//! pattern) is detected when, and only when, `decode_base64` is on.
 
 use base64::Engine;
 use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
-// The standard EICAR test string — the built-in DB carries a signature for it.
+// The standard EICAR test string: the built-in DB carries a signature for it.
 // Assembled at runtime; see `exav_core::unpack::eicar` for why it is never a
 // literal anywhere in this tree.
 fn eicar() -> &'static [u8] {
@@ -81,7 +81,7 @@ fn an_allowlisted_decoded_payload_is_not_reported() {
 #[test]
 fn base64_scan_off_leaves_it_clean() {
     // With decoding disabled (as under --clamav-compat / --no-base64) the base64
-    // text is inert — the PE never materializes, so the script scans clean.
+    // text is inert: the PE never materializes, so the script scans clean.
     let db = Scanner::builtin();
     let blob = script_with_base64(&eicar_pe());
     let mut opts = ScanOptions::default();
@@ -164,6 +164,64 @@ fn a_payload_behind_many_executables_is_found_or_the_scan_says_it_stopped() {
     runs.push(payload);
     let v = verdict_of(&script_with_all(&runs));
     assert!(limited(&v), "{v:?}");
+}
+
+/// The three numbers are `Limits`: a lower one stops the scan before the
+/// payload and says so, `u64::MAX` (`off`) takes it.
+#[test]
+fn the_base64_limits_are_limits() {
+    let db = Scanner::builtin();
+    let scan = |blob: &[u8], set: &dyn Fn(&mut ScanOptions)| {
+        let mut opts = ScanOptions::default();
+        set(&mut opts);
+        analyze(&db, blob, &opts).verdict
+    };
+    let found = |v: &Verdict| matches!(v, Verdict::Infected { .. });
+
+    let mut runs = vec![decoy(); 3];
+    runs.push(eicar_pe());
+    let behind_decoys = script_with_all(&runs);
+    let tries = |n: u64| scan(&behind_decoys, &|o| o.limits.max_base64_runs = n);
+    assert!(limited(&tries(3)), "{:?}", tries(3));
+    assert!(found(&tries(4)));
+    assert!(found(&tries(u64::MAX)));
+
+    let mut runs = vec![clean_pe(); 2];
+    runs.push(eicar_pe());
+    let behind_pes = script_with_all(&runs);
+    let payloads = |n: u64| scan(&behind_pes, &|o| o.limits.max_base64_payloads = n);
+    assert!(limited(&payloads(2)), "{:?}", payloads(2));
+    assert!(found(&payloads(3)));
+    assert!(found(&payloads(u64::MAX)));
+
+    let uri = |mime: &str, d: &[u8]| {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(d);
+        format!("<a href=\"data:{mime};base64,{b64}\">x</a>")
+    };
+    // Too short for a base64 run of a text: only the page's assets reach it.
+    let small_zip = {
+        use std::io::Write;
+        let deflated = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        z.start_file("e.com", deflated).unwrap();
+        z.write_all(&[eicar(), b"\n"].concat().repeat(40)).unwrap();
+        z.finish().unwrap().into_inner()
+    };
+    let png = [&b"\x89PNG\r\n\x1a\n"[..], &[7u8; 120]].concat();
+    let page = format!(
+        "<html><body>{}{}{}</body></html>",
+        uri("image/png", &png),
+        uri("image/png", &png),
+        uri("application/zip", &small_zip)
+    );
+    assert!(page.len() < 1400, "{}", page.len());
+    let eicar = eicar();
+    assert!(!page.as_bytes().windows(eicar.len()).any(|w| w == eicar));
+    let assets = |n: u64| scan(page.as_bytes(), &|o| o.limits.max_page_assets = n);
+    assert!(limited(&assets(2)), "{:?}", assets(2));
+    assert!(found(&assets(3)));
+    assert!(found(&assets(u64::MAX)));
 }
 
 #[test]

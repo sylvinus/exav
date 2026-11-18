@@ -9,12 +9,12 @@ ALL-MATCH ONLY
     Every scan is `ALLMATCHSCAN`, so a file's verdict is the SET of signatures
     that matched rather than whichever one the engine happened to reach first.
     First-match comparison is the largest source of *fake* disagreement between
-    two engines — both find the malware, each names a different signature, and
+    two engines: both find the malware, each names a different signature, and
     the diff reports it as a conflict.
 
     This forces one connection per file. clamd 1.5.3 refuses every multi-reply
-    command inside `IDSESSION` — `ALLMATCHSCAN`, `CONTSCAN` and `MULTISCAN` all
-    answer "Command invalid inside IDSESSION. ERROR" and hang up, because the
+    command inside `IDSESSION` (`ALLMATCHSCAN`, `CONTSCAN` and `MULTISCAN` all
+    answer "Command invalid inside IDSESSION. ERROR") and hang up, because the
     session protocol tags one reply per command id and these emit an unbounded
     number. Outside a session the daemon closes after a single command, and that
     close is the terminator.
@@ -27,7 +27,7 @@ COMPLIANCE, NOT BENCHMARKING
     This harness answers "do the two engines agree", and is tuned for throughput
     so that question can be asked often.
 
-    Timings are recorded anyway — total wall-clock per run, and per-file `ms` —
+    Timings are recorded anyway (total wall-clock per run, and per-file `ms`)
     but ONLY as a debugging aid: they are what tells you a file wedged a worker
     or that one engine is dramatically slower over the same corpus. **They are
     not a performance benchmark and must not be quoted as one.** Under
@@ -49,8 +49,8 @@ CONCURRENCY
         jobs=4   0.6 files/s   2 timeouts
         jobs=8   0.7 files/s   3 timeouts
 
-    Concurrency is worth about 1.75x, not the 8x the job count suggests — the
-    disk is the wall — and over-subscribing steadily converts throughput into
+    Concurrency is worth about 1.75x, not the 8x the job count suggests (the
+    disk is the wall), and over-subscribing steadily converts throughput into
     timeouts. Hence the default below: a small multiple of the CPU count,
     capped. More is not better.
 
@@ -127,7 +127,7 @@ def verdict_of(replies):
                      "flagged as unreadable" apart from "found malware".
     * `ERROR`        the scan itself failed
     """
-    # NO replies at all is not "clean" — it is a scan that did not answer. The
+    # NO replies at all is not "clean": it is a scan that did not answer. The
     # daemon closes the connection without a word when its worker dies mid-scan
     # (an allocation failure or the OOM killer under the per-job RLIMIT_AS), and
     # reading that as `-` turns a crash into a clean verdict, then into a false
@@ -135,7 +135,7 @@ def verdict_of(replies):
     #
     # Measured: 55 worker deaths in one 8,978-file run, every one recorded as
     # clean. The daemon logs them and the harness prints a NOTE, but a count in a
-    # log does not stop the TABLE from being wrong — the row itself has to say
+    # log does not stop the TABLE from being wrong: the row itself has to say
     # the scan failed, which also keeps it out of the cache so the next pass
     # retries it.
     if not replies:
@@ -148,7 +148,7 @@ def verdict_of(replies):
             body = line[: -len(" FOUND")]
             sigs.add(body.split(": ")[-1])
         elif line.endswith(" ERROR"):
-            # `path: <reason> <CATEGORY> ERROR` — the category is the word
+            # `path: <reason> <CATEGORY> ERROR`: the category is the word
             # before the status, so match it there rather than anywhere in the
             # line: a path like /data/UNSCANNABLE/x would otherwise read as a
             # PARTIAL when the scan really failed.
@@ -192,8 +192,8 @@ def main():
     # rather than silently answered from a stale row.
     #
     # An ERROR row is NOT a result and is deliberately not cached. It records
-    # that the scan did not happen — a timeout, a refused connection, a daemon
-    # that died mid-run — and every one of those is transient. Caching them makes
+    # that the scan did not happen (a timeout, a refused connection, a daemon
+    # that died mid-run), and every one of those is transient. Caching them makes
     # a one-off outage permanent: the affected files are skipped by every later
     # run, so the damage silently shrinks the comparable set forever instead of
     # being repaired by the next pass. (Observed: a clamd container that died
@@ -241,7 +241,7 @@ def main():
                 v = verdict_of(replies)
             # Deliberately every exception, not just the socket ones. A thread
             # that dies without posting a result leaves the collector below
-            # blocked on `results.get()` for a row that can never arrive — the
+            # blocked on `results.get()` for a row that can never arrive: the
             # run hangs with no error, which over a corpus this size means an
             # overnight pass silently producing nothing. Recording the file as
             # ERROR costs one row and keeps the run finite.
@@ -304,7 +304,7 @@ def main():
         f.write(f"elapsed_s\t{el:.1f}\n")
         f.write(f"bytes\t{scanned_bytes}\n")
     print(
-        f"{args.label}: done — {n} scanned, {skipped} from cache, "
+        f"{args.label}: done, {n} scanned, {skipped} from cache, "
         f"{counters['failed']} failed, {el:.0f}s ({n / max(el, 1e-9):.1f}/s, "
         f"{scanned_bytes / max(el, 1e-9) / 1e6:.0f} MB/s)",
         file=sys.stderr,

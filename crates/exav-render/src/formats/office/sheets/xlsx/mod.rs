@@ -598,15 +598,13 @@ fn comments(
     n.comments += 1;
     let k = n.comments;
     let mut authors: Vec<&str> = vec![];
+    let mut author_ids: HashMap<&str, usize> = HashMap::new();
     let mut list = String::new();
     for c in &sh.comments {
-        let ai = match authors.iter().position(|a| *a == c.author) {
-            Some(i) => i,
-            None => {
-                authors.push(&c.author);
-                authors.len() - 1
-            }
-        };
+        let ai = *author_ids.entry(c.author.as_str()).or_insert_with(|| {
+            authors.push(&c.author);
+            authors.len() - 1
+        });
         let _ = write!(
             list,
             "<comment ref=\"{}\" authorId=\"{ai}\"><text><r><t xml:space=\"preserve\">",
@@ -878,9 +876,7 @@ fn workbook_xml(wb: &Workbook, chart_sheets: &[bool]) -> String {
         let _ = write!(
             names,
             "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"{i}\" hidden=\"1\">{}!{}:{}</definedName>",
-            esc(&crate::formats::office::sheets::xls::formula::quote_sheet(
-                &sheet_list[i]
-            )),
+            esc(&exav_unpack::biff::formula::quote_sheet(&sheet_list[i])),
             abs(a.r1, a.c1),
             abs(a.r2, a.c2)
         );

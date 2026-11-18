@@ -9,21 +9,21 @@ Cargo.lock.orig
 *.cache
 *.exavdb
 # real-malware corpus must never be committed (the reproducible harness lives in
-# scripts/, not here — corpus/ holds only local, gitignored samples + data)
+# scripts/, not here; corpus/ holds only local, gitignored samples + data)
 /corpus/
 *.malware
 # real-malware test samples: kept locally (gitignored) for extra decoder
-# coverage, NEVER committed — the tests that use them skip when absent, and CI
+# coverage, NEVER committed: the tests that use them skip when absent, and CI
 # relies on the synthetic/EICAR fixtures. Provenance (sha256) is in each dir's
 # README.md. Each is kept as `<name>.zip`, AES-256 with the password
 # `infected` (crates/exav-unpack/tests/fixtures/README.md). The synthetic
 # `eicar.lnk` and the READMEs stay committed.
 crates/exav-unpack/tests/fixtures/**/real-malware-*
 /yara-x/
-# internal strategy notes — never commit
+# internal strategy notes: never commit
 /tmp/
 /.claude/
-# local secrets (API keys, e.g. MalwareBazaar Auth-Key) — never commit
+# local secrets (API keys, e.g. MalwareBazaar Auth-Key): never commit
 .env.local
 .env*.local
 .env
@@ -39,7 +39,7 @@ __pycache__/
 node_modules
 test-results/
 playwright-report/
-# fuzz corpora and artifacts — never commit
+# fuzz corpora and artifacts: never commit
 fuzz/corpora/
 .cargo/lld/
 .cargo/config.toml

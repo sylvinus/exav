@@ -726,15 +726,19 @@ impl Html<'_> {
                 .filter(|v| *v > 0.0)
                 .map(|v| (v * PX_EMU as f64) as i64)
         };
+        // `a * b / c` of sizes the page gives, saturated, `c` positive.
+        let scale = |a: i64, b: i64, c: i64| {
+            i64::try_from(i128::from(a) * i128::from(b) / i128::from(c)).unwrap_or(i64::MAX)
+        };
         let (mut cx, mut cy) = match (dim("width"), dim("height"), natural) {
             (Some(w), Some(h), _) => (w, h),
-            (Some(w), None, Some((nw, nh))) if nw > 0 => (w, w * nh / nw),
-            (None, Some(h), Some((nw, nh))) if nh > 0 => (h * nw / nh, h),
+            (Some(w), None, Some((nw, nh))) if nw > 0 => (w, scale(w, nh, nw)),
+            (None, Some(h), Some((nw, nh))) if nh > 0 => (scale(h, nw, nh), h),
             (_, _, Some(n)) => n,
             _ => (96 * PX_EMU, 96 * PX_EMU),
         };
         if cx > MAX_PICTURE {
-            cy = cy * MAX_PICTURE / cx.max(1);
+            cy = scale(cy, MAX_PICTURE, cx);
             cx = MAX_PICTURE;
         }
         let media = self.doc.add_media(ext, d);

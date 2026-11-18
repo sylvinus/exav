@@ -23,6 +23,7 @@ import type {
   ZoomController,
 } from "../core/types.js";
 import { folderOf } from "../archive/names.js";
+import { shownName } from "../core/names.js";
 import { useViewerContext } from "./context.js";
 import { useFullscreen, usePanel, useStore, type PanelInfo } from "./hooks.js";
 import { ArrowLeft, ChevronLeft, ChevronRight, Close, FileIcon, FolderIcon, FullscreenExitIcon, FullscreenIcon, Hand, LayersIcon, ListIcon, Minus, PanelClose, Plus, ResetIcon, Spinner, TextCursor } from "./icons.js";
@@ -242,7 +243,7 @@ function OutlineRail({ outline }: OutlineRailProps) {
             style={{ paddingLeft: `${e.depth * 12 + 8}px` }}
             onClick={() => outline.goTo(e)}
           >
-            {e.title}
+            {shownName(e.title)}
           </button>
         ))}
       </div>
@@ -278,8 +279,8 @@ function DrawingRail({ layers, storeys, layouts, ground, selection }: DrawingRai
                 aria-current={l.id === layoutState.current}
                 onClick={() => void layouts.select(l.id)}
               >
-                <span className="exav-viewer-truncate" title={l.isModel ? t("model_space") : l.name}>
-                  {l.isModel ? t("model_space") : l.name}
+                <span className="exav-viewer-truncate" title={l.isModel ? t("model_space") : shownName(l.name)}>
+                  {l.isModel ? t("model_space") : shownName(l.name)}
                 </span>
               </button>
             ))}
@@ -291,15 +292,15 @@ function DrawingRail({ layers, storeys, layouts, ground, selection }: DrawingRai
           <p className="exav-viewer-rail-label">{t("selection")}</p>
           {selected ? (
             <>
-              <p className="exav-viewer-truncate exav-viewer-strong" title={selected.name}>
-                {selected.name || t("selection_unnamed")}
+              <p className="exav-viewer-truncate exav-viewer-strong" title={shownName(selected.name)}>
+                {shownName(selected.name) || t("selection_unnamed")}
               </p>
-              <p className="exav-viewer-truncate exav-viewer-muted" title={selected.category}>
-                {selected.category}
+              <p className="exav-viewer-truncate exav-viewer-muted" title={shownName(selected.category)}>
+                {shownName(selected.category)}
               </p>
               {selected.storey && (
-                <p className="exav-viewer-truncate exav-viewer-muted" title={selected.storey}>
-                  {selected.storey}
+                <p className="exav-viewer-truncate exav-viewer-muted" title={shownName(selected.storey)}>
+                  {shownName(selected.storey)}
                 </p>
               )}
             </>
@@ -337,8 +338,8 @@ function DrawingRail({ layers, storeys, layouts, ground, selection }: DrawingRai
             {storeyState.items.map((s) => (
               <label key={s.id} className="exav-viewer-layer">
                 <input type="checkbox" checked={s.visible} onChange={(e) => storeys.setVisible(s.id, e.target.checked)} />
-                <span className={`exav-viewer-truncate${s.visible ? "" : " exav-viewer-faint"}`} title={s.name}>
-                  {s.name}
+                <span className={`exav-viewer-truncate${s.visible ? "" : " exav-viewer-faint"}`} title={shownName(s.name)}>
+                  {shownName(s.name)}
                 </span>
                 {s.elevation !== null && <span className="exav-viewer-muted">{formatElevation(s.elevation)}</span>}
               </label>
@@ -364,8 +365,8 @@ function DrawingRail({ layers, storeys, layouts, ground, selection }: DrawingRai
               <label key={l.id} className="exav-viewer-layer">
                 <input type="checkbox" checked={l.visible} onChange={(e) => layers.setVisible(l.id, e.target.checked)} />
                 <span className="exav-viewer-swatch" style={{ background: l.color }} aria-hidden="true" />
-                <span className={`exav-viewer-truncate${l.visible ? "" : " exav-viewer-faint"}`} title={l.name}>
-                  {l.name}
+                <span className={`exav-viewer-truncate${l.visible ? "" : " exav-viewer-faint"}`} title={shownName(l.name)}>
+                  {shownName(l.name)}
                 </span>
               </label>
             ))}
@@ -408,10 +409,10 @@ function SheetTabs({ sheets }: SheetTabsProps) {
           role="tab"
           aria-selected={sheet.index === s.current}
           className="exav-viewer-sheet-tab"
-          title={sheet.name}
+          title={shownName(sheet.name)}
           onClick={() => void sheets.select(sheet.index)}
         >
-          {sheet.name}
+          {shownName(sheet.name)}
         </button>
       ))}
     </div>
@@ -430,7 +431,7 @@ function Warnings({ warnings }: WarningsProps) {
         {warnings.map((w) => (
           <p key={w.key}>
             {t(`warning_${w.key}` as MessageKey, { count: w.count })}
-            {w.names && w.names.length > 0 && <span className="exav-viewer-warning-names"> {w.names.join(", ")}</span>}
+            {w.names && w.names.length > 0 && <span className="exav-viewer-warning-names"> {w.names.map(shownName).join(", ")}</span>}
           </p>
         ))}
       </div>
@@ -550,13 +551,14 @@ function ArchiveList({ archive }: ArchiveListProps) {
       {s.refused && <p className="exav-viewer-archive-refused">{t(s.refused.key)}</p>}
       <ul className="exav-viewer-archive-list">
         {s.members.map((m) => {
-          const folder = folderOf(m.name);
+          const name = shownName(m.name);
+          const folder = folderOf(name);
           return (
             <li key={m.index}>
               <button type="button" className={`exav-viewer-member${m.encrypted ? " exav-viewer-member-locked" : ""}`} disabled={s.opening !== null || m.encrypted} onClick={() => void archive.open(m.index)}>
                 {s.opening === m.index ? <Spinner /> : <FileIcon />}
                 <span className="exav-viewer-member-name">
-                  <span className="exav-viewer-truncate">{m.name.split("/").pop()}</span>
+                  <span className="exav-viewer-truncate">{name.split("/").pop()}</span>
                   {folder && (
                     <span className="exav-viewer-member-folder exav-viewer-truncate">
                       <FolderIcon />
@@ -582,8 +584,8 @@ function ArchiveBack({ archive, name }: ArchiveBackProps) {
         <ArrowLeft />
         {t("archive_back")}
       </button>
-      <span className="exav-viewer-truncate" title={name}>
-        {name}
+      <span className="exav-viewer-truncate" title={shownName(name)}>
+        {shownName(name)}
       </span>
     </div>
   );

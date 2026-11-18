@@ -21,30 +21,30 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use super::vol::{Emit, Found};
-use crate::stream::{MemberMeta, Region, Visit, emit_entry, emit_stream};
+use super::vol::{Disk, Emit, Found};
+use crate::stream::{MemberMeta, Region, Visit, emit_entry, emit_stream_with_holes};
 use crate::{Budget, Entry, LimitHit};
 
 /// A member that is only a report: `reason` about `size` bytes of `name`.
-pub(crate) fn report<T>(
+pub(crate) fn report(
     name: &str,
     size: u64,
     reason: &'static str,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     report_enc(name, size, false, reason, budget, visit)
 }
 
 /// [`report`] of content that is encrypted.
-pub(crate) fn report_enc<T>(
+pub(crate) fn report_enc(
     name: &str,
     size: u64,
     encrypted: bool,
     reason: &'static str,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     budget.count_entry()?;
     emit_entry(
         Entry::unsupported(name.to_string(), size, encrypted, reason),
@@ -141,15 +141,15 @@ fn sniff(head: &[u8]) -> Option<Fs> {
 }
 
 /// `[start, start + len)` of a disk, as a disk of its own.
-pub(crate) struct Window<'a, D> {
-    disk: &'a mut D,
+pub(crate) struct Window<'a> {
+    disk: &'a mut dyn Disk,
     start: u64,
     len: u64,
     pos: u64,
 }
 
-impl<'a, D> Window<'a, D> {
-    pub(crate) fn new(disk: &'a mut D, start: u64, len: u64) -> Self {
+impl<'a> Window<'a> {
+    pub(crate) fn new(disk: &'a mut dyn Disk, start: u64, len: u64) -> Self {
         Window {
             disk,
             start,
@@ -159,7 +159,7 @@ impl<'a, D> Window<'a, D> {
     }
 }
 
-impl<D: Read + Seek> Read for Window<'_, D> {
+impl Read for Window<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let left = self.len.saturating_sub(self.pos);
         let want = usize::try_from(left).map_or(buf.len(), |l| l.min(buf.len()));
@@ -177,7 +177,7 @@ impl<D: Read + Seek> Read for Window<'_, D> {
     }
 }
 
-impl<D> Seek for Window<'_, D> {
+impl Seek for Window<'_> {
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         let pos = match to {
             SeekFrom::Start(p) => Some(p),
@@ -193,15 +193,12 @@ impl<D> Seek for Window<'_, D> {
 /// Run a filesystem walker, which hands each file to an [`Emit`], as a walk
 /// handing members to `visit`, each name under `prefix`. A file read as it
 /// goes is a streamed member.
-pub(crate) fn entries<T>(
+pub(crate) fn entries(
     budget: &mut Budget,
-    visit: Visit<T>,
+    visit: Visit<()>,
     prefix: &str,
-    run: impl FnOnce(
-        &mut Budget,
-        Emit<Result<T, LimitHit>>,
-    ) -> Result<Option<Result<T, LimitHit>>, LimitHit>,
-) -> Result<Option<T>, LimitHit> {
+    run: &mut dyn FnMut(&mut Budget, Emit) -> crate::Extracted,
+) -> Result<Option<()>, LimitHit> {
     let under = |e: Entry| {
         if prefix.is_empty() {
             e
@@ -212,10 +209,10 @@ pub(crate) fn entries<T>(
             }
         }
     };
-    let mut emit = |found: Found<'_>, budget: &mut Budget| -> Option<Result<T, LimitHit>> {
+    let mut emit = |found: Found<'_>, budget: &mut Budget| -> Option<crate::Stop> {
         match found {
             Found::Held(e) => emit_entry(under(e), budget, &mut *visit).transpose(),
-            Found::Read(e, reader) => {
+            Found::Read(e, reader, holes) => {
                 let e = under(e);
                 let meta = MemberMeta {
                     name: e.name,
@@ -225,58 +222,78 @@ pub(crate) fn entries<T>(
                     mode: e.mode,
                     ..MemberMeta::default()
                 };
-                emit_stream(&meta, reader, budget, &mut *visit).transpose()
+                emit_stream_with_holes(&meta, reader, Some(&holes), budget, &mut *visit).transpose()
             }
         }
     };
     run(budget, &mut emit)?.transpose()
 }
 
+/// A filesystem walker over a volume of a given length.
+pub(crate) type VolumeWalker = fn(&mut dyn Disk, u64, &mut Budget, Emit) -> crate::Extracted;
+
+/// Walk a filesystem given whole as a source, with its `walker`.
+pub(crate) fn walk_source(
+    src: &dyn crate::source::ByteSource,
+    budget: &mut Budget,
+    visit: Visit<()>,
+    walker: VolumeWalker,
+) -> Result<Option<()>, LimitHit> {
+    entries(budget, visit, "", &mut |budget, sink| {
+        walker(
+            &mut crate::source::Reader::new(src),
+            src.len() as u64,
+            budget,
+            sink,
+        )
+    })
+}
+
 /// Walk the filesystem `fs` that fills `[start, start + len)` of `disk`, each
 /// file's name under `prefix`.
-fn walk_fs<D: Read + Seek, T>(
+fn walk_fs(
     fs: Fs,
-    disk: &mut D,
+    disk: &mut dyn Disk,
     start: u64,
     len: u64,
     prefix: &str,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
-    let window = Window::new(disk, start, len);
-    entries(budget, visit, prefix, |budget, sink| match fs {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    let mut window = Window::new(disk, start, len);
+    entries(budget, visit, prefix, &mut |budget, sink| match fs {
         #[cfg(feature = "ntfs")]
-        Fs::Ntfs => super::ntfs::walk_volume(window, len, budget, sink),
+        Fs::Ntfs => super::ntfs::walk_volume(&mut window, len, budget, sink),
         #[cfg(feature = "fat")]
-        Fs::Fat => super::fat::walk_volume(window, len, budget, sink),
+        Fs::Fat => super::fat::walk_volume(&mut window, len, budget, sink),
         #[cfg(feature = "ext")]
-        Fs::Ext => super::ext::walk_volume(window, len, budget, sink),
+        Fs::Ext => super::ext::walk_volume(&mut window, len, budget, sink),
         #[cfg(feature = "exfat")]
-        Fs::Exfat => super::exfat::walk_volume(window, len, budget, sink),
+        Fs::Exfat => super::exfat::walk_volume(&mut window, len, budget, sink),
         #[cfg(feature = "squashfs")]
-        Fs::Squashfs => super::squashfs::walk_volume(window, len, budget, sink),
+        Fs::Squashfs => super::squashfs::walk_volume(&mut window, len, budget, sink),
         #[cfg(feature = "cramfs")]
-        Fs::Cramfs => super::cramfs::walk_volume(window, len, budget, sink),
+        Fs::Cramfs => super::cramfs::walk_volume(&mut window, len, budget, sink),
         #[cfg(feature = "romfs")]
-        Fs::Romfs => super::romfs::walk_volume(window, len, budget, sink),
+        Fs::Romfs => super::romfs::walk_volume(&mut window, len, budget, sink),
         #[cfg(feature = "erofs")]
-        Fs::Erofs => super::erofs::walk_volume(window, len, budget, sink),
+        Fs::Erofs => super::erofs::walk_volume(&mut window, len, budget, sink),
         #[cfg(feature = "dmg")]
-        Fs::Hfs => super::hfsplus::walk_volume(window, budget, sink),
+        Fs::Hfs => super::hfsplus::walk_volume(&mut window, budget, sink),
         #[cfg(feature = "dmg")]
-        Fs::Apfs => super::apfs::walk_volume(window, budget, sink),
+        Fs::Apfs => super::apfs::walk_volume(&mut window, budget, sink),
     })
 }
 
 /// Walk a disk image: the filesystem that starts it, or the volumes its
 /// partition table lists. A disk that is neither is reported: its bytes were
 /// not read.
-pub(crate) fn walk_disk<D: Read + Seek, T>(
-    disk: &mut D,
+pub(crate) fn walk_disk(
+    disk: &mut dyn Disk,
     mode: Mode,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let len = disk
         .seek(SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("disk: {e}")))?;
@@ -286,7 +303,7 @@ pub(crate) fn walk_disk<D: Read + Seek, T>(
     }
     #[cfg(feature = "partition")]
     {
-        let regions = super::partition::stream_offsets(disk)?;
+        let regions = super::partition::stream_offsets(disk, budget.limits())?;
         if !regions.is_empty() {
             return walk_regions(disk, regions, mode, budget, visit);
         }
@@ -301,13 +318,13 @@ pub(crate) fn walk_disk<D: Read + Seek, T>(
 }
 
 /// Walk the volumes of a partitioned disk.
-pub(crate) fn walk_regions<D: Read + Seek, T>(
-    disk: &mut D,
+pub(crate) fn walk_regions(
+    disk: &mut dyn Disk,
     regions: Vec<Region>,
     mode: Mode,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let cap = budget.limits().max_buffer_bytes;
     if mode == Mode::Virtual {
         let first = regions
@@ -332,7 +349,8 @@ pub(crate) fn walk_regions<D: Read + Seek, T>(
             Region::Member(name, off, len) => (name, off, len),
             // A part of the table that was not walked arrives as it always did.
             Region::Unwalked(..) => {
-                if let Some(t) = crate::stream::stream_stored(disk, budget, &mut *visit, [region])?
+                if let Some(t) =
+                    crate::stream::stream_stored(disk, budget, &mut *visit, vec![region])?
                 {
                     return Ok(Some(t));
                 }
@@ -361,13 +379,13 @@ pub(crate) fn walk_regions<D: Read + Seek, T>(
 }
 
 /// Hand the visitor the bytes of a volume as a stream.
-fn stream_volume<D: Read + Seek, T>(
-    disk: &mut D,
+fn stream_volume(
+    disk: &mut dyn Disk,
     name: String,
     off: u64,
     len: u64,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
-    crate::stream::stream_stored(disk, budget, visit, [Region::Member(name, off, len)])
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    crate::stream::stream_stored(disk, budget, visit, vec![Region::Member(name, off, len)])
 }

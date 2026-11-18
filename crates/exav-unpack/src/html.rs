@@ -253,29 +253,63 @@ fn attr_value(head: &str, name: &str) -> Option<String> {
     None
 }
 
-/// A page as text: its byte order mark's encoding, else the charset a
-/// `<meta>` in its first kilobytes names, else UTF-8 when it is valid UTF-8,
-/// else Windows-1252, in which no byte is invalid.
-pub fn decode(b: &[u8]) -> Cow<'_, str> {
-    if let Some(enc) = utf16(b) {
-        // UTF-16 cut after an odd byte: the half unit dropped.
-        let even = b.len() - b.len() % 2;
-        return enc.decode_with_bom_removal(&b[..even]).0;
+/// How [`decode`] reads a page: `b[start..end]` in `encoding`, with no
+/// byte-order mark handling (a WHATWG decoder with `ignoreBOM`, such as a
+/// browser's `TextDecoder`, given its name).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reading {
+    pub encoding: &'static encoding_rs::Encoding,
+    /// After the byte-order mark.
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The [`Reading`] of a page: its byte order mark's encoding, else the
+/// charset a `<meta>` in its first kilobytes names, else UTF-8 when it is
+/// valid UTF-8, else Windows-1252, in which no byte is invalid.
+pub fn reading(b: &[u8]) -> Reading {
+    if let Some(encoding) = utf16(b) {
+        let marked = b.starts_with(&[0xFF, 0xFE]) || b.starts_with(&[0xFE, 0xFF]);
+        return Reading {
+            encoding,
+            start: 2 * usize::from(marked),
+            // UTF-16 cut after an odd byte: the half unit dropped.
+            end: b.len() - b.len() % 2,
+        };
     }
-    if let Some(rest) = b.strip_prefix(b"\xEF\xBB\xBF") {
-        return String::from_utf8_lossy(rest);
+    if b.starts_with(b"\xEF\xBB\xBF") {
+        return Reading {
+            encoding: encoding_rs::UTF_8,
+            start: 3,
+            end: b.len(),
+        };
     }
     let head = String::from_utf8_lossy(&b[..b.len().min(HEAD)]);
     let named =
         attr_value(&head, "charset").and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()));
-    let enc = match named {
+    let encoding = match named {
         // A page declaring UTF-16 that is not is read as ASCII-compatible.
         Some(e) if e == encoding_rs::UTF_16LE || e == encoding_rs::UTF_16BE => encoding_rs::UTF_8,
         Some(e) => e,
         None if std::str::from_utf8(b).is_ok() => encoding_rs::UTF_8,
         None => encoding_rs::WINDOWS_1252,
     };
-    enc.decode_without_bom_handling(b).0
+    Reading {
+        encoding,
+        start: 0,
+        end: b.len(),
+    }
+}
+
+/// A page as text, as [`reading`] says.
+pub fn decode(b: &[u8]) -> Cow<'_, str> {
+    let r = reading(b);
+    let body = &b[r.start..r.end];
+    // The same text as encoding_rs's UTF-8 decoder, borrowed when valid.
+    if r.encoding == encoding_rs::UTF_8 {
+        return String::from_utf8_lossy(body);
+    }
+    r.encoding.decode_without_bom_handling(body).0
 }
 
 #[cfg(test)]
@@ -370,6 +404,21 @@ mod tests {
         assert_eq!(r.unwrap().len(), 1000);
         assert!(told > 1000 * 3 * 20, "told {told} for 3000 bytes");
         assert_eq!(read(&page, &mut |_| false), Err(TooLarge));
+    }
+
+    /// What the viewer reads a page's source in, without decoding it here.
+    #[test]
+    fn the_reading_of_a_page_names_the_charset_of_its_meta() {
+        let page = b"<meta charset=\"Shift_JIS\"><p>\x93\xfa\x96\x7b</p>";
+        let r = reading(page);
+        assert_eq!(
+            (r.encoding.name(), r.start, r.end),
+            ("Shift_JIS", 0, page.len())
+        );
+        assert_eq!(
+            decode(page),
+            "<meta charset=\"Shift_JIS\"><p>\u{65e5}\u{672c}</p>"
+        );
     }
 
     #[test]

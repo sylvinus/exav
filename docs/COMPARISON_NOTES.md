@@ -27,7 +27,7 @@ quoting.
 
 Every one was verified. 101 of the 104 report a nested match location: the hit is
 inside a member clamd did not unpack, and re-scanning exav's own extracted
-members with clamd (see `exav-unpack/examples/dump_members.rs`) makes clamd flag
+members with clamd (written by `exav-unpack -r FILE -d OUTDIR`) makes clamd flag
 them under the same signature name while still calling the container clean. Of
 the other three, two are `Target:0` RTF-exploit signatures legitimately matching
 RTF files, and one is `Win.Trojan.Mimikatz` inside a PE that was base64-encoded
@@ -43,7 +43,7 @@ samples that sat there (an MPRESS-packed dropper and a UPX image carrying a bare
 A later code review found silent-miss paths the corpus had not exercised
 (container hashes and raw signatures over `INSTREAM`/stdin/ICAP, an ignored
 signature masking a later member, ZIP members hidden from the central directory,
-files over the deep-analysis limit reported clean). They were fixed with tests;
+files over the object limit reported clean). They were fixed with tests;
 this run predates those fixes.
 
 ### Why the run makes no speed claim

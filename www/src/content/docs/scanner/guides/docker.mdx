@@ -13,9 +13,11 @@ container's TCP 3310 works.
 
 To run the image on Kubernetes, see the [Kubernetes guide](/scanner/guides/kubernetes/).
 
-It is distroless and rootless: a static musl binary on `distroless/static` (no
-shell, no package manager) running as the `nonroot` user (uid 65532).
-Bind-mounted database volumes must be writable by that uid.
+It is distroless and never runs as root: a static musl binary on
+`distroless/static` (no shell, no package manager) running as uid and gid
+65532. It also runs with a read-only root filesystem and every capability
+dropped; see [User and volumes](#user-and-volumes) for the paths it writes and
+their ownership.
 
 ## Run it
 
@@ -45,6 +47,15 @@ as well as the tree to scan:
 
 ```sh
 docker run --rm -v exav-db:/var/lib/exav -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
+```
+
+The scan reads the files as uid 65532, so a file only its owner can read is
+reported `ERROR`, not scanned. To scan your own files with your permissions,
+run the container as you:
+
+```sh
+docker run --rm --user "$(id -u):$(id -g)" -v exav-db:/var/lib/exav:ro \
+  -v "$PWD:/scan:ro" ghcr.io/sylvinus/exav /scan
 ```
 
 `--listen` on the command line together with paths is refused: one command
@@ -212,29 +223,79 @@ docker run -d -p 127.0.0.1:1344:1344 -e EXAV_LISTEN=icap://0.0.0.0:1344 \
 
 See the [ICAP guide](/scanner/guides/icap/) for the verdict mapping and the settings.
 
-## Rootless bind mounts
+## User and volumes
 
-When you bind-mount a host directory instead of a named volume, make it writable
-by uid 65532 so the updater can write signatures there:
+The image runs as uid 65532 and gid 65532 (`nonroot` in distroless) from its
+first instruction: there is no entrypoint script that starts as root to change
+the owner of the volumes, as the ClamAV image's does by default. exav needs no
+capability either, so `--cap-drop ALL` and
+`--security-opt no-new-privileges` change nothing for it.
+
+It writes to three paths, and otherwise only to a file a flag names
+(`--log`, `--build-db`), which needs a volume under `--read-only`:
+
+| Path | What exav writes there | When |
+|---|---|---|
+| `/var/lib/exav` | Signatures `--auto-update` fetches, a pulled `.exavdb`, and the temp file each is written to before it is renamed into place | Whenever it fetches; a sidecar setup only reads it |
+| `/tmp` | An object past `--spill-threshold-bytes` (16M) while it is scanned. Each file is unlinked as soon as it is created. `EXAV_SPILL_DIR` moves it | Whenever such an object arrives |
+| `/run/exav` | The Unix socket | Only when `EXAV_LISTEN` names a socket there |
+
+### Ownership
+
+`/var/lib/exav` and `/run/exav` belong to 65532 in the image. A new named
+volume mounted on either starts as a copy of that directory, owner included,
+so it needs nothing. A bind mount keeps the owner it has on the host: give it
+to 65532, or run the container as your own user.
 
 ```sh
 mkdir -p ./exav-db && sudo chown 65532:65532 ./exav-db
 docker run -d -p 127.0.0.1:3310:3310 -v "$PWD/exav-db:/var/lib/exav" ghcr.io/sylvinus/exav
+
+# or, without sudo: the container runs as you
+docker run -d -p 127.0.0.1:3310:3310 --user "$(id -u):$(id -g)" \
+  -v "$PWD/exav-db:/var/lib/exav" ghcr.io/sylvinus/exav
 ```
 
-### `--read-only` needs a writable temp dir
+### A volume that root filled
 
-An object larger than `--spill-threshold-bytes` (16M) is written to disk while it
-is scanned, so a `--read-only` container with nowhere to write fails every scan
-above that size while small ones keep working. Give it somewhere to write: a
-`--tmpfs`, or a disk-backed volume with `--spill-dir` pointed at it. A tmpfs
-lives in RAM and counts against the container's memory limit, so size it, and
-keep the spill budget under it. `--max-total-spill-bytes` applies to each
-worker separately (one per CPU core by default), so the budget times the
-workers must fit:
+A volume created or filled outside this image keeps the owner it was given.
+One filled by `freshclam` or `cvd` running as root, by a container running as
+root, or by the ClamAV image (which gives it to its own `clamav` user) is not
+writable by 65532. exav still
+loads its files if they are world-readable, which is the usual mode, but every
+update fails, and the log says so on each attempt:
+
+```
+exav: fetch daily.cvd failed: Permission denied (os error 13)
+```
+
+Give the volume to 65532 once. The image has no shell, so use any image with
+`chown`:
+
+```sh
+docker run --rm -v exav-db:/data busybox chown -R 65532:65532 /data
+```
+
+For a bind mount, run `sudo chown -R 65532:65532` on the host directory. A
+volume that only a sidecar writes (the ClamAV image running freshclam, say)
+can keep its owner, as long as its files are readable by 65532.
+
+### Read-only root filesystem
+
+With `--read-only`, the image runs as is once `/var/lib/exav` is a volume (it
+is declared one, so Docker creates one if you name none) and `/tmp` is
+writable. An object larger than `--spill-threshold-bytes` (16M) is written to
+disk while it is scanned, so a `--read-only` container with nowhere to write
+fails every scan above that size while small ones keep working. Give it
+somewhere to write: a `--tmpfs`, or a disk-backed volume at `/tmp` (or
+anywhere, with `--spill-dir` pointed at it). A tmpfs lives in RAM and counts
+against the container's memory limit, so size it, and keep the spill budget
+under it. `--max-total-spill-bytes` applies to each worker separately (one per
+CPU core by default), so the budget times the workers must fit:
 
 ```sh
 docker run -d -p 127.0.0.1:3310:3310 --read-only --tmpfs /tmp:size=4g \
+  --cap-drop ALL --security-opt no-new-privileges \
   -e EXAV_WORKERS=2 -e EXAV_MAX_TOTAL_SPILL_BYTES=1500M \
   -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
 ```
@@ -244,6 +305,27 @@ Without one the daemon logs `connection error:` followed by the filesystem error
 exav's own) reports an error and exits `2`
 ([exit codes](/scanner/reference/verdicts/#process-exit-code)): the scan did not happen.
 
+### Sharing the Unix socket
+
+To reach the daemon from another container over a Unix socket rather than TCP,
+put the socket in a volume at `/run/exav` and mount the same volume in the
+client. The ClamAV image puts its socket in `/tmp`; exav keeps that path for
+spilled objects, so its socket goes in a directory only it can write.
+
+```sh
+docker run -d --name exav -v exav-db:/var/lib/exav -v exav-run:/run/exav \
+  -e 'EXAV_LISTEN=clamd:///run/exav/clamd.sock?mode=660' ghcr.io/sylvinus/exav
+
+# a client under another user (exav's own, here) through the same volume
+docker run --rm --user 1000:1000 --group-add 65532 -v exav-run:/run/exav \
+  ghcr.io/sylvinus/exav --ping --connect clamd:///run/exav/clamd.sock
+```
+
+The socket is created `0600` unless the address carries a mode, which leaves
+it to clients that run as 65532. `?mode=660` admits group 65532 as well, which a
+client under another user joins with `--group-add 65532` (`group_add` in
+Compose). The health check reads `EXAV_LISTEN`, so it probes the socket.
+
 ## Dual container (shared volume)
 
 An updater container refreshes a shared volume and the scanner hot-reloads it, as
@@ -252,11 +334,20 @@ in the repository's
 The updater is `--auto-update` with nothing to listen on:
 
 ```yaml
+x-hardening: &hardening       # both containers: see User and volumes above
+  user: "65532:65532"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
 services:
   exav:                       # scanner
+    <<: *hardening
     image: ghcr.io/sylvinus/exav:latest
     ports: ["127.0.0.1:3310:3310"]
-    volumes: [exav-db:/var/lib/exav]
+    volumes:
+      - exav-db:/var/lib/exav
+      - exav-spill:/tmp       # spilled objects; the root filesystem is read-only
     healthcheck:              # the image's own, repeated: see Health above
       test: ["CMD", "/exav", "--ping"]
       interval: 30s
@@ -266,6 +357,7 @@ services:
     restart: unless-stopped
 
   updater:                    # writes the shared volume, doesn't scan
+    <<: *hardening
     image: ghcr.io/sylvinus/exav:latest
     command: ["--auto-update", "--update-interval-secs", "43200"]
     environment:
@@ -278,9 +370,11 @@ services:
 
 volumes:
   exav-db:
+  exav-spill:
 ```
 
 Run it with `EXAV_SIG_SOURCES=https://clamav-mirror.internal/ docker compose up -d`.
+The repository's file says how to put the spill directory on a tmpfs instead.
 
 The scanner notices the updated files on the shared mount ([a poll of the
 source](/scanner/guides/daemon/#the-watch-polls-the-source)) and

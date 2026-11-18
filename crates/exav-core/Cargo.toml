@@ -117,6 +117,16 @@ visible-text-pdf = ["visible-text", "exav-render/text-pdf"]
 # of those formats whose text cannot be read (encrypted, past a limit, damaged)
 # marks the scan incomplete.
 visible-text-office = ["visible-text", "exav-render/text-office"]
+# The QR codes in images: each payload matched as a text view, and its links
+# judged by the phishing check (`ScanOptions::qr_codes`, off unless set, and
+# never under `--clamav-compat`). Through exav-render's `qr` (exav-qr) and its
+# image decoders. Not a default.
+qr = [
+    "dep:exav-render", "exav-render/qr", "exav-render/image", "exav-render/webp",
+    "exav-render/ico", "exav-render/pnm", "exav-render/qoi", "exav-render/dds",
+    "exav-render/ff", "exav-render/hdr", "exav-render/jp2", "exav-render/jbig2",
+    "exav-render/raw",
+]
 # `fuzzy_img#` subsignatures, through exav-imagehash and its image decoders.
 # Without it they load as unsupported, and no image is ever decoded.
 image-hash = ["dep:exav-imagehash"]
@@ -156,7 +166,7 @@ decrypt = ["exav-unpack/decrypt"]
 # individual formats for a smaller build (e.g. `features = ["zip"]`). A format
 # exav recognises but wasn't compiled to unpack is reported unsupported, never
 # silently clean.
-all-formats = ["exav-unpack/all-formats", "pdf", "base64scan", "lzw", "lzma", "rpm", "diskimage"]
+all-formats = ["exav-unpack/all-formats", "email", "pdf", "base64scan", "lzw", "lzma", "rpm", "diskimage"]
 base64scan = ["exav-unpack/base64scan"]
 zip = ["exav-unpack/zip"]
 gzip = ["exav-unpack/gzip"]
@@ -219,6 +229,9 @@ romfs = ["exav-unpack/romfs"]
 erofs = ["exav-unpack/erofs"]
 zoo = ["exav-unpack/zoo"]
 ishieldz = ["exav-unpack/ishieldz"]
+ishieldcab = ["exav-unpack/ishieldcab"]
+ishieldmsi = ["exav-unpack/ishieldmsi"]
+applesingle = ["exav-unpack/applesingle"]
 pepack = ["exav-unpack/pepack"]
 javaclass = ["exav-unpack/javaclass"]
 aimodel = ["exav-unpack/aimodel"]
@@ -256,7 +269,7 @@ wasi-bin = ["dep:serde_json"]
 # the note there): the ready-made crates bring `rustix` + `linux-raw-sys` and
 # their thousands of unsafe blocks along for a page of `std::fs`.
 # only for building test ZIPs in unit tests
-zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+zip = { version = ">=9.0.5, <9.1", default-features = false, features = ["deflate-flate2"] }
 # test fixtures only: build gzip/tar CVD fixtures + gzip scan inputs.
 # `default-features = false` turns off tar's `xattr` support, which is for
 # restoring extended attributes to a real filesystem (these fixtures are built
@@ -275,13 +288,16 @@ serde_json = "1.0.154"
 ppmd-rust = "1"
 # Encodes the images the `fuzzy_img#` tests scan.
 image = { version = "=0.25.9", default-features = false, features = ["png", "webp"] }
+# Draws the QR codes the `qr` tests scan.
+qrcode = { version = "0.14", default-features = false }
 # The unit tests of the vendored `src/fancy_regex/`, as upstream wrote them.
 matches = "0.1.10"
 quickcheck = { version = "1.1", default-features = false }
 # Small chunks when reading a source, so tests on small inputs cross many
 # chunk seams. Features only: which formats are built stays with the
-# dependency above.
-exav-unpack = { path = "../exav-unpack", default-features = false, features = ["small-chunks"] }
+# dependency above. `test-util` is the spill held in memory that the tests
+# hand to a scan.
+exav-unpack = { path = "../exav-unpack", default-features = false, features = ["small-chunks", "test-util"] }
 
 # All examples reach into the (unstable) engine internals (the `engine`/
 # `bytecode`/`pe` modules or `Database::engine()`), so they only build with the

@@ -3,19 +3,33 @@
  * their bytes; to the external converter what it does not recognise, or
  * everything when the options say so.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { RenderContext } from "../core/types.js";
+import { compoundFile } from "../test/compound.js";
+import { officeKindsNow, start } from "../test/sniff.js";
+import { storedZip } from "../test/stored-zip.js";
 import type { ConversionOptions } from "./index.js";
-import { SlideConversionError, sniffSlides } from "./slides.js";
+import { SlideConversionError, sniffSlides as sniff } from "./slides.js";
+
+// The containers are read by exav's readers, which the tests run in this process.
+vi.mock("./zip-engine.js", () => import("../test/sniff.js"));
+beforeAll(start);
+const sniffSlides = (b: Uint8Array) => sniff(b, officeKindsNow(b));
 
 const bytes = (...parts: (string | number[])[]) =>
   new Uint8Array(parts.flatMap((p) => (typeof p === "string" ? [...p].map((c) => c.charCodeAt(0)) : p)));
 
 const utf16 = (s: string) => [...s].flatMap((c) => [c.charCodeAt(0), 0]);
 
-/** A ZIP's first local header (30 bytes), then `rest`. */
-const zip = (rest: string) => bytes([0x50, 0x4b, 0x03, 0x04, ...new Array(26).fill(0)], rest);
+/** A stored ZIP whose members are the words of `rest`; a first word `mimetype...` is the member of that name holding the rest of the word. */
+const zip = (rest: string): Uint8Array =>
+  storedZip(
+    rest
+      .split(/\s+/)
+      .filter((w) => w && w !== "...")
+      .map((w, i) => (i === 0 && w.startsWith("mimetype") ? ["mimetype", bytes(w.slice(8))] : [w, new Uint8Array()]) as [string, Uint8Array]),
+  );
 
 const CFB = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
 
@@ -25,21 +39,32 @@ const entry = (name: string, type = 2) => {
   return [...units, ...new Array(64 - units.length).fill(0), (name.length + 1) * 2, 0, type, 0];
 };
 
-const PPT = bytes(CFB, entry("Current User"), entry("PowerPoint Document"));
+const PPT = compoundFile(["Current User", "PowerPoint Document"]);
 
 describe("what the bytes are", () => {
   it("reads compound files with a PowerPoint stream as PPT, whatever its version", () => {
     expect(sniffSlides(PPT)).toBe("ppt");
     // PowerPoint 95 has no "Current User" stream of that kind; PowerPoint 4 has a "PP40" stream.
-    expect(sniffSlides(bytes(CFB, entry("PowerPoint Document")))).toBe("ppt");
-    expect(sniffSlides(bytes(CFB, entry("PP40")))).toBe("ppt");
+    expect(sniffSlides(compoundFile(["PowerPoint Document"]))).toBe("ppt");
+    // One the reader could not look into (`officeKinds` says `null`) is taken as its name says.
+    expect(sniff(compoundFile(["WordDocument"]), null)).toBe("ppt");
+    expect(sniffSlides(compoundFile(["PP40"]))).toBe("ppt");
     // A workbook is not one, nor is a file that only mentions the name.
-    expect(sniffSlides(bytes(CFB, entry("Workbook")))).toBeNull();
+    expect(sniffSlides(compoundFile(["Workbook"]))).toBeNull();
     expect(sniffSlides(bytes(CFB, utf16("PowerPoint Document")))).toBeNull();
-    expect(sniffSlides(bytes(CFB, entry("PP40", 0)))).toBeNull();
+    expect(sniffSlides(compoundFile([["PP40", new Uint8Array(), 0]]))).toBeNull();
     // Names compare without regard to ASCII case, as the converter's reader does.
-    expect(sniffSlides(bytes(CFB, entry("PowerPoint DocUment")))).toBe("ppt");
-    expect(sniffSlides(bytes(CFB, entry("pp40")))).toBe("ppt");
+    expect(sniffSlides(compoundFile(["PowerPoint DocUment"]))).toBe("ppt");
+    expect(sniffSlides(compoundFile(["pp40"]))).toBe("ppt");
+  });
+
+  it("tells a compound file by its directory, not by a stream name written in its content", () => {
+    const quoted = compoundFile([["Notes", bytes(entry("PowerPoint Document"))]]);
+    expect(sniffSlides(quoted)).toBeNull();
+  });
+
+  it("reads the presentation of a compound file that holds a Word document and a workbook too", () => {
+    expect(sniffSlides(compoundFile(["WordDocument", "Workbook", "PowerPoint Document"]))).toBe("ppt");
   });
 
   it("reads PowerPoint 2 to 4 files, Windows and Macintosh, and their BinHex text", () => {
@@ -66,6 +91,12 @@ describe("what the bytes are", () => {
     expect(sniffSlides(zip("presentation.apxl"))).toBe("key");
     expect(sniffSlides(zip("Index/Document.iwa Index/Tables/Tile.iwa"))).toBeNull();
     expect(sniffSlides(zip("index.xml.gz"))).toBeNull();
+  });
+
+  it("tells a package by the members of its directory, not by bytes inside a member", () => {
+    // A ZIP that holds a deck, stored: the deck's own directory is in the last bytes.
+    const inner = zip("[Content_Types].xml ppt/presentation.xml");
+    expect(sniffSlides(storedZip([["backup.zip", inner]]))).toBeNull();
   });
 
   it("reads flat OpenDocument presentations, and nothing else as text", () => {

@@ -77,7 +77,7 @@ fn synthetic_deflate_block_recovers_marker() {
 fn truncated_and_garbage_do_not_panic() {
     let mut budget = Budget::new(Limits::default());
 
-    // Truncated real sample (header present, data block cut short) — only when
+    // Truncated real sample (header present, data block cut short), only when
     // the gitignored sample is present locally.
     if let Some(data) = real_nsis() {
         let truncated = &data[..data.len() / 3];

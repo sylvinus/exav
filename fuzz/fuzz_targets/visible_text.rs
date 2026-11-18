@@ -47,11 +47,14 @@ fuzz_target!(|data: &[u8]| {
     // Small limits keep a decompression bomb cheap to refuse.
     let mut limits = Limits::default();
     limits.max_buffer_bytes = 16 << 20;
+    // All the parts of a package together.
+    limits.max_extracted_bytes = 16 << 20;
+    limits.max_scanned_bytes = 32 << 20;
     let cap = 1 << 20;
     if let Some(v) = visible_text(name, body, cap, &limits) {
         assert!(v.text.len() <= cap, "{} bytes", v.text.len());
         assert!(v.links.len() <= 4096);
-        assert!(wants(name, &body[..body.len().min(1024)]));
+        assert!(wants(name, &body));
         // Sections are in order, inside the text, on character boundaries.
         let mut at = 0;
         for (_, r) in &v.sections {

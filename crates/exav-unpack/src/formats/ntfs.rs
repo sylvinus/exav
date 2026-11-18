@@ -1,4 +1,4 @@
-//! NTFS — walking the Master File Table.
+//! NTFS: walking the Master File Table.
 //!
 //! VHD and VHDX are Windows-native, so a disk image aimed at a Windows victim
 //! holds NTFS. Reconstructing the guest disk gives a pile of sectors; carving
@@ -9,13 +9,13 @@
 //! This is deliberately not a filesystem driver. A scanner wants every file's
 //! bytes, not a navigable tree, so it walks the MFT record by record instead of
 //! descending directory indexes. That skips the index B-trees, the `$Upcase`
-//! table and case-insensitive lookup entirely — and it picks up something a
+//! table and case-insensitive lookup entirely, and it picks up something a
 //! directory walk cannot: a **deleted file whose MFT record still holds its data
 //! runs**. A dropper that removed itself is still there to be scanned.
 //!
 //! ```text
 //! boot sector      bytes/sector, sectors/cluster, where $MFT starts
-//!   $MFT record 0  its own $DATA runs — the MFT itself can be fragmented
+//!   $MFT record 0  its own $DATA runs (the MFT itself can be fragmented)
 //!     FILE records $FILE_NAME for the name, $DATA for the bytes
 //!       resident   the value sits inside the record
 //!       non-resid. data runs: (length, signed LCN delta) pairs
@@ -27,14 +27,14 @@
 //! else is.
 //!
 //! **What is verified, and what is not.** Resident files, single-run files and a
-//! two-run file are checked byte-for-byte against `ntfscat` — the two-run volume
+//! two-run file are checked byte-for-byte against `ntfscat`: the two-run volume
 //! is a real one whose run list was split in half, and ntfs-3g reads the result
 //! back to the same digest, so an independent implementation agrees the layout
 //! is valid. Two paths are implemented but have no fixture behind them: extents
 //! spread across MFT records via `$ATTRIBUTE_LIST`, and LZNT1 compression.
 //! `mkntfs`/`ntfscp` cannot produce either, and a hand-built multi-record volume
 //! was rejected by `ntfscat`, so it is not used as proof of anything. Closing
-//! that needs a volume made by Windows — a heavily fragmented file, and one run
+//! that needs a volume made by Windows: a heavily fragmented file, and one run
 //! through `compact.exe`.
 //!
 //! Neither unproven path can quietly do harm: if the runs gathered fall short of
@@ -51,10 +51,12 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::SeekFrom;
 
-use super::vol::{Attrs, Emit, Found, Next, Piece, Pieces, Plan, Vol, hand, read_file};
-use crate::source::{ByteSource, Reader};
+use super::vol::{
+    Attrs, Emit, Fill, Found, Next, Piece, Pieces, Plan, STEP, Step, Vol, hand, read_file,
+};
+use crate::source::ByteSource;
 use crate::stream::Visit;
 use crate::{Budget, Entry, LimitHit};
 
@@ -75,7 +77,6 @@ const FLAG_DIRECTORY: u16 = 0x0002;
 /// Attribute header flags.
 const ATTR_COMPRESSED: u16 = 0x0001;
 const ATTR_ENCRYPTED: u16 = 0x4000;
-const ATTR_SPARSE: u16 = 0x8000;
 
 /// `$FILE_NAME` namespaces. The DOS 8.3 alias duplicates a name we already have.
 const NAMESPACE_DOS: u8 = 2;
@@ -83,8 +84,8 @@ const NAMESPACE_DOS: u8 = 2;
 /// The low 48 bits of a file reference are the record number.
 const RECORD_NUMBER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
-/// Records 0..15 are the filesystem's own metadata — `$MFT`, `$LogFile`,
-/// `$UpCase` and friends. They are skipped, and skipping them loses nothing: the
+/// Records 0..15 are the filesystem's own metadata (`$MFT`, `$LogFile`,
+/// `$UpCase` and friends). They are skipped, and skipping them loses nothing: the
 /// volume's raw bytes are pattern-scanned before this walk runs, so anything
 /// hidden in `$BadClus` or the journal in plain form is already covered. What
 /// the walk adds over that raw scan is reassembly and decompression, and neither
@@ -92,8 +93,7 @@ const RECORD_NUMBER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// `$LogFile` and `$UpCase` instead.
 const FIRST_USER_RECORD: usize = 16;
 
-/// Walk guards. Both are reported when hit, never a quiet stop.
-const MAX_RECORDS: usize = 200_000;
+/// The most runs read from one run list.
 const MAX_RUNS: usize = 65_536;
 
 fn le_u16(d: &[u8], off: usize) -> u16 {
@@ -278,7 +278,7 @@ impl Plan for Runs {
 }
 
 /// `visit`'s member `e`, held whole.
-fn held<R>(visit: Emit<R>, e: Entry, budget: &mut Budget) -> Option<R> {
+fn held(visit: Emit, e: Entry, budget: &mut Budget) -> Option<crate::Stop> {
     visit(Found::Held(e), budget)
 }
 
@@ -359,10 +359,46 @@ struct Mft {
     runs: Vec<Run>,
     /// Bytes of the table that are readable from its start.
     size: u64,
+    /// Bytes the table is declared to have, no more than the volume has.
+    declared: u64,
 }
 
 impl Mft {
-    /// The table `rec0`, record 0, describes.
+    /// The table of `runs` that is `real_size` bytes long, in a volume of
+    /// `volume` bytes. The table cannot be larger than the volume it is in,
+    /// and it is only as long as its runs can be read.
+    fn over(runs: Vec<Run>, real_size: u64, volume: u64, geo: &Geometry) -> Option<Mft> {
+        let limit = real_size.min(volume);
+        let cl = geo.cluster as u64;
+        let mut size = 0u64;
+        for r in &runs {
+            if size >= limit {
+                break;
+            }
+            let take = r
+                .clusters
+                .saturating_mul(cl)
+                .min(limit.saturating_sub(size));
+            match r.lcn {
+                None => size = size.saturating_add(take),
+                Some(lcn) if lcn >= 0 => {
+                    let start = (lcn as u64).saturating_mul(cl);
+                    if start.checked_add(take).is_none_or(|e| e > volume) {
+                        break;
+                    }
+                    size = size.saturating_add(take);
+                }
+                Some(_) => break,
+            }
+        }
+        (size > 0).then_some(Mft {
+            runs,
+            size,
+            declared: limit,
+        })
+    }
+
+    /// The table `rec0`, record 0, describes: the runs of its first extent.
     fn open(rec0: &[u8], v: &mut Vol, geo: &Geometry) -> Option<Mft> {
         let mut off = le_u16(rec0, 20) as usize;
         while off.saturating_add(8) <= rec0.len() {
@@ -378,32 +414,7 @@ impl Mft {
                 let real_size = le_u64(rec0, off.saturating_add(0x30));
                 let runs_off = off.saturating_add(le_u16(rec0, off.saturating_add(0x20)) as usize);
                 let runs = data_runs(rec0.get(runs_off..off.saturating_add(alen)).unwrap_or(&[]));
-                // The table cannot be larger than the volume it is in. It is
-                // only as long as its runs can be read.
-                let limit = real_size.min(v.len);
-                let cl = geo.cluster as u64;
-                let mut size = 0u64;
-                for r in &runs {
-                    if size >= limit {
-                        break;
-                    }
-                    let take = r
-                        .clusters
-                        .saturating_mul(cl)
-                        .min(limit.saturating_sub(size));
-                    match r.lcn {
-                        None => size = size.saturating_add(take),
-                        Some(lcn) if lcn >= 0 => {
-                            let start = (lcn as u64).saturating_mul(cl);
-                            if start.checked_add(take).is_none_or(|e| e > v.len) {
-                                break;
-                            }
-                            size = size.saturating_add(take);
-                        }
-                        Some(_) => break,
-                    }
-                }
-                return (size > 0).then_some(Mft { runs, size });
+                return Mft::over(runs, real_size, v.len, geo);
             }
             off = off.saturating_add(alen);
         }
@@ -426,7 +437,7 @@ impl Mft {
 ///
 /// A file fragmented past what one record can describe has its run list split
 /// over several records, listed in `$ATTRIBUTE_LIST`. That threshold is
-/// **attacker-controlled** — fragment a file hard enough and it crosses — so
+/// **attacker-controlled** (fragment a file hard enough and it crosses), so
 /// not following the list would hand an attacker a way to choose whether a file
 /// gets read. Which is exactly the kind of gap worth closing rather than
 /// reporting.
@@ -550,7 +561,7 @@ fn extents_of(r: &[u8]) -> HashMap<u64, (usize, Vec<Run>)> {
 /// The `$ATTRIBUTE_LIST` value.
 ///
 /// The list is normally resident, but a file fragmented hard enough pushes the
-/// list itself out of the record — and that threshold is reachable on purpose.
+/// list itself out of the record, and that threshold is reachable on purpose.
 /// So the non-resident form is followed too, by walking its own data runs.
 /// Stopping at the resident case would leave the most fragmented files, which is
 /// to say the ones someone took the trouble to fragment, unread.
@@ -595,8 +606,10 @@ struct File {
     /// Set when the bytes are present but exav could not read them.
     unreadable: Option<&'static str>,
     deleted: bool,
-    /// The runs and the size of a file too long to hold, to be read as it goes.
-    stream: Option<(Vec<Run>, u64)>,
+    /// The runs and the size of a file to be read as it goes: one too long to
+    /// hold, or one stored compressed, with the clusters of its compression
+    /// unit.
+    stream: Option<(Vec<Run>, u64, Option<u64>)>,
 }
 
 /// Parse one MFT record into a file, or `None` when it holds nothing to scan.
@@ -633,6 +646,7 @@ fn parse_record(
         name_from_extensions(l, v, mft, geo, sector)
     });
     let mut file: Option<File> = None;
+    let mut several = false;
     let mut off = le_u16(rec, 20) as usize;
 
     while off.saturating_add(8) <= rec.len() {
@@ -649,8 +663,11 @@ fn parse_record(
         let name_len = rec.get(off.saturating_add(9)).copied().unwrap_or(0) as usize;
 
         // Only the unnamed `$DATA` attribute is the file's own content; a named
-        // one is an alternate data stream.
-        if atype == ATTR_DATA && name_len == 0 {
+        // one is an alternate data stream. Windows reads the first of them, so
+        // a second is not the file: it is said to be left out.
+        if atype == ATTR_DATA && name_len == 0 && file.is_some() {
+            several = true;
+        } else if atype == ATTR_DATA && name_len == 0 {
             if attr_flags & ATTR_ENCRYPTED != 0 {
                 file = Some(File {
                     name: String::new(),
@@ -724,7 +741,41 @@ fn parse_record(
                             )
                         }
                     };
-                    if real_size > cap && attr_flags & ATTR_COMPRESSED == 0 {
+                    if attr_flags & ATTR_COMPRESSED != 0 {
+                        // Stored compressed: read a compression unit at a time,
+                        // held when the file fits and read as it goes when not.
+                        // A unit is 2^4 clusters in practice.
+                        let unit = Some(le_u16(rec, off.saturating_add(0x22)))
+                            .filter(|&s| s <= 16)
+                            .and_then(|s| 1u64.checked_shl(s.into()))
+                            .filter(|&n| n.saturating_mul(geo.cluster as u64) <= v.max as u64);
+                        file = Some(match unit {
+                            _ if real_size == 0 => File {
+                                name: String::new(),
+                                data: Some(Vec::new()),
+                                unreadable: None,
+                                deleted,
+                                stream: None,
+                            },
+                            Some(u) => File {
+                                name: String::new(),
+                                data: None,
+                                unreadable: None,
+                                deleted,
+                                stream: Some((runs, real_size as u64, Some(u))),
+                            },
+                            None => File {
+                                name: String::new(),
+                                data: None,
+                                unreadable: Some(
+                                    "NTFS-compressed file whose compression unit is over \
+                                     the buffer limit",
+                                ),
+                                deleted,
+                                stream: None,
+                            },
+                        });
+                    } else if real_size > cap {
                         // Read as it goes, its holes zeros, where the volume
                         // gives it. Runs short of the declared size are
                         // reported before it, as for a file that is held.
@@ -739,63 +790,16 @@ fn parse_record(
                                  the part that could be read was scanned",
                             ),
                             deleted,
-                            stream: Some((runs, real_size as u64)),
-                        });
-                    } else if real_size > cap {
-                        file = Some(File {
-                            name: String::new(),
-                            data: None,
-                            unreadable: Some("NTFS file exceeds the per-member size budget"),
-                            deleted,
-                            stream: None,
-                        });
-                    } else if attr_flags & ATTR_COMPRESSED != 0 {
-                        // A compression unit is 2^4 clusters in practice.
-                        let unit = Some(le_u16(rec, off.saturating_add(0x22)))
-                            .filter(|&s| s <= 16)
-                            .and_then(|s| 1usize.checked_shl(s.into()))
-                            .and_then(|n| n.checked_mul(geo.cluster))
-                            .filter(|&n| n <= cap);
-                        // Stored compressed, so never more than the file's size
-                        // plus a unit; a sparse run is not read past that.
-                        let raw = match unit {
-                            Some(u) => {
-                                read_runs(v, &runs, geo.cluster, real_size.saturating_add(u))
-                            }
-                            None => Vec::new(),
-                        };
-                        file = Some(match unit.and_then(|u| decompress(&raw, u, real_size)) {
-                            Some(d) => File {
-                                name: String::new(),
-                                data: Some(d),
-                                unreadable: None,
-                                deleted,
-                                stream: None,
-                            },
-                            None => File {
-                                name: String::new(),
-                                data: None,
-                                unreadable: Some("NTFS-compressed file that would not decompress"),
-                                deleted,
-                                stream: None,
-                            },
-                        });
-                    } else if attr_flags & ATTR_SPARSE != 0 || runs.iter().any(|r| r.lcn.is_none())
-                    {
-                        // Sparse holes read as zeroes, which is what the victim
-                        // sees too, so this is still the file.
-                        file = Some(File {
-                            name: String::new(),
-                            data: Some(read_runs(v, &runs, geo.cluster, real_size)),
-                            unreadable: None,
-                            deleted,
-                            stream: None,
+                            stream: Some((runs, real_size as u64, None)),
                         });
                     } else {
+                        // Sparse holes read as zeroes, which is what the victim
+                        // sees too, so they are still the file; but runs that
+                        // stop short of the size are not, holes or not.
                         let bytes = read_runs(v, &runs, geo.cluster, real_size);
                         // Short of the size the record declares. Passing that off
                         // as the file would be a silent truncation, so it is
-                        // reported — *and* the bytes that were read are still
+                        // reported, *and* the bytes that were read are still
                         // handed over, because a prefix is content and a
                         // signature inside it should still fire. Reporting alone
                         // would be the floor, not the answer.
@@ -821,6 +825,12 @@ fn parse_record(
     // names it by its record.
     let mut f = file?;
     f.name = name.unwrap_or_default();
+    if several && f.unreadable.is_none() {
+        f.unreadable = Some(
+            "NTFS record with several unnamed data attributes: the first, which Windows \
+             reads, was scanned and the others were not",
+        );
+    }
     Some(f)
 }
 
@@ -911,52 +921,197 @@ fn name_from_extensions(
     name
 }
 
-/// LZNT1 over a compressed attribute: the runs hold a sequence of compression
-/// units, each of which is either a compressed block or stored verbatim.
-fn decompress(raw: &[u8], unit_bytes: usize, real_size: usize) -> Option<Vec<u8>> {
-    if unit_bytes == 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(real_size);
-    for chunk in raw.chunks(unit_bytes) {
-        if out.len() >= real_size {
-            break;
+/// A file stored compressed, produced a compression unit at a time. The
+/// clusters a unit has allocated tell how it is stored, as they do on Windows:
+/// all of them, it is stored as it is; none, it is a hole; fewer than the unit
+/// has (the rest sparse), it is LZNT1 and decodes to the unit's size. Whether
+/// the bytes of a unit decode is not what decides.
+struct Compressed {
+    runs: std::vec::IntoIter<Run>,
+    /// What is left of the run the last unit ended in.
+    rest: Option<Run>,
+    cluster: u64,
+    /// Clusters in a unit.
+    unit: u64,
+    /// Bytes of the file not yet produced.
+    left: u64,
+    holes: u64,
+    packed: Vec<u8>,
+}
+
+impl Compressed {
+    fn new(runs: Vec<Run>, cluster: u64, unit: u64, size: u64) -> Self {
+        Compressed {
+            runs: runs.into_iter(),
+            rest: None,
+            cluster,
+            unit,
+            left: size,
+            holes: 0,
+            packed: Vec::new(),
         }
-        let mut unit = Vec::new();
-        match lznt1::decompress(chunk, &mut unit) {
-            Ok(()) => out.extend_from_slice(&unit),
-            // A unit that did not compress is stored as-is.
-            Err(_) => out.extend_from_slice(chunk),
+    }
+
+    /// Up to `want` clusters of the runs that follow, as runs of their own
+    /// pushed to `pieces`; how many there were.
+    fn take(&mut self, want: u64, pieces: &mut Vec<Run>) -> u64 {
+        let mut left = want;
+        while left > 0 {
+            let Some(r) = self.rest.take().or_else(|| self.runs.next()) else {
+                break;
+            };
+            let n = r.clusters.min(left);
+            if n == 0 {
+                continue;
+            }
+            pieces.push(Run {
+                lcn: r.lcn,
+                clusters: n,
+            });
+            left = left.saturating_sub(n);
+            if r.clusters > n {
+                self.rest = Some(Run {
+                    lcn: r
+                        .lcn
+                        .map(|l| l.saturating_add(i64::try_from(n).unwrap_or(i64::MAX))),
+                    clusters: r.clusters.saturating_sub(n),
+                });
+            }
+        }
+        want.saturating_sub(left)
+    }
+
+    /// The clusters of the whole units of a hole that the next run goes on
+    /// with, to be produced with the unit just taken, up to a step.
+    fn more_hole(&mut self) -> u64 {
+        if self.rest.is_none() {
+            self.rest = self.runs.next();
+        }
+        let unit_bytes = self.unit.saturating_mul(self.cluster).max(1);
+        let most = (STEP as u64).checked_div(unit_bytes).unwrap_or(0);
+        match &self.rest {
+            Some(Run {
+                lcn: None,
+                clusters,
+            }) => {
+                let units = clusters.checked_div(self.unit).unwrap_or(0);
+                let k = units.min(most.saturating_sub(1));
+                let used = k.saturating_mul(self.unit);
+                if used > 0 {
+                    self.rest = Some(Run {
+                        lcn: None,
+                        clusters: clusters.saturating_sub(used),
+                    });
+                }
+                used
+            }
+            _ => 0,
         }
     }
-    if out.len() < real_size {
-        return None;
+}
+
+const RUNS_END: &str = "NTFS compressed file whose runs end before its size";
+const CLUSTERS_CUT: &str = "NTFS compressed file with clusters that are not all in the volume";
+const NOT_DECOMPRESSED: &str = "NTFS compressed file with a unit that did not decompress";
+
+impl Fill for Compressed {
+    fn holes(&self) -> u64 {
+        self.holes
     }
-    out.truncate(real_size);
-    Some(out)
+
+    fn fill(&mut self, v: &mut Vol, out: &mut Vec<u8>) -> Step {
+        if self.left == 0 {
+            return Step::End;
+        }
+        let mut pieces = Vec::new();
+        let got = self.take(self.unit, &mut pieces);
+        // The runs end before the file does.
+        if got == 0 {
+            return Step::Broken(RUNS_END);
+        }
+        let allocated = pieces
+            .iter()
+            .filter(|r| r.lcn.is_some())
+            .fold(0u64, |n, r| n.saturating_add(r.clusters));
+        let unit_bytes = crate::bytes::to_usize(self.unit.saturating_mul(self.cluster));
+        let base = out.len();
+        let give = if allocated == 0 {
+            // A hole, and as many whole units of the same one as fit a step.
+            let more = if got == self.unit {
+                self.more_hole()
+            } else {
+                0
+            };
+            let bytes = got.saturating_add(more).saturating_mul(self.cluster);
+            let give = bytes.min(self.left);
+            out.resize(base.saturating_add(crate::bytes::to_usize(give)), 0);
+            self.holes = self.holes.saturating_add(give);
+            give
+        } else if allocated == self.unit {
+            // Stored as it is.
+            for r in &pieces {
+                if !read_cluster_run(v, r, self.cluster, out) {
+                    out.truncate(base);
+                    return Step::Broken(CLUSTERS_CUT);
+                }
+            }
+            let give = (out.len().saturating_sub(base) as u64).min(self.left);
+            out.truncate(base.saturating_add(crate::bytes::to_usize(give)));
+            give
+        } else {
+            // LZNT1, over the clusters allocated.
+            self.packed.clear();
+            for r in pieces.iter().filter(|r| r.lcn.is_some()) {
+                if !read_cluster_run(v, r, self.cluster, &mut self.packed) {
+                    return Step::Broken(CLUSTERS_CUT);
+                }
+            }
+            let mut plain = Vec::new();
+            if lznt1::decompress(&self.packed, &mut plain).is_err() {
+                return Step::Broken(NOT_DECOMPRESSED);
+            }
+            plain.resize(unit_bytes, 0);
+            let give = (unit_bytes as u64).min(self.left);
+            out.extend_from_slice(&plain[..crate::bytes::to_usize(give)]);
+            give
+        };
+        self.left = self.left.saturating_sub(give);
+        Step::More
+    }
+}
+
+/// The clusters of run `r`, which is not a hole, appended to `out`.
+fn read_cluster_run(v: &mut Vol, r: &Run, cluster: u64, out: &mut Vec<u8>) -> bool {
+    let (Some(at), Some(len)) = (
+        r.lcn
+            .and_then(|l| u64::try_from(l).ok())
+            .and_then(|l| l.checked_mul(cluster)),
+        r.clusters.checked_mul(cluster),
+    ) else {
+        return false;
+    };
+    v.append(at, crate::bytes::to_usize(len), out)
 }
 
 /// Walk a raw NTFS volume.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Visit<T>,
-) -> Result<Option<T>, LimitHit> {
-    super::volumes::entries(budget, visit, "", |budget, sink| {
-        walk_volume(Reader::new(src), src.len() as u64, budget, sink)
-    })
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    super::volumes::walk_source(src, budget, visit, walk_volume)
 }
 
 /// Walk the NTFS volume `disk`, which is `len` bytes long, handing each file
 /// to `visit`.
-pub(crate) fn walk_volume<D: Read + Seek, R>(
-    mut disk: D,
+pub(crate) fn walk_volume(
+    disk: &mut dyn super::vol::Disk,
     len: u64,
     budget: &mut Budget,
-    visit: Emit<R>,
-) -> Result<Option<R>, LimitHit> {
+    visit: Emit,
+) -> crate::Extracted {
     let mut v = Vol {
-        disk: &mut disk,
+        disk,
         len,
         max: crate::bytes::to_usize(budget.limits().max_buffer_bytes),
     };
@@ -986,7 +1141,7 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
     };
 
     // Record 0 is `$MFT` itself, and its `$DATA` gives the runs of the whole
-    // table — which can be fragmented, so the MFT cannot simply be read
+    // table, which can be fragmented, so the MFT cannot simply be read
     // linearly from its first cluster.
     let mft_start = geo.mft_lcn.saturating_mul(geo.cluster as u64);
     let Some(mut rec0) = v.at(mft_start, geo.record_size) else {
@@ -1029,18 +1184,29 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
             budget,
         ));
     };
-
-    let records = crate::bytes::to_usize(mft.size.checked_div(geo.record_size as u64).unwrap_or(0));
-    let n = records.min(MAX_RECORDS);
-    if records > MAX_RECORDS {
+    // A table fragmented past what its record holds has the rest of its runs
+    // in the records its attribute list names, which the first extent is where
+    // to find. Records past the first extent are files like the others.
+    let listed = find_attribute_list(&rec0, &mut v, &geo);
+    let mft = match listed
+        .as_deref()
+        .map(|l| data_extents(l, &mut v, &mft, &geo, sector))
+    {
+        Some(Ok(Some((runs, real_size)))) => {
+            Mft::over(runs, real_size as u64, len, &geo).unwrap_or(mft)
+        }
+        _ => mft,
+    };
+    if listed.is_some() && mft.size < mft.declared {
         budget.count_entry()?;
         if let Some(r) = held(
             visit,
             Entry::unsupported(
-                format!("<ntfs-records-beyond-{MAX_RECORDS}>"),
-                0,
+                "<ntfs-volume>".to_string(),
+                len,
                 false,
-                "too many MFT records to walk them all",
+                "NTFS master file table not fully mapped: the records past what it maps \
+                 were not walked",
             ),
             budget,
         ) {
@@ -1048,7 +1214,14 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
         }
     }
 
-    for i in FIRST_USER_RECORD..n {
+    let records = crate::bytes::to_usize(mft.size.checked_div(geo.record_size as u64).unwrap_or(0));
+
+    // Each record of the table is one member, used or not, and the members a
+    // record yields are not counted again: the limit is on the records read,
+    // so a table that declares more than `max_members` ends the walk with the
+    // limit, as one entry too many does in any container.
+    for i in FIRST_USER_RECORD..records {
+        budget.count_entry()?;
         let Some(mut rec) = mft.record(&mut v, &geo, i as u64) else {
             break;
         };
@@ -1057,10 +1230,9 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
         }
         // Past this point the slot carries the `FILE` magic, so a record IS here
         // and whatever it names is a file on the volume. Failing to read it is a
-        // gap to report, not a slot to skip — an unused slot was already handled
+        // gap to report, not a slot to skip: an unused slot was already handled
         // above, and conflating the two hides real files.
         if !apply_fixups(&mut rec, sector) {
-            budget.count_entry()?;
             if let Some(r) = held(
                 visit,
                 Entry::unsupported(
@@ -1076,8 +1248,8 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
             continue;
         }
         let cap = crate::bytes::to_usize(budget.reserve()?);
-        // `None` here means "not a user file with content" — a directory, or the
-        // volume's own metadata — not a parse failure. Reporting it would flag
+        // `None` here means "not a user file with content" (a directory, or the
+        // volume's own metadata), not a parse failure. Reporting it would flag
         // every healthy volume, which the reserved records 16..63 make loud.
         let Some(f) = parse_record(&rec, &mut v, &mft, &geo, sector, cap) else {
             continue;
@@ -1097,31 +1269,40 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
         // A file can be both partly readable and short: the report says what is
         // missing, and the bytes that exist are still scanned. Emitting only one
         // of the two would either hide the gap or throw away content.
-        if let Some(why) = f.unreadable {
-            budget.count_entry()?;
-            if let Some(r) = held(
+        if let Some(why) = f.unreadable
+            && let Some(r) = held(
                 visit,
                 Entry::unsupported(name.clone(), 0, why.contains("encrypted"), why),
                 budget,
-            ) {
-                return Ok(Some(r));
-            }
+            )
+        {
+            return Ok(Some(r));
         }
         if let Some(d) = f.data
             && !d.is_empty()
         {
-            budget.count_entry()?;
             budget.commit(d.len() as u64);
             if let Some(r) = held(visit, Entry::new(name, d), budget) {
                 return Ok(Some(r));
             }
-        } else if let Some((runs, size)) = f.stream {
-            budget.count_entry()?;
-            let plan = Runs {
-                runs: runs.into_iter(),
-                cluster: geo.cluster as u64,
+        } else if let Some((runs, size, unit)) = f.stream {
+            let cluster = geo.cluster as u64;
+            let got = match unit {
+                // Held when it fits what a member may hold, as a file is.
+                Some(unit) => read_file(
+                    &mut v,
+                    Compressed::new(runs, cluster, unit, size),
+                    size,
+                    cap as u64,
+                ),
+                None => {
+                    let plan = Runs {
+                        runs: runs.into_iter(),
+                        cluster,
+                    };
+                    read_file(&mut v, Pieces::new(plan, size), size, 0)
+                }
             };
-            let got = read_file(&mut v, Pieces::new(plan, size), size, 0);
             if let Some(r) = hand(budget, &mut *visit, name, Attrs::default(), got) {
                 return Ok(Some(r));
             }
@@ -1226,5 +1407,504 @@ mod tests {
         assert_eq!(out, [9]);
         assert!(v.append(60, 4, &mut out));
         assert_eq!(out, [9, 60, 61, 62, 63]);
+    }
+
+    /// A volume of 64 clusters of 16 bytes holding a file of compression units
+    /// of 4 clusters, one of each way a unit is stored, with the file as
+    /// Windows reads it and the runs that describe it:
+    ///
+    /// 0. compressed, in the fewest clusters, the rest of the unit sparse;
+    /// 1. stored as it is, in four clusters, its bytes a valid LZNT1 chunk, an
+    ///    end marker and then the payload;
+    /// 2. a hole of four clusters;
+    /// 3. compressed to fewer bytes than a unit (zeros after them);
+    /// 4. a hole of sixteen clusters, four units;
+    /// 5. stored as it is, the last unit, the file ending inside it.
+    fn compressed_file() -> (Vec<u8>, Vec<Run>, Vec<u8>) {
+        const UNIT: usize = 64;
+        let mut disk = vec![0u8; 16 * 64];
+        let mut file = Vec::new();
+        let mut runs = Vec::new();
+        let clusters = |bytes: usize| bytes.div_ceil(16) as u64;
+        let place = |disk: &mut Vec<u8>, at: u64, bytes: &[u8]| {
+            let from = at as usize * 16;
+            disk[from..from + bytes.len()].copy_from_slice(bytes);
+        };
+        let repetitive =
+            |word: &[u8], n: usize| -> Vec<u8> { word.iter().cycle().take(n).copied().collect() };
+
+        let plain = repetitive(b"compressible ", UNIT);
+        let mut packed = Vec::new();
+        lznt1::compress(&plain, &mut packed);
+        assert!(clusters(packed.len()) < 4);
+        place(&mut disk, 2, &packed);
+        runs.push(Run {
+            lcn: Some(2),
+            clusters: clusters(packed.len()),
+        });
+        runs.push(Run {
+            lcn: None,
+            clusters: 4 - clusters(packed.len()),
+        });
+        file.extend_from_slice(&plain);
+
+        let mut raw = Vec::new();
+        lznt1::compress(&repetitive(b"benign ", 28), &mut raw);
+        raw.extend_from_slice(&[0, 0]);
+        raw.extend_from_slice(b"PAYLOAD-AFTER-THE-END-MARKER");
+        raw.resize(UNIT, b'#');
+        place(&mut disk, 8, &raw);
+        runs.push(Run {
+            lcn: Some(8),
+            clusters: 4,
+        });
+        file.extend_from_slice(&raw);
+
+        runs.push(Run {
+            lcn: None,
+            clusters: 4,
+        });
+        file.extend_from_slice(&[0; UNIT]);
+
+        let short = repetitive(b"short unit ", 40);
+        let mut packed = Vec::new();
+        lznt1::compress(&short, &mut packed);
+        assert!(clusters(packed.len()) < 4);
+        place(&mut disk, 20, &packed);
+        runs.push(Run {
+            lcn: Some(20),
+            clusters: clusters(packed.len()),
+        });
+        runs.push(Run {
+            lcn: None,
+            clusters: 4 - clusters(packed.len()),
+        });
+        file.extend_from_slice(&short);
+        file.resize(file.len() + UNIT - short.len(), 0);
+
+        runs.push(Run {
+            lcn: None,
+            clusters: 16,
+        });
+        file.extend_from_slice(&[0; 4 * UNIT]);
+
+        let last = repetitive(b"last unit, stored. ", UNIT);
+        place(&mut disk, 40, &last);
+        runs.push(Run {
+            lcn: Some(40),
+            clusters: 4,
+        });
+        // The file ends 10 bytes into the last unit's final cluster.
+        file.extend_from_slice(&last[..UNIT - 10]);
+        (disk, runs, file)
+    }
+
+    /// What `read_file` gives of the file: the bytes, the bytes of holes among
+    /// them, whether it came as a stream, and whether it was whole.
+    fn read_compressed(cap: u64, runs: Vec<Run>, size: u64) -> (Vec<u8>, u64, bool, bool) {
+        use crate::formats::vol::Got;
+        let (disk, ..) = compressed_file();
+        let mut cursor = Cursor::new(disk);
+        let mut v = Vol {
+            len: cursor.get_ref().len() as u64,
+            disk: &mut cursor,
+            max: usize::MAX,
+        };
+        match read_file(&mut v, Compressed::new(runs, 16, 4, size), size, cap) {
+            Got::Whole(d) => (d, 0, false, true),
+            Got::Partial(d, _) => (d, 0, false, false),
+            Got::Stream(mut r, _, holes) => {
+                let mut d = Vec::new();
+                let whole = r.read_to_end(&mut d).is_ok();
+                (d, holes.get(), true, whole)
+            }
+            _ => panic!("neither held nor read as it goes"),
+        }
+    }
+
+    /// Every unit is what its allocation says: a stored unit that starts like
+    /// LZNT1 is the bytes it holds, a hole is a whole unit of zeros (the next
+    /// units are not moved up), and a unit that decodes to less is padded to
+    /// its size.
+    #[test]
+    fn a_compressed_file_is_read_by_the_clusters_each_unit_has_allocated() {
+        let (_, runs, file) = compressed_file();
+        let size = file.len() as u64;
+        // Held, and read as it goes: the same bytes.
+        let (held, _, streamed, whole) = read_compressed(size, runs.clone(), size);
+        assert!(whole && !streamed);
+        assert!(held == file, "held");
+        let (went, holes, streamed, whole) = read_compressed(100, runs, size);
+        assert!(whole && streamed);
+        assert!(went == file, "read as it goes");
+        // The hole of unit 2 and the four units of the hole, and the sparse
+        // parts of the compressed units that are not read at all.
+        assert_eq!(holes, 5 * 64);
+    }
+
+    /// A unit that is stored and whose bytes are a valid LZNT1 chunk and an end
+    /// marker is not decoded: that is what the old rule, "does it decode",
+    /// turned into the short benign text.
+    #[test]
+    fn a_stored_unit_that_starts_like_lznt1_is_not_decoded() {
+        let (_, runs, file) = compressed_file();
+        let (got, ..) = read_compressed(u64::MAX, runs, file.len() as u64);
+        let marker = b"PAYLOAD-AFTER-THE-END-MARKER";
+        assert!(got.windows(marker.len()).any(|w| w == marker));
+    }
+
+    /// The run list `runs` as an MFT record holds it: lengths of a byte, offsets
+    /// of two bytes, holes with none.
+    fn encoded(runs: &[Run]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut at = 0i64;
+        for r in runs {
+            match r.lcn {
+                None => out.extend_from_slice(&[0x01, r.clusters as u8]),
+                Some(lcn) => {
+                    out.extend_from_slice(&[0x21, r.clusters as u8]);
+                    out.extend_from_slice(&((lcn - at) as i16).to_le_bytes());
+                    at = lcn;
+                }
+            }
+        }
+        out.push(0);
+        out
+    }
+
+    /// A record with one non-resident `$DATA` attribute, `flags` and a
+    /// compression unit of 2^`unit` clusters.
+    fn record(runs: &[Run], size: u64, flags: u16, unit: u16) -> Vec<u8> {
+        let mut rec = vec![0u8; 1024];
+        rec[0..4].copy_from_slice(b"FILE");
+        rec[20..22].copy_from_slice(&0x38u16.to_le_bytes());
+        rec[22..24].copy_from_slice(&1u16.to_le_bytes());
+        let list = encoded(runs);
+        let len = (0x48 + list.len()).next_multiple_of(8);
+        let a = 0x38;
+        rec[a..a + 4].copy_from_slice(&ATTR_DATA.to_le_bytes());
+        rec[a + 4..a + 8].copy_from_slice(&(len as u32).to_le_bytes());
+        rec[a + 8] = 1;
+        rec[a + 12..a + 14].copy_from_slice(&flags.to_le_bytes());
+        rec[a + 0x20..a + 0x22].copy_from_slice(&0x48u16.to_le_bytes());
+        rec[a + 0x22..a + 0x24].copy_from_slice(&unit.to_le_bytes());
+        rec[a + 0x30..a + 0x38].copy_from_slice(&size.to_le_bytes());
+        rec[a + 0x48..a + 0x48 + list.len()].copy_from_slice(&list);
+        rec[a + len..a + len + 4].copy_from_slice(&ATTR_END.to_le_bytes());
+        rec
+    }
+
+    /// The record of a compressed file is read by the unit it names, held or
+    /// read as it goes, whatever its size against what a member may hold.
+    #[test]
+    fn a_record_of_a_compressed_file_is_read_through_its_units() {
+        let (disk, runs, file) = compressed_file();
+        let size = file.len() as u64;
+        let geo = Geometry {
+            cluster: 16,
+            record_size: 1024,
+            mft_lcn: 0,
+        };
+        let mft = Mft {
+            runs: Vec::new(),
+            size: 0,
+            declared: 0,
+        };
+        for cap in [10, usize::MAX] {
+            let mut cursor = Cursor::new(disk.clone());
+            let mut v = Vol {
+                len: disk.len() as u64,
+                disk: &mut cursor,
+                max: usize::MAX,
+            };
+            let rec = record(&runs, size, ATTR_COMPRESSED, 2);
+            let f = parse_record(&rec, &mut v, &mft, &geo, 512, cap).expect("a file");
+            assert!(f.data.is_none() && f.unreadable.is_none(), "cap {cap}");
+            let (stream_runs, n, unit) = f.stream.expect("read through its units");
+            assert_eq!((n, unit), (size, Some(4)), "cap {cap}");
+            let fill = Compressed::new(stream_runs, 16, 4, n);
+            let got = match read_file(&mut v, fill, n, u64::MAX) {
+                crate::formats::vol::Got::Whole(d) => d,
+                _ => panic!("cap {cap}: not held"),
+            };
+            assert!(got == file, "cap {cap}");
+        }
+        // A unit over the buffer limit is reported, not read.
+        let mut cursor = Cursor::new(disk.clone());
+        let mut v = Vol {
+            len: disk.len() as u64,
+            disk: &mut cursor,
+            max: 32,
+        };
+        let rec = record(&runs, size, ATTR_COMPRESSED, 2);
+        let f = parse_record(&rec, &mut v, &mft, &geo, 512, usize::MAX).expect("a file");
+        assert!(f.stream.is_none() && f.unreadable.is_some_and(|r| r.contains("compression unit")));
+    }
+
+    /// A resident, unnamed attribute of type `kind` holding `value`.
+    fn resident(kind: u32, value: &[u8]) -> Vec<u8> {
+        let len = (24 + value.len()).next_multiple_of(8);
+        let mut a = vec![0u8; len];
+        a[0..4].copy_from_slice(&kind.to_le_bytes());
+        a[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+        a[16..20].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        a[20..22].copy_from_slice(&24u16.to_le_bytes());
+        a[24..24 + value.len()].copy_from_slice(value);
+        a
+    }
+
+    /// Windows reads the first unnamed `$DATA` of a record. The file is that
+    /// one, and a record with another says it left it out, as it is in no
+    /// other pass.
+    #[test]
+    fn the_first_of_two_unnamed_data_attributes_is_the_file_and_the_other_is_said() {
+        let parse = |values: &[&[u8]]| {
+            let mut rec = vec![0u8; 1024];
+            rec[0..4].copy_from_slice(b"FILE");
+            rec[20..22].copy_from_slice(&0x38u16.to_le_bytes());
+            rec[22..24].copy_from_slice(&1u16.to_le_bytes());
+            let mut at = 0x38;
+            for value in values {
+                let a = resident(ATTR_DATA, value);
+                rec[at..at + a.len()].copy_from_slice(&a);
+                at += a.len();
+            }
+            rec[at..at + 4].copy_from_slice(&ATTR_END.to_le_bytes());
+            let geo = Geometry {
+                cluster: 16,
+                record_size: 1024,
+                mft_lcn: 0,
+            };
+            let mft = Mft {
+                runs: Vec::new(),
+                size: 0,
+                declared: 0,
+            };
+            let mut cursor = Cursor::new(vec![0u8; 64]);
+            let mut v = Vol {
+                len: 64,
+                disk: &mut cursor,
+                max: usize::MAX,
+            };
+            parse_record(&rec, &mut v, &mft, &geo, 512, usize::MAX).expect("a file")
+        };
+        let f = parse(&[b"first, as Windows reads it", b"second, not read"]);
+        assert_eq!(f.data.as_deref(), Some(&b"first, as Windows reads it"[..]));
+        assert!(f.unreadable.is_some_and(|r| r.contains("several unnamed")));
+        let f = parse(&[b"alone"]);
+        assert_eq!(f.data.as_deref(), Some(&b"alone"[..]));
+        assert!(f.unreadable.is_none());
+    }
+
+    /// A non-resident unnamed `$DATA` attribute whose first VCN is `first`.
+    fn extent(runs: &[Run], first: u64, size: u64) -> Vec<u8> {
+        let list = encoded(runs);
+        let len = (0x48 + list.len()).next_multiple_of(8);
+        let mut a = vec![0u8; len];
+        a[0..4].copy_from_slice(&ATTR_DATA.to_le_bytes());
+        a[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+        a[8] = 1;
+        a[16..24].copy_from_slice(&first.to_le_bytes());
+        a[0x20..0x22].copy_from_slice(&0x48u16.to_le_bytes());
+        a[0x30..0x38].copy_from_slice(&size.to_le_bytes());
+        a[0x48..0x48 + list.len()].copy_from_slice(&list);
+        a
+    }
+
+    /// An MFT record of `attrs` with its update sequence in place.
+    fn mft_record(attrs: &[Vec<u8>]) -> Vec<u8> {
+        let mut rec = vec![0u8; 1024];
+        rec[0..4].copy_from_slice(b"FILE");
+        rec[4..6].copy_from_slice(&0x30u16.to_le_bytes());
+        rec[6..8].copy_from_slice(&3u16.to_le_bytes());
+        rec[20..22].copy_from_slice(&0x38u16.to_le_bytes());
+        rec[22..24].copy_from_slice(&1u16.to_le_bytes());
+        let mut at = 0x38;
+        for a in attrs {
+            rec[at..at + a.len()].copy_from_slice(a);
+            at += a.len();
+        }
+        rec[at..at + 4].copy_from_slice(&ATTR_END.to_le_bytes());
+        for end in [0x30, 510, 1022] {
+            rec[end..end + 2].copy_from_slice(&[1, 0]);
+        }
+        rec
+    }
+
+    /// A volume of 100 clusters of 512 bytes whose `$MFT` is in two extents of
+    /// 20 records each, the second named by the attribute list of record 0 and
+    /// described in record 15. Record 30, in the second extent, is a file.
+    fn split_mft_volume() -> Vec<u8> {
+        let mut disk = vec![0u8; 512 * 100];
+        disk[3..11].copy_from_slice(b"NTFS    ");
+        disk[11..13].copy_from_slice(&512u16.to_le_bytes());
+        disk[13] = 1;
+        disk[0x30..0x38].copy_from_slice(&2u64.to_le_bytes());
+        disk[0x40] = 0xF6;
+        disk[510..512].copy_from_slice(&[0x55, 0xAA]);
+        let first = [Run {
+            lcn: Some(2),
+            clusters: 40,
+        }];
+        let second = [Run {
+            lcn: Some(50),
+            clusters: 40,
+        }];
+        let mut list = Vec::new();
+        for (vcn, record) in [(0u64, 0u64), (40, 15)] {
+            let mut e = vec![0u8; 32];
+            e[0..4].copy_from_slice(&ATTR_DATA.to_le_bytes());
+            e[4..6].copy_from_slice(&32u16.to_le_bytes());
+            e[7] = 26;
+            e[8..16].copy_from_slice(&vcn.to_le_bytes());
+            e[16..24].copy_from_slice(&record.to_le_bytes());
+            list.extend_from_slice(&e);
+        }
+        let mut put = |at: usize, rec: &[u8]| disk[at..at + rec.len()].copy_from_slice(rec);
+        put(
+            2 * 512,
+            &mft_record(&[resident(0x20, &list), extent(&first, 0, 40960)]),
+        );
+        put(2 * 512 + 15 * 1024, &mft_record(&[extent(&second, 40, 0)]));
+        put(
+            50 * 512 + 10 * 1024,
+            &mft_record(&[resident(ATTR_DATA, b"payload in the second extent")]),
+        );
+        disk
+    }
+
+    /// Each member of the volume `disk`: name, bytes, why not whole.
+    fn walked(disk: Vec<u8>) -> Vec<(String, Vec<u8>, Option<&'static str>)> {
+        let len = disk.len() as u64;
+        let mut budget = crate::Budget::new(crate::Limits::default());
+        let mut got = Vec::new();
+        walk_volume(
+            &mut Cursor::new(disk),
+            len,
+            &mut budget,
+            &mut |f: Found<'_>, _: &mut Budget| {
+                let e = f.whole();
+                got.push((e.name, e.data, e.unsupported));
+                None
+            },
+        )
+        .unwrap();
+        got
+    }
+
+    /// The records of a `$MFT` past its first extent are files too: the
+    /// extents are found through the attribute list of record 0. When they
+    /// cannot be, the volume says the table was not walked to its end.
+    #[test]
+    fn a_master_file_table_in_two_extents_is_walked_to_its_end() {
+        let got = walked(split_mft_volume());
+        let names: Vec<&String> = got.iter().map(|g| &g.0).collect();
+        let file = got
+            .iter()
+            .find(|g| g.0 == "<mft-record-30>")
+            .unwrap_or_else(|| panic!("{names:?}"));
+        assert_eq!(file.1, b"payload in the second extent");
+        assert!(got.iter().all(|g| g.2.is_none()), "{names:?}");
+
+        let mut broken = split_mft_volume();
+        broken[2 * 512 + 15 * 1024..2 * 512 + 16 * 1024].fill(0);
+        let got = walked(broken);
+        assert!(
+            got.iter()
+                .any(|g| g.2.is_some_and(|r| r.contains("not fully mapped")))
+        );
+        assert!(!got.iter().any(|g| g.0 == "<mft-record-30>"));
+    }
+
+    /// A unit whose clusters do not decode, a file whose runs end before it
+    /// does, and a compression unit that is not the one the runs were cut
+    /// by, are each not whole: never a short file passed off as the file.
+    #[test]
+    fn a_compressed_file_the_volume_does_not_give_is_not_whole() {
+        let (_, runs, file) = compressed_file();
+        let size = file.len() as u64;
+        // The first unit's compressed clusters are garbage.
+        let (mut bad, ..) = compressed_file();
+        bad[2 * 16..2 * 16 + 4].copy_from_slice(&[0xFF, 0xBF, 1, 2]);
+        let mut cursor = Cursor::new(bad);
+        let mut v = Vol {
+            len: cursor.get_ref().len() as u64,
+            disk: &mut cursor,
+            max: usize::MAX,
+        };
+        let got = read_file(
+            &mut v,
+            Compressed::new(runs.clone(), 16, 4, size),
+            size,
+            u64::MAX,
+        );
+        assert!(
+            matches!(&got, crate::formats::vol::Got::Partial(_, why) if why.contains("did not decompress")),
+            "a unit that does not decompress"
+        );
+        // Runs that end before the size does.
+        let (_, _, _, whole) = read_compressed(u64::MAX, runs[..4].to_vec(), size);
+        assert!(!whole);
+        let (_, _, _, whole) = read_compressed(100, runs[..4].to_vec(), size);
+        assert!(!whole);
+    }
+
+    /// Why a compressed file breaks, held and read as it goes: the reason of
+    /// the held file, and the error that ends the read of the other.
+    fn why_it_breaks(runs: Vec<Run>, size: u64) -> (String, String) {
+        use crate::formats::vol::Got;
+        let (disk, ..) = compressed_file();
+        let mut said = Vec::new();
+        for cap in [u64::MAX, 100] {
+            let mut cursor = Cursor::new(disk.clone());
+            let mut v = Vol {
+                len: cursor.get_ref().len() as u64,
+                disk: &mut cursor,
+                max: usize::MAX,
+            };
+            said.push(
+                match read_file(
+                    &mut v,
+                    Compressed::new(runs.clone(), 16, 4, size),
+                    size,
+                    cap,
+                ) {
+                    Got::Partial(_, why) => why.to_string(),
+                    Got::Stream(mut r, ..) => r
+                        .read_to_end(&mut Vec::new())
+                        .err()
+                        .map_or_else(|| "whole".to_string(), |e| e.to_string()),
+                    _ => "whole".to_string(),
+                },
+            );
+        }
+        (said[0].clone(), said[1].clone())
+    }
+
+    /// Each way a compressed file breaks has its own reason, held or read as it
+    /// goes.
+    #[test]
+    fn a_compressed_file_that_breaks_says_why() {
+        let (_, runs, file) = compressed_file();
+        let size = file.len() as u64;
+        // The runs end before the size does.
+        let (held, went) = why_it_breaks(runs[..4].to_vec(), size);
+        assert!(held.contains("runs end before its size"), "{held}");
+        assert_eq!(held, went);
+        // A compressed unit (the first run) and a stored one (the third) whose
+        // clusters are not in the volume.
+        for unit in [0, 2] {
+            let mut gone = runs.clone();
+            gone[unit] = Run {
+                lcn: Some(1 << 20),
+                clusters: gone[unit].clusters,
+            };
+            let (held, went) = why_it_breaks(gone, size);
+            assert!(
+                held.contains("not all in the volume"),
+                "unit {unit}: {held}"
+            );
+            assert_eq!(held, went, "unit {unit}");
+        }
     }
 }

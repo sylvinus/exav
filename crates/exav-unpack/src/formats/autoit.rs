@@ -83,12 +83,69 @@ const EA06: Version = Version {
     content: 0x2477,
 };
 
-pub(crate) fn is_autoit(p: &crate::Probe) -> bool {
-    p.find(MARKER_EA05).is_some() || p.find(MARKER_EA06).is_some()
+/// The 16 bytes that come before the marker in a compiled script: in the
+/// `SCRIPT` resource of an executable (EA06) and in the data appended to one
+/// (EA05), as AutoIt-Ripper's constants and a published dump show.
+const SCRIPT_GUID: [u8; 16] = [
+    0xA3, 0x48, 0x4B, 0xBE, 0x98, 0x6C, 0x4A, 0xA9, 0x99, 0x4C, 0x53, 0x0A, 0x86, 0xD6, 0x48, 0x7D,
+];
+
+const fn after_guid(marker: &[u8; 8]) -> [u8; 24] {
+    let mut out = [0u8; 24];
+    let mut i = 0;
+    while i < 24 {
+        out[i] = if i < 16 {
+            SCRIPT_GUID[i]
+        } else {
+            marker[i - 16]
+        };
+        i += 1;
+    }
+    out
 }
 
-fn find_marker(data: &[u8], needle: &[u8; 8]) -> Option<usize> {
-    memchr::memmem::find(data, needle)
+/// What [`is_autoit`] searches an object for, and the length of the part
+/// before the marker.
+pub(crate) const GUID_EA05: [u8; 24] = after_guid(MARKER_EA05);
+pub(crate) const GUID_EA06: [u8; 24] = after_guid(MARKER_EA06);
+const GUID_LEN: usize = 16;
+
+/// Whether an object starts with the marker, as a script saved by itself does.
+pub(crate) fn starts_with_marker(head: &[u8]) -> bool {
+    head.starts_with(MARKER_EA05) || head.starts_with(MARKER_EA06)
+}
+
+/// A compiled script: the marker at the object's start, or after the script
+/// GUID in its start (a resource of the executable) or in the bytes after an
+/// executable's image (where a script of old is appended). A marker alone
+/// elsewhere is a string.
+pub(crate) fn is_autoit(p: &crate::Probe) -> bool {
+    let holds = |hay: &[u8]| {
+        memchr::memmem::find(hay, &GUID_EA05).is_some()
+            || memchr::memmem::find(hay, &GUID_EA06).is_some()
+    };
+    starts_with_marker(p.head)
+        || holds(p.searched_start())
+        || p.after_image().is_some_and(|(_, after)| holds(&after))
+}
+
+/// Where the first marker of a compiled script is in `data`, and its version.
+fn locate(data: &[u8]) -> Option<(usize, &'static Version)> {
+    let anchored = |needle: &[u8; 24], v: &'static Version| {
+        memchr::memmem::find(data, needle).map(|at| (at + GUID_LEN, v))
+    };
+    let start = [(&MARKER_EA05[..], &EA05), (&MARKER_EA06[..], &EA06)]
+        .into_iter()
+        .find(|(m, _)| data.starts_with(m))
+        .map(|(_, v)| (0, v));
+    [
+        start,
+        anchored(&GUID_EA05, &EA05),
+        anchored(&GUID_EA06, &EA06),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|(at, _)| *at)
 }
 
 #[inline]
@@ -104,27 +161,15 @@ fn be32(d: &[u8], p: usize) -> Option<u32> {
     ))
 }
 
-pub(crate) fn extract_autoit<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    if let Some(off) = find_marker(data, MARKER_EA05) {
-        return records(&data[off + 8..], &EA05, budget, visit);
+pub(crate) fn extract_autoit(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
+    match locate(data) {
+        Some((off, version)) => records(&data[off + 8..], version, budget, visit),
+        None => Ok(None),
     }
-    if let Some(off) = find_marker(data, MARKER_EA06) {
-        return records(&data[off + 8..], &EA06, budget, visit);
-    }
-    Ok(None)
 }
 
 /// Decode the record stream (`body` starts just past the marker).
-fn records<R>(
-    body: &[u8],
-    v: &Version,
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+fn records(body: &[u8], v: &Version, budget: &mut Budget, visit: Sink) -> crate::Extracted {
     if body.len() < 16 {
         return Ok(None);
     }
@@ -207,7 +252,10 @@ fn records<R>(
             continue;
         }
         if out.len() as u64 > cap {
-            return Err(LimitHit::new("autoit member exceeds budget".to_string()));
+            let spent = out.len() as u64;
+            let subtype = crate::tree::quoted(&subtype);
+            budget.over_cap(cap, spent, format_args!("autoit member '{subtype}'"))?;
+            continue;
         }
 
         budget.count_entry()?;
@@ -743,6 +791,35 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "autoit-script.au3");
         assert_eq!(entries[0].data, script);
+    }
+
+    /// The script is read from the marker after the GUID, not from a string
+    /// of the same bytes before it (the strings of the program that runs it).
+    #[test]
+    fn a_marker_with_no_guid_before_the_script_is_not_where_it_is_read() {
+        let script = b"; AutoIt\nMsgBox(0, \"x\", \"MALWARETEST\")\n";
+        let blob = build_ea05_stored(b">>>AUTOIT SCRIPT<<<", script);
+        let mut data = b"MZ".to_vec();
+        data.resize(100, 0);
+        data.extend_from_slice(MARKER_EA06);
+        data.extend_from_slice(b"strings of the interpreter");
+        data.resize(400, 0);
+        data.extend_from_slice(&SCRIPT_GUID);
+        data.extend_from_slice(&blob);
+        assert!(is_autoit(&data));
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Autoit, &data, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].data, script);
+        // The same without the GUID is a string and a file with no script.
+        data.drain(400..400 + SCRIPT_GUID.len());
+        assert!(!is_autoit(&data));
+        let mut budget = Budget::new(Limits::default());
+        assert!(
+            extract(Format::Autoit, &data, &mut budget)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

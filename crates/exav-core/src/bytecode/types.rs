@@ -63,7 +63,7 @@ impl TypeTable {
         // Predefined static pointer types (ids 65..69): pointers to i8, i16,
         // i32, i64 respectively (contained-type codes {8,16,32,64}). Their
         // pointee size is what GEP uses to scale an index, so this must be
-        // exact — `Pointer(0)` would make every typed GEP stride by 1.
+        // exact: `Pointer(0)` would make every typed GEP stride by 1.
         let mut defs = vec![
             TypeDef::Pointer(8),
             TypeDef::Pointer(16),

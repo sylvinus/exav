@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the filesystem images of this directory.
 #
-#     bash make.sh [ext] [fat] [exfat] [squashfs] [cramfs] [romfs] [erofs]
+#     bash make.sh [ext] [fat] [exfat] [squashfs] [cramfs] [romfs] [erofs] [erofs_z]
 #
 # Each image holds the tree of tree.py (the suites compare a walk with it), and
 # is kept gzipped, a filesystem being mostly empty space. The tools are
@@ -158,7 +158,7 @@ erofs() {
     keep "$WORK/small.erofs" erofs_small_blocks
     mkfs.erofs -E force-inode-compact "$WORK/compact.erofs" "$WORK/tree" > /dev/null 2>&1
     keep "$WORK/compact.erofs" erofs_compact_inodes
-    # Compressed: the files are reported, the directories are read.
+    # Compressed with LZ4.
     mkfs.erofs -zlz4hc "$WORK/lz4.erofs" "$WORK/tree" > /dev/null 2>&1
     keep "$WORK/lz4.erofs" erofs_lz4
     # Files in chunks, with holes.
@@ -167,12 +167,42 @@ erofs() {
     keep "$WORK/chunks.erofs" erofs_chunks
 }
 
+# The tree and zextras.py's files, compressed each way mkfs.erofs can: the
+# algorithms, the full index (legacy-compress), physical clusters of 64 KiB,
+# the last extent after the index (ztailpacking), blocks of 1 KiB, and the
+# tails kept in the packed inode (fragments), which are reported. Then one file
+# of 64 MiB of zeros with each algorithm, for the memory tests.
+erofs_z() {
+    rm -rf "$WORK/tree"
+    tree "$WORK/tree"
+    python3 "$DIR/zextras.py" "$WORK/tree"
+    ln -s tiny.txt "$WORK/tree/link"
+    z() { mkfs.erofs "${@:2}" "$WORK/$1.erofs" "$WORK/tree" > /dev/null 2>&1; keep "$WORK/$1.erofs" "erofs_z_$1"; }
+    z lz4 -zlz4
+    z lz4hc -zlz4hc
+    z lzma -zlzma
+    z deflate -zdeflate
+    z zstd -zzstd
+    z legacy -zlz4hc -E legacy-compress
+    z big -zlz4hc -C 65536
+    z lzma_big -zlzma -C 65536
+    z tail -zlz4hc -E ztailpacking
+    z blocks1k -zlz4hc -b 1024
+    z fragments -zlz4hc -E fragments
+    rm -rf "$WORK/tree"
+    python3 "$DIR/zextras.py" "$WORK/tree" --zeros-only
+    for a in lz4hc lzma deflate zstd; do
+        mkfs.erofs "-z$a" "$WORK/zeros_$a.erofs" "$WORK/tree" > /dev/null 2>&1
+        keep "$WORK/zeros_$a.erofs" "erofs_zeros_$a"
+    done
+}
+
 exfat() {
     # Written by a kernel (sudo); the sparse file does not fit.
     kernel exfat "mkfs.exfat -c 4096 IMG" 16 "uid=$(id -u)" 30000 trunc
     kernel exfat_small_clusters "mkfs.exfat -c 512 IMG" 16 "uid=$(id -u)" 30000 trunc
 }
 
-[ $# -eq 0 ] && set -- ext fat exfat squashfs cramfs romfs erofs
+[ $# -eq 0 ] && set -- ext fat exfat squashfs cramfs romfs erofs erofs_z
 for what in "$@"; do "$what"; done
 ls -l "$DIR"/*.img.gz

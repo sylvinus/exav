@@ -4,12 +4,12 @@
 //! Fixtures each hold a single member, `eicar.txt` (the exact EICAR test
 //! string), encrypted with password `secret` (ZIP) / `password` (7z):
 //!
-//! * `zip_aes256_store.zip`      — WinZip AES-256
-//! * `zip_zipcrypto_store.zip`   — legacy PKWARE ZipCrypto
-//! * `aes256_hdr.7z`             — header-encrypted 7z (`-mhe=on`)
+//! * `zip_aes256_store.zip`: WinZip AES-256
+//! * `zip_zipcrypto_store.zip`: legacy PKWARE ZipCrypto
+//! * `aes256_hdr.7z`: header-encrypted 7z (`-mhe=on`)
 //!
 //! With the password the inner EICAR is FOUND (`Infected`); without it the scan
-//! is `PasswordProtected` — never `Clean`, never `Infected`.
+//! is `PasswordProtected`, never `Clean`, never `Infected`.
 
 use exav_core::{ScanOptions, Verdict, analyze, loader};
 
@@ -83,13 +83,86 @@ fn sevenz_encrypted_header_decrypts_and_finds_eicar() {
         ),
         other => panic!("expected Infected with password, got {other:?}"),
     }
-    // Without the password: PasswordProtected — never Clean, never Infected.
+    // Without the password: PasswordProtected, never Clean, never Infected.
     for opts in [ScanOptions::default(), with_pw("wrong")] {
         match analyze(&db, &blob, &opts).verdict {
             Verdict::PasswordProtected { .. } => {}
             other => panic!("expected PasswordProtected without password, got {other:?}"),
         }
     }
+}
+
+/// `aes_copy_eicar.7z` (exav-unpack's fixtures; password `hunter2`; three
+/// folders of one file each, AES and then Copy, one of them the EICAR string),
+/// with the CRCs of its files taken out of the header, which is not
+/// compressed, and the checksums of the headers made right again.
+fn sevenz_without_crcs() -> Vec<u8> {
+    let p = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../exav-unpack/tests/fixtures/7z/aes_copy_eicar.7z"
+    );
+    let blob = exav_core::unpack::read_fixture(p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+    let crc = |d: &[u8]| {
+        let mut c = flate2::Crc::new();
+        c.update(d);
+        c.sum()
+    };
+    let u64_at = |at: usize| u64::from_le_bytes(blob[at..at + 8].try_into().unwrap()) as usize;
+    let (header_at, size) = (32 + u64_at(12), u64_at(20));
+    let header = &blob[header_at..header_at + size];
+    // The digests of the substreams: property 0x0A, all defined, one CRC for
+    // each of the three folders.
+    let at = header
+        .windows(2)
+        .rposition(|w| w == [0x0A, 0x01])
+        .expect("the digests are in the header");
+    assert_eq!(header[at + 2 + 12..at + 2 + 14], [0, 0], "three CRCs");
+    let mut new = header[..at].to_vec();
+    new.extend_from_slice(&[0x0A, 0x00, 0x00]);
+    new.extend_from_slice(&header[at + 2 + 12..]);
+    let mut out = blob[..header_at].to_vec();
+    out[20..28].copy_from_slice(&(new.len() as u64).to_le_bytes());
+    out[28..32].copy_from_slice(&crc(&new).to_le_bytes());
+    let start = crc(&out[12..32]);
+    out[8..12].copy_from_slice(&start.to_le_bytes());
+    out.extend_from_slice(&new);
+    out
+}
+
+/// With no CRC in the header nothing confirms the password, and with a stored
+/// coder under the cipher a wrong one decodes as well as the right one: what
+/// it gives is garbage. The folders are read with the first password that
+/// decodes them and the archive is PasswordProtected, unless something is
+/// found in what they decode to.
+#[test]
+fn a_7z_without_crcs_is_password_protected_unless_something_is_found() {
+    let db = builtin_db();
+    let eicar = |blob: &[u8], opts: &ScanOptions| {
+        matches!(&analyze(&db, blob, opts).verdict, Verdict::Infected { signature, .. }
+            if signature.to_ascii_uppercase().contains("EICAR"))
+    };
+    let password_protected = |blob: &[u8], opts: &ScanOptions| {
+        matches!(
+            analyze(&db, blob, opts).verdict,
+            Verdict::PasswordProtected { .. }
+        )
+    };
+    let p = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../exav-unpack/tests/fixtures/7z/aes_copy_eicar.7z"
+    );
+    let with_crcs = exav_core::unpack::read_fixture(p).unwrap();
+    // As 7-Zip wrote it, the CRCs tell the password: found with the right
+    // one, refused with a wrong one.
+    assert!(eicar(&with_crcs, &with_pw("hunter2")));
+    assert!(password_protected(&with_crcs, &with_pw("nope")));
+
+    let blob = sevenz_without_crcs();
+    // The right password still finds what is there.
+    assert!(eicar(&blob, &with_pw("hunter2")));
+    // A wrong one decodes to garbage, in which nothing is found.
+    assert!(password_protected(&blob, &with_pw("nope")));
+    assert!(password_protected(&blob, &ScanOptions::default()));
 }
 
 /// The `.pwdb` pool (loaded into the database) also supplies decryption
@@ -109,13 +182,47 @@ fn pwdb_pool_supplies_decryption_password() {
     assert_eq!(db.passwords(), &["secret".to_string()][..]);
 
     let blob = fixture("zip_aes256_store.zip");
-    // No runtime password — only the `.pwdb` pool — still decrypts + detects.
+    // No runtime password, only the `.pwdb` pool: it still decrypts and detects.
     match analyze(&db, &blob, &ScanOptions::default()).verdict {
         Verdict::Infected { signature, .. } => assert!(
             signature.to_ascii_uppercase().contains("EICAR"),
             "unexpected signature {signature}"
         ),
         other => panic!("expected Infected from .pwdb pool, got {other:?}"),
+    }
+}
+
+/// An encrypted archive among the members of another is reported as
+/// password-protected once the other members are scanned, whatever their
+/// order; the password reaches it.
+#[test]
+fn an_encrypted_archive_inside_an_archive_is_password_protected() {
+    use std::io::Write;
+
+    let db = builtin_db();
+    let inner = fixture("zip_aes256_store.zip");
+    for encrypted_first in [true, false] {
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let mut members: Vec<(&str, &[u8])> =
+            vec![("inner.zip", &inner[..]), ("note.txt", b"nothing to see")];
+        if !encrypted_first {
+            members.reverse();
+        }
+        for (name, data) in members {
+            z.start_file(name, stored).unwrap();
+            z.write_all(data).unwrap();
+        }
+        let outer = z.finish().unwrap().into_inner();
+        match analyze(&db, &outer, &ScanOptions::default()).verdict {
+            Verdict::PasswordProtected { .. } => {}
+            other => panic!("first {encrypted_first}: expected PasswordProtected, got {other:?}"),
+        }
+        match analyze(&db, &outer, &with_pw("secret")).verdict {
+            Verdict::Infected { .. } => {}
+            other => panic!("first {encrypted_first}: expected Infected, got {other:?}"),
+        }
     }
 }
 

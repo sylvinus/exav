@@ -378,6 +378,13 @@ fn every_flag_named_in_a_message_exists() {
         "password",
         // Removed from exav, named in the error that says what replaced it.
         "build-shard-bytes",
+        "icap-idle-secs",
+        "icap-max-requests",
+        "icap-max-header-bytes",
+        "icap-preview-bytes",
+        "icap-transfer-preview",
+        "icap-options-ttl-secs",
+        "icap-infection-header",
     ];
 
     let real = flags_in_help();

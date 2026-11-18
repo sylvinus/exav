@@ -20,6 +20,7 @@ import { ExternalConversionError, externalUrl, loadExternal, NeedsConverterError
 import { nativeFirst } from "./route.js";
 import { convertSheet, SheetConversionError, sniffSheet } from "./sheets.js";
 import { convertSlides, SlideConversionError, sniffSlides } from "./slides.js";
+import { officeKinds } from "./zip.js";
 
 export { statusOf };
 export { docsFirst, nativeFirst, slidesFirst } from "./route.js";
@@ -40,7 +41,7 @@ export async function prefetchUrls(kind: ConvertedFormat, assetBase: string, opt
 
 /** The file as XLSX from `sheets`, or `null` when it is not one it reads. */
 async function bySheets(bytes: Uint8Array, ctx: RenderContext<ConversionOptions>): Promise<Uint8Array | null> {
-  const format = sniffSheet(bytes);
+  const format = sniffSheet(bytes, await officeKinds(bytes, ctx.signal));
   if (format === "xlsx") return bytes;
   if (!format) return null;
   ctx.status({ phase: "converting", step: "convert" });
@@ -58,7 +59,7 @@ async function bySheets(bytes: Uint8Array, ctx: RenderContext<ConversionOptions>
 
 /** The file as PPTX from `slides`, or `null` when it is not a presentation or drawing it recognises. */
 async function bySlides(bytes: Uint8Array, ctx: RenderContext<ConversionOptions>): Promise<Uint8Array | null> {
-  const format = sniffSlides(bytes);
+  const format = sniffSlides(bytes, await officeKinds(bytes, ctx.signal));
   if (format === "pptx") return bytes;
   if (!format) return null;
   ctx.status({ phase: "converting", step: "convert" });
@@ -76,7 +77,7 @@ async function bySlides(bytes: Uint8Array, ctx: RenderContext<ConversionOptions>
 
 /** The file as DOCX from `docs`, or `null` when it is not a document it recognises. */
 async function byDocs(bytes: Uint8Array, ctx: RenderContext<ConversionOptions>): Promise<Uint8Array | null> {
-  const format = sniffDocs(bytes);
+  const format = sniffDocs(bytes, await officeKinds(bytes, ctx.signal));
   if (format === "docx") return bytes;
   if (!format) return null;
   ctx.status({ phase: "converting", step: "convert" });
@@ -149,7 +150,10 @@ async function byExternal(kind: ConvertedFormat, bytes: Uint8Array, ctx: RenderC
 
 /** Shows `bytes`, of `format`, in a nested session. */
 function show(host: HTMLElement, ctx: RenderContext<ConversionOptions>, format: "pdf" | "xlsx" | "pptx" | "docx", bytes: Uint8Array) {
-  const file: ViewerFile = { id: `${ctx.file.id}#${format}`, name: ctx.file.name, source: { bytes }, format };
+  const { highlights, focusHighlight } = ctx.file;
+  // A PDF made by the external converter has pages to find the file's highlights on.
+  const marks = format === "pdf" ? { ...(highlights && { highlights }), ...(focusHighlight !== undefined && { focusHighlight }) } : {};
+  const file: ViewerFile = { id: `${ctx.file.id}#${format}`, name: ctx.file.name, source: { bytes }, format, ...marks };
   const session = ctx.mountNested(host, file, { forward: true });
   return { controllers: {}, resize: () => session.resize(), destroy: () => session.destroy() };
 }

@@ -1,4 +1,4 @@
-//! Structural validation of images — ClamAV's `Heuristics.Broken.Media.*`.
+//! Structural validation of images: ClamAV's `Heuristics.Broken.Media.*`.
 //!
 //! The premise is that a decoder is forgiving and a parser is not: every viewer
 //! that renders a truncated GIF is being generous, and the generosity is what
@@ -6,7 +6,7 @@
 //! say nothing about pixels.
 //!
 //! Both directions are pinned for every format. A validator that fires on
-//! ordinary images is worse than no validator at all — images are the most
+//! ordinary images is worse than no validator at all: images are the most
 //! common file type on earth, and this alert is opt-in precisely because a false
 //! positive is expensive.
 
@@ -77,12 +77,12 @@ fn valid_jpeg() -> Vec<u8> {
     v.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x10]);
     v.extend_from_slice(b"JFIF\0");
     v.extend_from_slice(&[0x01, 0x01, 0x00, 0, 1, 0, 1, 0, 0]);
-    // SOF0: length 0x0B covers its own 2 bytes plus 9 of payload — precision,
-    // height, width, component count, then 3 bytes for the single component.
+    // SOF0: length 0x0B covers its own 2 bytes plus 9 of payload (precision,
+    // height, width, component count, then 3 bytes for the single component).
     v.extend_from_slice(&[
         0xFF, 0xC0, 0x00, 0x0B, 0x08, 0, 1, 0, 1, 0x01, 0x01, 0x11, 0x00,
     ]);
-    // SOS — entropy data follows and is not validated
+    // SOS: entropy data follows and is not validated
     v.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
     v.extend_from_slice(&[0x00; 8]);
     v
@@ -99,7 +99,7 @@ fn well_formed_images_are_not_flagged() {
         assert_eq!(
             broken_media_alert(&blob),
             None,
-            "{what}: a well-formed image must not be flagged — this alert exists \
+            "{what}: a well-formed image must not be flagged: this alert exists \
              to catch containers that do not hold together, not ordinary files"
         );
     }
@@ -220,7 +220,7 @@ fn a_tiff_ifd_chain_that_loops_backwards_is_flagged() {
 #[test]
 fn a_jpeg_segment_running_past_eof_is_flagged() {
     let mut j = valid_jpeg();
-    // Enlarge the APP0 length beyond the file. The length lives at 4..6 — 2..4
+    // Enlarge the APP0 length beyond the file. The length lives at 4..6; 2..4
     // is the marker itself.
     j[4] = 0xF0;
     assert_eq!(

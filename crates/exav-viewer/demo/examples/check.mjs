@@ -56,7 +56,7 @@ for (const e of manifest.examples) {
   if (!SPDX.test(lic) && !/^public-domain \(.{8,}\)$/.test(lic)) bad(f, `licence "${lic}" is not allowed (use an SPDX id of the list, or "public-domain (reason)")`);
   if (REFUSED.test(lic)) bad(f, `licence "${lic}" is refused`);
   if (NEEDS_ATTRIBUTION.test(lic) && !(e.attribution ?? "").trim()) bad(f, `${lic} needs an attribution line`);
-  if (e.attribution && /—|load-bearing|genuinely/i.test(e.attribution + e.title)) bad(f, "dash or AI wording in the credit");
+  if (e.attribution && ((e.attribution + e.title).includes(String.fromCharCode(0x2014)) || /load-bearing|genuinely/i.test(e.attribution + e.title))) bad(f, "dash or AI wording in the credit");
 
   const origins = ["generated", "fetched", "fixture"].filter((k) => e[k] !== undefined);
   if (!origins.length) bad(f, "none of generated, fetched, fixture");

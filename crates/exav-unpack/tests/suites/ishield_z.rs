@@ -1,14 +1,14 @@
-//! InstallShield Z (`.z`) — the older installer archive.
+//! InstallShield Z (`.z`): the older installer archive.
 //!
 //! **The oracle is the plaintext.** `undhr.z` holds one file, and the upstream
 //! project ships the original of it alongside as `undhr.md`. The assertion is
-//! that what comes out matches that file byte for byte — nothing here trusts
+//! that what comes out matches that file byte for byte: nothing here trusts
 //! the decoder's own output, which matters because the codec is PKWARE's DCL
 //! "implode" and a subtly wrong implementation emits plausible text rather than
 //! an error.
 //!
 //! Not to be confused with the `ISc(` InstallScript cabinet, which exav
-//! recognises and does not open — see `formats/reported.rs` for why.
+//! recognises and does not open (see `formats/reported.rs` for why).
 //!
 //! Fixtures are the `unshield` project's own examples (MIT); see `NOTICE`.
 
@@ -48,7 +48,7 @@ fn an_installshield_z_archive_is_recognised() {
 fn the_magic_alone_does_not_claim_a_file() {
     // Recognition is confirmed against the header's own arithmetic, because the
     // four magic bytes on their own would report an ordinary file as an archive
-    // exav then could not open — a lie in the other direction.
+    // exav then could not open: a lie in the other direction.
     let mut fake = vec![0x13, 0x5D, 0x65, 0x8C];
     fake.extend(std::iter::repeat_n(0u8, 200));
     assert_eq!(detect(&fake), None, "a bare magic must not be enough");
@@ -88,7 +88,7 @@ fn the_decompressed_member_matches_the_original_file() {
     );
     assert_eq!(
         e[0].data, want,
-        "the DCL-imploded member must decode to the original byte for byte — a \
+        "the DCL-imploded member must decode to the original byte for byte: a \
          codec that is subtly wrong emits plausible text, not an error"
     );
 }

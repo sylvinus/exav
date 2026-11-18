@@ -283,7 +283,13 @@ Markdown is read as above. HTML goes through html5gum's tokenizer alone (no
 tree), with a sink that keeps the words and drops comments, scripts, styles,
 templates and iframes; an image is its `alt`. The XML parts of Word,
 PowerPoint, Excel and OpenDocument files (known by their path in the package)
-are read by quick-xml, without field codes and deleted text. DXF and DWG
+are read by quick-xml, without field codes and deleted text. A DOCX, PPTX or
+XLSX package (known by its name or its first part) gives its hyperlinks, each
+label joined to the target its `.rels` part gives, and Word's `HYPERLINK`
+fields. An email gives its headers (From, Sender, Reply-To, To, Cc, Bcc,
+Subject, Date), read by mail-parser with display names and RFC 2047 words
+decoded. An IFC model or another STEP file gives the strings of each instance
+(names, descriptions, property values) without GlobalIds. DXF and DWG
 drawings give their TEXT and MTEXT, attributes with their tags and prompts,
 dimension overrides, multileaders' text, and block and layer names. PDF
 (`text-pdf`) is read by [hayro](https://crates.io/crates/hayro-interpret): each
@@ -320,8 +326,53 @@ flat OpenDocument files and SYLK are told by their first bytes, and the iWork
 files by the name (`.key`, `.keynote`, `.numbers`, `.pages`). A document of
 those kinds whose text could not be taken out (encrypted, past a limit,
 damaged) is never an empty text: `Visible::unreadable` says why, and a scanner
-marks the scan incomplete. Speaker notes and the text of animations are left
-out, as the converters leave them out.
+marks the scan incomplete. A compound file that holds several documents (a
+Word document, a workbook, a presentation) has the text of each, one after
+the other; `office::kinds::compound_kinds` names them. The speaker notes of
+PPT and FODP files and the text of animations are left out, as the converters
+leave them out (a PPTX's notes are a part of their own, and an ODP's are in
+its content, both read).
+
+## QR codes
+
+Feature `qr` (not a default): `qr::find` reads the QR codes in an image of any
+format `image` decodes, through exav-qr (rqrr vendored without `unsafe`), in
+grey, a transparent pixel taken as white. The search is bounded by the image's
+pixels, its time, its memory, the finder patterns it finds, the candidate
+grids it tries and the codes read (`Limits::max_codes`, `max_finders` and
+`max_grids`, `None` for all), and `Found::cut` says when a limit stopped it.
+One of the reader's steps copies the whole image for every candidate group of
+finder patterns, so exav-qr counts its steps in its own loops, reads the clock
+every few thousand of them and returns what it has found when a limit is
+reached; it never unwinds for a limit. The memory of the search (the grey
+image, the copy for a candidate and the working buffers) is counted against
+`max_alloc`, the budget `find` also gives the image decoders. Where panics
+unwind, a panic of the reader on a crafted image is caught and reported in
+`Found::cut`; the feature builds with `panic = "abort"` too.
+
+`qr::search(data, raster, &Settings)` is the entry for a caller that holds its
+limits as options: `raster` is `Some` for a PDF image, which exav-unpack
+describes (its raw samples, or the CCITT or JBIG2 codec still on the bytes,
+`RasterCodec::Jbig2` carrying the globals shared by the images of a
+document), and `qr::wants(head, raster)` says whether to read an object at
+all. It returns `Some(Found { payloads, cut, unread })` for any image `wants`
+accepts: `cut` is a limit, `unread` an image no setting makes readable (it does
+not decode, or a PDF image whose dictionary, color space or predictor is not
+read). It is `None` for a file with the signature of BMP, ICO, PNM, DDS, QOI or
+a bare JPEG XL codestream and no header of it. Feature `raster` (not a
+default; `qr` implies it, and `ccitt` and `jbig2`): `image::from_raster(&Raster,
+&[u8], max_alloc)` gives the grey pixels of a PDF image's samples (PNG
+predictors, 1 to 16 bits, Gray, RGB, CMYK, Indexed, `/Decode`, image masks).
+
+```rust
+use exav_render::qr::{Limits, find};
+
+let found = find(&std::fs::read("flyer.png")?, 1 << 28, &Limits::default())?;
+for payload in &found.payloads {
+    println!("{payload}");
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 hayro puts no bound on what a PDF stream decompresses to (a 1 MB file took
 2.1 GB), so a PDF is handed to it only after exav-unpack's reader has taken

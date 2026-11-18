@@ -4,8 +4,8 @@ MalwareBazaar metadata (`<sha>.json`, written by fetch-corpus-meta.py /
 fetch-corpus-bulk.py) saved next to each sample.
 
 For each sample's `intelligence.clamav` names, classify which feed the name comes
-from — the paid SecuriteInfo feed, the free Sanesecurity / TwinWave / Porcupine /
-MiscreantPunch feeds, or official ClamAV main/daily — so you can see which feeds
+from (the paid SecuriteInfo feed, the free Sanesecurity / TwinWave / Porcupine /
+MiscreantPunch feeds, or official ClamAV main/daily), so you can see which feeds
 to subscribe to. Optionally cross-reference a list of samples a scan MISSED (e.g.
 the both-clean files from a differential run) to rank feeds by how many of *our*
 misses each would have caught.

@@ -32,7 +32,7 @@ use regex_syntax::hir::literal::{ExtractKind, Extractor};
 use serde::{Deserialize, Serialize};
 
 use crate::byte_source::ByteSource;
-use crate::grams::{GramStats, Grams, IndexAnchor, structural, sweep};
+use crate::grams::{GramStats, Grams, IndexAnchor, Sweeper, structural, sweep};
 use crate::yara::matcher::{Base64Sub, Needle, parse_hir, widen_hir};
 
 /// Maximum atom window length taken from a literal / base64 needle. A longer
@@ -366,15 +366,42 @@ impl PatternGate {
         if pending == 0 {
             return run;
         }
-        sweep(
-            &self.grams,
-            &[true, true],
-            src,
-            &mut |part, value, _, _, _| mark(&self.groups[part], value, &mut run, &mut pending),
-        );
+        sweep(&self.grams, &BOTH, src, &mut |part, value, _, _, _| {
+            mark(&self.groups[part], value, &mut run, &mut pending)
+        });
         run
     }
+
+    /// The search of `src` for the atoms, for an object that is handed over a
+    /// window at a time, by a read of it that serves other searches too.
+    pub(crate) fn sweeper<'a>(
+        &'a self,
+        src: &'a dyn ByteSource,
+    ) -> Sweeper<'a, dyn ByteSource + 'a> {
+        Sweeper::new(&self.grams, &BOTH, src)
+    }
+
+    /// The patterns that have atom `value` of partition `part`: the
+    /// case-sensitive atoms are partition 0 and the `nocase` ones 1. A
+    /// pattern runs when one of its atoms occurs.
+    pub(crate) fn members(&self, part: usize, value: u32) -> &[usize] {
+        &self.groups[part][value as usize]
+    }
+
+    /// How many atoms partition `part` has.
+    pub(crate) fn atoms(&self, part: usize) -> usize {
+        self.groups[part].len()
+    }
+
+    /// Whether pattern `pid` has no atom, and so runs whatever the object
+    /// holds.
+    pub(crate) fn is_ungated(&self, pid: usize) -> bool {
+        self.ungated[pid]
+    }
 }
+
+/// Both partitions of the gate: case-sensitive atoms and `nocase` ones.
+static BOTH: [bool; 2] = [true, true];
 
 /// Slates the patterns of atom `value` to run. `false` once none is left.
 fn mark(groups: &[Vec<usize>], value: u32, run: &mut [bool], pending: &mut usize) -> bool {

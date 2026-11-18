@@ -1,4 +1,4 @@
-//! The dictionary size an XZ stream declares — ClamAV's
+//! The dictionary size an XZ stream declares: ClamAV's
 //! `Heuristics.XZ.DicSizeLimit`, which has no flag to turn it off.
 //!
 //! This is a decompression-bomb signal that costs nothing to check: the declared
@@ -14,7 +14,7 @@
 use exav_unpack::{XZ_MAX_DICT, xz_declared_dict_size};
 
 /// Build an XZ stream header plus one block header declaring an LZMA2 filter
-/// with dictionary-size property `prop`. The body is irrelevant — the whole
+/// with dictionary-size property `prop`. The body is irrelevant: the whole
 /// point is that this is readable before any decoding happens.
 fn xz_with_dict_prop(prop: u8) -> Vec<u8> {
     let mut v = b"\xfd7zXZ\x00".to_vec();
@@ -56,7 +56,7 @@ fn a_modest_dictionary_is_read_and_accepted() {
 
 #[test]
 fn the_maximum_declaration_is_over_the_cap() {
-    // 40 is the largest legal property and means 4 GiB — the shape that makes
+    // 40 is the largest legal property and means 4 GiB, the shape that makes
     // this worth checking at all.
     let got = xz_declared_dict_size(&xz_with_dict_prop(40)).expect("must parse");
     assert_eq!(got, 4 * 1024 * 1024 * 1024, "property 40 is exactly 4 GiB");
@@ -84,7 +84,7 @@ fn non_xz_input_reports_nothing() {
 
 #[test]
 fn a_real_xz_stream_declares_a_sane_dictionary() {
-    // Produced by GNU `xz -9` — a genuine stream from an external encoder, not a
+    // Produced by GNU `xz -9`: a genuine stream from an external encoder, not a
     // hand-built header. `-9` is the largest ordinary preset, so if any honest
     // compressor were going to trip the cap it would be this one.
     let path = format!(
@@ -96,7 +96,7 @@ fn a_real_xz_stream_declares_a_sane_dictionary() {
         .expect("a real xz stream must be parseable, or the parser is too strict");
     assert!(
         dict <= XZ_MAX_DICT,
-        "`xz -9` declared {dict}, above exav's cap — the cap or the parser is wrong"
+        "`xz -9` declared {dict}, above exav's cap: the cap or the parser is wrong"
     );
     assert!(
         dict >= 4096,

@@ -4,7 +4,7 @@
 //! is too large to hold in RAM, readable again through a second handle, deleted
 //! when the scan is done. That is a page of `std::fs`. The crates that offer it
 //! ready-made reach it through `rustix` and `linux-raw-sys`, whose thousands of
-//! `unsafe` blocks would dwarf everything else in the tree — for a feature that
+//! `unsafe` blocks would dwarf everything else in the tree, for a feature that
 //! never touches a scanned byte.
 //!
 //! The security properties a temp file has to have, and how they are met here:
@@ -16,15 +16,15 @@
 //!   random seed taken from the standard library's `RandomState` (which the OS
 //!   seeds), and a counter, so names cannot be guessed between runs or within
 //!   one.
-//! * **Not world-readable.** On Unix the file is created `0600` — a scanned
+//! * **Not world-readable.** On Unix the file is created `0600`: a scanned
 //!   payload is somebody's data and has no business being readable by other
 //!   users of the machine.
 //! * **Cleaned up.** Dropping removes the file (or the directory tree); a crash
 //!   can leave one behind.
 //!
 //! `exav-core` carries a smaller, test-only copy for the same reason. It shares
-//! the security properties above; the spill-specific parts — `new_in`,
-//! unlink-on-create, and the refusal to write after a read-back — live only here.
+//! the security properties above; the spill-specific parts (`new_in`,
+//! unlink-on-create, and the refusal to write after a read-back) live only here.
 
 // The binary uses the spill file; the integration tests that include this module
 // by path use only the directory. Neither has to use all of it.
@@ -61,7 +61,7 @@ fn next_name(prefix: &str) -> String {
 
 /// A temporary file that deletes itself when dropped.
 ///
-/// Write it, then read it back through [`TempFile::reopen`] — in that order, and
+/// Write it, then read it back through [`TempFile::reopen`], in that order, and
 /// not interleaved. [`TempFile::reopen`] says why, and enforces it.
 pub struct TempFile {
     path: PathBuf,
@@ -79,7 +79,7 @@ impl TempFile {
     /// Create a new temp file in `dir`.
     ///
     /// Separate from [`TempFile::new`] so a deployment can put spilled payloads
-    /// somewhere it chose — a disk with room, a filesystem it is willing to see
+    /// somewhere it chose: a disk with room, a filesystem it is willing to see
     /// fill up, or one that is not shared with everything else on the host.
     pub fn new_in(dir: &Path) -> io::Result<TempFile> {
         // A handful of attempts: a collision means another process took the
@@ -99,12 +99,12 @@ impl TempFile {
                 Ok(file) => {
                     // Unlink at once on Unix and keep only the open handle. The
                     // file stays fully usable and the kernel reclaims it when the
-                    // last descriptor closes — including when the process is
+                    // last descriptor closes, including when the process is
                     // killed. `Drop` cannot be relied on here: a worker that hits
                     // its per-job alarm leaves through `_exit`, and one that hits
                     // `RLIMIT_AS` or the OOM killer leaves through `SIGKILL`.
                     // Neither runs destructors, so a spilled payload would sit in
-                    // the temp filesystem until reboot — on demand, as often as a
+                    // the temp filesystem until reboot, on demand, as often as a
                     // client cares to trigger it.
                     #[cfg(unix)]
                     let _ = std::fs::remove_file(&path);
@@ -144,7 +144,7 @@ impl TempFile {
     /// On Unix the file was unlinked at creation, so there is no name left to
     /// open and this duplicates the descriptor instead. A duplicate shares the
     /// file **offset**, which is why the rewind happens here rather than in the
-    /// caller — and why writing after a read-back is refused rather than
+    /// caller, and why writing after a read-back is refused rather than
     /// documented. Left to a convention it would fail silently and expensively:
     /// the write would land at byte 0, overwriting the payload with a fragment
     /// of itself, and the scan would then run over bytes no client ever sent.
@@ -247,7 +247,7 @@ mod tests {
     /// This is what makes a killed worker cost nothing. A spilled payload can be
     /// gigabytes, and a worker that hits its per-job alarm leaves through
     /// `_exit` while one that hits `RLIMIT_AS` or the OOM killer leaves through
-    /// `SIGKILL` — neither runs `Drop`. Anything relying on a destructor would
+    /// `SIGKILL`: neither runs `Drop`. Anything relying on a destructor would
     /// accumulate those payloads in the temp filesystem, and a client can ask
     /// for that as often as it likes.
     #[cfg(unix)]
@@ -267,7 +267,7 @@ mod tests {
 
     /// A reader holds a duplicate of the write handle and rewound the shared
     /// offset, so a write after it would land at byte 0 and eat the payload.
-    /// Refused loudly, through both ways of reaching the handle — silent
+    /// Refused loudly, through both ways of reaching the handle: silent
     /// corruption of a spilled object means scanning bytes no client sent.
     #[test]
     fn writing_after_a_read_back_is_refused() {

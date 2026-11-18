@@ -2,8 +2,8 @@
 //!
 //! aPLib is a byte-aligned LZ77 variant with an interleaved MSB-first tag-bit
 //! stream and gamma-2 coded offsets/lengths. It is the compression codec used
-//! by several PE runtime packers — Petite 2.x, FSG 2.0 and NsPack all wrap an
-//! aPLib stream around the original image — so decoding it lets the engine scan
+//! by several PE runtime packers (Petite 2.x, FSG 2.0 and NsPack all wrap an
+//! aPLib stream around the original image), so decoding it lets the engine scan
 //! the *original* bytes rather than only the packed stub.
 //!
 //! The two stream primitives (`getbit`, `getgamma`) are reproduced verbatim from
@@ -60,7 +60,7 @@ impl<'a> BitIn<'a> {
         Some(bit as u32)
     }
 
-    /// `aP_getgamma`: gamma-2 code — `result` starts at 1, then repeatedly
+    /// `aP_getgamma`: gamma-2 code. `result` starts at 1, then repeatedly
     /// `result = (result << 1) + bit` while the following continuation bit is 1.
     /// The smallest value it can encode is 2.
     fn gamma(&mut self) -> Option<u32> {
@@ -186,7 +186,7 @@ fn copy_match(out: &mut Vec<u8>, offs: usize, len: usize, max_out: usize) -> Opt
 
 /// MSB-first tag-bit writer mirroring [`BitIn`]: a tag byte is reserved in the
 /// output the moment its first bit is written and filled in place, so data bytes
-/// appended in between land after it — exactly the interleaving the decoder
+/// appended in between land after it, exactly the interleaving the decoder
 /// expects. Test-only: the independent encoder used to build round-trip and
 /// end-to-end fixtures; not part of the scanning path.
 #[cfg(test)]

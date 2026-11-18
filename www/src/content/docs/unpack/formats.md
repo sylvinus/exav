@@ -13,7 +13,7 @@ format, and how it reports such content, is on the scanner's
 [Supported formats](/scanner/reference/formats/) page.
 
 Each format is a Cargo feature; see [the crate's features](/unpack/rust/#features)
-to build a subset. The [format matrix](/project/formats/) puts what the
+to build a subset. The [file formats](/formats/) page puts what the
 scanner, the extractor and the viewer do with each format side by side.
 
 ## Archives
@@ -21,25 +21,25 @@ scanner, the extractor and the viewer do with each format side by side.
 | Format | Notes |
 |---|---|
 | ZIP | Every common method (see [codecs](#codec-level-coverage)) and [decryption](#encryption-support); orphan local headers and deferred-size members are carved too |
-| gzip · bzip2 · xz · zstd · lzip · `.lzma` · `.Z` (LZW) · LZ4 | Streaming decompressors: a member is decoded as it is read, at any size. Concatenated streams and frames are followed for all of them. An xz stream with a check the decoder does not read (SHA-256, the reserved types) is decoded without it, as liblzma does; a `.lzma` file is known by its extension and a plausible header |
+| gzip · bzip2 · xz · zstd · lzip · `.lzma` · `.Z` (LZW) · LZ4 · CryptFF | Streaming decompressors: a member is decoded as it is read, at any size. Concatenated streams and frames are followed for all of them. An xz stream with a check the decoder does not read (SHA-256, the reserved types) is decoded without it, as liblzma does; a `.lzma` file is known by its extension and a plausible header; CryptFF has no codec: its content is the bytes after a 16-byte header, each flipped |
 | RPM | The package's install scripts, one member each, and its payload (usually a compressed cpio) |
 | ARC (SEA ARC / PKARC / PAK) | the pre-ZIP archiver; a member failing its CRC-16 after a full decode is still returned, as in ZIP |
 | tar | POSIX/GNU |
 | 7z | Every common coder (see [codecs](#codec-level-coverage)) and AES-256 [decryption](#encryption-support) |
 | CAB · CHM | Microsoft cabinet / help (ITSF + LZX) |
-| RAR | RAR3 and RAR5, including solid archives; a member failing its CRC after a full decode is still returned, as in ZIP (see [codecs](#codec-level-coverage)) |
+| RAR | RAR3 and RAR5, including solid archives; a member is its whole stream, whatever size its header declares, and one failing its CRC after a full decode is still returned, as in ZIP (see [codecs](#codec-level-coverage)) |
 | ARJ · LHA | classic archivers |
 | ALZ · EGG | ESTsoft's Korean archivers: ALZ stored, deflate and bzip2 members; EGG stored, deflate, bzip2, LZMA and AZO members (a block failing its CRC after a full decode is still returned, as in ZIP) |
 | InstallShield `.z` | the older installer archive (PKWARE DCL implode) |
 | ISO · UDF | CD/DVD/Blu-ray images: the ISO 9660 tree (with Joliet) and the UDF tree, including UDF-only images with no ISO 9660 descriptor. A bridge image carrying both is walked once per file (a file is its first sector and its length) |
-| `ar` (.deb / .a) · cpio (RPM) · xar (.pkg) | Unix and package archives. A cpio is read to the end of the file, every archive of an initramfs in turn, and bytes that are not a header are scanned as they lie |
+| `ar` (.deb / .a) · cpio (RPM) · xar (.pkg) | Unix and package archives. A cpio is read to the end of the file, every archive of an initramfs in turn, and bytes that are not a header are scanned as they lie. A xar member stored, or in the zlib, bzip2 or LZMA style, is decoded as it is read; a member in another style is scanned as stored and reported |
 | DMG | Apple UDIF, including [encrypted](#encryption-support), with HFS+/APFS extraction; recognised by its trailer when its data opens with a bzip2 or xz run |
 | FAT12/16/32 | files inside a disk image, with their paths, reassembled from the cluster chain, so a fragmented file comes back whole |
 | exFAT | files inside a disk image or a memory card's, with their paths, reassembled from the cluster chain (or the run a file with no chain is in). What is past a file's valid length reads as zeros |
 | ext2/3/4 | files inside a Linux disk image, with their paths, reassembled from the inode's extent tree or block map (inline data, meta block groups and bigalloc included; a preallocated extent reads as zeros). A file in an encrypted directory is reported. Symlinks and device nodes hold no bytes and are skipped. The journal is not replayed |
 | SquashFS | firmware, live and snap images: gzip, LZMA, LZO, XZ, LZ4 and Zstandard blocks, fragments and sparse blocks, both byte orders; version 4 |
 | cramfs · romfs | the small read-only filesystems of boot images; cramfs in both byte orders, with room for boot code and with holes; romfs with its hard links read as the files they name |
-| EROFS | files stored plain, with their tail after the inode, or in chunks with holes; a file stored compressed is reported |
+| EROFS | files stored plain, with their tail after the inode, in chunks with holes, or compressed (LZ4, LZMA, DEFLATE, Zstandard; the full and the compact index), read an extent at a time; a file whose tail is in the packed inode (fragments) is reported |
 | ZOO | Rahul Dhesi's 1986 archiver, both codecs (LZD, a 13-bit LZW, and LZH). A member failing its CRC-16 is still returned, as in ZIP. Deleted members are extracted too: ZOO flags them and leaves the bytes in place |
 | NTFS | files inside a disk image, walked through the MFT: reassembled from their data runs (including across `$ATTRIBUTE_LIST`), read in place when resident, LZNT1-decompressed when compressed. Data runs short of the declared size are reported. The MFT walk also surfaces deleted-but-resident records a directory walk cannot see |
 | WIM (`.wim`/`.esd`) | Windows imaging format: file resources with their paths, uncompressed, XPRESS or LZX. When checksums are verified (the `checksums` feature), a resource failing its SHA-1 delivers its bytes and then ends its stream with an error; LZMS resources are reported |
@@ -61,15 +61,27 @@ standard document format and a recurring spear-phishing carrier:
 ## Size: what is read as it goes, and what is read whole
 
 The bound on what is held in memory at once is `Limits::max_buffer_bytes`
-(256 MiB by default; `--max-memory` on the command, 1 GiB).
+(256 MiB by default; `--max-object-bytes` on the command, 1 GiB).
 
 These are decoded as they are read, at any size, and their members come out as
 a `Member::Stream`: ZIP, tar, CAB, ISO/UDF, LHA, `ar`, cpio, 7z, WIM, xar,
-TNEF, OneNote, SWF, SZDD, partition maps, self-extracting executables,
-universal Mach-O, `.pyc`, and the single-stream compressors above. The
-exceptions: ZIP Shrink, Reduce and Implode members, encrypted ZIP members, and
-the folders of a 7z with an encrypted coder or with several packed streams
-(BCJ2), are decoded whole under that bound. A 7z reads its header and a WIM its
+RAR (volume sets too), CHM, OLE compound files (MSI included), email and
+mailboxes, TNEF, OneNote, SWF, SZDD, CryptFF, partition maps, self-extracting
+executables, universal Mach-O, `.pyc`, and the single-stream compressors above.
+The exceptions: ZIP Shrink, Reduce and Implode members and encrypted ZIP
+members are decoded whole under that bound; a 7z folder with an encrypted coder
+is decrypted and decoded as it is read, its password found by decoding its
+first member to the CRC in the header. A CHM is read a chunk of its directory
+and a frame of its LZX stream at a time. A compound file
+is read stream by stream from its sectors; the streams the macro and
+embedded-object passes need are held under the bound, and an encrypted Office
+package past it is reported, not decrypted. A mailbox is split message by
+message, and a message past the bound is read part by part. A RAR is read from where it lies,
+its members decoded as they are read in the archive's own dictionary, which
+is held and must fit the bound (a member whose dictionary does not is
+reported); a RAR with encrypted headers, encrypted members or RAR5 links is
+read whole under the bound, and a stale member of a solid group (one after a
+member that failed) is held under it until its CRC says the bytes are its own. A 7z reads its header and a WIM its
 directory tree whole under it too; the rest of each is read from where it lies
 in the source, so the archive is never held.
 
@@ -80,10 +92,14 @@ bound), the virtual disks VHD, VHDX, QCOW2 and VMDK, which are read as a
 seekable disk (a unit is fetched when a read reaches it, and decoded units are
 cached up to 32 MiB), and the partition maps and filesystems on them or on
 their own: FAT, exFAT, NTFS, ext, SquashFS, cramfs, romfs, EROFS, HFS+ and APFS,
-read in place. A file a filesystem stores compressed is decoded whole under the
-bound and reported, not read, past it, and the walk goes on. A stream that
-fails where the volume stops giving the file ends with an error after the
-bytes there were. A hole of a sparse file reads as zeros, and a file can
+read in place. A file stored compressed is read a unit at a time: a
+compression unit of NTFS (LZNT1), a block of HFS+ and APFS (decmpfs, in the
+resource fork), an extent of EROFS; a decmpfs file kept in its attribute is one
+unit, held under the bound and reported past it, and an EROFS file whose tail
+is in the packed inode is reported. A
+stream that fails where the volume stops giving the file ends with an error
+after the bytes there were. A hole of a sparse file reads as zeros, counted
+against `Limits::max_hole_bytes` rather than the scan budget, and a file can
 declare a length far past what the volume backs: what a stream gives is bounded
 by the scan budget (`Limits::max_scanned_bytes`). Every APFS volume of a container is walked. A file macOS
 compressed (decmpfs) keeps its bytes in an attribute or its resource fork
@@ -92,8 +108,9 @@ reported, not read, and the data fork is read beside it. An encrypted APFS
 volume is reported.
 
 Every other format is read whole: a container larger than the bound is a
-`LimitHit` and its members are not reached. That includes RAR, OLE, PDF, CHM,
-ARJ and email, so raise the bound where such files are expected. The
+`LimitHit` and its members are not reached. That includes PDF and ARJ, so
+raise the bound where such files are expected. A member past the bound that
+such a format decodes whole is left out, and the walk goes on to the next. The
 scanner's own bounds for the same formats are on its
 [Supported formats](/scanner/reference/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole)
 page.
@@ -113,23 +130,20 @@ unexamined, rather than getting the compressed bytes as if they were content.
 |---|---|
 | ACE | No encoder exists to validate a decoder against, and the one sample obtainable is rejected as invalid by both `lsar` and `unace` |
 | StuffIt / StuffIt X | Compression methods undocumented; the only implementations are closed-source or GPL |
-| Inno Setup | The layout changes across setup-data versions; `innoextract` (zlib license) is the reference |
-| InstallShield MSI | Sniffed by `"InstallShield\0"` plus a fixed record 292 bytes on; not opened yet |
+| Inno Setup before 5.1.5 and from 6.5 | The layout changes across setup-data versions; `innoextract` (zlib license) is the reference. 5.1.5 to 6.4 are decoded, files named by their place in the installer; an encrypted file is reported encrypted, one in a separate `setup-1.bin` reported |
 | ZIP method 10 (DCL Implode) | No tool in print creates one, so a decoder could only be validated against found samples |
 | ZIP methods 94 / 96 / 97 (MP3, JPEG, WavPack) | WinZip-only; no other extractor in the reference set reads them |
 | WIM LZMS resources | Used by `.esd` images and `wimlib --solid` |
-| RAR5 dictionaries over 64 MiB (including RAR 7's larger ones) | The decoder's window is capped at 64 MiB |
+| RAR dictionaries larger than `Limits::max_buffer_bytes`, and RAR5 dictionaries over 64 MiB in an archive read whole (encrypted, or with links) | The window is held, so it must fit the bound; such a member is reported with that reason |
 | RAR 1.5 / 2.x compression (unpack versions 15, 20, 26) | No permissively licensed decoder to port or check against; stored members of these archives are extracted |
 | KWAJ LZSS, MSZIP and LZH methods | Stored and XOR-obfuscated KWAJ members are decoded |
-| CHM multi-frame LZX intervals | Reported |
 | 7z BCJ ARMT / PPC / SPARC / IA64 / RISC-V | Minor architectures |
 | 7z Deflate64 / Zstandard coders | The Zstandard coder is a 7-Zip ZS fork extension |
 | PKWARE Strong Encryption | Rare, proprietary; reported encrypted |
-| CryptFF | Encrypted, which is what it is; reported encrypted |
 
 They are listed because [an attacker picks a format by what the victim can open](/unpack/how-it-works/#the-parity-principle),
-so they are gaps against 7-Zip, WinRAR and The Unarchiver. For ACE, StuffIt and
-Inno the blocker is [validation](/unpack/how-it-works/#validating-a-decoder):
+so they are gaps against 7-Zip, WinRAR and The Unarchiver. For ACE and StuffIt
+the blocker is [validation](/unpack/how-it-works/#validating-a-decoder):
 with no trustworthy implementation to check against, a subtly wrong decoder emits
 plausible bytes rather than errors.
 
@@ -141,7 +155,7 @@ cheaper than decoding and removes that hole on its own:
 
 | Format | exav-unpack | Sniff |
 |---|---|---|
-| InstallShield InstallScript cabinet | Recognised, reported | `ISc(` at 0 |
+| InstallShield InstallScript cabinet | **Decoded** (a cabinet holding its header; files in the other cabinets of a set are reported) | `ISc(` at 0 |
 | InstallShield `.z` archive | **Decoded** | `13 5D 65 8C` at 0, confirmed against the header's own arithmetic (declared archive size, table-of-contents offset) |
 | ext2/3/4 | **Decoded** | `0xEF53` at offset 1080; nothing at offset 0 identifies the image |
 | exFAT | **Decoded** | `EXFAT   ` at 3, zeros to 64 and `55 AA` at 510 |
@@ -150,13 +164,20 @@ cheaper than decoding and removes that hole on its own:
 | romfs | **Decoded** | `-rom1fs-` at 0 |
 | EROFS | **Decoded** | `E2 E1 F5 E0` at 1024 |
 | ZOO | **Decoded** | tag `0xFDC4A7DC` at 20 plus a non-zero version byte at 32; the leading `ZOO ?.?? Archive.` text may be anything |
-| AppleSingle / AppleDouble | Recognised, reported | `0x00051600` / `0x00051607` |
+| AppleSingle / AppleDouble | **Decoded** (the data and resource forks) | `0x00051600` / `0x00051607` |
 | lrzip | Recognised, reported | `LRZI` at 0 |
 
 ext is walked as a filesystem rather than carved, for the same reason as FAT: a
 file written into a hole lands in several extents. InstallShield `.z` is read
 through the MIT `unshield` crate; the header check keeps four magic bytes alone
 from reporting ordinary files as archives exav then could not open.
+InstallScript cabinets are read as the MIT `unshield` C library reads them. A
+set is a header (`data1.hdr`, or the start of `data1.cab`) and its data
+cabinets: a cabinet that holds its header is opened, and a file the header
+places in another cabinet of the set, or a data cabinet whose header is a file
+of its own, is reported. AppleDouble's `._name` files, which macOS puts in
+`__MACOSX/` in a ZIP, are opened like any other: most hold no fork, only
+Finder information, and pass with nothing to report.
 
 lrzip and the `ISc(` cabinet stay at recognition for licensing reasons. Neither
 has a published specification: lrzip's long-range match stream is defined only
@@ -264,7 +285,7 @@ it reads back as a valid PE. See [PE stub emulation](/scanner/concepts/pe-emulat
 | PDF | object streams (FlateDecode, LZW, ASCII85, ASCIIHex, RunLength and filter chains), JavaScript, URI and launch-action harvesting; [decryption](#encryption-support) |
 | HWP3 (Hangul Word Processor 3) | the deflate-compressed body |
 | RTF | embedded hex objects |
-| MIME email | decoded attachments and parts, and those of attached messages (64 deep) |
+| MIME email | decoded attachments and parts, and those of attached messages (64 deep); past the buffer limit an attached message is handed over as its bytes and reported |
 | TNEF (`winmail.dat`) · OneNote · Adobe XDP | embedded-file carriers |
 
 ## Executables
@@ -312,7 +333,7 @@ Content that is still encrypted after that comes back as an unsupported
 member marked encrypted, never as ciphertext passed off as content. That
 covers a wrong or missing password, and the schemes exav-unpack detects but
 does not decrypt: RAR 2.0's own cipher, PKWARE Strong Encryption, encrypted
-ALZ and EGG members, ARJ GOST-256, encrypted legacy Word `.doc`, and CryptFF.
+ALZ and EGG members, ARJ GOST-256, and encrypted legacy Word `.doc`.
 
 The passwords are `Budget::passwords` in the crate, `-P` on the command
 (repeatable). The scanner's pool, built from its flags and `.pwdb` databases,

@@ -1,6 +1,6 @@
 //! LZ4 frames (`.lz4`).
 //!
-//! The expected digests are `lz4 -dc` output — the reference tool's, not this
+//! The expected digests are `lz4 -dc` output, the reference tool's, not this
 //! crate's. Fixtures cover the frame variants the tool itself produces, because
 //! the ones a decoder is most likely to get wrong are the ones it never sees:
 //! linked blocks, the legacy frame, per-block checksums, and **concatenation**,
@@ -76,7 +76,7 @@ fn every_frame_variant_matches_the_reference_tool() {
 fn a_payload_hidden_behind_a_first_frame_is_still_reached() {
     // `lz4 -dc` on concatenated frames emits all of them. A decoder that stops
     // at the first end mark leaves everything after it unscanned while the file
-    // still reports clean — and appending a frame is a single `cat`.
+    // still reports clean, and appending a frame is a single `cat`.
     let d = content("two_frames.lz4");
     assert_eq!(
         &sha256_hex(&d)[..12],

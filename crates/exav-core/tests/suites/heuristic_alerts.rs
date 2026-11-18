@@ -4,9 +4,9 @@
 //! default**: with the flag clear the existing verdict is unchanged; only when
 //! the caller opts in does the heuristic upgrade to an `Infected` detection.
 //!
-//! * `alert_encrypted` — a password-protected member becomes
+//! * `alert_encrypted`: a password-protected member becomes
 //!   `Heuristics.Encrypted.*` (was [`Verdict::PasswordProtected`]).
-//! * `alert_macros` — an OLE2 document carrying a VBA project becomes
+//! * `alert_macros`: an OLE2 document carrying a VBA project becomes
 //!   `Heuristics.OLE2.ContainsMacros`.
 //!
 //! It also covers the `clamav_heuristics` / `heuristics` split: the
@@ -240,7 +240,7 @@ fn a_decrypted_7z_member_is_still_reported_as_encrypted() {
 /// Build a minimal, valid OLE2 (Compound File Binary) document carrying a VBA
 /// project: a `VBA/dir` stream holding an (uncompressed) MS-OVBA compressed
 /// container with a single `MODULENAME` record. exav's OLE extractor decompresses
-/// this, finds one module, and emits the `vba_project` text artifact — the signal
+/// this, finds one module, and emits the `vba_project` text artifact, the signal
 /// the `--alert-macros` heuristic keys on.
 fn macro_ole2() -> Vec<u8> {
     // A single MS-OVBA `dir` record: MODULENAME (id 0x0019), size 6, "Macros".
@@ -312,7 +312,7 @@ fn alert_macros_flags_vba_project() {
 // --- clamav-default heuristics: PDF ObfuscatedNameObject --------------------
 
 /// A minimal PDF whose `/JavaScript` name object hex-escapes an alphanumeric
-/// (`#61` = 'a') to hide the keyword — the exact trick ClamAV flags by default.
+/// (`#61` = 'a') to hide the keyword: the exact trick ClamAV flags by default.
 fn obfuscated_pdf() -> Vec<u8> {
     b"%PDF-1.5\n1 0 obj<</Type/Catalog/Open#41ction<</J#61vaScript(x)>>>>endobj\n%%EOF".to_vec()
 }
@@ -377,5 +377,43 @@ fn pdf_obfuscated_name_fires_under_full_heuristics() {
             assert_eq!(signature, "Heuristics.PDF.ObfuscatedNameObject");
         }
         other => panic!("expected Heuristics.PDF.ObfuscatedNameObject, got {other:?}"),
+    }
+}
+
+/// A PDF whose `/JavaScript` name object, hex-escaped, is inside an object
+/// stream. The stream is hex-encoded, so the escape is not in the file's bytes.
+fn obfuscated_pdf_in_an_object_stream() -> Vec<u8> {
+    let object = "<</S/J#61vaScript/JS(x)>>";
+    let data = format!("5 0 {object}");
+    let hex: String = data.bytes().map(|b| format!("{b:02x}")).collect();
+    let mut pdf = b"%PDF-1.5\n1 0 obj<</Type/Catalog/Pages 3 0 R>>endobj\n".to_vec();
+    pdf.extend(
+        format!(
+            "2 0 obj<</Type/ObjStm/N 1/First 4/Filter/ASCIIHexDecode/Length {}>>\n\
+             stream\n{hex}>\nendstream\nendobj\n%%EOF",
+            hex.len() + 1
+        )
+        .into_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn pdf_obfuscated_name_in_an_object_stream_fires_except_under_clamav_compat() {
+    // exav's own reach, beyond the document's bytes that ClamAV reads.
+    let db = builtin_db();
+    let blob = obfuscated_pdf_in_an_object_stream();
+    match analyze(&db, &blob, &ScanOptions::default()).verdict {
+        Verdict::Infected {
+            signature, method, ..
+        } => {
+            assert_eq!(signature, "Heuristics.PDF.ObfuscatedNameObject");
+            assert_eq!(method, Method::Heuristic);
+        }
+        other => panic!("expected Heuristics.PDF.ObfuscatedNameObject, got {other:?}"),
+    }
+    match analyze(&db, &blob, &ScanOptions::clamav_compat()).verdict {
+        Verdict::Clean => {}
+        other => panic!("expected Clean under clamav_compat, got {other:?}"),
     }
 }

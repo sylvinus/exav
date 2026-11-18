@@ -68,9 +68,11 @@ different things, and raising the wrong one changes nothing (see
 
 The common case is a large file. One over `--max-object-bytes` (256 MiB by
 default) is scanned through a block cache, but the checks that parse a file whole
-(a PE's structure, YARA's `pe` module, a RAR or OLE container) do not run on it.
+(a PE's structure and YARA's `pe` module when its image is past the limit, a
+PDF or ARJ container) do not run on it.
 With `--spill-dir off`, a large text file also skips its HTML and script views,
-and an archive member that decodes past the limit is not scanned. Raise
+and an archive member that decodes past the limit has only its first bytes, up
+to the limit, scanned. Raise
 `--max-object-bytes` to have those checks run, at the cost of memory. See
 [Streaming & memory](/scanner/concepts/streaming-memory/).
 
@@ -83,6 +85,11 @@ and an archive member that decodes past the limit is not scanned. Raise
 - **`UNSCANNABLE`**: the container was recognised but could not be decoded (an
   unsupported codec, a RAR member split across volumes, a compressed stream
   damaged part way). Inspect it manually.
+  A PE whose import table does not parse, or has a descriptor that does not
+  parse inside the size of its directory, is also `UNSCANNABLE` when an
+  import-hash (`.imp`) signature is loaded, a YARA rule imports `pe`, or
+  `--detect exav-heuristics` is on, and nothing else matched: those checks read
+  the table. The reason says which. Packed executables are the usual case.
 
 ## exav uses a lot of memory when loading signatures
 

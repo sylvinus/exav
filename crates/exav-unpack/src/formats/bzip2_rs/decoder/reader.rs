@@ -3,15 +3,15 @@ use std::io::{self, Read, Result};
 use super::{Decoder, ReadState, WriteState};
 
 /// A high-level decoder that wraps a [`Read`] and implements [`Read`], yielding decompressed bytes
-pub struct DecoderReader<R> {
+pub struct DecoderReader<'a> {
     decoder: Decoder,
 
-    reader: R,
+    reader: Box<dyn Read + 'a>,
     /// The reader has returned 0.
     input_ended: bool,
 }
 
-impl<R> DecoderReader<R> {
+impl<'a> DecoderReader<'a> {
     /// Construct a new decoder from something implementing [`Read`]
     // NSIS alone uses only `new_nsis`.
     #[cfg(any(
@@ -20,36 +20,37 @@ impl<R> DecoderReader<R> {
         feature = "alz",
         feature = "egg",
         feature = "dmg",
+        feature = "inno",
         test
     ))]
-    pub fn new(reader: R) -> Self {
+    pub fn new(reader: impl Read + 'a) -> Self {
         Self {
             decoder: Decoder::new(),
 
-            reader,
+            reader: Box::new(reader),
             input_ended: false,
         }
     }
 }
 
 #[cfg(feature = "nsis")]
-impl<R: Read> DecoderReader<io::Chain<R, io::Take<io::Repeat>>> {
+impl<'a> DecoderReader<'a> {
     /// As [`DecoderReader::new`], for NSIS's bzip2 (see [`Decoder::new_nsis`]).
     /// The bit reader looks up to 8 bytes ahead, which a standard stream's
     /// 10-byte trailer always leaves room for and NSIS's one-byte end marker
     /// does not: zeros past the input keep the last block decodable, and the
     /// end marker is read before any of them.
-    pub fn new_nsis(reader: R) -> Self {
+    pub fn new_nsis(reader: impl Read + 'a) -> Self {
         Self {
             decoder: Decoder::new_nsis(),
 
-            reader: reader.chain(io::repeat(0).take(16)),
+            reader: Box::new(reader.chain(io::repeat(0).take(16))),
             input_ended: false,
         }
     }
 }
 
-impl<R: Read> Read for DecoderReader<R> {
+impl Read for DecoderReader<'_> {
     /// Decompress bzip2 data from the underlying reader. A block whose bits
     /// run out once the reader has none left is an `UnexpectedEof` error: the
     /// stream was cut short. A block cut short is not decoded at all, as the

@@ -3,7 +3,9 @@
 
 use super::{Dest, Font, ListDef, ListLevelDef, Parser, RStyle, St, Target};
 use crate::formats::office::docs::error::Result;
+use crate::formats::office::docs::limits::LIST_BYTES;
 use crate::formats::office::docs::model::*;
+use std::collections::HashMap;
 
 fn flag(n: Option<i32>) -> bool {
     n != Some(0)
@@ -171,7 +173,8 @@ pub(crate) fn finish_level(p: &mut Parser<'_>, st: &St) {
     l.rpr = st.chp.clone();
     let text = std::mem::take(&mut p.list_text);
     let numbers = std::mem::take(&mut p.list_numbers);
-    if let Some(def) = p.lists.get_mut(li) {
+    // Nine levels are converted, and held.
+    if let Some(def) = p.lists.get_mut(li).filter(|d| d.levels.len() < 9) {
         def.levels.push(ListLevelDef {
             level: l,
             text,
@@ -279,6 +282,7 @@ impl Parser<'_> {
             }
             "list" => {
                 if matches!(dest, Dest::ListTable) {
+                    self.b.alloc(LIST_BYTES)?;
                     self.lists.push(ListDef {
                         id: 0,
                         levels: vec![],
@@ -1253,13 +1257,13 @@ pub(crate) fn build_lists(p: &mut Parser<'_>) {
         });
         p.list_ids.push(l.id);
     }
+    // The first list of each id.
+    let mut by_id: HashMap<i32, u32> = HashMap::new();
+    for (i, id) in p.list_ids.iter().enumerate() {
+        by_id.entry(*id).or_insert(i as u32);
+    }
     for (listid, ls, starts) in std::mem::take(&mut p.overrides) {
-        let abs = p
-            .list_ids
-            .iter()
-            .position(|x| *x == listid)
-            .map(|x| x as u32)
-            .unwrap_or(0);
+        let abs = by_id.get(&listid).copied().unwrap_or(0);
         p.doc.numbering.nums.push(Num {
             id: ls.max(0) as u32,
             abstract_id: abs,

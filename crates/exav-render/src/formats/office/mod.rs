@@ -10,12 +10,15 @@
 pub(crate) mod common;
 #[cfg(feature = "office-docs")]
 pub mod docs;
-#[cfg(feature = "office-sheets")]
+#[cfg(any(feature = "office-sheets", feature = "office-csv"))]
 pub mod sheets;
 // Presentations write their ODF charts with the spreadsheets' chart writer;
-// without `office-sheets` the module is private and most of it unused.
-#[cfg(all(feature = "office-slides", not(feature = "office-sheets")))]
-#[allow(dead_code)]
+// without `office-sheets` or `office-csv` the module is private and most of it
+// unused.
+#[cfg(all(
+    feature = "office-slides",
+    not(any(feature = "office-sheets", feature = "office-csv"))
+))]
 mod sheets;
 #[cfg(feature = "office-slides")]
 pub mod slides;

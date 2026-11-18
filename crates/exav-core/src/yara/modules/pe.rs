@@ -9,12 +9,10 @@
 //! are implemented; any other `pe.*` field or function is an explicit compile
 //! error so that coverage gaps are visible rather than silently undefined.
 
-use std::cmp::{max, min};
 use std::rc::Rc;
 
-use md5::{Digest, Md5};
-
-use super::{FieldName, FuncId};
+use super::{Copies, FieldName, FuncId};
+use crate::pe::yarax_offset as rva_to_offset;
 use crate::yara::error::{Error, Result};
 use crate::yara::ir::{Fields, Value};
 
@@ -26,11 +24,31 @@ pub(crate) struct PeExtra {
     imports: Vec<(String, Vec<ImpFunc>)>,
     exports: Vec<ExpFunc>,
     section_names: Vec<Vec<u8>>,
+    /// A table (the imports first) that could not be read, so its values are
+    /// those of a PE without one, or for an import table with a descriptor
+    /// that could not be read, those of the others: its name and why.
+    unread: Option<(&'static str, crate::pe::Unread)>,
+    /// Whether `unread` is only because the import directory starts at or past
+    /// the end of the bytes: the table is not in them.
+    absent: bool,
+}
+
+impl PeExtra {
+    pub(crate) fn unread(&self) -> Option<(&'static str, crate::pe::Unread)> {
+        self.unread
+    }
+
+    pub(crate) fn absent(&self) -> bool {
+        self.absent
+    }
 }
 
 struct ImpFunc {
-    name: Option<String>,
-    ordinal: u16,
+    /// The name yara-x lists: for an import by ordinal, the one its library's
+    /// table gives, or `ord` and the ordinal.
+    name: String,
+    /// Set for an import by ordinal.
+    ordinal: Option<u16>,
 }
 
 struct ExpFunc {
@@ -43,11 +61,16 @@ struct ExpFunc {
 // ---------------------------------------------------------------------------
 
 /// Parses `data` and returns the `pe` root value plus the extra state used by
-/// PE functions. For non-PE inputs the root is `{ is_pe: false }`.
-pub(crate) fn build(data: &[u8]) -> (Value, PeExtra) {
-    match goblin::pe::PE::parse(data) {
-        Ok(pe) => build_pe(data, &pe),
-        Err(_) => {
+/// PE functions. For non-PE inputs the root is `{ is_pe: false }`. The names
+/// copied out of the import and export tables are charged to `copies`, and
+/// are cut where it runs out; the tables are parsed only if their memory fits
+/// what is left of it. A table that cannot be read has the values of a PE
+/// without one, and [`PeExtra::unread`] says so.
+pub(crate) fn build(data: &[u8], copies: &Copies) -> (Value, PeExtra) {
+    let room = copies.room();
+    match crate::pe::tables(data, room) {
+        Some(pe) => build_pe(&pe, &pe.exports(data, room), copies),
+        None => {
             let mut f = Fields::new();
             f.insert("is_pe".into(), Value::Bool(false));
             (
@@ -57,13 +80,19 @@ pub(crate) fn build(data: &[u8]) -> (Value, PeExtra) {
                     imports: Vec::new(),
                     exports: Vec::new(),
                     section_names: Vec::new(),
+                    unread: None,
+                    absent: false,
                 },
             )
         }
     }
 }
 
-fn build_pe(_data: &[u8], pe: &goblin::pe::PE) -> (Value, PeExtra) {
+fn build_pe(
+    pe: &crate::pe::Tables,
+    exported: &std::result::Result<Vec<crate::pe::Export>, crate::pe::Unread>,
+    copies: &Copies,
+) -> (Value, PeExtra) {
     let coff = &pe.header.coff_header;
     let mut f = Fields::new();
     let ins = |f: &mut Fields, k: &str, v: i64| {
@@ -188,18 +217,28 @@ fn build_pe(_data: &[u8], pe: &goblin::pe::PE) -> (Value, PeExtra) {
         );
     }
 
-    // Group imports by DLL, preserving first-seen order.
+    // The libraries and functions as yara-x lists them (see
+    // `Imports::listed`), a descriptor each: two that name one library are two
+    // imports. A name that many thunks refer to is copied for each, so each
+    // copy is charged.
     let mut imports: Vec<(String, Vec<ImpFunc>)> = Vec::new();
-    for imp in &pe.imports {
-        let dll = imp.dll.to_string();
-        let entry = match imports.iter_mut().find(|(d, _)| *d == dll) {
-            Some(e) => e,
-            None => imports.push_mut((dll, Vec::new())),
+    let mut in_library = None;
+    for import in pe.listed().iter().flat_map(|table| table.listed()) {
+        let first = in_library != Some(import.library.index);
+        let charged =
+            (!first || copies.take(import.library_name.len())) && copies.take(import.name.len());
+        if !charged {
+            break;
+        }
+        in_library = Some(import.library.index);
+        let function = ImpFunc {
+            name: import.name.into_owned(),
+            ordinal: import.ordinal,
         };
-        entry.1.push(ImpFunc {
-            name: Some(imp.name.to_string()),
-            ordinal: imp.ordinal,
-        });
+        match imports.last_mut() {
+            Some((_, functions)) if !first => functions.push(function),
+            _ => imports.push((import.library_name.to_owned(), vec![function])),
+        }
     }
     let num_imported_functions: usize = imports.iter().map(|(_, fns)| fns.len()).sum();
     ins(&mut f, "number_of_imports", imports.len() as i64);
@@ -210,22 +249,41 @@ fn build_pe(_data: &[u8], pe: &goblin::pe::PE) -> (Value, PeExtra) {
     );
 
     let mut exports = Vec::new();
-    for exp in &pe.exports {
+    let listed = exported.as_deref().unwrap_or_default();
+    for exp in listed {
+        if !copies.take(exp.name.map_or(0, str::len)) {
+            break;
+        }
         exports.push(ExpFunc {
             name: exp.name.map(|n| n.to_string()),
-            // goblin doesn't surface the ordinal on Export directly; use rva as
-            // a placeholder isn't meaningful, so default to 0 (exports-by-name
-            // is what real rules use).
-            ordinal: 0,
+            ordinal: exp.ordinal,
         });
     }
-    ins(&mut f, "number_of_exports", pe.exports.len() as i64);
+    ins(&mut f, "number_of_exports", listed.len() as i64);
 
     let extra = PeExtra {
         is_pe: true,
         imports,
         exports,
         section_names,
+        unread: pe
+            .listed()
+            .as_ref()
+            .err()
+            .copied()
+            .or_else(|| {
+                pe.listed()
+                    .as_ref()
+                    .is_ok_and(|imports| imports.fault)
+                    .then_some(crate::pe::Unread::Malformed)
+            })
+            .map(|why| ("import", why))
+            .or_else(|| exported.as_ref().err().map(|&why| ("export", why))),
+        absent: pe
+            .listed()
+            .as_ref()
+            .is_ok_and(|imports| imports.fault && imports.past_end)
+            && exported.is_ok(),
     };
     (Value::Struct(Rc::new(f)), extra)
 }
@@ -263,7 +321,7 @@ fn trim_name(raw: &[u8; 8]) -> Vec<u8> {
 /// Delegating to `layout()` would keep the single-fixture difftest green while
 /// silently regressing yara-x parity on real inputs, so we keep this version.
 pub(crate) fn entry_point_offset(data: &[u8]) -> Option<i64> {
-    let pe = goblin::pe::PE::parse(data).ok()?;
+    let pe = crate::pe::headers(data)?;
     let opt = pe.header.optional_header.as_ref()?;
     let off = rva_to_offset(
         opt.standard_fields.address_of_entry_point,
@@ -272,48 +330,6 @@ pub(crate) fn entry_point_offset(data: &[u8]) -> Option<i64> {
         opt.windows_fields.section_alignment,
     )?;
     Some(off as i64)
-}
-
-/// Convert an RVA to a file offset. Ported from yara-x's `pe/rva2off.rs`.
-fn rva_to_offset(
-    rva: u32,
-    sections: &[goblin::pe::section_table::SectionTable],
-    file_alignment: u32,
-    section_alignment: u32,
-) -> Option<u32> {
-    let lowest_section_rva = sections.iter().map(|s| s.virtual_address).min();
-    if matches!(lowest_section_rva, Some(x) if rva < x) {
-        return Some(rva);
-    }
-
-    let mut section_rva = 0;
-    let mut section_offset = 0;
-    let mut section_raw_size = 0;
-
-    for s in sections {
-        let size = max(s.virtual_size, s.size_of_raw_data);
-        let start = s.virtual_address;
-        let end = start.saturating_add(size);
-
-        if section_rva <= s.virtual_address && (start..end).contains(&rva) {
-            section_rva = s.virtual_address;
-            section_offset = s.pointer_to_raw_data;
-            section_raw_size = s.size_of_raw_data;
-
-            let file_alignment = min(file_alignment, 0x200);
-            if let Some(rem) = section_offset.checked_rem(file_alignment) {
-                section_offset -= rem;
-            }
-            if section_alignment >= 0x1000 {
-                section_offset = section_offset.saturating_sub(section_offset % 0x200);
-            }
-        }
-    }
-
-    if rva.saturating_sub(section_rva) >= section_raw_size {
-        return None;
-    }
-    Some(section_offset.saturating_add(rva - section_rva))
 }
 
 // ---------------------------------------------------------------------------
@@ -342,24 +358,21 @@ pub(crate) fn call(func: FuncId, extra: Option<&PeExtra>, args: &[Value]) -> Opt
                 .iter()
                 .filter(|(d, _)| d.as_bytes().eq_ignore_ascii_case(dll))
                 .flat_map(|(_, fns)| fns.iter())
-                .any(|fun| {
-                    fun.name
-                        .as_ref()
-                        .is_some_and(|n| n.as_bytes().eq_ignore_ascii_case(fname))
-                });
+                .any(|fun| fun.name.as_bytes().eq_ignore_ascii_case(fname));
             Some(Value::Bool(found))
         }
         FuncId::PeImportsOrdinal => {
             let dll = args[0].as_bytes()?;
             let ordinal = args[1].to_i64()?;
-            let count: i64 = extra
+            // 1 or 0, as libyara (yara-x gives a boolean): only an import by
+            // ordinal has an ordinal.
+            let found = extra
                 .imports
                 .iter()
                 .filter(|(d, _)| d.as_bytes().eq_ignore_ascii_case(dll))
                 .flat_map(|(_, fns)| fns.iter())
-                .filter(|fun| fun.ordinal as i64 == ordinal)
-                .count() as i64;
-            Some(Value::Int(count))
+                .any(|fun| fun.ordinal.is_some_and(|o| i64::from(o) == ordinal));
+            Some(Value::Int(i64::from(found)))
         }
         FuncId::PeExportsFunc => {
             let fname = args[0].as_bytes()?;
@@ -387,53 +400,20 @@ pub(crate) fn call(func: FuncId, extra: Option<&PeExtra>, args: &[Value]) -> Opt
     }
 }
 
-/// The import hash. Ported from yara-x: DLL names lowercased and stripped of
-/// `.dll`/`.sys`/`.ocx`, function names lowercased, entries joined `dll.func`
-/// with commas, then MD5-hashed.
+/// The import hash, [`crate::pe::ImpHash`] of the imports listed: the same
+/// value the `imphash:` lines of a `.fdb` file are matched with. A PE with no
+/// import has the hash of the empty string, as in yara-x.
 fn imphash(extra: &PeExtra) -> Option<Value> {
     if !extra.is_pe {
         return None;
     }
-    let mut hasher = Md5::new();
-    let mut first = true;
+    let mut hash = crate::pe::ImpHash::new();
     for (dll, fns) in &extra.imports {
-        let dll = trim_library_extension(dll);
         for fun in fns {
-            let Some(name) = &fun.name else { continue };
-            if !first {
-                Digest::update(&mut hasher, b",");
-            }
-            Digest::update(&mut hasher, dll.to_ascii_lowercase().as_bytes());
-            Digest::update(&mut hasher, b".");
-            Digest::update(&mut hasher, name.to_ascii_lowercase().as_bytes());
-            first = false;
+            hash.add(dll, &fun.name);
         }
     }
-    let digest = hasher.finalize();
-    let mut out = Vec::with_capacity(32);
-    for b in digest.iter() {
-        out.push(hex_nibble(b >> 4));
-        out.push(hex_nibble(b & 0xf));
-    }
-    Some(Value::Str(out))
-}
-
-fn hex_nibble(n: u8) -> u8 {
-    match n {
-        0..=9 => b'0' + n,
-        _ => b'a' + (n - 10),
-    }
-}
-
-fn trim_library_extension(name: &str) -> &str {
-    for ext in [".dll", ".sys", ".ocx"] {
-        let nb = name.as_bytes();
-        let eb = ext.as_bytes();
-        if nb.len() >= eb.len() && nb[nb.len() - eb.len()..].eq_ignore_ascii_case(eb) {
-            return &name[..nb.len() - eb.len()];
-        }
-    }
-    name
+    Some(Value::Str(hash.finish().into_bytes()))
 }
 
 // ---------------------------------------------------------------------------
@@ -726,6 +706,38 @@ mod tests {
         assert!(t("pe.imports(\"kernel32.dll\", \"exitprocess\")", PE));
         assert!(!t("pe.imports(\"kernel32.dll\", \"NoSuchFunc\")", PE));
         assert!(!t("pe.exports(\"ExitProcess\")", PE));
+    }
+
+    /// `PE` with an export directory in the free space of its headers: two
+    /// functions from ordinal base 5, the second named `Func`.
+    fn pe_exporting() -> Vec<u8> {
+        let mut pe = PE.to_vec();
+        let mut put = |at: usize, value: &[u8]| pe[at..at + value.len()].copy_from_slice(value);
+        put(0xf8, &0x1a0u32.to_le_bytes()); // the export data directory
+        put(0xfc, &40u32.to_le_bytes());
+        put(0x1a0 + 16, &5u32.to_le_bytes()); // the ordinal base
+        put(0x1a0 + 20, &2u32.to_le_bytes()); // functions
+        put(0x1a0 + 24, &1u32.to_le_bytes()); // names
+        put(0x1a0 + 28, &0x1c8u32.to_le_bytes()); // their addresses
+        put(0x1a0 + 32, &0x1d0u32.to_le_bytes()); // the addresses of the names
+        put(0x1a0 + 36, &0x1d4u32.to_le_bytes()); // and their ordinals
+        put(0x1c8, &0x1000u32.to_le_bytes());
+        put(0x1cc, &0x1004u32.to_le_bytes());
+        put(0x1d0, &0x1d8u32.to_le_bytes());
+        put(0x1d4, &1u16.to_le_bytes());
+        put(0x1d8, b"Func\0");
+        pe
+    }
+
+    #[test]
+    fn exports_have_their_ordinal() {
+        let pe = pe_exporting();
+        assert!(t("pe.number_of_exports == 2", &pe));
+        assert!(t("pe.exports(\"func\")", &pe));
+        assert!(t("pe.exports(5)", &pe));
+        assert!(t("pe.exports(6)", &pe));
+        assert!(!t("pe.exports(0)", &pe));
+        assert!(!t("pe.exports(7)", &pe));
     }
 
     #[test]

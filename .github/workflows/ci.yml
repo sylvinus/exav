@@ -27,7 +27,9 @@ jobs:
       - run: cargo clippy -p exav --all-targets --no-default-features --features yara,zip -- -D warnings
       - run: cargo clippy -p exav-render --all-targets --no-default-features --features ifc,stl,obj,ply,gltf -- -D warnings
       - run: cargo clippy -p exav-render --all-targets --no-default-features --features markdown -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --no-default-features --features text-view -- -D warnings
       - run: cargo clippy -p exav-render --all-targets --no-default-features --features text-pdf -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --no-default-features --features office-csv -- -D warnings
       - run: cargo clippy -p exav-render --all-targets --no-default-features --features office-sheets -- -D warnings
       - run: cargo clippy -p exav-render --all-targets --no-default-features --features office-slides -- -D warnings
       - run: cargo clippy -p exav-render --all-targets --no-default-features --features office-docs -- -D warnings
@@ -37,6 +39,10 @@ jobs:
       - run: cargo clippy -p exav-core --all-targets --features visible-text-office -- -D warnings
       - run: cargo clippy -p exav-grep --all-targets --features text-office -- -D warnings
       - run: cargo clippy -p exav-unpack --all-targets --features text-pdf -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --features qr -- -D warnings
+      - run: cargo clippy -p exav-core --all-targets --features qr -- -D warnings
+      - run: cargo clippy -p exav-grep --all-targets --features qr -- -D warnings
+      - run: cargo clippy -p exav --all-targets --features qr -- -D warnings
       # The full native test matrix, every feature pass. Defined once in the
       # Makefile so this and a local `make test` can't drift.
       - run: make test-native
@@ -52,6 +58,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: make msrv
+
+  # The code of exav's crates is compiled once in a binary, not once per type a
+  # generic reader is used with (see scripts/compiled-once.py). It reads the
+  # release binaries, each built alone as the release workflow builds them, and
+  # the wasm, so it costs four release builds and a wasm one.
+  compiled-once:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: make compiled-once
 
   # The yara-x A/B differential harness. Deliberately NOT part of `make test`
   # (see the Makefile): a differential test can go red because the other engine
@@ -157,10 +177,11 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit
+      # Every feature, so the crates behind an optional one are checked too.
       - name: cargo-deny
         run: |
           cargo install cargo-deny --locked
-          cargo deny check advisories bans sources licenses
+          cargo deny --all-features check advisories bans sources licenses
       # `crates/exav-unpack-wasm` is workspace-excluded (it needs its own
       # release profile and a `cdylib` crate-type), so the run above cannot see
       # it. It is the crate that ships to npm, which makes it the one whose

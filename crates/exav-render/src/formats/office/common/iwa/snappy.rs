@@ -4,9 +4,9 @@
 //! raw blocks inside chunks of their own, without the framing format's
 //! stream identifier or checksums.
 
-/// Decompresses `src`, appending to `out`, refusing to grow `out` past
-/// `limit` bytes. `None` when the block is damaged.
-pub fn decompress(src: &[u8], out: &mut Vec<u8>, limit: usize) -> Option<()> {
+/// The length a block says it decompresses to, and the bytes that say it.
+/// `None` when they do not read.
+pub fn declared_len(src: &[u8]) -> Option<(usize, usize)> {
     let mut p = 0usize;
     let mut len: u64 = 0;
     let mut shift = 0;
@@ -22,8 +22,15 @@ pub fn decompress(src: &[u8], out: &mut Vec<u8>, limit: usize) -> Option<()> {
             return None;
         }
     }
+    Some((usize::try_from(len).ok()?, p))
+}
+
+/// Decompresses `src`, appending to `out`, refusing to grow `out` past
+/// `limit` bytes. `None` when the block is damaged.
+pub fn decompress(src: &[u8], out: &mut Vec<u8>, limit: usize) -> Option<()> {
+    let (len, mut p) = declared_len(src)?;
     let base = out.len();
-    let end = base.checked_add(usize::try_from(len).ok()?)?;
+    let end = base.checked_add(len)?;
     if end > limit {
         return None;
     }

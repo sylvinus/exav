@@ -1,4 +1,4 @@
-//! ICAP (RFC 3507) server — a drop-in replacement for a `c-icap` container
+//! ICAP (RFC 3507) server: a drop-in replacement for a `c-icap` container
 //! running the `virus_scan` service against ClamAV.
 //!
 //! An ICAP client (Squid, a WAF, a mail gateway) hands over an HTTP request or
@@ -9,7 +9,7 @@
 //!
 //! The listener is **opt-in**: nothing here runs without an `icap://` address on
 //! `--listen`, so starting the scanner or the clamd daemon binds no ICAP port on
-//! its own. It is a listener rather than a mode — named alongside a `clamd://`
+//! its own. It is a listener rather than a mode: named alongside a `clamd://`
 //! address, both protocols are served from one process over one loaded database.
 //!
 //! Every setting reads a flag, then an `EXAV_ICAP_*` environment variable, then
@@ -21,7 +21,7 @@
 //!
 //! | [`Verdict`](exav_core::Verdict) | ICAP response | headers |
 //! |---|---|---|
-//! | `Clean` | `204 No Content` when the client sent `Allow: 204`, else `200` echoing the message unmodified | — |
+//! | `Clean` | `204 No Content` when the client sent `Allow: 204`, else `200` echoing the message unmodified | none |
 //! | `Infected` | `200 OK` + a block page | `X-Infection-Found: Type=0; Resolution=2; Threat=<name>;` |
 //! | `LimitsExceeded` / `Unscannable` / `PasswordProtected` | `200 OK` + a block page, or the clean answer above when [`PartialAs`](crate::policy::PartialAs) says `ok` | `X-Infection-Found` naming `Heuristics.Exav.<Condition>` on a block only, plus `X-Exav-Status: PARTIAL` + `X-Exav-Category` + `X-Exav-Reason` either way |
 //!
@@ -29,7 +29,7 @@
 //! vocabulary. Both halves are needed, because ICAP clients split into two
 //! kinds. A proxy acts on the message: it sees a `200` carrying a replacement
 //! body instead of the object and stops it, whatever the headers say. A scan
-//! wrapper acts on the headers alone — it hands a file over and greps the
+//! wrapper acts on the headers alone: it hands a file over and greps the
 //! response for `X-Infection-Found`, and a `200` without that header is what it
 //! calls clean. Withholding the header from a partial block therefore turns
 //! exav's fail-closed answer into a fail-open one on the second kind of client,
@@ -57,7 +57,7 @@
 //!
 //! A pass here is never silent. It is logged per object, the listener says at
 //! startup that it is running that way, and the response still carries
-//! `X-Exav-Category` / `X-Exav-Reason` naming what was skipped — never
+//! `X-Exav-Category` / `X-Exav-Reason` naming what was skipped, never
 //! `X-Infection-Found`, which on a delivered object would be false and would
 //! make the header-only client the setting exists for block it anyway.
 //!
@@ -72,13 +72,13 @@
 //! it is larger than the ceiling. `--max-input-bytes` is the same knob
 //! with the opposite default: past the ceiling the object is blocked with
 //! `X-Exav-Category: LIMITS-EXCEEDED`. [`PartialAs`](crate::policy::PartialAs) can ask for c-icap's
-//! answer back, and the difference that remains is the one that matters — exav
+//! answer back, and the difference that remains is the one that matters: exav
 //! says which objects it delivered without examining, where c-icap says nothing
 //! at all.
 //
 // The crate as a whole cannot forbid `unsafe`, because the prefork daemon is
 // built on libc calls that have no safe binding. This module needs none of
-// them — ICAP is a line protocol over `std::net` and a scan — so it carries the
+// them (ICAP is a line protocol over `std::net` and a scan), so it carries the
 // guarantee itself, and it is the part of the binary that most needs it: every
 // byte the parsers below look at arrived from the network.
 //
@@ -86,7 +86,7 @@
 // switched off inside the module it guards, which is precisely where such an
 // exemption would be written and least likely to be questioned. `forbid` cannot
 // be overridden from within, so the only way to add `unsafe` here is to delete
-// this line — a visible change to the module's contract rather than a local
+// this line: a visible change to the module's contract rather than a local
 // annotation. The lint level applies to every submodule below.
 #![forbid(unsafe_code)]
 
@@ -103,7 +103,7 @@ mod response;
 mod server;
 mod wire;
 
-pub(crate) use self::config::{IcapConfig, InfectionHeader};
+pub(crate) use self::config::IcapConfig;
 pub(crate) use self::server::Server;
 #[cfg(feature = "fuzzing")]
 pub(crate) use self::server::fuzz_exchange;
@@ -124,7 +124,7 @@ pub fn config_from_cli(cli: &Cli) -> Result<IcapConfig, String> {
     // Naming services replaces the default set rather than adding to it: an
     // operator who names them means that set exactly, and silently adding the
     // defaults back would answer on names they did not configure. They come off
-    // the address — the path of the ICAP URL, or `?service=` — because that is
+    // the address (the path of the ICAP URL, or `?service=`) because that is
     // where a proxy's configuration already carries them.
     let services = match endpoint.as_ref().map(|e| e.services.as_slice()) {
         Some([]) | None => d.services,
@@ -139,36 +139,62 @@ pub fn config_from_cli(cli: &Cli) -> Result<IcapConfig, String> {
             _ => d.listen,
         },
         services,
-        preview_size: cli.icap_preview_size.map_or(d.preview_size, |p| p.value()),
-        // `off` omits the header. An empty string used to be the way to say
-        // that, which is a sentinel nobody guesses and a shell quoting accident
-        // away from being set by mistake.
-        transfer_preview: match cli.icap_transfer_preview.as_deref() {
-            Some(v) if v.eq_ignore_ascii_case("off") => String::new(),
-            Some(v) => v.to_string(),
-            None => d.transfer_preview,
-        },
+        // What the service answers comes off the address too: `?preview-bytes=`,
+        // `?transfer-preview=`, `?options-ttl-secs=`, `?infection-header=`.
+        preview_size: endpoint
+            .as_ref()
+            .and_then(|e| e.preview_bytes)
+            .map_or(d.preview_size, |p| p.value()),
+        transfer_preview: endpoint
+            .as_ref()
+            .and_then(|e| e.transfer_preview)
+            .unwrap_or(d.transfer_preview),
         // `?max-connections=` on the address, the same option the clamd listener
-        // reads — a cap belongs to the listener it bounds, not to a flag that
+        // reads: a cap belongs to the listener it bounds, not to a flag that
         // would have to name a protocol to apply to. Also advertised to clients
         // as `Max-Connections`.
         max_connections: endpoint
             .as_ref()
             .and_then(|e| e.max_connections)
             .unwrap_or(d.max_connections),
-        options_ttl: cli.icap_options_ttl.map_or(d.options_ttl, |t| t.value()),
-        keepalive_requests: match cli.icap_keepalive_requests {
+        options_ttl: endpoint
+            .as_ref()
+            .and_then(|e| e.options_ttl_secs)
+            .map_or(d.options_ttl, |t| t.value()),
+        // What bounds this listener's clients comes off its address:
+        // `?max-requests=`, `?idle-secs=`, `?session-secs=`, `?reply-secs=`,
+        // `?request-secs=` and `?max-header-bytes=`.
+        keepalive_requests: match endpoint.as_ref().and_then(|e| e.max_requests) {
             Some(0) => u64::MAX,
             Some(n) => n,
             None => d.keepalive_requests,
         },
-        idle_timeout: cli
-            .icap_idle_timeout
+        idle_timeout: endpoint
+            .as_ref()
+            .and_then(|e| e.idle_secs)
             .map_or(d.idle_timeout, Duration::from_secs),
+        // `?session-secs=` and `?reply-secs=`, off unless the address has them.
+        session: endpoint
+            .as_ref()
+            .and_then(|e| e.session_secs)
+            .map(Duration::from_secs),
+        reply: endpoint
+            .as_ref()
+            .and_then(|e| e.reply_secs)
+            .map(Duration::from_secs),
+        request_read: crate::daemon::command_read_limit(
+            endpoint.as_ref().and_then(|e| e.request_secs),
+        ),
         max_drain_bytes: d.max_drain_bytes,
-        max_header_bytes: cli.icap_max_header_size.unwrap_or(d.max_header_bytes),
+        max_header_bytes: endpoint
+            .as_ref()
+            .and_then(|e| e.max_header_bytes)
+            .unwrap_or(d.max_header_bytes),
         service_label: d.service_label,
-        infection_header: cli.icap_infection_header.unwrap_or(d.infection_header),
+        infection_header: endpoint
+            .as_ref()
+            .and_then(|e| e.infection_header)
+            .unwrap_or(d.infection_header),
         partial_as: cli.partial_as.unwrap_or(d.partial_as),
     })
 }
@@ -196,7 +222,7 @@ fn announce(server: &Server) {
             .map_or_else(|| "off".to_string(), |n| format!("{n} B")),
     );
     // Said at startup as well as per object, because a deployment that passes
-    // what it could not examine should be legible from its logs alone — nobody
+    // what it could not examine should be legible from its logs alone: nobody
     // reconstructs a running container's command line to answer "are we
     // delivering unscanned files?".
     if cfg.partial_as.reports_any_as_ok() {
@@ -233,7 +259,7 @@ pub fn spawn(server: Server, db: Arc<SharedDb>, opts: Arc<ScanOptions>) {
 /// handful of idle proxy connections would occupy every worker and starve the
 /// clamd listener as well. A dedicated child keeps ICAP's threaded model while
 /// still sharing the supervisor's warmed database copy-on-write, and the
-/// supervisor re-forks it from the new database on every reload — so the
+/// supervisor re-forks it from the new database on every reload, so the
 /// signature swap needs no in-process machinery at all. The retired child
 /// finishes the requests it is serving before it exits.
 #[cfg(unix)]

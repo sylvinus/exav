@@ -26,7 +26,7 @@
 //! exav-unpack's `screnc`, which surfaces the plaintext as a member of its own.
 //!
 //! Not yet implemented:
-//! * **base64→script rescan** — decoding long base64 runs to *script/text* (not
+//! * **base64→script rescan**: decoding long base64 runs to *script/text* (not
 //!   just exec-magic payloads, which `exav-unpack::base64_payloads` already
 //!   covers). The higher-yield lever per corpus evidence, but needs a distinct
 //!   FP-safe gate (base64 text is ubiquitous and benign).
@@ -933,7 +933,7 @@ fn is_kept(name: &[u8]) -> bool {
     ident_is_keyword(name) || KEEP_IDENTS.iter().any(|k| name.eq_ignore_ascii_case(k))
 }
 
-/// JavaScript reserved words and control keywords — never renamed, and a value
+/// JavaScript reserved words and control keywords: never renamed, and a value
 /// is expected right after them (regex disambiguation).
 fn ident_is_keyword(name: &[u8]) -> bool {
     KEYWORDS.iter().any(|k| name.eq_ignore_ascii_case(k))

@@ -1,6 +1,6 @@
 //! Regression: logical signatures scoped to an OOXML container
 //! (`Container:CL_TYPE_OOXML_WORD`, e.g. ClamAV's `Doc.Downloader.Loda`) must
-//! fire on the STREAMED container path — the path a `.docx` (a ZIP) actually
+//! fire on the STREAMED container path, the path a `.docx` (a ZIP) actually
 //! takes via the daemon and CLI. Two bugs suppressed the whole class: the
 //! streamed path passed no container context to members, and it never probed the
 //! ZIP's OOXML sub-type, so a member of `word/document.xml` was scanned as a

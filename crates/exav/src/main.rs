@@ -14,13 +14,15 @@
 //!
 //! This is the one crate in the workspace without `#![forbid(unsafe_code)]`.
 //! [`daemon`] accounts for nearly all of it: the prefork pool is `fork`,
-//! `waitpid`, `setrlimit`, `sigaction`, the `umask` that fixes the socket's
-//! permissions at creation, and `SCM_RIGHTS` descriptor passing in both
-//! directions (the daemon's `FILDES`, the client's `--send-as fd`), none of
-//! which has a safe binding that does not itself pull in a raw-syscall crate
+//! `waitpid`, `setrlimit`, `sigaction`, and `SCM_RIGHTS` descriptor passing in
+//! both directions (the daemon's `FILDES`, the client's `--send-as fd`), none
+//! of which has a safe binding that does not itself pull in a raw-syscall crate
 //! larger than the code it replaces. The rest is two `SIGPIPE` dispositions set
-//! here. Nothing on the scanning path is unsafe: no scanned byte reaches any of
-//! it, and the engine, extractor, emulator and decoder all forbid it outright.
+//! here and the shared mapping of the pool's counters in [`metrics`]. The tests
+//! that need an environment of their own run in a child process with it, so
+//! none changes this one's. Nothing on the scanning path is unsafe: no
+//! scanned byte reaches any of it, and the engine, extractor, emulator and
+//! decoder all forbid it outright.
 //! The `icap` module, whose parsers read straight off the network, carries
 //! `#![forbid(unsafe_code)]` of its own.
 
@@ -45,7 +47,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use exav_core::{ScanOptions, ScanReport, Scanner, Verdict, VerdictCategory, loader, scan_path};
 
 /// Categories the daemon names before the closing ` ERROR` when a verdict is
@@ -183,20 +185,6 @@ Coming from ClamAV:
 
   A clamscan flag exav does not have is REFUSED, never ignored: the run stops
   rather than scanning under settings you did not ask for.";
-
-/// Every flag falls back to an environment variable, and the environment
-/// belongs to the process while a test does not. So any test that sets a
-/// variable, or that parses a command line a variable could change the meaning
-/// of, holds this for its duration, and the whole crate shares the one lock:
-/// two test modules with a lock each would not exclude one another.
-#[cfg(test)]
-pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // A poisoned lock means some earlier test panicked, not that the
-    // environment is unusable; taking it anyway keeps one failure from
-    // cascading into every test that parses.
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// How a switch set in the environment is read: `1`/`yes`/`on`/`true` (and
 /// `y`/`t`) turn it on, `0`/`no`/`off`/`false` (and `n`/`f`) leave it off, and
@@ -399,8 +387,9 @@ struct Cli {
     allow_no_db: bool,
 
     /// Compile the loaded signatures into a prebuilt `.exavdb` database, write it
-    /// to FILE, and exit. The file loads directly with `-d` for a near-instant
-    /// cold start and can be distributed as-is. Run this on a host with enough
+    /// to FILE (making its directory if needed), and exit. The file loads
+    /// directly with `-d` for a near-instant cold start and can be distributed
+    /// as-is. Run this on a host with enough
     /// RAM (compiling takes more memory than loading the result); the resulting
     /// database loads cheaply everywhere.
     #[arg(long = "build-db", value_name = "FILE", env = "EXAV_BUILD_DB")]
@@ -433,6 +422,48 @@ struct Cli {
     ///                        as `Max-Connections`). Bounds the clamd listener
     ///                        only under `--workers threads`; the prefork pool
     ///                        bounds concurrency by its worker count.
+    ///   idle-secs=120        the most seconds a connection waits for its client
+    ///                        before it is closed, on each read and each write:
+    ///                        default 120 for clamd (clamd's ReadTimeout), 600
+    ///                        for ICAP, between requests or inside one
+    ///                        (c-icap's KeepAliveTimeout). At least 1.
+    ///   request-secs=600     the most seconds one clamd command or ICAP request
+    ///                        takes to arrive in full, from its first byte to
+    ///                        the end of its data. Past it the client is
+    ///                        answered (`COMMAND READ TIMED OUT`, ICAP 408) and
+    ///                        disconnected. Default 600; `off` for none.
+    ///   session-secs=3600    the most seconds a connection stays open, from
+    ///                        accept. Past it no new command or request is
+    ///                        read; one already begun is answered. At least 1.
+    ///                        Default: no limit.
+    ///   reply-secs=60        the most seconds the writes of one reply (a clamd
+    ///                        command, an ICAP request) wait for the client, in
+    ///                        all. At least 1. Default: no limit.
+    ///   max-requests=100     ICAP: requests served on one connection before it
+    ///                        is closed (c-icap's MaxKeepAliveRequests). Default
+    ///                        100; `off` for none.
+    ///   max-header-bytes=64K ICAP: the largest ICAP head plus encapsulated HTTP
+    ///                        headers of one request. At least 1K, no `off`.
+    ///                        Default 64K.
+    ///   preview-bytes=4096   ICAP: bytes of a body a client sends before pausing
+    ///                        for a verdict (the `Preview` header). `0` previews
+    ///                        the headers only; `off` leaves the header out, so
+    ///                        clients send whole bodies. Default 4096.
+    ///   transfer-preview=off ICAP: `*` sends `Transfer-Preview: *`, asking for a
+    ///                        preview of every object; `off` leaves the header
+    ///                        out, so RFC 3507 clients send objects whole.
+    ///                        Default `*`.
+    ///   options-ttl-secs=60  ICAP: seconds a client may keep the OPTIONS answer
+    ///                        (`Options-TTL`). `0` asks it to re-ask every time;
+    ///                        `off` leaves the header out, which RFC 3507 reads
+    ///                        as never expiring. Default 3600.
+    ///   infection-header=detections
+    ///                        ICAP: which blocks carry c-icap's
+    ///                        `X-Infection-Found`: `blocks` (every one, a partial
+    ///                        verdict under `Heuristics.Exav.*`) or `detections`
+    ///                        (a signature match only). Default `blocks`, so a
+    ///                        client that reads only that header sees every
+    ///                        block.
     ///   service=a&service=b  several ICAP service names, for two proxies whose
     ///                        configurations disagree about the path. One name
     ///                        belongs in the path instead.
@@ -465,7 +496,8 @@ struct Cli {
     /// no worker, so it answers whatever the rest is doing: point the health
     /// check at it. `exav --ping` does so on its own when the same
     /// configuration names one. It takes `?max-connections=` like --listen
-    /// (default 64), and a client has five seconds to send its request.
+    /// (default 64), and `?idle-secs=`, the seconds a client has to send its
+    /// request and take the reply (default 5).
     #[arg(
         long = "listen-health",
         value_name = "ADDR",
@@ -477,8 +509,8 @@ struct Cli {
 
     /// Scan by handing each file to a daemon already running at this address,
     /// instead of loading a database here. Same address grammar as --listen,
-    /// but a bare address: query options (`?mode=`, `?max-connections=`,
-    /// `?service=`) tune the listener and are refused here.
+    /// but a bare address: query options (`?mode=`, `?idle-secs=` and the
+    /// others) tune the listener and are refused here.
     ///
     /// The direction is the flag, not a mode: --listen accepts connections,
     /// --connect makes one.
@@ -498,94 +530,6 @@ struct Cli {
     /// clamd listener, `OPTIONS` on an ICAP one.
     #[arg(long = "ping", env = "EXAV_PING", value_parser = env_switch())]
     ping: bool,
-
-    /// Bytes of a body an ICAP client should send before pausing for a verdict
-    /// (the `Preview` header). `0` previews the headers only; `off` leaves the
-    /// header out, so clients send whole bodies. [default: 4096]
-    #[cfg(feature = "icap")]
-    #[arg(
-        long = "icap-preview-bytes",
-        value_name = "SIZE|off",
-        env = "EXAV_ICAP_PREVIEW_BYTES",
-        value_parser = parse_size_or_omit
-    )]
-    icap_preview_size: Option<OrOff<usize>>,
-
-    /// Which objects a client should preview (the `Transfer-Preview` header);
-    /// `*` means all, `off` omits the header. [default: *]
-    #[cfg(feature = "icap")]
-    #[arg(
-        long = "icap-transfer-preview",
-        value_name = "PATTERN|off",
-        env = "EXAV_ICAP_TRANSFER_PREVIEW"
-    )]
-    icap_transfer_preview: Option<String>,
-
-    /// Seconds a client may cache the ICAP `OPTIONS` answer (`Options-TTL`).
-    /// `0` asks it to re-ask every time; `off` leaves the header out, which
-    /// RFC 3507 reads as never expiring. [default: 3600]
-    #[cfg(feature = "icap")]
-    #[arg(
-        long = "icap-options-ttl-secs",
-        value_name = "SECS|off",
-        env = "EXAV_ICAP_OPTIONS_TTL_SECS",
-        value_parser = parse_secs_or_omit
-    )]
-    icap_options_ttl: Option<OrOff<u32>>,
-
-    /// Requests served on one ICAP connection before it is closed; `off` or
-    /// `0` means no limit. [default: 100] [c-icap.conf: MaxKeepAliveRequests]
-    #[cfg(feature = "icap")]
-    #[arg(
-        long = "icap-max-requests",
-        value_name = "N|off",
-        env = "EXAV_ICAP_MAX_REQUESTS",
-        value_parser = parse_count
-    )]
-    icap_keepalive_requests: Option<u64>,
-
-    /// Seconds an ICAP connection may go without sending or taking a byte,
-    /// between requests or in the middle of one. No `off`: without it a
-    /// client that stops sending holds its connection forever. [default: 600]
-    /// [c-icap.conf: KeepAliveTimeout]
-    #[cfg(feature = "icap")]
-    #[arg(
-        long = "icap-idle-secs",
-        value_name = "SECS",
-        env = "EXAV_ICAP_IDLE_SECS",
-        value_parser = parse_timeout_secs
-    )]
-    icap_idle_timeout: Option<u64>,
-
-    /// Largest ICAP head plus encapsulated HTTP headers accepted in one
-    /// request, at least 1K. No `off`: this is what stops a client that sends
-    /// header bytes forever. [default: 64K]
-    #[cfg(feature = "icap")]
-    #[arg(
-        long = "icap-max-header-bytes",
-        value_name = "SIZE",
-        env = "EXAV_ICAP_MAX_HEADER_BYTES",
-        value_parser = parse_header_bytes
-    )]
-    icap_max_header_size: Option<usize>,
-
-    /// Which ICAP blocks carry the c-icap `X-Infection-Found` header: `blocks`
-    /// (every one, a partial verdict under `Heuristics.Exav.*`) or
-    /// `detections` (a signature match only). [default: blocks]
-    ///
-    /// The default is what makes a block visible to a client that decides
-    /// clean-or-not from that header alone, such as a script that shells out to
-    /// `c-icap-client` and greps the response. `detections` keeps the header
-    /// meaning a database hit and nothing else, at the cost of those clients
-    /// reading an unscannable object as clean.
-    #[cfg(feature = "icap")]
-    #[arg(
-        long = "icap-infection-header",
-        value_name = "WHEN",
-        env = "EXAV_ICAP_INFECTION_HEADER",
-        value_parser = icap::InfectionHeader::parse
-    )]
-    icap_infection_header: Option<icap::InfectionHeader>,
 
     /// What `--connect` hands the daemon for each file: `path` (default),
     /// `contents`, or `fd`.
@@ -649,9 +593,10 @@ struct Cli {
     /// the prefork pool it is per scan job: on expiry the job is answered
     /// LIMITS-EXCEEDED and its worker replaced; it also caps CPU time
     /// (RLIMIT_CPU). In a one-shot run it bounds the whole run, which then
-    /// exits 3 saying so: running out of time is a scan that stopped short, not
-    /// a scanner that failed. The deterministic in-core caps still apply first
-    /// in every mode.
+    /// says so and exits as for what it found: 1 for a detection, else 2 for
+    /// an error, else as `--partial-as` sets for a scan that stopped short
+    /// (3 by default). The deterministic in-core caps still apply first in
+    /// every mode.
     /// [default in the pool: 120; unset otherwise]
     #[arg(
         long = "max-scan-secs",
@@ -712,7 +657,9 @@ struct Cli {
     ///
     /// `off` makes --spill-threshold-bytes a hard per-object memory ceiling:
     /// anything larger has that much scanned and is reported LIMITS-EXCEEDED,
-    /// and an archive member past --max-object-bytes is not scanned. For a
+    /// and an archive member that decodes past --max-object-bytes has only its
+    /// first --max-object-bytes bytes scanned, LIMITS-EXCEEDED unless they hold
+    /// a detection. For a
     /// read-only root filesystem, a container with no writable
     /// temp directory, or a deployment that would rather refuse a large object
     /// than let a scanned payload touch a disk. Worst-case memory is then
@@ -777,9 +724,9 @@ struct Cli {
     ///
     /// A larger object gets the same scan read through a block cache, or a
     /// spill file for a member, except for the checks that parse an object
-    /// whole (a PE's structure, YARA's pe/elf/dotnet modules, containers read
-    /// whole); an object one of those applied to is reported LIMITS-EXCEEDED
-    /// unless something is found.
+    /// whole (a PE's structure and YARA's pe/elf/dotnet modules when its
+    /// image is past the limit, containers read whole); an object one of those
+    /// applied to is reported LIMITS-EXCEEDED unless something is found.
     #[arg(
         long = "max-object-bytes",
         env = "EXAV_MAX_OBJECT_BYTES",
@@ -788,17 +735,18 @@ struct Cli {
     )]
     max_buffer_bytes: Option<u64>,
 
-    /// The most bytes of members that a format decodes whole into memory
-    /// (RAR, OLE streams, PDF streams, RTF objects, installers and the like),
-    /// summed over one scan and never released. A member streamed to the
-    /// matcher (ZIP, 7z, TAR, CAB and the stream codecs) is not counted: those
-    /// are bounded by --max-matcher-bytes. K/M/G/T suffixes; `off` or `0` means
-    /// no limit. [default: 1G, 400M under --clamav-compat]
+    /// The most bytes of members that a format decodes into memory itself
+    /// before handing them over (OLE streams, PDF streams, RTF objects,
+    /// installers, decrypted members and the like), summed over one scan and
+    /// never released. A member handed over as a stream (ZIP, 7z, TAR, CAB and
+    /// the stream codecs) is not counted: the scan holds it up to
+    /// --max-object-bytes and reads a larger one in place or from a spill
+    /// file. K/M/G/T suffixes; `off` or `0` means no limit. [default: 1G, 400M
+    /// under --clamav-compat]
     ///
-    /// This is what bounds the memory a scan holds in extracted members, so
-    /// raise it with the memory to hold them: under --max-process-bytes (and in
-    /// the worker pool, which sets one) it is lowered to what fits that memory,
-    /// and raising it past that changes nothing.
+    /// Under --max-process-bytes (and in the worker pool, which sets one) it is
+    /// lowered to what fits that memory, and raising it past that changes
+    /// nothing.
     #[arg(
         long = "max-extracted-bytes",
         env = "EXAV_MAX_EXTRACTED_BYTES",
@@ -826,11 +774,12 @@ struct Cli {
     /// Memory of the block cache held for an object read in place instead of
     /// held whole: a file past --max-object-bytes, a member or view spilled to
     /// disk, a http(s):// input. One cache per such object being scanned, the
-    /// nested ones included. K/M/G/T suffixes. [default: 8M]
+    /// nested ones included. K/M/G/T suffixes. [default: 32M]
     ///
     /// A larger cache refetches less when a scan goes back to what it read
-    /// (signature verification, an archive's directory); it costs that much
-    /// memory per object. Never below two blocks.
+    /// (signature verification, an archive's directory) and keeps more of the
+    /// object from one pass to the next; it costs that much memory per object.
+    /// Never below two blocks.
     #[arg(
         long = "object-cache-bytes",
         env = "EXAV_OBJECT_CACHE_BYTES",
@@ -869,11 +818,57 @@ struct Cli {
     )]
     http_request_bytes: Option<u64>,
 
+    /// Over http(s)://, the most one request may take, from connecting to the
+    /// last byte of its body. `off` or `0`: no limit. [default: 120]
+    ///
+    /// A server that does not answer range requests sends the object in one
+    /// request, which this bounds too.
+    #[arg(
+        long = "http-timeout-secs",
+        env = "EXAV_HTTP_TIMEOUT_SECS",
+        value_name = "SECS|off",
+        value_parser = parse_limit_secs
+    )]
+    http_timeout_secs: Option<u64>,
+
+    /// Over http(s)://, the redirects followed to reach the object; `0`
+    /// follows none, `off` any number. A redirect to another scheme is never
+    /// followed. [default: 10]
+    #[arg(
+        long = "http-max-redirects",
+        env = "EXAV_HTTP_MAX_REDIRECTS",
+        value_name = "N|off",
+        value_parser = parse_redirects
+    )]
+    http_max_redirects: Option<u32>,
+
+    /// Over http(s)://, follow a redirect to a host with a loopback, private,
+    /// link-local, shared-address or unspecified address, an IPv6 address
+    /// that carries one included. Off by default: the address given is the
+    /// caller's choice, where a redirect leads is the server's, and a daemon
+    /// with --allow-http-scan can reach addresses its clients cannot. The
+    /// addresses are filtered where each connection is made.
+    #[arg(
+        long = "http-redirect-private",
+        env = "EXAV_HTTP_REDIRECT_PRIVATE",
+        value_parser = env_switch()
+    )]
+    http_redirect_private: bool,
+
+    /// Over http(s)://, download an object past --max-object-bytes once into a
+    /// spill file and scan it from there: one transfer in place of one for
+    /// each pass of the scan, paid in disk up to --max-spill-bytes. An object
+    /// that does not fit the spill, or is past --max-input-bytes, is read by
+    /// range requests, as without the flag. Off by default.
+    #[arg(long = "http-spill", env = "EXAV_HTTP_SPILL", value_parser = env_switch())]
+    http_spill: bool,
+
     /// The most bytes fed to the matcher for one top-level file: its members,
     /// decoded payloads and carved regions, summed. A **CPU/time** bound, not a
-    /// memory one: a streamed member is scanned without being held, so this can
-    /// be set far higher to scan multi-gigabyte members in full, paying only in
-    /// scan time. Guards decompression bombs. K/M/G/T suffixes; `off` or `0`
+    /// memory one: a member past --max-object-bytes is read in place or from a
+    /// spill file through the block cache rather than held, so this can be set
+    /// far higher to scan multi-gigabyte members in full, paying in scan time
+    /// and spill space. Guards decompression bombs. K/M/G/T suffixes; `off` or `0`
     /// means no limit. [default: 10G] [clamscan: --max-scansize]
     #[arg(
         long = "max-matcher-bytes",
@@ -883,8 +878,23 @@ struct Cli {
     )]
     max_scanned_bytes: Option<u64>,
 
+    /// The most bytes of holes (the unwritten stretches of a sparse file in a
+    /// filesystem image) handed to the matcher as zeros for one top-level
+    /// file. They count here instead of toward --max-matcher-bytes, so a large
+    /// sparse file does not end the walk of the rest of the volume. A
+    /// CPU/time bound. K/M/G/T suffixes; `off` or `0` means no limit.
+    /// [default: 64G]
+    #[arg(
+        long = "max-hole-bytes",
+        env = "EXAV_MAX_HOLE_BYTES",
+        value_name = "SIZE|off",
+        value_parser = parse_size
+    )]
+    max_hole_bytes: Option<u64>,
+
     /// The largest object PCRE subsignatures run on: on a larger one they do
-    /// not match, as with ClamAV's PCREMaxFileSize. A CPU bound: an object
+    /// not match, as with ClamAV's PCREMaxFileSize, and the scan is said to
+    /// be incomplete (not under --clamav-compat). A CPU bound: an object
     /// is matched without being copied. K/M/G/T suffixes; `off` or `0` means
     /// no limit. [default: off, 100M under --clamav-compat] [clamscan:
     /// --pcre-max-filesize]
@@ -895,6 +905,38 @@ struct Cli {
         value_parser = parse_size
     )]
     max_pcre_bytes: Option<u64>,
+
+    /// Most steps one search may make in a regex engine that a crafted pattern
+    /// or object can make take long: a PCRE subsignature that uses lookaround
+    /// or a back reference, and a YARA regexp. A search is the work of one
+    /// subsignature or pattern on one object. A backtrack of a PCRE is a step,
+    /// and so is each 32 bytes that a part of it handed to the linear engine,
+    /// or a back reference, reads; a YARA regexp makes a step for each 32
+    /// bytes its searches read. A search that reaches the limit stops, and the
+    /// scan is LIMITS-EXCEEDED (PARTIAL, exit 3) unless something is found. A
+    /// CPU bound. `off` or `0` means no limit, and a crafted pattern then runs
+    /// until it ends. [default: 100000000]
+    #[arg(
+        long = "max-regex-steps",
+        env = "EXAV_MAX_REGEX_STEPS",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_regex_steps: Option<u64>,
+
+    /// Steps the verifier of body signatures with wildcards and gaps may take,
+    /// per MiB of the object it searches; an object under 256 MiB counts as
+    /// 256 MiB, so by default one gets 512 million. One group of signatures
+    /// sharing an anchor may take a 32nd of that. Past either, the search stops
+    /// and the scan is LIMITS-EXCEEDED (PARTIAL, exit 3) unless something is
+    /// found. A CPU bound. `off` or `0` means no limit. [default: 2000000]
+    #[arg(
+        long = "max-matcher-steps",
+        env = "EXAV_MAX_MATCHER_STEPS",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_matcher_steps: Option<u64>,
 
     /// The smallest object scanned: a smaller file or member is neither
     /// matched nor unpacked and counts as clean, as ClamAV scans no object
@@ -920,10 +962,11 @@ struct Cli {
     max_pe_emulation_steps: Option<u64>,
 
     /// Maximum nesting depth for recursive unpacking: a zip inside a tar
-    /// inside a disk image. At least 1, and there is no `off`: every level
-    /// costs stack, and an archive nested a million deep would otherwise
-    /// crash the scan instead of being reported. [default: 16; 17 with
-    /// --clamav-compat]
+    /// inside a disk image. `0` opens no container: each file is scanned as
+    /// it stands, and an archive is reported with its members not scanned.
+    /// There is no `off`: every level costs stack, and an archive nested a
+    /// million deep would otherwise crash the scan instead of being reported.
+    /// [default: 16; 17 with --clamav-compat]
     ///
     /// Not directory depth: `find`, `du` and `tree` all spell that
     /// `--max-depth`, so the bare word would be read as a bound on the
@@ -948,6 +991,77 @@ struct Cli {
         value_parser = parse_count
     )]
     max_members: Option<u64>,
+
+    /// Leave out a member that decodes to more than N times its size, once it
+    /// is past --max-object-bytes: the other members are still scanned, and the
+    /// file is LIMITS-EXCEEDED unless something is found. Below that a member is
+    /// held in memory and the memory limits bound it, and with --max-object-bytes
+    /// off the ratio never acts. `off` or `0` means no limit. [default: 1000]
+    #[arg(
+        long = "max-compression-ratio",
+        env = "EXAV_MAX_COMPRESSION_RATIO",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_compression_ratio: Option<u64>,
+
+    /// Most PE, ELF or Mach-O images carving takes from one object, of each
+    /// kind. A further one that validates is left out, and the file is
+    /// LIMITS-EXCEEDED unless something is found. `off` or `0` means no limit.
+    /// [default: 16]
+    #[arg(
+        long = "max-carved-executables",
+        env = "EXAV_MAX_CARVED_EXECUTABLES",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_carved_executables: Option<u64>,
+
+    /// Most archives carving takes from one object. A further one that
+    /// validates is left out, and the file is LIMITS-EXCEEDED unless something
+    /// is found. `off` or `0` means no limit. [default: 32]
+    #[arg(
+        long = "max-carved-archives",
+        env = "EXAV_MAX_CARVED_ARCHIVES",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_carved_archives: Option<u64>,
+
+    /// Most executables or archives decoded from the base64 runs of one text.
+    /// A further one is left out, and the file is LIMITS-EXCEEDED unless
+    /// something is found. `off` or `0` means no limit. [default: 8]
+    #[arg(
+        long = "max-base64-payloads",
+        env = "EXAV_MAX_BASE64_PAYLOADS",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_base64_payloads: Option<u64>,
+
+    /// Most base64 runs of one text that start like an executable or an
+    /// archive and are decoded to see. A further one is left out, and the file
+    /// is LIMITS-EXCEEDED unless something is found. `off` or `0` means no
+    /// limit. [default: 64]
+    #[arg(
+        long = "max-base64-runs",
+        env = "EXAV_MAX_BASE64_RUNS",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_base64_runs: Option<u64>,
+
+    /// Most base64 assets (`data:` URIs, inline images) decoded from one page
+    /// of HTML or flat-XML Office. A further one is left out, and the page is
+    /// LIMITS-EXCEEDED unless something is found. `off` or `0` means no limit.
+    /// [default: 16]
+    #[arg(
+        long = "max-page-assets",
+        env = "EXAV_MAX_PAGE_ASSETS",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_page_assets: Option<u64>,
 
     /// Encodings to recover a payload from before scanning it: `all` (the
     /// default), `none`, or a comma-separated list.
@@ -1012,6 +1126,65 @@ struct Cli {
         value_parser = parse_dlp_count
     )]
     structured_ssn_count: Option<u32>,
+
+    /// Read the QR codes in images (every format exav decodes, inside archives
+    /// and documents too, and the JPEG images of PDFs): each payload is matched
+    /// as text, and a link in one is judged by `--detect phishing`. Off by
+    /// default and under --clamav-compat. Needs the `qr` feature.
+    #[arg(long = "qr", env = "EXAV_QR", value_parser = env_switch())]
+    qr_codes: bool,
+
+    /// Pixels an image may have for --qr to read it; `off` or `0` means
+    /// no limit. A larger image makes the scan PARTIAL. [default: 50000000]
+    #[arg(
+        long = "max-qr-pixels",
+        env = "EXAV_MAX_QR_PIXELS",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_qr_pixels: Option<u64>,
+
+    /// Milliseconds --qr may spend on one image; `off` or `0` means no
+    /// limit. A reading cut short makes the scan PARTIAL. [default: 5000]
+    #[arg(
+        long = "max-qr-millis",
+        env = "EXAV_MAX_QR_MILLIS",
+        value_name = "MS|off",
+        value_parser = parse_count
+    )]
+    max_qr_millis: Option<u64>,
+
+    /// QR codes --qr may read in one image; `off` or `0` means all. An
+    /// image with more makes the scan PARTIAL. [default: 64]
+    #[arg(
+        long = "max-qr-codes",
+        env = "EXAV_MAX_QR_CODES",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_qr_codes: Option<u64>,
+
+    /// Finder patterns (the square a QR code has in three corners) --qr may
+    /// find in one image; `off` or `0` means all. An image with more makes
+    /// the scan PARTIAL. [default: 1000]
+    #[arg(
+        long = "max-qr-finders",
+        env = "EXAV_MAX_QR_FINDERS",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_qr_finders: Option<u64>,
+
+    /// Groups of three finder patterns --qr may try as a QR code in one
+    /// image; `off` or `0` means all. An image with more makes the scan
+    /// PARTIAL. [default: 256]
+    #[arg(
+        long = "max-qr-grids",
+        env = "EXAV_MAX_QR_GRIDS",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_qr_grids: Option<u64>,
 
     /// Heuristic detectors to switch on, over and above the signature database:
     /// `none` (default), `all`, or a comma-separated list.
@@ -1197,7 +1370,9 @@ struct Cli {
     json: bool,
 
     /// Print informational findings: the detected type, and under
-    /// `--detect exav-heuristics` the imphash, section entropy and static score. Those
+    /// `--detect exav-heuristics` the imphash (the value of `.imp` signatures), the
+    /// pe-imphash (the usual import hash, the value of `imphash:` lines), section
+    /// entropy and static score. Those
     /// come from the local scanner, and a daemon reply carries a verdict and
     /// nothing else, so in client mode this prints what the client itself knows:
     /// which daemon answered, and the command sent for each target.
@@ -1401,7 +1576,7 @@ fn shared_version(shared: &std::sync::Arc<daemon::SharedDb>) -> health::Version 
 /// The health listeners this run asks for, a malformed one having stopped the
 /// run at startup already.
 fn health_endpoints(cli: &Cli) -> Vec<endpoint::Endpoint> {
-    endpoint::listeners_of("--listen-health", &cli.listen_health).unwrap_or_default()
+    endpoint::health_listeners_of(&cli.listen_health).unwrap_or_default()
 }
 
 /// The clamd endpoint, if one was asked for.
@@ -1621,13 +1796,58 @@ fn clamscan_flag_hint(args: &[String]) -> Option<String> {
 /// does not, with what replaced it. The variable is checked too: clap ignores
 /// one it does not know, which would drop the setting without a word.
 fn removed_flag(args: &[String]) -> Option<String> {
-    const REMOVED: [(&str, &str, &str); 1] = [(
-        "--build-shard-bytes",
-        "EXAV_BUILD_SHARD_BYTES",
-        "building a database no longer has a matcher to split",
-    )];
-    REMOVED.iter().find_map(|&(flag, var, instead)| {
-        let said = format!("{flag} was removed in 0.0.2: {instead}");
+    const REMOVED: [(&str, &str, &str, &str); 8] = [
+        (
+            "--build-shard-bytes",
+            "EXAV_BUILD_SHARD_BYTES",
+            "0.0.2",
+            "building a database no longer has a matcher to split",
+        ),
+        (
+            "--icap-idle-secs",
+            "EXAV_ICAP_IDLE_SECS",
+            "0.0.3",
+            "the ICAP address takes it, icap://host:1344?idle-secs=600",
+        ),
+        (
+            "--icap-max-requests",
+            "EXAV_ICAP_MAX_REQUESTS",
+            "0.0.3",
+            "the ICAP address takes it, icap://host:1344?max-requests=100",
+        ),
+        (
+            "--icap-max-header-bytes",
+            "EXAV_ICAP_MAX_HEADER_BYTES",
+            "0.0.3",
+            "the ICAP address takes it, icap://host:1344?max-header-bytes=64K",
+        ),
+        (
+            "--icap-preview-bytes",
+            "EXAV_ICAP_PREVIEW_BYTES",
+            "0.0.3",
+            "the ICAP address takes it, icap://host:1344?preview-bytes=4096",
+        ),
+        (
+            "--icap-transfer-preview",
+            "EXAV_ICAP_TRANSFER_PREVIEW",
+            "0.0.3",
+            "the ICAP address takes it, `*` or `off`, icap://host:1344?transfer-preview=off",
+        ),
+        (
+            "--icap-options-ttl-secs",
+            "EXAV_ICAP_OPTIONS_TTL_SECS",
+            "0.0.3",
+            "the ICAP address takes it, icap://host:1344?options-ttl-secs=3600",
+        ),
+        (
+            "--icap-infection-header",
+            "EXAV_ICAP_INFECTION_HEADER",
+            "0.0.3",
+            "the ICAP address takes it, icap://host:1344?infection-header=detections",
+        ),
+    ];
+    REMOVED.iter().find_map(|&(flag, var, version, instead)| {
+        let said = format!("{flag} was removed in {version}: {instead}");
         if args.iter().any(|a| a.split('=').next() == Some(flag)) {
             Some(said)
         } else {
@@ -1652,7 +1872,7 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let mut cli = Cli::parse();
+    let (mut cli, matches) = parse_cli(std::env::args_os());
 
     // `--listen` from the ENVIRONMENT is a default, not an instruction, and the
     // documented precedence is that a flag on the command line wins over the
@@ -1686,6 +1906,13 @@ fn main() -> ExitCode {
     // environment is what it wants to see, not a contradiction to refuse.
     if cli.ping {
         return run_ping(&cli);
+    }
+
+    // After `EXAV_LISTEN` has yielded to a non-serving role, since the
+    // listeners a run has decide what a setting is for, and before
+    // `check_flag_conflicts` refuses the settings that have no listener.
+    for warning in drop_unused_env_settings(&mut cli, &matches) {
+        eprintln!("exav: {warning}");
     }
 
     // Before any role is chosen, so it covers every one of them.
@@ -1795,7 +2022,7 @@ fn main() -> ExitCode {
         eprintln!("exav: --listen: {e}");
         return ExitCode::from(2);
     }
-    if let Err(e) = endpoint::listeners_of("--listen-health", &cli.listen_health) {
+    if let Err(e) = endpoint::health_listeners_of(&cli.listen_health) {
         eprintln!("exav: --listen-health: {e}");
         return ExitCode::from(2);
     }
@@ -1955,6 +2182,23 @@ fn main() -> ExitCode {
         }
     }
 
+    // A pool's periodic re-check is a child of its own, forked here, while this
+    // process has one thread and before the database is loaded, so that the
+    // child holds none of it (see `daemon::Updater`).
+    #[cfg(unix)]
+    let (auto_update, updater) = match auto_update {
+        Some(a) if serves && pool_workers > 0 && a.polls() => match daemon::Updater::start(a) {
+            Ok(u) => (None, Some(u)),
+            Err(e) => {
+                eprintln!("exav: --auto-update: cannot fork the signature updater: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        other => (other, None),
+    };
+    #[cfg(not(unix))]
+    let updater: Option<daemon::Updater> = None;
+
     // Before the load, so a source rewritten during it still reads as changed.
     let watch = if serves {
         reload_watch_dir(&cli).map(daemon::Watch::new)
@@ -1992,11 +2236,15 @@ fn main() -> ExitCode {
     }
 
     if serves {
-        return run_listeners(&cli, db, pool_workers, watch);
+        return run_listeners(&cli, db, pool_workers, watch, updater);
     }
 
     if let Some(out) = &cli.build_db {
-        return match exav_core::database::save(&db, out) {
+        let made = match out.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => std::fs::create_dir_all(dir),
+            _ => Ok(()),
+        };
+        return match made.and_then(|()| exav_core::database::save(&db, out)) {
             Ok(()) => {
                 if !cli.quiet {
                     println!(
@@ -2146,6 +2394,7 @@ fn run_listeners(
     db: Scanner,
     pool_workers: usize,
     watch: Option<daemon::Watch>,
+    updater: Option<daemon::Updater>,
 ) -> ExitCode {
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut opts = build_scan_options(cli);
@@ -2242,6 +2491,24 @@ fn run_listeners(
         .as_ref()
         .and_then(|e| e.max_connections)
         .unwrap_or(daemon::DEFAULT_MAX_CONNECTIONS);
+    // `?idle-secs=` on the clamd address bounds each read and write,
+    // `?request-secs=` a command, `?session-secs=` the connection and
+    // `?reply-secs=` the writes of one reply, in either model.
+    let reads = daemon::Reads {
+        idle: clamd
+            .as_ref()
+            .and_then(|e| e.idle_secs)
+            .map_or(daemon::DEFAULT_IDLE, std::time::Duration::from_secs),
+        command: daemon::command_read_limit(clamd.as_ref().and_then(|e| e.request_secs)),
+        session: clamd
+            .as_ref()
+            .and_then(|e| e.session_secs)
+            .map(std::time::Duration::from_secs),
+        reply: clamd
+            .as_ref()
+            .and_then(|e| e.reply_secs)
+            .map(std::time::Duration::from_secs),
+    };
     let addr = match clamd.map(|e| e.addr) {
         Some(endpoint::Addr::Tcp(a)) => daemon::ListenAddr::Tcp(a),
         #[cfg(unix)]
@@ -2277,6 +2544,7 @@ fn run_listeners(
             max_jobs: cli.max_jobs_per_worker.unwrap_or(1000),
             allow_shutdown: shutdown_allowed(cli.allow_shutdown),
             allow_http_scan: cli.allow_http_scan,
+            reads,
         };
         // One child each, forked and re-forked with the workers: ICAP for its
         // long-lived connections, and the health listeners, which no worker
@@ -2287,7 +2555,7 @@ fn run_listeners(
         if !health.is_empty() {
             side.push(health::side_listener(health));
         }
-        return match daemon::run_prefork(db, addr, opts, cfg, watch, &reload, &side) {
+        return match daemon::run_prefork(db, addr, opts, cfg, watch, &reload, &side, updater) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("exav: daemon error: {e}");
@@ -2299,6 +2567,8 @@ fn run_listeners(
     if pool_workers > 0 {
         eprintln!("exav: --workers is only supported on Unix; using in-process threads");
     }
+    #[cfg(not(unix))]
+    let _ = updater;
 
     // Thread model: one process, so one reporter covers every listener it runs.
     metrics::spawn_reporter(metrics_interval(cli), "daemon");
@@ -2331,6 +2601,7 @@ fn run_listeners(
             allow_shutdown,
             allow_http_scan,
             clamd_max_connections,
+            reads,
         ) {
             eprintln!("exav: daemon error: {e}");
         }
@@ -2395,13 +2666,10 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     // (`fit_limits_to_job_memory`): 1G extracted in total (`Limits::default`),
     // and ClamAV's 400M scan size under compat.
     if compat {
-        opts.deep_analysis_max = 400 * MIB;
         opts.limits.max_extracted_bytes = 400 * MIB;
     }
-    // --max-object-bytes: the global peak-buffer limit. Sets the unpack
-    // per-object cap and the core-side structural buffer (deep_analysis_max)
-    // together, so one knob governs the largest single allocation on every
-    // materialization path.
+    // --max-object-bytes: the global peak-buffer limit, so one knob governs
+    // the largest single allocation on every materialization path.
     let no_limit_at_zero = |n: u64| if n == 0 { u64::MAX } else { n };
     if let Some(b) = cli.max_extracted_bytes.map(no_limit_at_zero) {
         opts.limits.max_extracted_bytes = b;
@@ -2418,9 +2686,16 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     if let Some(b) = cli.http_request_bytes {
         opts.http_request_bytes = b;
     }
+    if let Some(s) = cli.http_timeout_secs {
+        opts.http_timeout_secs = (s != 0).then_some(s);
+    }
+    if let Some(n) = cli.http_max_redirects {
+        opts.http_max_redirects = (n != u32::MAX).then_some(n);
+    }
+    opts.http_redirect_private = cli.http_redirect_private;
+    opts.http_spill = cli.http_spill;
     if let Some(b) = cli.max_buffer_bytes.map(no_limit_at_zero) {
         opts.limits.max_buffer_bytes = b;
-        opts.deep_analysis_max = b;
     }
     // --max-matcher-bytes: the cumulative scan-reach (CPU/time) limit. Decoupled
     // from memory: a streamed member is bounded by this, not by the buffer cap,
@@ -2429,6 +2704,9 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     if let Some(s) = cli.max_scanned_bytes.map(no_limit_at_zero) {
         opts.limits.max_scanned_bytes = s;
     }
+    if let Some(s) = cli.max_hole_bytes.map(no_limit_at_zero) {
+        opts.limits.max_hole_bytes = s;
+    }
     // --max-pcre-bytes: no limit by default; under compat, the 100M of
     // ClamAV's PCREMaxFileSize.
     opts.max_pcre_bytes = match cli.max_pcre_bytes {
@@ -2436,6 +2714,12 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
         Some(v) => Some(v),
         None => compat.then_some(100 * MIB),
     };
+    if let Some(n) = cli.max_regex_steps {
+        opts.max_regex_steps = (n != 0).then_some(n);
+    }
+    if let Some(n) = cli.max_matcher_steps {
+        opts.max_matcher_steps = (n != 0).then_some(n);
+    }
     if let Some(n) = cli.min_scan_bytes {
         opts.min_scan_bytes = n;
     }
@@ -2450,6 +2734,24 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     // `Limits::max_members` for why it is higher than ClamAV's); compat 10000.
     if let Some(f) = cli.max_members.or_else(|| compat.then_some(10_000)) {
         opts.limits.max_members = no_limit_at_zero(f);
+    }
+    if let Some(n) = cli.max_compression_ratio.map(no_limit_at_zero) {
+        opts.limits.max_compression_ratio = n;
+    }
+    if let Some(n) = cli.max_carved_executables.map(no_limit_at_zero) {
+        opts.limits.max_carved_executables = n;
+    }
+    if let Some(n) = cli.max_carved_archives.map(no_limit_at_zero) {
+        opts.limits.max_carved_archives = n;
+    }
+    if let Some(n) = cli.max_base64_payloads.map(no_limit_at_zero) {
+        opts.limits.max_base64_payloads = n;
+    }
+    if let Some(n) = cli.max_base64_runs.map(no_limit_at_zero) {
+        opts.limits.max_base64_runs = n;
+    }
+    if let Some(n) = cli.max_page_assets.map(no_limit_at_zero) {
+        opts.limits.max_page_assets = n;
     }
 
     // Narrowing the unpacking reach to stock ClamAV's, and naming signatures the
@@ -2493,6 +2795,22 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     opts.alert_partition_intersection = detect.partition_intersection();
     opts.alert_broken = detect.broken();
     opts.alert_phishing = detect.phishing();
+    opts.qr_codes = cli.qr_codes;
+    if let Some(n) = cli.max_qr_pixels {
+        opts.max_qr_pixels = (n > 0).then_some(n);
+    }
+    if let Some(n) = cli.max_qr_millis {
+        opts.max_qr_millis = (n > 0).then_some(n);
+    }
+    if let Some(n) = cli.max_qr_codes {
+        opts.max_qr_codes = (n > 0).then_some(n);
+    }
+    if let Some(n) = cli.max_qr_finders {
+        opts.max_qr_finders = (n > 0).then_some(n);
+    }
+    if let Some(n) = cli.max_qr_grids {
+        opts.max_qr_grids = (n > 0).then_some(n);
+    }
     opts.alert_encrypted = partial_as.reports_encrypted_as_found();
     opts.alert_exceeds_max = partial_as.reports_limits_as_found();
     opts
@@ -2663,6 +2981,95 @@ fn detectors(cli: &Cli) -> policy::Detectors {
         .without(cli.no_detect.unwrap_or_default())
 }
 
+/// The command line and the environment, parsed as `Cli::parse` does, with the
+/// matches kept so that where a setting came from can be asked.
+fn parse_cli<I, T>(args: I) -> (Cli, clap::ArgMatches)
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let mut command = Cli::command();
+    let matches = command
+        .try_get_matches_from_mut(args)
+        .unwrap_or_else(|e| e.exit());
+    match Cli::from_arg_matches(&matches) {
+        Ok(cli) => (cli, matches),
+        Err(e) => e.format(&mut command).exit(),
+    }
+}
+
+/// Drops the settings of a listener this run does not have, when only the
+/// environment gave them, and returns one warning for each.
+///
+/// A variable is a default for whatever the container runs: an image that sets
+/// `EXAV_MAX_JOBS_PER_WORKER` for its daemon also runs one-shot scans, and
+/// `check_flag_conflicts` would refuse each of them. The same setting typed on
+/// the command line is a contradiction and stays refused there.
+fn drop_unused_env_settings(cli: &mut Cli, matches: &clap::ArgMatches) -> Vec<String> {
+    use clap::parser::ValueSource;
+    const LISTEN: &str = "--listen";
+    const CLAMD: &str = "--listen clamd://…";
+    const POOL: &str = "the worker pool (--listen clamd://… with --workers N)";
+    let any = serves(cli);
+    let clamd = clamd_endpoint(cli).is_some();
+    let pool = clamd && cli.workers.unwrap_or_else(default_workers) > 0;
+
+    // One row per setting: its field, whether it has a value, whether the run
+    // has what it needs, what that is, and how to drop it.
+    struct Row(&'static str, bool, bool, &'static str, fn(&mut Cli));
+    // A function, so that the closures passed to it become function pointers.
+    fn row(
+        id: &'static str,
+        given: bool,
+        available: bool,
+        needs: &'static str,
+        drop: fn(&mut Cli),
+    ) -> Row {
+        Row(id, given, available, needs, drop)
+    }
+    let rows = vec![
+        row("workers", cli.workers.is_some(), clamd, CLAMD, |c| {
+            c.workers = None
+        }),
+        row("allow_shutdown", cli.allow_shutdown, clamd, CLAMD, |c| {
+            c.allow_shutdown = false
+        }),
+        row(
+            "max_jobs_per_worker",
+            cli.max_jobs_per_worker.is_some(),
+            pool,
+            POOL,
+            |c| c.max_jobs_per_worker = None,
+        ),
+        row(
+            "listen_health",
+            !cli.listen_health.is_empty(),
+            any,
+            LISTEN,
+            |c| c.listen_health.clear(),
+        ),
+    ];
+
+    let command = Cli::command();
+    let mut said = Vec::new();
+    for Row(id, given, available, needs, drop) in rows {
+        if !given || available || matches.value_source(id) != Some(ValueSource::EnvVariable) {
+            continue;
+        }
+        drop(cli);
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == id)
+            .expect("a setting of Cli");
+        said.push(format!(
+            "ignoring {}: --{} needs {needs}, and this run has none",
+            arg.get_env().unwrap_or_default().to_string_lossy(),
+            arg.get_long().unwrap_or_default(),
+        ));
+    }
+    said
+}
+
 fn check_flag_conflicts(cli: &Cli) -> Result<(), String> {
     // The policy belongs to whoever scans. A client only ever sees the reply the
     // daemon already decided, so this flag would parse, look like it was in
@@ -2707,41 +3114,6 @@ fn check_flag_conflicts(cli: &Cli) -> Result<(), String> {
             "--workers is the clamd listener's worker model; it needs --listen clamd://…"
                 .to_string(),
         );
-    }
-    // A listener's settings need that listener, the same way `--workers` above
-    // does. One process serves at most one listener per protocol, so there is
-    // never a question of *which* one these mean; the only way to get them wrong
-    // is to tune a listener that was never started, and then wonder why the
-    // preview size or the shutdown policy had no effect.
-    #[cfg(feature = "icap")]
-    if icap_endpoint(cli).is_none() {
-        let set: Vec<&str> = [
-            ("--icap-preview-bytes", cli.icap_preview_size.is_some()),
-            (
-                "--icap-transfer-preview",
-                cli.icap_transfer_preview.is_some(),
-            ),
-            ("--icap-options-ttl-secs", cli.icap_options_ttl.is_some()),
-            ("--icap-max-requests", cli.icap_keepalive_requests.is_some()),
-            ("--icap-idle-secs", cli.icap_idle_timeout.is_some()),
-            (
-                "--icap-max-header-bytes",
-                cli.icap_max_header_size.is_some(),
-            ),
-            (
-                "--icap-infection-header",
-                cli.icap_infection_header.is_some(),
-            ),
-        ]
-        .into_iter()
-        .filter_map(|(name, given)| given.then_some(name))
-        .collect();
-        if !set.is_empty() {
-            return Err(format!(
-                "{} tune the ICAP listener; it needs --listen icap://…",
-                set.join(", ")
-            ));
-        }
     }
     if cli.allow_shutdown && clamd.is_none() {
         return Err(
@@ -2806,6 +3178,12 @@ fn check_flag_conflicts(cli: &Cli) -> Result<(), String> {
                 dropped.join(", "),
             ));
         }
+    }
+    // QR codes asked for in a build that cannot read them would scan as if
+    // they had been read.
+    #[cfg(not(feature = "qr"))]
+    if cli.qr_codes {
+        return Err("--qr needs a build with `--features qr`".to_string());
     }
     // Serving is chosen before `--build-db` is ever looked at, so without this
     // the pair does not fail: it silently serves, builds nothing, and leaves
@@ -3030,7 +3408,6 @@ fn scan_split_sets(
     totals: &mut Totals,
 ) {
     use std::collections::BTreeMap;
-    use std::io::Read;
     let mut by_dir: BTreeMap<&Path, Vec<String>> = BTreeMap::new();
     for p in files {
         let (Some(dir), Some(name)) = (p.parent(), p.file_name().and_then(|n| n.to_str())) else {
@@ -3039,13 +3416,8 @@ fn scan_split_sets(
         by_dir.entry(dir).or_default().push(name.to_string());
     }
     for (dir, names) in by_dir {
-        let verdicts = exav_core::analyze_split_sets(db, &names, opts, |name, head| {
-            let limit = head.map_or(opts.deep_analysis_max.saturating_add(1), |n| n as u64);
-            let mut data = Vec::new();
-            std::fs::File::open(dir.join(name))?
-                .take(limit)
-                .read_to_end(&mut data)?;
-            Ok(data)
+        let verdicts = exav_core::analyze_split_sets_seekable(db, &names, opts, |name| {
+            std::fs::File::open(dir.join(name))
         });
         // The sets `only` is a part of, or every set.
         let wanted = only.and_then(|p| p.file_name()).and_then(|n| n.to_str());
@@ -3112,11 +3484,12 @@ fn scan_volume_sets(
     }
     for (dir, names) in by_dir {
         let verdicts = exav_core::analyze_volume_sets(db, &names, opts, |name| {
-            use std::io::Read;
             let mut data = Vec::new();
-            std::fs::File::open(dir.join(name))?
-                .take(opts.deep_analysis_max.saturating_add(1))
-                .read_to_end(&mut data)?;
+            exav_core::unpack::source::read_capped(
+                &mut std::fs::File::open(dir.join(name))?,
+                &mut data,
+                opts.limits.max_buffer_bytes.saturating_add(1),
+            )?;
             Ok(data)
         });
         // One line per *archive*, not per part: every part of a set carries the
@@ -3203,11 +3576,7 @@ impl<'a> Input<'a> {
         opts: &ScanOptions,
     ) -> io::Result<Option<(Vec<(String, exav_core::Method)>, exav_core::AllMatchOutcome)>> {
         match self {
-            Self::File(p) => {
-                let file = std::fs::File::open(p)?;
-                let size = file.metadata()?.len();
-                exav_core::analyze_all_seekable(db, file, size, opts).map(Some)
-            }
+            Self::File(p) => exav_core::analyze_all_path(db, p, opts).map(Some),
             Self::Held(held, n) if held.short.is_none() => {
                 held.payload.all_matches(db, opts, *n).map(Some)
             }
@@ -3378,22 +3747,18 @@ fn scan_stdin(db: &Scanner, opts: &ScanOptions, cli: &Cli, totals: &mut Totals) 
 }
 
 /// Scan an http(s):// URL via range requests. One within `--max-object-bytes`
-/// is fetched whole; a larger one is read through the block cache.
+/// is fetched whole; a larger one is read through the block cache, or from a
+/// spill file with `--http-spill`.
 #[cfg(feature = "http-scan")]
 fn scan_url(url: &str, db: &Scanner, opts: &ScanOptions, cli: &Cli, totals: &mut Totals) {
     totals.scanned += 1;
-    let reader = match exav_core::source::HttpRangeReader::open_with(
-        url,
-        opts.object_cache_block_bytes,
-        opts.http_request_bytes,
-    ) {
+    let (reader, size) = match exav_core::source::open_http(url, opts) {
         Ok(r) => r,
         Err(e) => {
             report_error(url, &e.to_string(), cli, totals);
             return;
         }
     };
-    let size = reader.len();
     let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         exav_core::scan_seekable(db, reader, size, opts)
     }));
@@ -3445,7 +3810,7 @@ fn ping_target(cli: &Cli) -> Result<endpoint::Endpoint, String> {
     }
     // A health listener first: it answers while the others are busy, which is
     // when a health check matters.
-    let health = endpoint::listeners_of("--listen-health", &cli.listen_health)?;
+    let health = endpoint::health_listeners_of(&cli.listen_health)?;
     let found = if health.is_empty() {
         listeners(cli)?
     } else {
@@ -3754,7 +4119,7 @@ fn client_stream(cli: &Cli, target: &str, src: impl io::Read) -> io::Result<Stri
 #[cfg(unix)]
 fn client_fdpass(cli: &Cli, path: &Path) -> io::Result<String> {
     use std::io::BufReader;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::AsFd;
     let Some(endpoint::Addr::Unix { path: sock, .. }) = connect_endpoint(cli).map(|e| e.addr)
     else {
         return Err(io::Error::other(
@@ -3763,7 +4128,7 @@ fn client_fdpass(cli: &Cli, path: &Path) -> io::Result<String> {
     };
     let file = std::fs::File::open(path)?;
     let stream = std::os::unix::net::UnixStream::connect(sock)?;
-    daemon::send_fd_command(&stream, b"zFILDES\0", file.as_raw_fd())?;
+    daemon::send_fd_command(&stream, b"zFILDES\0", file.as_fd())?;
     let mut r = BufReader::new(stream.try_clone()?);
     match read_reply(&mut r)? {
         Some(line) => Ok(retarget(&line, &path.display().to_string())),
@@ -4780,6 +5145,18 @@ fn parse_limit_secs(s: &str) -> Result<u64, String> {
         .map_err(|_| format!("expected a number of seconds or `off`, got `{s}`"))
 }
 
+/// `--http-max-redirects`: a count, `0` included, or `off`, which reads as
+/// `u32::MAX`.
+fn parse_redirects(s: &str) -> Result<u32, String> {
+    if s.eq_ignore_ascii_case("off") {
+        return Ok(u32::MAX);
+    }
+    match s.parse::<u32>() {
+        Ok(u32::MAX) | Err(_) => Err(format!("expected a number or `off`, got `{s}`")),
+        Ok(n) => Ok(n),
+    }
+}
+
 /// A count, or `off`, which reads as `0`.
 fn parse_count(s: &str) -> Result<u64, String> {
     if s.eq_ignore_ascii_case("off") {
@@ -4795,14 +5172,9 @@ fn parse_limit_secs_u32(s: &str) -> Result<u32, String> {
     u32::try_from(n).map_err(|_| format!("too many seconds: {s}"))
 }
 
-/// `--max-unpack-depth`: at least 1, no `off` (see its help).
+/// `--max-unpack-depth`: a number, no `off` (see its help).
 fn parse_unpack_depth(s: &str) -> Result<u32, String> {
     match s.parse::<u32>() {
-        Ok(0) => Err(
-            "a depth of 0 would report every container as over the limit; \
-                       give at least 1"
-                .to_string(),
-        ),
         Ok(n) => Ok(n),
         Err(_) if s.eq_ignore_ascii_case("off") => Err("there is no unlimited depth: each \
              level costs stack, so a deep enough nesting would crash the scan; give a number"
@@ -4831,7 +5203,6 @@ pub(crate) enum OrOff<T> {
 
 impl<T> OrOff<T> {
     /// The value, `None` for `off`.
-    #[cfg_attr(not(feature = "icap"), allow(dead_code))]
     pub(crate) fn value(self) -> Option<T> {
         match self {
             OrOff::Off => None,
@@ -4840,7 +5211,6 @@ impl<T> OrOff<T> {
     }
 }
 
-#[cfg_attr(not(feature = "icap"), allow(dead_code))]
 fn parse_size_or_omit(s: &str) -> Result<OrOff<usize>, String> {
     if s.trim().eq_ignore_ascii_case("off") {
         return Ok(OrOff::Off);
@@ -4848,31 +5218,11 @@ fn parse_size_or_omit(s: &str) -> Result<OrOff<usize>, String> {
     parse_size_usize(s).map(OrOff::On)
 }
 
-#[cfg_attr(not(feature = "icap"), allow(dead_code))]
 fn parse_secs_or_omit(s: &str) -> Result<OrOff<u32>, String> {
     if s.trim().eq_ignore_ascii_case("off") {
         return Ok(OrOff::Off);
     }
     parse_limit_secs_u32(s).map(OrOff::On)
-}
-
-/// A timeout that has to exist: at least one second, no `off`.
-#[cfg_attr(not(feature = "icap"), allow(dead_code))]
-fn parse_timeout_secs(s: &str) -> Result<u64, String> {
-    match s.trim().parse::<u64>() {
-        Ok(0) => Err("a timeout of 0 would drop every connection at once".to_string()),
-        Ok(n) => Ok(n),
-        Err(_) => Err(format!("expected a number of seconds, got `{s}`")),
-    }
-}
-
-/// `--icap-max-header-bytes`: a size of at least 1K, no `off`.
-#[cfg_attr(not(feature = "icap"), allow(dead_code))]
-fn parse_header_bytes(s: &str) -> Result<usize, String> {
-    match parse_size_not_off(s)? {
-        n if n < 1024 => Err("below 1K no ICAP request's headers fit".to_string()),
-        n => usize::try_from(n).map_err(|_| format!("size too large for this platform: {s}")),
-    }
 }
 
 /// A size that is not a limit, so `0` is taken as it is and `off` means
@@ -4933,6 +5283,44 @@ fn parse_size(s: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The variable that tells a child [`with_env`] started which case it runs.
+    const ENV_CASE: &str = "EXAV_TEST_ENV_CASE";
+
+    /// Whether this is a child [`with_env`] started, where only its case runs.
+    fn env_child() -> bool {
+        std::env::var_os(ENV_CASE).is_some()
+    }
+
+    /// Every flag falls back to an environment variable, and a test that needs
+    /// one set cannot set it in the process the other tests run in: they read
+    /// the environment as they parse. So `body` runs in a child process of this
+    /// test binary that runs `test` alone, with `vars` set (`None`: removed). In
+    /// that child only the call whose `case` it was started for runs its body;
+    /// in the test binary, the call fails the test if the child does.
+    fn with_env(test: &str, case: &str, vars: &[(&str, Option<&str>)], body: impl FnOnce()) {
+        if let Some(running) = std::env::var_os(ENV_CASE) {
+            if running == case {
+                body();
+            }
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args([test, "--exact"]).env(ENV_CASE, case);
+        for (k, v) in vars {
+            match v {
+                Some(v) => child.env(k, v),
+                None => child.env_remove(k),
+            };
+        }
+        let out = child.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{test}, case {case:?}, {vars:?}:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 
     /// `--ping` probes what this configuration serves, so a health check need
     /// not repeat an address that only the environment knows.
@@ -5135,39 +5523,6 @@ mod tests {
         );
     }
 
-    /// Environment variables set for the length of a test and put back
-    /// afterwards, whatever they were, so no test leaves configuration behind
-    /// for the next one to read as its own.
-    struct EnvVars(Vec<(String, Option<String>)>);
-
-    impl EnvVars {
-        fn set(vars: &[(&str, &str)]) -> Self {
-            let saved = vars
-                .iter()
-                .map(|(k, v)| {
-                    let prev = std::env::var(k).ok();
-                    // FIXME: Audit that the environment access only happens in single-threaded code.
-                    unsafe { std::env::set_var(k, v) };
-                    ((*k).to_string(), prev)
-                })
-                .collect();
-            Self(saved)
-        }
-    }
-
-    impl Drop for EnvVars {
-        fn drop(&mut self) {
-            for (k, prev) in &self.0 {
-                match prev {
-                    // FIXME: Audit that the environment access only happens in single-threaded code.
-                    Some(v) => unsafe { std::env::set_var(k, v) },
-                    // FIXME: Audit that the environment access only happens in single-threaded code.
-                    None => unsafe { std::env::remove_var(k) },
-                }
-            }
-        }
-    }
-
     /// A session command answers with as many messages as it has files to
     /// answer about, and only the marker says it has stopped.
     ///
@@ -5262,37 +5617,29 @@ mod tests {
     /// question below answerable by parsing rather than by two sources.
     #[test]
     fn shutdown_is_refused_unless_the_operator_opts_in() {
-        let _env = env_guard();
-        let restore = std::env::var("EXAV_ALLOW_SHUTDOWN").ok();
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("EXAV_ALLOW_SHUTDOWN") };
+        const TEST: &str = "tests::shutdown_is_refused_unless_the_operator_opts_in";
+        let unset = [("EXAV_ALLOW_SHUTDOWN", None)];
+        with_env(TEST, "unset", &unset, || {
+            let off = Cli::parse_from(["exav", "--listen", "clamd://h:1"]);
+            assert!(
+                !shutdown_allowed(off.allow_shutdown),
+                "with no opt-in, SHUTDOWN must be refused"
+            );
 
-        let off = Cli::parse_from(["exav", "--listen", "clamd://h:1"]);
-        assert!(
-            !shutdown_allowed(off.allow_shutdown),
-            "with no opt-in, SHUTDOWN must be refused"
-        );
+            let on = Cli::parse_from(["exav", "--listen", "clamd://h:1", "--allow-shutdown"]);
+            assert!(
+                shutdown_allowed(on.allow_shutdown),
+                "--allow-shutdown restores clamd's behaviour"
+            );
+        });
 
-        let on = Cli::parse_from(["exav", "--listen", "clamd://h:1", "--allow-shutdown"]);
-        assert!(
-            shutdown_allowed(on.allow_shutdown),
-            "--allow-shutdown restores clamd's behaviour"
-        );
-
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("EXAV_ALLOW_SHUTDOWN", "1") };
-        let from_env = Cli::parse_from(["exav", "--listen", "clamd://h:1"]);
-        assert!(
-            shutdown_allowed(from_env.allow_shutdown),
-            "EXAV_ALLOW_SHUTDOWN=1 is the same setting under its own name"
-        );
-
-        match restore {
-            // FIXME: Audit that the environment access only happens in single-threaded code.
-            Some(v) => unsafe { std::env::set_var("EXAV_ALLOW_SHUTDOWN", v) },
-            // FIXME: Audit that the environment access only happens in single-threaded code.
-            None => unsafe { std::env::remove_var("EXAV_ALLOW_SHUTDOWN") },
-        }
+        with_env(TEST, "set", &[("EXAV_ALLOW_SHUTDOWN", Some("1"))], || {
+            let from_env = Cli::parse_from(["exav", "--listen", "clamd://h:1"]);
+            assert!(
+                shutdown_allowed(from_env.allow_shutdown),
+                "EXAV_ALLOW_SHUTDOWN=1 is the same setting under its own name"
+            );
+        });
     }
 
     /// Assert every limit flag in `argv` lands on its own field, using the
@@ -5300,9 +5647,7 @@ mod tests {
     /// carries the six spellings under test; `label` names the spelling family
     /// in the assertion messages.
     ///
-    /// `--max-object-bytes` is parsed on its own because it also sets the
-    /// deep-analysis cap (one knob for the largest single allocation), which
-    /// would mask the extracted-bytes assertion.
+    /// `--max-object-bytes` is parsed on its own, with its own sentinel.
     fn assert_limit_flags(label: &str, argv: [&str; 9], buffer_argv: [&str; 3]) {
         let opts = build_scan_options(&Cli::parse_from(argv));
         assert_eq!(opts.max_scan_size, Some(101), "{label}: input bytes");
@@ -5312,7 +5657,6 @@ mod tests {
 
         let opts = build_scan_options(&Cli::parse_from(buffer_argv));
         assert_eq!(opts.limits.max_buffer_bytes, 106, "{label}: buffer bytes");
-        assert_eq!(opts.deep_analysis_max, 106, "{label}: buffer (deep)");
     }
 
     /// Pins the flag→field mapping in [`build_scan_options`], for exav's own
@@ -5322,7 +5666,6 @@ mod tests {
     /// here rather than in someone's migrated command line.
     #[test]
     fn limit_flags_land_on_their_fields() {
-        let _env = env_guard();
         assert_limit_flags(
             "exav",
             [
@@ -5357,12 +5700,14 @@ mod tests {
         // With no flags, the defaults the --help text quotes.
         let opts = build_scan_options(&Cli::parse_from(["exav"]));
         assert_eq!(opts.max_scan_size, None);
-        assert_eq!(opts.deep_analysis_max, 256 * 1024 * 1024);
         assert_eq!(opts.limits.max_extracted_bytes, 1024 * 1024 * 1024);
         assert_eq!(opts.limits.max_buffer_bytes, 256 * 1024 * 1024);
         assert_eq!(opts.limits.max_scanned_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(opts.limits.max_recursion, 16);
         assert_eq!(opts.limits.max_members, 100_000);
+        assert_eq!(opts.limits.max_compression_ratio, 1000);
+        assert_eq!(opts.limits.max_carved_executables, 16);
+        assert_eq!(opts.limits.max_carved_archives, 32);
 
         assert_eq!(opts.limits.max_pe_emulation_steps, 1_000_000_000);
 
@@ -5379,7 +5724,6 @@ mod tests {
     /// `off` is no limit.
     #[test]
     fn the_extraction_total_and_the_bytecode_memory_are_settings() {
-        let _env = env_guard();
         let opts = build_scan_options(&Cli::parse_from(["exav"]));
         assert_eq!(opts.limits.max_bytecode_memory_bytes, 256 * 1024 * 1024);
         let opts = build_scan_options(&Cli::parse_from([
@@ -5407,26 +5751,229 @@ mod tests {
     /// are settings, with defaults under either mode.
     #[test]
     fn the_object_cache_and_http_request_are_settings() {
-        let _env = env_guard();
         for compat in [false, true] {
             let mut args = vec!["exav"];
             args.extend(compat.then_some("--clamav-compat"));
             let opts = build_scan_options(&Cli::parse_from(&args));
-            assert_eq!(opts.object_cache_bytes, 8 << 20);
+            assert_eq!(opts.object_cache_bytes, 32 << 20);
             assert_eq!(opts.object_cache_block_bytes, 1 << 20);
             assert_eq!(opts.http_request_bytes, 8 << 20);
             args.extend([
                 "--object-cache-bytes",
-                "32M",
+                "64M",
                 "--object-cache-block-bytes",
                 "1M",
                 "--http-request-bytes",
                 "16M",
             ]);
             let opts = build_scan_options(&Cli::parse_from(&args));
-            assert_eq!(opts.object_cache_bytes, 32 << 20);
+            assert_eq!(opts.object_cache_bytes, 64 << 20);
             assert_eq!(opts.object_cache_block_bytes, 1 << 20);
             assert_eq!(opts.http_request_bytes, 16 << 20);
+        }
+    }
+
+    /// How an http(s) source is fetched: settings, each with its default and
+    /// a way to turn it off.
+    #[test]
+    fn the_http_fetch_is_settings() {
+        let opts = build_scan_options(&Cli::parse_from(["exav"]));
+        assert_eq!(opts.http_timeout_secs, Some(120));
+        assert_eq!(opts.http_max_redirects, Some(10));
+        assert!(!opts.http_redirect_private && !opts.http_spill);
+        let opts = build_scan_options(&Cli::parse_from([
+            "exav",
+            "--http-timeout-secs",
+            "off",
+            "--http-max-redirects",
+            "off",
+            "--http-redirect-private",
+            "--http-spill",
+        ]));
+        assert_eq!(opts.http_timeout_secs, None);
+        assert_eq!(opts.http_max_redirects, None);
+        assert!(opts.http_redirect_private && opts.http_spill);
+        let opts = build_scan_options(&Cli::parse_from([
+            "exav",
+            "--http-timeout-secs",
+            "5",
+            "--http-max-redirects",
+            "0",
+        ]));
+        assert_eq!(opts.http_timeout_secs, Some(5));
+        assert_eq!(opts.http_max_redirects, Some(0));
+    }
+
+    /// The ICAP listener reads what bounds its clients off its address, each
+    /// with its default when the address leaves it out.
+    #[cfg(feature = "icap")]
+    #[test]
+    fn the_icap_client_bounds_come_off_the_address() {
+        let cfg = |addr: &str| {
+            icap::config_from_cli(&Cli::parse_from(["exav", "--listen", addr])).unwrap()
+        };
+        let d =
+            icap::config_from_cli(&Cli::parse_from(["exav", "--listen", "icap://h:1"])).unwrap();
+        assert_eq!(d.request_read, Some(daemon::DEFAULT_COMMAND_READ));
+        assert_eq!((d.keepalive_requests, d.max_header_bytes), (100, 64 * 1024));
+        let c = cfg("icap://h:1?request-secs=7&max-requests=3&max-header-bytes=8K");
+        assert_eq!(c.request_read, Some(std::time::Duration::from_secs(7)));
+        assert_eq!((c.keepalive_requests, c.max_header_bytes), (3, 8 * 1024));
+        let c = cfg("icap://h:1?request-secs=off&max-requests=off");
+        assert_eq!((c.request_read, c.keepalive_requests), (None, u64::MAX));
+    }
+
+    /// The settings that tune a listener or the worker pool, as (flag, variable,
+    /// a value, whether the flag takes it).
+    fn listener_settings() -> Vec<(&'static str, &'static str, &'static str, bool)> {
+        vec![
+            ("--workers", "EXAV_WORKERS", "2", true),
+            ("--allow-shutdown", "EXAV_ALLOW_SHUTDOWN", "1", false),
+            (
+                "--max-jobs-per-worker",
+                "EXAV_MAX_JOBS_PER_WORKER",
+                "10",
+                true,
+            ),
+            (
+                "--listen-health",
+                "EXAV_LISTEN_HEALTH",
+                "clamd://127.0.0.1:1",
+                true,
+            ),
+        ]
+    }
+
+    /// A listener's setting that only the environment gave, in a run with no
+    /// such listener, is dropped with a warning: a shared environment (an image
+    /// that sets them for its daemon) must not break a one-shot scan. Every
+    /// setting `check_flag_conflicts` would refuse is dropped, each warning names
+    /// its variable, and the run is then accepted.
+    #[test]
+    fn a_listener_setting_from_the_environment_is_dropped_without_its_listener() {
+        with_env(
+            "tests::a_listener_setting_from_the_environment_is_dropped_without_its_listener",
+            "all",
+            &listener_vars(),
+            dropped_without_its_listener,
+        );
+    }
+
+    /// Every listener setting's variable with its value.
+    fn listener_vars() -> Vec<(&'static str, Option<&'static str>)> {
+        listener_settings()
+            .into_iter()
+            .map(|(_, var, value, _)| (var, Some(value)))
+            .collect()
+    }
+
+    fn dropped_without_its_listener() {
+        let settings = listener_settings();
+        let (mut cli, matches) = parse_cli(["exav", "--allow-no-db", "/etc/hosts"]);
+        assert!(
+            check_flag_conflicts(&cli).is_err(),
+            "the variables alone would be refused"
+        );
+        let said = drop_unused_env_settings(&mut cli, &matches);
+        assert_eq!(said.len(), settings.len(), "{said:#?}");
+        for (flag, var, _, _) in &settings {
+            let warning = said.iter().find(|w| w.contains(var)).unwrap_or_else(|| {
+                panic!("no warning for {var}: {said:#?}");
+            });
+            assert!(warning.contains(flag), "{warning}");
+        }
+        assert_eq!(check_flag_conflicts(&cli), Ok(()));
+        assert!(cli.workers.is_none() && !cli.allow_shutdown && cli.listen_health.is_empty());
+        assert!(cli.max_jobs_per_worker.is_none());
+    }
+
+    /// The same settings typed on the command line stay refused, and the
+    /// command line wins when the variable is set as well: only what the
+    /// environment gave is dropped.
+    #[test]
+    fn a_listener_setting_on_the_command_line_is_not_dropped() {
+        // With every variable set, the others are dropped and this one is not.
+        let check = |with_vars: bool| {
+            for (flag, var, value, takes_value) in listener_settings() {
+                let mut args = vec!["exav", "--allow-no-db", flag];
+                if takes_value {
+                    args.push(value);
+                }
+                args.push("/etc/hosts");
+                let (mut cli, matches) = parse_cli(args);
+                let said = drop_unused_env_settings(&mut cli, &matches);
+                assert!(
+                    !said.iter().any(|w| w.contains(var)),
+                    "{flag}, variables {with_vars}: {said:?}"
+                );
+                assert_eq!(
+                    said.len(),
+                    if with_vars {
+                        listener_settings().len() - 1
+                    } else {
+                        0
+                    },
+                    "{flag}, variables {with_vars}: {said:?}"
+                );
+                // The worker count is checked later, in `main`, where the pool
+                // is known.
+                if flag != "--max-jobs-per-worker" {
+                    let refused = check_flag_conflicts(&cli).expect_err(flag);
+                    assert!(refused.contains(flag), "{flag}: {refused}");
+                }
+            }
+        };
+        with_env(
+            "tests::a_listener_setting_on_the_command_line_is_not_dropped",
+            "all",
+            &listener_vars(),
+            || check(true),
+        );
+        if !env_child() {
+            check(false);
+        }
+    }
+
+    /// With the listener a setting tunes, the environment's value is kept; with
+    /// another listener, or another worker model, it is dropped.
+    #[test]
+    fn a_listener_setting_from_the_environment_is_kept_with_its_listener() {
+        with_env(
+            "tests::a_listener_setting_from_the_environment_is_kept_with_its_listener",
+            "all",
+            &listener_vars(),
+            kept_with_its_listener,
+        );
+    }
+
+    fn kept_with_its_listener() {
+        let dropped = |args: &[&str]| {
+            let (mut cli, matches) = parse_cli(std::iter::once("exav").chain(args.iter().copied()));
+            let said = drop_unused_env_settings(&mut cli, &matches);
+            assert_eq!(check_flag_conflicts(&cli), Ok(()), "{args:?}");
+            said.iter()
+                .filter_map(|w| w.strip_prefix("ignoring ")?.split(':').next())
+                .map(str::to_string)
+                .collect::<std::collections::BTreeSet<String>>()
+        };
+        let has = |set: &std::collections::BTreeSet<String>, var: &str| set.contains(var);
+
+        let pool = dropped(&["--listen", "clamd://127.0.0.1:1", "--workers", "2"]);
+        assert!(!has(&pool, "EXAV_MAX_JOBS_PER_WORKER"), "{pool:?}");
+        assert!(!has(&pool, "EXAV_LISTEN_HEALTH"), "{pool:?}");
+        assert!(!has(&pool, "EXAV_ALLOW_SHUTDOWN"), "{pool:?}");
+
+        // The thread model has no worker recycling.
+        let threads = dropped(&["--listen", "clamd://127.0.0.1:1", "--workers", "threads"]);
+        assert!(has(&threads, "EXAV_MAX_JOBS_PER_WORKER"), "{threads:?}");
+        assert!(!has(&threads, "EXAV_ALLOW_SHUTDOWN"), "{threads:?}");
+
+        #[cfg(feature = "icap")]
+        {
+            let icap = dropped(&["--listen", "icap://127.0.0.1:1"]);
+            assert!(!has(&icap, "EXAV_LISTEN_HEALTH"), "{icap:?}");
+            assert!(has(&icap, "EXAV_WORKERS"), "{icap:?}");
+            assert!(has(&icap, "EXAV_ALLOW_SHUTDOWN"), "{icap:?}");
         }
     }
 
@@ -5434,37 +5981,124 @@ mod tests {
     /// naming why rather than a setting dropped without a word.
     #[test]
     fn a_removed_flag_is_named() {
-        let _env = env_guard();
+        let var = "EXAV_BUILD_SHARD_BYTES";
+        with_env(
+            "tests::a_removed_flag_is_named",
+            "set",
+            &[(var, Some("1G"))],
+            || {
+                let msg = removed_flag(&[]);
+                assert!(msg.is_some_and(|m| m.contains(var)), "{var}");
+            },
+        );
+        if env_child() {
+            return;
+        }
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         for (argv, why) in [
             (&["--build-shard-bytes", "1G"][..], "no longer"),
             (&["--build-shard-bytes=off"], "no longer"),
+            (&["--icap-idle-secs", "30"], "?idle-secs="),
+            (&["--icap-max-requests", "30"], "?max-requests="),
+            (&["--icap-max-header-bytes=8K"], "?max-header-bytes="),
+            (&["--icap-preview-bytes", "0"], "?preview-bytes="),
+            (&["--icap-transfer-preview=*"], "?transfer-preview="),
+            (&["--icap-options-ttl-secs", "off"], "?options-ttl-secs="),
+            (&["--icap-infection-header", "blocks"], "?infection-header="),
         ] {
             let msg = removed_flag(&args(argv)).expect("refused");
             assert!(msg.contains(why), "{msg}");
         }
         assert_eq!(removed_flag(&args(&["--max-object-bytes", "1G"])), None);
-        let var = "EXAV_BUILD_SHARD_BYTES";
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var(var, "1G") };
-        let msg = removed_flag(&[]);
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var(var) };
-        assert!(msg.is_some_and(|m| m.contains(var)), "{var}");
+    }
+
+    /// `--max-compression-ratio` sets the ratio and no other limit.
+    #[test]
+    fn max_compression_ratio_is_read() {
+        let opts = build_scan_options(&Cli::parse_from(["exav", "--max-compression-ratio", "50"]));
+        assert_eq!(opts.limits.max_compression_ratio, 50);
+        assert_eq!(opts.limits.max_buffer_bytes, 256 * 1024 * 1024);
+    }
+
+    /// `--max-carved-executables` sets the cap on the PE, ELF and Mach-O images
+    /// carving takes from one object, and no other.
+    #[test]
+    fn max_carved_executables_is_read() {
+        let argv = ["exav", "--max-carved-executables", "3"];
+        let opts = build_scan_options(&Cli::parse_from(argv));
+        assert_eq!(opts.limits.max_carved_executables, 3);
+        assert_eq!(opts.limits.max_carved_archives, 32);
+    }
+
+    /// `--max-carved-archives` sets the cap on the archives carving takes from
+    /// one object, and no other.
+    #[test]
+    fn max_carved_archives_is_read() {
+        let argv = ["exav", "--max-carved-archives", "5"];
+        let opts = build_scan_options(&Cli::parse_from(argv));
+        assert_eq!(opts.limits.max_carved_archives, 5);
+        assert_eq!(opts.limits.max_carved_executables, 16);
+    }
+
+    /// `--max-base64-payloads`, `--max-base64-runs` and `--max-page-assets`
+    /// each set their own limit, and take `off`.
+    #[test]
+    fn base64_limits_are_read() {
+        let argv = [
+            "exav",
+            "--max-base64-payloads",
+            "2",
+            "--max-base64-runs",
+            "3",
+            "--max-page-assets",
+            "4",
+        ];
+        let l = build_scan_options(&Cli::parse_from(argv)).limits;
+        assert_eq!(
+            (l.max_base64_payloads, l.max_base64_runs, l.max_page_assets),
+            (2, 3, 4)
+        );
+        let l = build_scan_options(&Cli::parse_from(["exav"])).limits;
+        assert_eq!(
+            (l.max_base64_payloads, l.max_base64_runs, l.max_page_assets),
+            (8, 64, 16)
+        );
+        for flag in [
+            "--max-base64-payloads",
+            "--max-base64-runs",
+            "--max-page-assets",
+        ] {
+            let l = build_scan_options(&Cli::parse_from(["exav", flag, "off"])).limits;
+            let set = [l.max_base64_payloads, l.max_base64_runs, l.max_page_assets];
+            assert_eq!(set.iter().filter(|&&n| n == u64::MAX).count(), 1, "{flag}");
+        }
     }
 
     /// Counts that are limits take `off`; the depth and the DLP thresholds,
     /// where no limit or a zero means nothing useful, refuse them.
     #[test]
     fn counts_read_off_as_no_limit_or_refuse_it() {
-        let _env = env_guard();
         for v in ["0", "off"] {
             let opts = build_scan_options(&Cli::parse_from(["exav", "--max-members", v]));
             assert_eq!(opts.limits.max_members, u64::MAX, "--max-members {v}");
+            let opts = build_scan_options(&Cli::parse_from(["exav", "--max-compression-ratio", v]));
+            assert_eq!(
+                opts.limits.max_compression_ratio,
+                u64::MAX,
+                "--max-compression-ratio {v}"
+            );
+            let opts =
+                build_scan_options(&Cli::parse_from(["exav", "--max-carved-executables", v]));
+            assert_eq!(
+                opts.limits.max_carved_executables,
+                u64::MAX,
+                "executables {v}"
+            );
+            let opts = build_scan_options(&Cli::parse_from(["exav", "--max-carved-archives", v]));
+            assert_eq!(opts.limits.max_carved_archives, u64::MAX, "archives {v}");
         }
         for bad in [
-            &["--max-unpack-depth", "0"][..],
-            &["--max-unpack-depth", "off"],
+            &["--max-unpack-depth", "off"][..],
             &["--dlp-ssns", "0"],
             &["--dlp-credit-cards", "0"],
             &["--spill-threshold-bytes", "off"],
@@ -5479,12 +6113,14 @@ mod tests {
             Cli::parse_from(["exav", "--spill-threshold-bytes", "0"]).spill_threshold,
             Some(0)
         );
+        // 0 opens no container.
+        let opts = build_scan_options(&Cli::parse_from(["exav", "--max-unpack-depth", "0"]));
+        assert_eq!(opts.limits.max_recursion, 0);
     }
 
     /// `off` (and `0`) on a limit is "no limit", never a limit of zero.
     #[test]
     fn off_lifts_a_limit() {
-        let _env = env_guard();
         let opts = build_scan_options(&Cli::parse_from(["exav", "--max-pe-emulation-steps", "7"]));
         assert_eq!(opts.limits.max_pe_emulation_steps, 7);
         for off in ["off", "0"] {
@@ -5498,7 +6134,6 @@ mod tests {
                 off,
             ]));
             assert_eq!(opts.limits.max_buffer_bytes, u64::MAX, "{off}: object");
-            assert_eq!(opts.deep_analysis_max, u64::MAX, "{off}: object (deep)");
             assert_eq!(opts.limits.max_scanned_bytes, u64::MAX, "{off}: matcher");
             assert_eq!(
                 opts.limits.max_pe_emulation_steps,
@@ -5506,6 +6141,68 @@ mod tests {
                 "{off}: emulation"
             );
         }
+    }
+
+    /// The step budget of the regex engines: 100,000,000 by default, under
+    /// `--clamav-compat` too, set by the flag or its variable, and `off` or `0`
+    /// is no limit.
+    #[test]
+    fn the_regex_step_budget_is_a_setting() {
+        let var = [("EXAV_MAX_REGEX_STEPS", Some("9"))];
+        with_env(
+            "tests::the_regex_step_budget_is_a_setting",
+            "9",
+            &var,
+            || {
+                let opts = build_scan_options(&Cli::parse_from(["exav"]));
+                assert_eq!(opts.max_regex_steps, Some(9), "the variable");
+            },
+        );
+        if env_child() {
+            return;
+        }
+        for argv in [&["exav"][..], &["exav", "--clamav-compat"]] {
+            let opts = build_scan_options(&Cli::parse_from(argv));
+            assert_eq!(opts.max_regex_steps, Some(100_000_000), "{argv:?}");
+        }
+        let opts = build_scan_options(&Cli::parse_from(["exav", "--max-regex-steps", "7"]));
+        assert_eq!(opts.max_regex_steps, Some(7));
+        for off in ["off", "0"] {
+            let opts = build_scan_options(&Cli::parse_from(["exav", "--max-regex-steps", off]));
+            assert_eq!(opts.max_regex_steps, None, "{off}");
+        }
+        assert!(Cli::try_parse_from(["exav", "--max-regex-steps", "many"]).is_err());
+    }
+
+    /// The step bounds of the body-signature verifier: 2,000,000 per MiB by
+    /// default, under `--clamav-compat` too, set by the flag or its variable,
+    /// and `off` or `0` is no limit.
+    #[test]
+    fn the_matcher_step_rate_is_a_setting() {
+        let var = [("EXAV_MAX_MATCHER_STEPS", Some("9"))];
+        with_env(
+            "tests::the_matcher_step_rate_is_a_setting",
+            "9",
+            &var,
+            || {
+                let opts = build_scan_options(&Cli::parse_from(["exav"]));
+                assert_eq!(opts.max_matcher_steps, Some(9), "the variable");
+            },
+        );
+        if env_child() {
+            return;
+        }
+        for argv in [&["exav"][..], &["exav", "--clamav-compat"]] {
+            let opts = build_scan_options(&Cli::parse_from(argv));
+            assert_eq!(opts.max_matcher_steps, Some(2_000_000), "{argv:?}");
+        }
+        let opts = build_scan_options(&Cli::parse_from(["exav", "--max-matcher-steps", "7"]));
+        assert_eq!(opts.max_matcher_steps, Some(7));
+        for off in ["off", "0"] {
+            let opts = build_scan_options(&Cli::parse_from(["exav", "--max-matcher-steps", off]));
+            assert_eq!(opts.max_matcher_steps, None, "{off}");
+        }
+        assert!(Cli::try_parse_from(["exav", "--max-matcher-steps", "many"]).is_err());
     }
 
     /// Pins the ClamAV-compatibility surface documented by the flag matrix
@@ -5519,7 +6216,6 @@ mod tests {
     /// Adding a flag here is part of adding it to the page.
     #[test]
     fn clamav_spellings_are_accepted_or_refused_as_documented() {
-        let _env = env_guard();
         // exav does not take clamscan's command line. What it does share is the
         // handful of short flags any scanner has, spelled the obvious way, and
         // the promise that anything else stops the run instead of being
@@ -5673,7 +6369,6 @@ mod tests {
     /// are alternatives, so there is no combination of two to refuse.
     #[test]
     fn send_as_needs_a_daemon_to_send_to() {
-        let _env = env_guard();
         let refused = |argv: &[&str]| {
             let cli = Cli::parse_from(std::iter::once("exav").chain(argv.iter().copied()));
             check_flag_conflicts(&cli).is_err()
@@ -5736,11 +6431,12 @@ mod tests {
     /// client-side key passes through by construction.
     #[test]
     fn connect_refuses_listener_tuning() {
-        let _env = env_guard();
         let cli =
             |argv: &[&str]| Cli::parse_from(std::iter::once("exav").chain(argv.iter().copied()));
         for argv in [
             &["--connect", "h:1?max-connections=5", "f"][..],
+            &["--connect", "h:1?session-secs=5", "f"][..],
+            &["--connect", "h:1?reply-secs=5", "f"][..],
             &["--connect", "/s?mode=660", "f"][..],
             &["--connect", "icap://h:1/avscan", "f"][..],
         ] {
@@ -5766,7 +6462,6 @@ mod tests {
     #[cfg(feature = "icap")]
     #[test]
     fn icap_is_opt_in_and_composes() {
-        let _env = env_guard();
         let cli =
             |argv: &[&str]| Cli::parse_from(std::iter::once("exav").chain(argv.iter().copied()));
 
@@ -5805,20 +6500,9 @@ mod tests {
             );
         }
 
-        // A listener's own settings need that listener. One process serves at
-        // most one listener per protocol, so these are never ambiguous about
-        // which listener they mean; the only way to get them wrong is to tune
-        // one that was never started, and a setting with nothing to apply to is
-        // how someone concludes the setting does not work.
+        // A listener's own settings need that listener: a setting with nothing
+        // to apply to is how someone concludes the setting does not work.
         for (argv, why) in [
-            (
-                &["--listen", "clamd://h:1", "--icap-preview-bytes", "8192"][..],
-                "an ICAP setting with only a clamd listener",
-            ),
-            (
-                &["--icap-idle-secs", "30", "file"][..],
-                "an ICAP setting on a one-shot scan",
-            ),
             (
                 &["--listen", "icap://h:1", "--allow-shutdown"][..],
                 "SHUTDOWN is a clamd command; ICAP has no such request",
@@ -5835,15 +6519,12 @@ mod tests {
         }
         // And each is fine once the listener it belongs to is there.
         for ok in [
-            &["--listen", "icap://h:1", "--icap-preview-bytes", "8192"][..],
-            &["--listen", "clamd://h:1", "--allow-shutdown"],
+            &["--listen", "clamd://h:1", "--allow-shutdown"][..],
             &[
                 "--listen",
-                "icap://h:1",
+                "icap://h:1?options-ttl-secs=30",
                 "--listen",
                 "clamd://h:2",
-                "--icap-idle-secs",
-                "30",
                 "--allow-shutdown",
             ],
         ] {
@@ -5855,11 +6536,11 @@ mod tests {
     }
 
     /// The ICAP defaults are the service names and bounds a c-icap deployment
-    /// already answers on, and a flag replaces the one it names and no other.
+    /// already answers on, and an address key replaces the one it names and no
+    /// other.
     #[cfg(feature = "icap")]
     #[test]
-    fn icap_settings_come_from_flags_then_defaults() {
-        let _env = env_guard();
+    fn icap_settings_come_from_the_address_then_defaults() {
         // No `--listen icap://…` at all: the defaults still resolve, which is
         // what the settings below are measured against.
         let cfg = icap::config_from_cli(&Cli::parse_from(["exav"])).unwrap();
@@ -5868,18 +6549,20 @@ mod tests {
         // Out of the box every block is legible to a client that reads only
         // `X-Infection-Found`, which is what makes exav a safe swap for a
         // c-icap container behind such a client.
-        assert_eq!(cfg.infection_header, icap::InfectionHeader::Blocks);
+        assert_eq!(cfg.infection_header, endpoint::InfectionHeader::Blocks);
         // exav does not take the c-icap trade on a deployment's behalf.
         assert_eq!(cfg.partial_as, policy::PartialAs::default());
+
+        assert_eq!(
+            (cfg.preview_size, cfg.transfer_preview, cfg.options_ttl),
+            (Some(4096), true, Some(3600))
+        );
 
         let cfg = icap::config_from_cli(&Cli::parse_from([
             "exav",
             "--listen",
-            "icap://127.0.0.1:2000?service=one&service=two",
-            "--icap-preview-bytes",
-            "512",
-            "--icap-infection-header",
-            "detections",
+            "icap://127.0.0.1:2000?service=one&service=two&preview-bytes=512\
+             &infection-header=detections",
             "--partial-as",
             "password-protected=ok",
         ]))
@@ -5889,6 +6572,7 @@ mod tests {
         // exav never answers on a name nobody configured.
         assert_eq!(cfg.services, ["one", "two"]);
         assert_eq!(cfg.preview_size, Some(512));
+        assert_eq!((cfg.transfer_preview, cfg.options_ttl), (true, Some(3600)));
 
         // `0` and `off` are different settings where both mean something, and
         // where no limit would leave a client able to hold a connection, there
@@ -5899,26 +6583,33 @@ mod tests {
             ))
             .unwrap()
         };
-        assert_eq!(icap(&["--icap-preview-bytes", "0"]).preview_size, Some(0));
-        assert_eq!(icap(&["--icap-preview-bytes", "off"]).preview_size, None);
-        assert_eq!(icap(&["--icap-options-ttl-secs", "0"]).options_ttl, Some(0));
-        assert_eq!(icap(&["--icap-options-ttl-secs", "off"]).options_ttl, None);
+        let at = |q: &str| icap(&["--listen", &format!("icap://127.0.0.1:2000?{q}")]);
+        assert_eq!(at("preview-bytes=0").preview_size, Some(0));
+        assert_eq!(at("preview-bytes=off").preview_size, None);
+        assert_eq!(at("options-ttl-secs=0").options_ttl, Some(0));
+        assert_eq!(at("options-ttl-secs=off").options_ttl, None);
+        assert!(at("transfer-preview=*").transfer_preview);
+        assert!(!at("transfer-preview=off").transfer_preview);
         for v in ["0", "off"] {
-            assert_eq!(
-                icap(&["--icap-max-requests", v]).keepalive_requests,
-                u64::MAX
-            );
+            let addr = format!("icap://127.0.0.1:2000?max-requests={v}");
+            assert_eq!(icap(&["--listen", &addr]).keepalive_requests, u64::MAX);
         }
-        for bad in [
-            &["--icap-idle-secs", "0"][..],
-            &["--icap-idle-secs", "off"],
-            &["--icap-max-header-bytes", "off"],
-            &["--icap-max-header-bytes", "100"],
-        ] {
-            assert!(
-                Cli::try_parse_from(["exav"].iter().chain(bad.iter()).copied()).is_err(),
-                "{bad:?}"
-            );
+        // The idle wait is the address's.
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(icap(&[]).idle_timeout, secs(600));
+        let addr = ["--listen", "icap://127.0.0.1:2000?idle-secs=30"];
+        assert_eq!(icap(&addr).idle_timeout, secs(30));
+        // The lifetime and the reply budget are off unless the address says.
+        assert_eq!((icap(&[]).session, icap(&[]).reply), (None, None));
+        let addr = [
+            "--listen",
+            "icap://127.0.0.1:2000?session-secs=90&reply-secs=7",
+        ];
+        assert_eq!(icap(&addr).session, Some(secs(90)));
+        assert_eq!(icap(&addr).reply, Some(secs(7)));
+        for bad in ["off", "100"] {
+            let addr = format!("icap://127.0.0.1:2000?max-header-bytes={bad}");
+            assert!(endpoint::Endpoint::parse(&addr).is_err(), "{addr}");
         }
         // The ICAP listener has no size ceiling of its own to configure: an
         // object's size is `--max-input-bytes`, the same on every surface.
@@ -5926,7 +6617,7 @@ mod tests {
             Cli::try_parse_from(["exav", "--icap-max-object-size", "5M"]).is_err(),
             "a per-listener size ceiling would answer differently from the daemon"
         );
-        assert_eq!(cfg.infection_header, icap::InfectionHeader::Detections);
+        assert_eq!(cfg.infection_header, endpoint::InfectionHeader::Detections);
         // The ICAP listener does not have its own pass policy: `--partial-as`
         // answers the same question for the CLI's exit code and the daemon's
         // reply, and one question with two answers is how two surfaces come to
@@ -5936,24 +6627,16 @@ mod tests {
             policy::PartialAs::parse("password-protected=ok").unwrap()
         );
 
-        // A value neither flag recognises is refused at parse time rather than
-        // falling back to a policy nobody asked for. Both of these decide what
-        // reaches a client for an object exav could not examine, so a typo that
-        // parsed would be a hole nobody knows they are running.
-        for bad in [
-            &["--icap-infection-header", "sometimes"][..],
-            &["--partial-as", "unscannble"],
-        ] {
-            assert!(
-                Cli::try_parse_from(["exav"].iter().chain(bad.iter()).copied()).is_err(),
-                "{bad:?}"
-            );
-        }
+        // A value neither setting recognises is refused at parse time rather
+        // than falling back to a policy nobody asked for. Both of these decide
+        // what reaches a client for an object exav could not examine, so a typo
+        // that parsed would be a hole nobody knows they are running.
+        assert!(endpoint::Endpoint::parse("icap://h:1?infection-header=sometimes").is_err());
+        assert!(Cli::try_parse_from(["exav", "--partial-as", "unscannble"]).is_err());
     }
 
     #[test]
     fn spill_budgets_have_to_nest() {
-        let _env = env_guard();
         let cli =
             |argv: &[&str]| Cli::parse_from(std::iter::once("exav").chain(argv.iter().copied()));
 
@@ -6019,7 +6702,6 @@ mod tests {
     /// unrepresentable.
     #[test]
     fn an_updater_serves_nothing() {
-        let _env = env_guard();
         let cli =
             |argv: &[&str]| Cli::parse_from(std::iter::once("exav").chain(argv.iter().copied()));
 
@@ -6050,9 +6732,45 @@ mod tests {
     /// image's environment gets the environment's value and no indication of it.
     #[test]
     fn a_flag_beats_the_environment_and_the_environment_beats_the_default() {
-        let _env = env_guard();
+        const TEST: &str =
+            "tests::a_flag_beats_the_environment_and_the_environment_beats_the_default";
         let cli =
             |argv: &[&str]| Cli::parse_from(std::iter::once("exav").chain(argv.iter().copied()));
+        let mut vars = vec![
+            ("EXAV_SIG_DIR", Some("/env/sigs")),
+            (
+                "EXAV_LISTEN",
+                Some("clamd://10.0.0.1:3310,icap://10.0.0.1:1344"),
+            ),
+            ("EXAV_WORKERS", Some("3")),
+            ("EXAV_MAX_PROCESS_BYTES", Some("512M")),
+            ("EXAV_STARTUP_WAIT_SECS", Some("90")),
+            ("EXAV_AUTO_UPDATE", Some("yes")),
+            ("EXAV_ALLOW_NO_DB", Some("true")),
+            ("EXAV_LOG", Some("/env/scan.log")),
+        ];
+        with_env(TEST, "env", &vars, || set_by_the_environment(&cli));
+
+        // The ICAP services ride on the address, so they inherit the one
+        // precedence rule rather than having their own: a `--listen` replaces
+        // the environment's address entire, services included. Nothing can
+        // half-override, because there is only ever one address in play.
+        #[cfg(feature = "icap")]
+        {
+            vars[1].1 = Some("icap://0.0.0.0:1344?service=a&service=b");
+            with_env(TEST, "icap", &vars, || {
+                let e = icap::config_from_cli(&cli(&[])).unwrap();
+                assert_eq!(e.services, ["a", "b"]);
+                let f = icap::config_from_cli(&cli(&["--listen", "icap://0.0.0.0:1344/from_flag"]))
+                    .unwrap();
+                assert_eq!(f.services, ["from_flag"]);
+            });
+        }
+        #[cfg(not(feature = "icap"))]
+        let _ = &mut vars;
+        if env_child() {
+            return;
+        }
 
         // Defaults, with nothing set anywhere.
         let d = cli(&[]);
@@ -6061,18 +6779,9 @@ mod tests {
         assert_eq!(d.workers, None);
         assert!(!d.auto_update);
         assert!(!d.allow_no_db);
+    }
 
-        let _vars = EnvVars::set(&[
-            ("EXAV_SIG_DIR", "/env/sigs"),
-            ("EXAV_LISTEN", "clamd://10.0.0.1:3310,icap://10.0.0.1:1344"),
-            ("EXAV_WORKERS", "3"),
-            ("EXAV_MAX_PROCESS_BYTES", "512M"),
-            ("EXAV_STARTUP_WAIT_SECS", "90"),
-            ("EXAV_AUTO_UPDATE", "yes"),
-            ("EXAV_ALLOW_NO_DB", "true"),
-            ("EXAV_LOG", "/env/scan.log"),
-        ]);
-
+    fn set_by_the_environment(cli: &dyn Fn(&[&str]) -> Cli) {
         // The environment beats the defaults.
         let e = cli(&[]);
         assert_eq!(e.sigs, PathBuf::from("/env/sigs"));
@@ -6115,21 +6824,6 @@ mod tests {
         assert_eq!(f.max_scan_memory, Some(64 * 1024 * 1024));
         assert_eq!(f.startup_timeout, Some(5));
         assert_eq!(f.log, Some(PathBuf::from("/flag/scan.log")));
-
-        // The ICAP services ride on the address, so they inherit the one
-        // precedence rule rather than having their own: a `--listen` replaces
-        // the environment's address entire, services included. Nothing can
-        // half-override, because there is only ever one address in play.
-        #[cfg(feature = "icap")]
-        {
-            let _listen =
-                EnvVars::set(&[("EXAV_LISTEN", "icap://0.0.0.0:1344?service=a&service=b")]);
-            let e = icap::config_from_cli(&cli(&[])).unwrap();
-            assert_eq!(e.services, ["a", "b"]);
-            let f = icap::config_from_cli(&cli(&["--listen", "icap://0.0.0.0:1344/from_flag"]))
-                .unwrap();
-            assert_eq!(f.services, ["from_flag"]);
-        }
     }
 
     /// A switch set in the environment is read the way a container writes one,
@@ -6138,31 +6832,36 @@ mod tests {
     /// it, and `EXAV_AUTO_UPDATE=ture` would silently update nothing.
     #[test]
     fn an_environment_switch_is_true_false_or_an_error() {
-        let _env = env_guard();
+        const TEST: &str = "tests::an_environment_switch_is_true_false_or_an_error";
+        let read = |value: &str, check: &dyn Fn(Result<Cli, clap::Error>)| {
+            let case = format!("value {value:?}");
+            with_env(TEST, &case, &[("EXAV_AUTO_UPDATE", Some(value))], || {
+                check(Cli::try_parse_from(["exav"]))
+            });
+        };
         for on in ["1", "true", "yes", "on"] {
-            let _v = EnvVars::set(&[("EXAV_AUTO_UPDATE", on)]);
-            assert!(
-                Cli::try_parse_from(["exav"])
-                    .expect("a known spelling")
-                    .auto_update,
-                "EXAV_AUTO_UPDATE={on} must set the flag"
-            );
+            read(on, &|cli| {
+                assert!(
+                    cli.expect("a known spelling").auto_update,
+                    "EXAV_AUTO_UPDATE={on} must set the flag"
+                )
+            });
         }
         for off in ["0", "false", "no", "off"] {
-            let _v = EnvVars::set(&[("EXAV_AUTO_UPDATE", off)]);
-            assert!(
-                !Cli::try_parse_from(["exav"])
-                    .expect("a known spelling")
-                    .auto_update,
-                "EXAV_AUTO_UPDATE={off} must leave the flag unset"
-            );
+            read(off, &|cli| {
+                assert!(
+                    !cli.expect("a known spelling").auto_update,
+                    "EXAV_AUTO_UPDATE={off} must leave the flag unset"
+                )
+            });
         }
         for bad in ["ture", "maybe", ""] {
-            let _v = EnvVars::set(&[("EXAV_AUTO_UPDATE", bad)]);
-            assert!(
-                Cli::try_parse_from(["exav"]).is_err(),
-                "EXAV_AUTO_UPDATE={bad:?} says neither yes nor no and must be refused"
-            );
+            read(bad, &|cli| {
+                assert!(
+                    cli.is_err(),
+                    "EXAV_AUTO_UPDATE={bad:?} says neither yes nor no and must be refused"
+                )
+            });
         }
     }
 
@@ -6176,7 +6875,6 @@ mod tests {
     /// code is told the tree is clean while the detection is on its screen.
     #[test]
     fn a_set_annotated_detection_still_counts() {
-        let _env = env_guard();
         let cli = Cli::parse_from(["exav"]);
         let mut totals = Totals::default();
         print_daemon_reply(

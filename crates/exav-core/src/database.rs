@@ -34,15 +34,16 @@ const MAGIC: &[u8; 8] = b"EXAVDB\x00\x01";
 /// The current layout includes the serialized COMPILED YARA rule set in `YaraDb`
 /// (the compiled-blob + blob-version fields), so a prebuilt database loads the
 /// YARA engine without recompiling. Version 3 is exav 0.0.1's; version 4
-/// replaced the signature automatons with the anchor index and the pinned
-/// bodies, and the trailing SHA-256 with a CRC-32. Bumped once per release
-/// at most.
+/// (exav 0.0.2's) replaced the signature automatons with the anchor index and
+/// the pinned bodies, and the trailing SHA-256 with a CRC-32; version 5 keeps
+/// the `imphash:` lines of a `.fdb` file apart from the `.imp` signatures.
+/// Bumped once per release at most.
 ///
 /// Enum variants are stored by index ([`to_vec_indexed`]), so reordering the
 /// variants of a stored enum, or inserting one before others, changes the
 /// format as much as a new field does: bump this then, and exav-update's
 /// `EXAV_DB_VERSION` with it. New variants go at the end instead.
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 /// Fixed header: 8-byte magic + 4-byte little-endian version.
 const HEADER_LEN: u64 = 12;
 /// Trailing CRC-32 of the payload, little-endian. The file is trusted (see the
@@ -750,6 +751,7 @@ mod tests {
         assert_eq!(stored(FileType::TextView), [66], "TextView");
         assert_eq!(stored(FileType::Exfat), [67], "Exfat");
         assert_eq!(stored(FileType::Erofs), [71], "Erofs");
+        assert_eq!(stored(FileType::ScriptView), [72], "ScriptView");
     }
 
     #[test]
@@ -822,6 +824,32 @@ mod tests {
                     assert_eq!(v.detail(), want, "{sample:?}");
                 }
             }
+        }
+    }
+
+    /// A database of version 4, which exav 0.0.2 wrote, is refused and not read
+    /// with the layout of this one: `.imp` signatures and `imphash:` lines
+    /// are kept apart since, so the fuzzy part of its payload is not this
+    /// one's. Same for a version past this one.
+    #[test]
+    fn a_database_of_exav_0_0_2_is_refused() {
+        let mut bytes = Vec::new();
+        super::write(&crate::loader::Builder::new().build().unwrap(), &mut bytes).unwrap();
+        assert_eq!(
+            bytes[8..12],
+            5u32.to_le_bytes(),
+            "the version this build writes"
+        );
+        for version in [4u32, 6] {
+            bytes[8..12].copy_from_slice(&version.to_le_bytes());
+            let Err(err) = super::read(&bytes[..]) else {
+                panic!("version {version} was read");
+            };
+            assert!(
+                err.to_string()
+                    .contains(&format!("unsupported database version {version}")),
+                "{err}"
+            );
         }
     }
 
@@ -986,5 +1014,53 @@ mod tests {
             );
             assert_eq!(crate::phishing::scan(allowed, &db.phishing), None);
         }
+    }
+
+    /// A database built from `.ldb` text, and what it counts as unsupported
+    /// before it is written, read back, and written and read back again.
+    fn unsupported_through_a_file(ldb: &str) -> [usize; 3] {
+        let mut loader = crate::loader::Builder::new();
+        loader.add_named_bytes("t.ldb", ldb.as_bytes(), false);
+        let built = loader.build().unwrap();
+        let stored = |db: &crate::Scanner| {
+            let mut file = Vec::new();
+            super::write(db, &mut file).unwrap();
+            super::read(file.as_slice()).unwrap()
+        };
+        let once = stored(&built);
+        let twice = stored(&once);
+        [
+            built.unsupported_count(),
+            once.unsupported_count(),
+            twice.unsupported_count(),
+        ]
+    }
+
+    /// A PCRE that translates but that neither engine builds (a lookbehind of
+    /// variable length on a high byte: `regex` has no lookaround, and the
+    /// backtracking engine builds variable lookbehinds of ASCII only) is found
+    /// when the database is written. Each logical signature counts once
+    /// however many it holds, and a database written again keeps its count.
+    #[test]
+    fn a_pcre_no_engine_builds_is_counted_when_written() {
+        let [lazy, stored, again] = unsupported_through_a_file(
+            "T.One;Engine:81-255,Target:0;0&1&2;4d41524b;0/(?<=\\xe9{1,2})x/;0/(?<=\\xe9{1,2})y/\n\
+             T.Two;Engine:81-255,Target:0;0&1;4d41524b;0/(?<=\\xe9{1,2})z/\n\
+             T.Fine;Engine:81-255,Target:0;0&1;4d41524b;0/ab+c/\n",
+        );
+        assert_eq!(lazy, 0, "the lazy count is unchanged");
+        assert_eq!(stored, 2);
+        assert_eq!(again, 2);
+    }
+
+    /// A PCRE only the backtracking engine builds (lookahead, back reference)
+    /// is not counted.
+    #[test]
+    fn a_pcre_the_backtracking_engine_builds_is_not_counted_when_written() {
+        let [lazy, stored, again] = unsupported_through_a_file(
+            "T.Look;Engine:81-255,Target:0;0&1;4d41524b;0/a(?=b)/\n\
+             T.Back;Engine:81-255,Target:0;0&1;4d41524b;0/(a)\\1/\n",
+        );
+        assert_eq!([lazy, stored, again], [0, 0, 0]);
     }
 }

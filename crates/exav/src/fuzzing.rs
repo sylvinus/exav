@@ -5,7 +5,7 @@
 use exav_core::{ScanOptions, Scanner};
 use std::io::{self, Cursor, Read};
 
-use crate::daemon::{FdSource, handle_conn};
+use crate::daemon::{FdSource, Reads, SetReadTimeout, handle_conn};
 
 /// A connection's bytes, from memory. A transport that cannot pass a
 /// descriptor, as TCP cannot.
@@ -14,6 +14,12 @@ struct Memory<'a>(Cursor<&'a [u8]>);
 impl Read for Memory<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
+    }
+}
+
+impl SetReadTimeout for Memory<'_> {
+    fn set_read_timeout(&self, _wait: std::time::Duration) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -37,6 +43,7 @@ pub fn clamd(input: &[u8], db: &Scanner, opts: &ScanOptions) -> Vec<u8> {
         &|| {},
         &|| false,
         false,
+        Reads::with_command(None),
     );
     out
 }

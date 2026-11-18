@@ -1,6 +1,6 @@
 #![no_main]
 //! Archive extraction on hostile bytes, tried as EVERY supported format.
-//! The fuzzer doesn't need to "luck into" valid headers — each input is
+//! The fuzzer doesn't need to "luck into" valid headers: each input is
 //! attempted as all formats, so even random bytes exercise every parser's
 //! error paths. Tight budgets prevent DoS from decompression bombs.
 //!

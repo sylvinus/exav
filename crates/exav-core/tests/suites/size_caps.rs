@@ -137,9 +137,9 @@ fn udf_fixture(name: &str) -> Vec<u8> {
     out
 }
 
-fn tiny_deep_analysis(max: u64) -> ScanOptions {
+fn tiny_object_limit(max: u64) -> ScanOptions {
     let mut o = ScanOptions::default();
-    o.deep_analysis_max = max;
+    o.limits.max_buffer_bytes = max;
     o
 }
 
@@ -170,8 +170,8 @@ fn an_iso_too_large_to_buffer_is_walked() {
     for name in ["bridge", "udf_only", "metadata"] {
         let blob = udf_fixture(name);
         let size = blob.len() as u64;
-        let opts = tiny_deep_analysis(64 * 1024);
-        assert!(size > opts.deep_analysis_max);
+        let opts = tiny_object_limit(64 * 1024);
+        assert!(size > opts.limits.max_buffer_bytes);
         expect_eicar(
             scan_seekable(&db, Cursor::new(blob), size, &opts)
                 .expect("scan")
@@ -195,9 +195,9 @@ fn walking_an_input_too_large_to_buffer_still_reports_the_limit() {
     let mut false_sfx = b"MZ".to_vec();
     false_sfx.resize(64 * 1024, 0x90);
     false_sfx.extend_from_slice(b"PK\x03\x04 not an archive");
-    for blob in [udf_fixture("bridge"), udf_fixture("udf_only"), false_sfx] {
+    for blob in [udf_fixture("udf_only"), false_sfx] {
         let size = blob.len() as u64;
-        match scan_seekable(&db, Cursor::new(blob), size, &tiny_deep_analysis(16 * 1024))
+        match scan_seekable(&db, Cursor::new(blob), size, &tiny_object_limit(16 * 1024))
             .expect("scan")
             .verdict
         {
@@ -205,6 +205,14 @@ fn walking_an_input_too_large_to_buffer_still_reports_the_limit() {
             other => panic!("expected LIMITS-EXCEEDED, got {other:?}"),
         }
     }
+    // The files of an ISO 9660 tree are stored as they stand, so one past the
+    // limit is read where it lies, and nothing is left unscanned.
+    let blob = udf_fixture("bridge");
+    let size = blob.len() as u64;
+    let v = scan_seekable(&db, Cursor::new(blob), size, &tiny_object_limit(16 * 1024))
+        .expect("scan")
+        .verdict;
+    assert!(matches!(v, Verdict::Clean), "{v:?}");
 }
 
 #[test]
@@ -226,8 +234,8 @@ fn an_sfx_too_large_to_buffer_is_walked() {
     blob.extend_from_slice(&payload);
     assert!(!blob.windows(eicar.len()).any(|w| w == eicar));
     let size = blob.len() as u64;
-    let opts = tiny_deep_analysis(16 * 1024);
-    assert!(payload.len() as u64 <= opts.deep_analysis_max);
+    let opts = tiny_object_limit(16 * 1024);
+    assert!(payload.len() as u64 <= opts.limits.max_buffer_bytes);
     expect_eicar(
         scan_seekable(&Scanner::builtin(), Cursor::new(blob), size, &opts)
             .expect("scan")

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fetch the free unofficial ClamAV signature feeds that add the most coverage for
-# our differential corpus's misses — TwinWave (EvilDoc, malicious Office docs) and
-# Sanesecurity (BadMacro / Shelter / Foxhole / Porcupine) — over plain HTTPS (no
+# our differential corpus's misses (TwinWave: EvilDoc, malicious Office docs; and
+# Sanesecurity: BadMacro / Shelter / Foxhole / Porcupine) over plain HTTPS (no
 # rsync needed). exav loads these standard `.ndb`/`.ldb`/`.hdb`/`.hsb`/`.cdb`
 # databases the same as `daily.cvd`.
 #
@@ -12,9 +12,9 @@
 # alone cover ~36% of ours, at zero cost. These feeds are heavily Office-macro
 # focused, which is exactly our largest miss class.
 #
-# LICENSES / TERMS (not redistributed here — fetched at runtime, DEST is gitignored):
-#   * TwinWave twinclams — BSD-2-Clause (github.com/twinwave-security/twinclams).
-#   * Sanesecurity — free for use under Sanesecurity's terms; see sanesecurity.org.
+# LICENSES / TERMS (not redistributed here; fetched at runtime, DEST is gitignored):
+#   * TwinWave twinclams: BSD-2-Clause (github.com/twinwave-security/twinclams).
+#   * Sanesecurity: free for use under Sanesecurity's terms; see sanesecurity.org.
 #     For production/mirrored use prefer rsync + the official clamav-unofficial-sigs
 #     tool (github.com/extremeshok/clamav-unofficial-sigs) to respect mirror load.
 set -euo pipefail

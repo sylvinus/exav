@@ -10,6 +10,7 @@
 
 pub mod base64;
 pub mod bytes;
+#[allow(unused_imports)]
 pub use exav_unpack::charset as codepage;
 pub mod css;
 pub mod escher;

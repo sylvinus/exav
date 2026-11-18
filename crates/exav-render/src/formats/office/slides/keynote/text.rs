@@ -37,9 +37,25 @@ fn data_table(m: Option<Msg>) -> Vec<(u32, u32)> {
     .unwrap_or_default()
 }
 
-/// The entry in force at character `at`.
-fn at<T: Copy>(t: &[(u32, T)], at: u32) -> Option<T> {
-    t.iter().take_while(|e| e.0 <= at).last().map(|e| e.1)
+/// A table read at characters in increasing order, in one pass.
+struct Cursor<'t, T> {
+    t: &'t [(u32, T)],
+    next: usize,
+}
+
+impl<'t, T: Copy> Cursor<'t, T> {
+    fn new(t: &'t [(u32, T)]) -> Self {
+        Cursor { t, next: 0 }
+    }
+
+    /// The entry in force at character `at`, which is not below the one
+    /// asked before.
+    fn at(&mut self, at: u32) -> Option<T> {
+        while self.t.get(self.next).is_some_and(|e| e.0 <= at) {
+            self.next += 1;
+        }
+        self.next.checked_sub(1).map(|i| self.t[i].1)
+    }
 }
 
 /// A PostScript font name to a family and its weight and slant:
@@ -321,6 +337,12 @@ pub fn body(
     let fields = table(st.msg(11));
     let levels = data_table(st.msg(6));
     let default_para = r.find(shape_style, Props::Text, |p| p.reference(10));
+    let mut para_at = Cursor::new(&para_styles);
+    let mut level_at = Cursor::new(&levels);
+    let mut list_at = Cursor::new(&list_styles);
+    let mut char_at = Cursor::new(&char_styles);
+    let mut field_at = Cursor::new(&fields);
+    let mut attachment_at = Cursor::new(&attachments);
 
     let mut paras = vec![];
     let mut start = 0usize;
@@ -328,17 +350,27 @@ pub fn body(
         let end = (start..chars.len())
             .find(|&i| matches!(chars[i], '\n' | '\u{2029}'))
             .unwrap_or(chars.len());
-        let ps = at(&para_styles, start as u32).flatten().or(default_para);
-        let level = at(&levels, start as u32).unwrap_or(0).min(8);
-        let list = at(&list_styles, start as u32).flatten();
+        let ps = para_at.at(start as u32).flatten().or(default_para);
+        let level = level_at.at(start as u32).unwrap_or(0).min(8);
+        let list = list_at.at(start as u32).flatten();
         let base = run_props(r, ps, None);
         let props = para_props(r, ps, level, list, base.color);
         let mut runs: Vec<Run> = vec![];
+        // The properties of the last character style, read once for its run.
+        let mut last: Option<(Option<u64>, RunProps)> = None;
         let mut i = start;
         while i < end {
-            let cs = at(&char_styles, i as u32).flatten();
-            let mut rp = run_props(r, ps, cs);
-            let link = at(&fields, i as u32)
+            let cs = char_at.at(i as u32).flatten();
+            let mut rp = match &last {
+                Some((k, rp)) if *k == cs => rp.clone(),
+                _ => {
+                    let rp = run_props(r, ps, cs);
+                    last = Some((cs, rp.clone()));
+                    rp
+                }
+            };
+            let link = field_at
+                .at(i as u32)
                 .flatten()
                 .and_then(|id| match r.store.get(id) {
                     Some((2032, f)) => f.string(2).and_then(|u| Link::url(&u)),
@@ -350,7 +382,8 @@ pub fn body(
             let c = chars[i];
             let kind = match c {
                 '\u{2028}' | '\u{000B}' => RunKind::Break,
-                '\u{FFFC}' => match at(&attachments, i as u32)
+                '\u{FFFC}' => match attachment_at
+                    .at(i as u32)
                     .flatten()
                     .and_then(|id| r.store.get(id))
                 {

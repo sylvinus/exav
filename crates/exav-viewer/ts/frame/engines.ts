@@ -60,10 +60,17 @@ export const ENGINES: Readonly<Record<string, Engine>> = {
   meshes: { formats: [], files: ["model.worker.js", "exav_viewer_model_bg.wasm"] },
   ifc: { formats: ["ifc"], needs: ["three", "meshes"], entries: ["ts/ifc/"] },
   model: { formats: ["stl", "obj", "ply", "gltf"], needs: ["three", "meshes"], entries: ["ts/model/"] },
-  // The page the Office viewers share, and their licence.
-  office: { formats: [], entries: ["ts/office/renderer.ts"], notices: ["@silurus/ooxml"] },
+  // exav's detection of what a file is, which tells the host what a file is
+  // and an archive's members, and exav-unpack's ZIP reader, which the Office
+  // page asks where a DOCX or a PPTX ends and how large it is: one module, in
+  // a worker for each call. In every frame.
+  sniff: { formats: [], files: ["sniff.worker.js", "exav_viewer_sniff_bg.wasm"] },
+  // The page the Office viewers share, its worker that reads a ZIP's
+  // directory, and their licence.
+  office: { formats: [], needs: ["sniff"], entries: ["ts/office/renderer.ts"], files: ["zip.worker.js"], notices: ["@silurus/ooxml"] },
   docx: { formats: ["docx"], needs: ["office"], entries: ["node_modules/@silurus/ooxml/dist/docx.mjs"], files: ["docx_parser_bg.wasm"] },
-  xlsx: { formats: ["xlsx", "csv"], needs: ["office"], entries: ["node_modules/@silurus/ooxml/dist/xlsx.mjs"], files: ["xlsx_parser_bg.wasm"] },
+  // A CSV is made an XLSX by the worker that has the table module.
+  xlsx: { formats: ["xlsx", "csv"], needs: ["office"], entries: ["node_modules/@silurus/ooxml/dist/xlsx.mjs"], files: ["table.worker.js", "exav_viewer_table_bg.wasm", "xlsx_parser_bg.wasm"] },
   pptx: { formats: ["pptx"], needs: ["office"], entries: ["node_modules/@silurus/ooxml/dist/pptx.mjs"], files: ["pptx_parser_bg.wasm"] },
   // A file the external converter converts is shown as a PDF or an XLSX, so
   // these two come with every converted format where one is set.
@@ -75,9 +82,10 @@ export const ENGINES: Readonly<Record<string, Engine>> = {
   sheets: { formats: ["xls", "ods", "numbers"], needs: ["convert", "xlsx"], shows: ["xlsx"], files: ["sheets.worker.js", "exav_viewer_sheets_bg.wasm"] },
   slides: { formats: ["ppt", "odp", "keynote", "odg", "visio"], needs: ["convert", "pptx"], shows: ["pptx"], files: ["slides.worker.js", "exav_viewer_slides_bg.wasm"] },
   docs: { formats: ["rtf", "doc", "odt"], needs: ["convert", "docx"], shows: ["docx"], files: ["docs.worker.js", "exav_viewer_docs_bg.wasm"] },
-  text: { formats: ["text"], entries: ["ts/text/"], files: ["markdown.worker.js", "exav_viewer_text_bg.wasm"] },
+  text: { formats: ["text"], entries: ["ts/text/"], files: ["text.worker.js", "exav_viewer_text_bg.wasm"] },
   archive: {
     formats: ["archive"],
+    needs: ["sniff"],
     entries: ["ts/archive/", "node_modules/@exav/unpack-wasm/", "../exav-unpack-wasm/"],
     files: ["worker.js", "ranges.worker.js", "exav_unpack_wasm_bg.wasm"],
     notices: ["@exav/unpack-wasm"],
@@ -103,6 +111,8 @@ export function engineClosure(formats: readonly BuiltinFormat[], external = fals
     for (const n of [...(e.needs ?? []), ...(external ? (e.external?.needs ?? []) : [])]) add(n);
   };
   for (const f of formats) add(engineOf(f));
+  // Every frame tells the host what a file is from its first bytes (`sniff`).
+  if (formats.length) add("sniff");
   return seen;
 }
 

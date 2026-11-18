@@ -130,6 +130,7 @@ worker() {
     asan=""
     [ "$t" = x86_decode ] && asan="detect_leaks=0"
     mkdir -p "$ROOT/fuzz/artifacts/$t" "$LOGS/cwd_$t"
+    had="$(find "$ROOT/fuzz/artifacts/$t" -type f | wc -l)"
     echo "[$w] === $t (${slice}s, corpus $(find "$corpus" -type f | wc -l) inputs) ==="
     # In a directory of its own: fork mode writes `fuzz-N.log` files to the
     # working directory.
@@ -141,7 +142,10 @@ worker() {
       -max_total_time="$slice") >"$LOGS/run_$t.log" 2>&1
     code=$?
     echo "exit $code" >"$QUEUE/$t/result"
-    echo "[$w] $t done (exit $code): $(grep -c 'artifact_prefix' "$LOGS/run_$t.log") artifacts reported, $(tail -1 "$LOGS/run_$t.log" | cut -c1-120)"
+    # Counted in the directory: in fork mode a crash is written by a child,
+    # whose log is not this one.
+    found=$(($(find "$ROOT/fuzz/artifacts/$t" -type f | wc -l) - had))
+    echo "[$w] $t done (exit $code): $found new artifacts, $(tail -1 "$LOGS/run_$t.log" | cut -c1-120)"
     [ "$KEEP_BINARIES" = 1 ] || rm -f "$BIN/$t" "$BIN"/deps/"$t"-* 2>/dev/null
   done
 }

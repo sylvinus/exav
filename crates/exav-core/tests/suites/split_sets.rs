@@ -13,8 +13,11 @@
 //! ZIP is `zip -0 -s 64k split.zip payload.bin` of 100,000 bytes of
 //! `random.Random(77)`, whose rejoined archive (`zip -s 0`) holds the payload.
 
-use exav_core::{ScanOptions, Scanner, Verdict, analyze, analyze_split_sets, loader};
+use exav_core::{
+    ScanOptions, Scanner, Verdict, analyze, analyze_split_sets, analyze_split_sets_seekable, loader,
+};
 use std::cell::RefCell;
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = format!(
@@ -113,6 +116,36 @@ fn a_rar_set_with_a_volume_missing_is_unscannable_not_clean() {
         |n, _| Ok(fixture(n)),
     );
     assert!(alone.is_empty());
+}
+
+/// `x.part1.rar` and `x.part01.rar` name one volume twice. The set is not
+/// joined, and every name in it is reported with the reason: none is left out
+/// of the result to be scanned as a file of its own.
+#[test]
+fn a_rar_set_with_two_names_for_one_volume_is_reported_not_dropped() {
+    let scanner = db(&[("t.hdb", &format!("{NOISE_MD5}:20000:Test.Noise\n"))]);
+    let given = names(&[
+        "set5.part2.rar",
+        "set5.part01.rar",
+        "notes.txt",
+        "set5.part1.rar",
+    ]);
+    let got = analyze_split_sets(&scanner, &given, &ScanOptions::default(), |n, _| {
+        panic!("{n} was fetched: a set that is not joined is not read")
+    });
+    let mut reported: Vec<&str> = got.iter().map(|v| v.name.as_str()).collect();
+    reported.sort_unstable();
+    assert_eq!(
+        reported,
+        ["set5.part01.rar", "set5.part1.rar", "set5.part2.rar"]
+    );
+    for v in &got {
+        let Verdict::Unscannable { reason } = &v.report.verdict else {
+            panic!("{}: {:?}", v.name, v.report.verdict);
+        };
+        assert!(reason.contains("two names claim one volume"), "{reason}");
+        assert_eq!(v.set, "set5.rar");
+    }
 }
 
 #[test]
@@ -312,7 +345,7 @@ fn a_set_turned_away_for_its_size_does_not_use_up_the_budget_of_the_next() {
     // given back, so the second set, which fits, was "too large to hold" too.
     let scanner = db(&[]);
     let mut opts = ScanOptions::default();
-    opts.deep_analysis_max = 4096;
+    opts.limits.max_buffer_bytes = 4096;
     let given = names(&["a.part1.rar", "a.part2.rar", "b.part1.rar", "b.part2.rar"]);
     let got = analyze_split_sets(&scanner, &given, &opts, |n, _| {
         Ok(vec![0u8; if n == "a.part1.rar" { 4097 } else { 1000 }])
@@ -331,4 +364,295 @@ fn a_set_turned_away_for_its_size_does_not_use_up_the_budget_of_the_next() {
         "b fits the budget: {}",
         reason("b.part1.rar")
     );
+}
+
+#[test]
+fn rar_sets_are_scanned_where_their_volumes_lie() {
+    let scanner = db(&[("t.hdb", &format!("{NOISE_MD5}:20000:Test.Noise\n"))]);
+    let opts = ScanOptions::default();
+    for (set, parts) in [
+        (
+            "set5.rar",
+            ["set5.part1.rar", "set5.part2.rar", "set5.part3.rar"],
+        ),
+        ("set4.rar", ["set4.rar", "set4.r00", "set4.r01"]),
+    ] {
+        let mut given = names(&parts);
+        given.push("notes.txt".into());
+        let opened = RefCell::new(Vec::new());
+        let got = analyze_split_sets_seekable(&scanner, &given, &opts, |n| {
+            opened.borrow_mut().push(n.to_string());
+            Ok(Cursor::new(fixture(n)))
+        });
+        assert_eq!(got.len(), 3, "{set}");
+        for v in &got {
+            assert_eq!(
+                infected(&v.report.verdict),
+                Some("Test.Noise"),
+                "{set}: {}",
+                v.name
+            );
+            assert_eq!(v.set, set);
+        }
+        assert!(
+            !opened.borrow().iter().any(|n| n == "notes.txt"),
+            "a file of no set is not opened"
+        );
+    }
+}
+
+#[test]
+fn a_rar_set_the_seekable_form_cannot_join_is_reported_not_dropped() {
+    let scanner = db(&[("t.hdb", &format!("{NOISE_MD5}:20000:Test.Noise\n"))]);
+    let opts = ScanOptions::default();
+    let unscannable = |got: &[exav_core::VolumeSetVerdict]| {
+        got.iter()
+            .map(|v| match &v.report.verdict {
+                Verdict::Unscannable { reason } => reason.clone(),
+                other => panic!("{}: {other:?}", v.name),
+            })
+            .collect::<Vec<_>>()
+    };
+    // A volume missing, and one not read: each part of the set is reported.
+    let got = analyze_split_sets_seekable(
+        &scanner,
+        &names(&["set5.part1.rar", "set5.part3.rar"]),
+        &opts,
+        |n| Ok(Cursor::new(fixture(n))),
+    );
+    assert_eq!(unscannable(&got).len(), 2);
+    let got = analyze_split_sets_seekable(
+        &scanner,
+        &names(&["set5.part1.rar", "set5.part2.rar", "set5.part3.rar"]),
+        &opts,
+        |n| {
+            if n.contains("part2") {
+                return Err(io::Error::other("no such file"));
+            }
+            Ok(Cursor::new(fixture(n)))
+        },
+    );
+    let reasons = unscannable(&got);
+    assert_eq!(reasons.len(), 3);
+    assert!(
+        reasons.iter().all(|r| r.contains("could not be read")),
+        "{reasons:?}"
+    );
+    // Two names for one volume: not joined, so nothing is opened.
+    let got = analyze_split_sets_seekable(
+        &scanner,
+        &names(&["set5.part2.rar", "set5.part01.rar", "set5.part1.rar"]),
+        &opts,
+        |n| -> io::Result<Cursor<Vec<u8>>> { panic!("{n} was opened: the set is not joined") },
+    );
+    assert!(unscannable(&got).iter().all(|r| r.contains("two names")));
+}
+
+/// A RAR5 block: the checksum the walk does not read, the size of the header,
+/// and the header.
+fn block5(content: Vec<u8>) -> Vec<u8> {
+    [vec![0; 4], vint(content.len() as u64), content].concat()
+}
+
+fn vint(mut x: u64) -> Vec<u8> {
+    let mut o = Vec::new();
+    loop {
+        let b = (x & 0x7f) as u8;
+        x >>= 7;
+        if x == 0 {
+            o.push(b);
+            return o;
+        }
+        o.push(b | 0x80);
+    }
+}
+
+/// A stored member of `data`, a part of `size` bytes in all.
+fn member5(name: &str, split: u64, size: usize, data: &[u8]) -> Vec<u8> {
+    let mut c = [2, 0x02 | split, data.len() as u64].map(vint).concat();
+    // File flags, unpacked size, attributes, stored, host OS, name.
+    c.extend(
+        [0, size as u64, 0, 0, 0, name.len() as u64]
+            .map(vint)
+            .concat(),
+    );
+    c.extend_from_slice(name.as_bytes());
+    [block5(c), data.to_vec()].concat()
+}
+
+/// A RAR5 set of three volumes: `payload` stored in a member across all of
+/// them, and `filler` in one of its own in the last.
+fn rar5_set(payload: &[u8], filler: &[u8]) -> Vec<Vec<u8>> {
+    let share = payload.len().div_ceil(3);
+    (0..3)
+        .map(|k| {
+            let mut v = b"Rar!\x1a\x07\x01\x00".to_vec();
+            let mut main = [1, 0, if k > 0 { 3 } else { 1 }].map(vint).concat();
+            if k > 0 {
+                main.extend(vint(k as u64));
+            }
+            v.extend(block5(main));
+            let part = &payload[k * share..((k + 1) * share).min(payload.len())];
+            let split = if k > 0 { 0x08 } else { 0 } | if k < 2 { 0x10 } else { 0 };
+            v.extend(member5("big.bin", split, payload.len(), part));
+            if k == 2 {
+                v.extend(member5("filler.bin", 0, filler.len(), filler));
+            }
+            v.extend(block5([5, 0, if k < 2 { 1 } else { 0 }].map(vint).concat()));
+            v
+        })
+        .collect()
+}
+
+/// `(i * 7) % 251` for `i` below 100,000.
+const BIG_MD5: &str = "c260642229888763c0fa2a4843f50a36";
+
+/// A set too large to hold is scanned all the same where it lies: what a
+/// member holds is found across the volumes, in the memory of a window.
+#[test]
+fn a_rar_set_past_the_memory_limit_is_scanned_where_it_lies() {
+    let payload: Vec<u8> = (0..100_000).map(|i| (i * 7 % 251) as u8).collect();
+    let vols = rar5_set(&payload, &[b' '; 70_000]);
+    // The member fits the limit, the set does not.
+    let mut opts = ScanOptions::default();
+    opts.limits.max_buffer_bytes = 128 * 1024;
+    assert!(vols.iter().map(Vec::len).sum::<usize>() as u64 > opts.limits.max_buffer_bytes);
+    let scanner = db(&[("t.hdb", &format!("{BIG_MD5}:100000:Test.Big\n"))]);
+    let given = names(&["big.part1.rar", "big.part2.rar", "big.part3.rar"]);
+    let file = |n: &str, vols: &[Vec<u8>]| vols[usize::from(n.as_bytes()[8] - b'1')].clone();
+    // Held in memory, a set of this size is turned away.
+    let held = analyze_split_sets(&scanner, &given, &opts, |n, _| Ok(file(n, &vols)));
+    assert_eq!(held.len(), 3);
+    for v in &held {
+        let Verdict::Unscannable { reason } = &v.report.verdict else {
+            panic!("{}: {:?}", v.name, v.report.verdict);
+        };
+        assert!(reason.contains("too large to hold"), "{reason}");
+    }
+    let got =
+        analyze_split_sets_seekable(&scanner, &given, &opts, |n| Ok(Cursor::new(file(n, &vols))));
+    assert_eq!(got.len(), 3);
+    for v in &got {
+        assert_eq!(infected(&v.report.verdict), Some("Test.Big"), "{}", v.name);
+        assert_eq!(v.set, "big.rar");
+    }
+    // One byte of the member different, the signature does not match.
+    let mut other = vols.clone();
+    let at = other[1].len() / 2;
+    other[1][at] ^= 1;
+    let got = analyze_split_sets_seekable(&scanner, &given, &opts, |n| {
+        Ok(Cursor::new(file(n, &other)))
+    });
+    assert!(got.iter().all(|v| infected(&v.report.verdict).is_none()));
+}
+
+/// A volume read from memory that fails over a stretch of its bytes.
+struct Flaky {
+    inner: Cursor<Vec<u8>>,
+    bad: std::ops::Range<u64>,
+}
+
+impl Read for Flaky {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.bad.contains(&self.inner.position()) {
+            return Err(io::Error::other("the disk is gone"));
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for Flaky {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+/// A volume that fails to read is not a clean one, whether it fails where the
+/// set is joined or where the scan reads a member.
+#[test]
+fn a_set_with_a_volume_that_fails_to_read_is_not_clean() {
+    let payload: Vec<u8> = (0..100_000).map(|i| (i * 7 % 251) as u8).collect();
+    let vols = rar5_set(&payload, &[b' '; 70_000]);
+    let mut opts = ScanOptions::default();
+    opts.object_cache_block_bytes = 4096;
+    let scanner = db(&[("t.hdb", &format!("{BIG_MD5}:100000:Test.Big\n"))]);
+    let given = names(&["big.part1.rar", "big.part2.rar", "big.part3.rar"]);
+    // (volume, the bytes that fail): the first block of the second, then the
+    // second's data.
+    for (volume, bad, join) in [(1, 0..4096, true), (1, 8192..12288, false)] {
+        let got = analyze_split_sets_seekable(&scanner, &given, &opts, |n| {
+            let k = usize::from(n.as_bytes()[8] - b'1');
+            Ok(Flaky {
+                inner: Cursor::new(vols[k].clone()),
+                bad: if k == volume { bad.clone() } else { 0..0 },
+            })
+        });
+        assert_eq!(got.len(), 3);
+        for v in &got {
+            let Verdict::Unscannable { reason } = &v.report.verdict else {
+                panic!("{bad:?}: {}: {:?}", v.name, v.report.verdict);
+            };
+            if join {
+                assert!(reason.contains("a part could not be read"), "{reason}");
+            }
+        }
+    }
+}
+
+/// A volume that fails where no member is read (the data of a service block,
+/// which the walk of the archive skips) is not clean either: the scan of the
+/// bytes of the joined archive reads it, and the walk that ends on a source
+/// that failed says so, with the failure's own words.
+#[test]
+fn a_set_with_a_volume_that_fails_where_no_member_is_read_is_not_clean() {
+    let payload: Vec<u8> = (0..100_000).map(|i| (i * 7 % 251) as u8).collect();
+    let mut vols = rar5_set(&payload, &[b' '; 70_000]);
+    // A comment of 40,000 bytes in the second volume, before its end block.
+    let data = [b'c'; 40_000];
+    let mut service = [3, 0x02, data.len() as u64].map(vint).concat();
+    service.extend([0, data.len() as u64, 0, 0, 0, 3].map(vint).concat());
+    service.extend_from_slice(b"CMT");
+    let service = [block5(service), data.to_vec()].concat();
+    let end = block5([5, 0, 1].map(vint).concat());
+    let at = vols[1].len() - end.len();
+    vols[1].splice(at..at, service.iter().copied());
+    // What fails is the inside of the comment: the blocks of the cache that
+    // start 8 KiB or more from either end, so that the headers around it
+    // read.
+    let (from, to) = (at + service.len() - data.len(), at + service.len());
+    let bad = (from + 8192) as u64..(to - 8192) as u64;
+
+    let mut opts = ScanOptions::default();
+    opts.object_cache_block_bytes = 4096;
+    let given = names(&["big.part1.rar", "big.part2.rar", "big.part3.rar"]);
+    let scan = |scanner: &Scanner, bad: std::ops::Range<u64>| {
+        analyze_split_sets_seekable(scanner, &given, &opts, |n| {
+            let k = usize::from(n.as_bytes()[8] - b'1');
+            Ok(Flaky {
+                inner: Cursor::new(vols[k].clone()),
+                bad: if k == 1 { bad.clone() } else { 0..0 },
+            })
+        })
+    };
+    // Control: the comment where it is and nothing failing. The member is
+    // found with its signature, and with another the set is clean.
+    let found = db(&[("t.hdb", &format!("{BIG_MD5}:100000:Test.Big\n"))]);
+    for v in scan(&found, 0..0) {
+        assert_eq!(infected(&v.report.verdict), Some("Test.Big"), "{}", v.name);
+    }
+    let none = db(&[(
+        "t.hdb",
+        "00000000000000000000000000000000:100000:Test.None\n",
+    )]);
+    for v in scan(&none, 0..0) {
+        assert!(matches!(v.report.verdict, Verdict::Clean), "{}", v.name);
+    }
+    let got = scan(&none, bad);
+    assert_eq!(got.len(), 3);
+    for v in &got {
+        let Verdict::Unscannable { reason } = &v.report.verdict else {
+            panic!("{}: {:?}", v.name, v.report.verdict);
+        };
+        assert!(reason.contains("the disk is gone"), "{reason}");
+    }
 }

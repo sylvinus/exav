@@ -292,10 +292,11 @@ fn try_decrypt_dmg(
     // single chunk allocation by the (default) global peak-buffer limit and
     // reject a zero block size (which would divide-by-zero below).
     let chunk_size = header.blocksize as usize;
-    if chunk_size == 0 || chunk_size as u64 > crate::Limits::default().max_buffer_bytes {
-        return Err(LimitHit::new(
-            "DMG block size invalid or exceeds max-buffer".into(),
-        ));
+    if chunk_size == 0 {
+        return Err(LimitHit::corrupt("DMG block size is zero".into()));
+    }
+    if chunk_size as u64 > crate::Limits::default().max_buffer_bytes {
+        return Err(LimitHit::new("DMG block size exceeds max-buffer".into()));
     }
     let data_size = crate::bytes::to_usize(header.datasize);
     let data_start = crate::bytes::to_usize(header.dataoffset);
@@ -364,17 +365,17 @@ fn try_decrypt_dmg(
 
 /// Walk a DMG off its source, each file handed to `visit`. The disk image is
 /// decompressed a run at a time as the filesystem reaches it, never whole.
-pub(crate) fn walk<T>(
+pub(crate) fn walk(
     src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     budget.count_entry()?;
     if src.window(0, 8)[..] != ENCRCDSA_SIG[..] {
-        return walk_disk(Reader::new(src), budget, visit);
+        return walk_disk(Box::new(Reader::new(src)), budget, visit);
     }
     match decrypt_image(src, budget)? {
-        Ok(disk) => walk_disk(Cursor::new(disk), budget, visit),
+        Ok(disk) => walk_disk(Box::new(Cursor::new(disk)), budget, visit),
         Err(reason) => crate::stream::emit_entry(
             Entry::unsupported("encrypted.dmg".to_string(), src.len() as u64, true, reason),
             budget,
@@ -428,11 +429,11 @@ fn decrypt_image(
 /// before the failure, and bytes past it that may not be the disk's
 /// (decoders can run on past damage before they notice it), so it is
 /// reported once the walk is done.
-fn walk_disk<D: Read + Seek, T>(
-    disk: D,
+fn walk_disk(
+    disk: super::udif::Source<'_>,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     let disk = super::udif::disk(disk)?;
     let damaged = disk.damage();
     let found = walk_fs(disk, budget, &mut *visit)?;
@@ -449,11 +450,11 @@ fn walk_disk<D: Read + Seek, T>(
 }
 
 /// Walk the HFS+ or APFS filesystem on `disk`.
-fn walk_fs<D: Read + Seek, T>(
-    mut disk: super::udif::Disk<D>,
+fn walk_fs(
+    mut disk: super::udif::Disk<'_>,
     budget: &mut Budget,
-    visit: crate::stream::Visit<T>,
-) -> Result<Option<T>, LimitHit> {
+    visit: crate::stream::Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     // Both filesystems are looked for in the first 64 KiB, as `is_dmg` does.
     let mut head = Vec::new();
     disk.seek(SeekFrom::Start(0))
@@ -461,16 +462,16 @@ fn walk_fs<D: Read + Seek, T>(
         .map_err(|e| LimitHit::corrupt(format!("UDIF decompress: {e}")))?;
 
     if let Some(nxsb_off) = find_apfs_offset(&head) {
-        let part = Part::new(disk, nxsb_off.saturating_sub(32) as u64)?;
-        return volumes::entries(budget, visit, "", |budget, sink| {
-            super::apfs::walk_volume(part, budget, sink)
+        let mut part = Part::new(disk, nxsb_off.saturating_sub(32) as u64)?;
+        return volumes::entries(budget, visit, "", &mut |budget, sink| {
+            super::apfs::walk_volume(&mut part, budget, sink)
         });
     }
 
     if let Some(hfs_off) = find_hfs_offset(&head) {
-        let part = Part::new(disk, hfs_off.saturating_sub(1024) as u64)?;
-        return volumes::entries(budget, visit, "", |budget, sink| {
-            super::hfsplus::walk_volume(part, budget, sink)
+        let mut part = Part::new(disk, hfs_off.saturating_sub(1024) as u64)?;
+        return volumes::entries(budget, visit, "", &mut |budget, sink| {
+            super::hfsplus::walk_volume(&mut part, budget, sink)
         });
     }
 
@@ -617,6 +618,30 @@ mod tests {
         let spent = std::sync::atomic::AtomicU64::new(0);
         let out = try_decrypt_dmg(&h, "any", &spent).expect("the walk ends with nothing decrypted");
         assert!(out.is_empty());
+    }
+
+    /// A block size of zero is a header that cannot be true: damage. One past
+    /// the buffer limit is a limit.
+    #[cfg(feature = "decrypt")]
+    #[test]
+    fn a_block_size_that_is_zero_is_damage_and_a_huge_one_is_a_limit() {
+        let spent = std::sync::atomic::AtomicU64::new(0);
+        for (blocksize, corrupt) in [(0u32, true), (u32::MAX, false)] {
+            let mut h = vec![0u8; 264];
+            h[..8].copy_from_slice(b"encrcdsa");
+            let put32 = |h: &mut Vec<u8>, at: usize, v: u32| {
+                h[at..at + 4].copy_from_slice(&v.to_be_bytes());
+            };
+            put32(&mut h, 8, 2); // version
+            put32(&mut h, 24, 128); // AES key bits
+            put32(&mut h, 32, 160); // HMAC key bits
+            put32(&mut h, 52, blocksize);
+            put32(&mut h, 104, 1); // kdf iterations
+            put32(&mut h, 196, 64); // keyblob size
+            h.resize(8192, 0);
+            let e = try_decrypt_dmg(&h, "any", &spent).expect_err("refused");
+            assert_eq!(e.is_corrupt(), corrupt, "{blocksize}: {}", e.reason);
+        }
     }
 
     /// The iteration count is the file's (a `u32`); 264 bytes with u32::MAX took

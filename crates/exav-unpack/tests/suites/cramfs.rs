@@ -5,7 +5,7 @@
 //! bytes for boot code, with the empty blocks made holes, with extended block
 //! pointers, and byte-swapped, as an image of a big-endian machine is.
 
-use super::fs_tree::{assert_streams_alike, assert_tree, image, members, tree, walked};
+use super::fs_tree::{assert_streams_alike, assert_tree, came, image, members, tree, walked};
 use exav_unpack::{Format, Limits, detect};
 
 const IMAGES: [&str; 5] = [
@@ -72,4 +72,53 @@ fn a_block_that_does_not_inflate_is_a_file_reported_with_what_precedes_it() {
         e.iter().any(|x| x.unsupported.is_none()),
         "nothing else was read"
     );
+}
+
+/// A file that breaks part way says why, held or read as it goes, and gives the
+/// blocks before the break. Each image has one byte changed (the offsets were
+/// found by changing each byte in turn), or is cut.
+#[test]
+fn a_file_that_breaks_part_way_says_why() {
+    let flipped = |name: &str, at: usize, x: u8| {
+        let mut d = image(name);
+        d[at] ^= x;
+        d
+    };
+    let cases = [
+        (flipped("cramfs", 98, 0xFF), "big4k.bin", "go backwards"),
+        (
+            flipped("cramfs", 100, 0xFF),
+            "big4k.bin",
+            "longer than a page",
+        ),
+        (flipped("cramfs", 96, 0xFF), "big4k.bin", "did not inflate"),
+        (
+            flipped("cramfs_extended", 100, 0x80),
+            "big4k.bin",
+            "direct pointer",
+        ),
+        (
+            image("cramfs")[..7698].to_vec(),
+            "a/b/c/deep.bin",
+            "not all in the volume",
+        ),
+    ];
+    for (damaged, name, why) in cases {
+        let h = members(Format::Cramfs, &image("cramfs"))
+            .into_iter()
+            .find(|m| m.name == name)
+            .unwrap();
+        // Held, then read as it goes (a buffer limit under the file's size).
+        for cap in [1 << 30, 1000] {
+            let (got, _) = came(Format::Cramfs, &damaged, cap);
+            let c = got.iter().find(|c| c.name == name).expect(name);
+            let said = c.unsupported.map(String::from).or(c.read_error.clone());
+            assert!(
+                said.as_ref().is_some_and(|s| s.contains(why)),
+                "{name}, buffer limit {cap}: {said:?}"
+            );
+            assert!(c.data.len() < h.data.len(), "{name}, buffer limit {cap}");
+            assert_eq!(c.streamed, cap == 1000, "{name}");
+        }
+    }
 }

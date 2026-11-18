@@ -303,6 +303,50 @@ mod tests {
         );
     }
 
+    /// A folder whose PPMd model is over the object limit is left out, the
+    /// folder after it is read, and the walk ends with the limit.
+    #[test]
+    fn a_folder_over_the_object_limit_does_not_hide_the_next() {
+        use sevenz_rust2::encoder_options::PpmdOptions;
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter, EncoderMethod};
+        use std::io::Cursor;
+        let mut sink = Cursor::new(Vec::new());
+        {
+            let mut w = ArchiveWriter::new(&mut sink).unwrap();
+            w.set_content_methods(vec![PpmdOptions::from_order_memory_size(6, 4 << 20).into()]);
+            let ppmd = b"modelled with a large model".to_vec();
+            w.push_archive_entry(ArchiveEntry::new_file("a"), Some(Cursor::new(ppmd)))
+                .unwrap();
+            w.set_content_methods(vec![EncoderMethod::COPY.into()]);
+            let copy = b"stored after it".to_vec();
+            w.push_archive_entry(ArchiveEntry::new_file("b"), Some(Cursor::new(copy)))
+                .unwrap();
+            w.finish().unwrap();
+        }
+        let blob = sink.into_inner();
+        let mut budget = Budget::new(Limits {
+            max_buffer_bytes: 1 << 20,
+            ..Limits::default()
+        });
+        let mut seen = Vec::new();
+        let end = crate::walk::<()>(
+            Format::SevenZip,
+            &blob.as_slice(),
+            &mut budget,
+            &mut |meta, content, b| {
+                let data = content.map(|c| c.into_bytes(meta, b).unwrap().0);
+                seen.push((meta.name.clone(), data));
+                None
+            },
+        );
+        assert_eq!(seen, [("b".to_string(), Some(b"stored after it".to_vec()))]);
+        let hit = end.unwrap_err();
+        assert!(
+            hit.reason.contains("member 'a': 7z: PPMD model memory"),
+            "{hit}"
+        );
+    }
+
     /// Fuzz regressions: crafted 7z headers with absurd stream/file counts must
     /// fail gracefully (Err or empty), never panic (integer overflow / capacity
     /// overflow). Reproducers minimized by the `unpack` fuzz target.
@@ -452,7 +496,8 @@ mod tests {
     }
 
     /// An archive on a source that is not in memory gives the members it gives
-    /// when it is, under a buffer limit far under the archive.
+    /// when it is, under a buffer limit far under the archive where the codec
+    /// allows it.
     #[test]
     fn an_archive_on_a_source_that_is_not_in_memory_gives_the_same_members() {
         for name in [
@@ -471,10 +516,14 @@ mod tests {
         ] {
             let blob = fixture(name);
             let (held, _) = walked_from(&blob.as_slice(), Budget::new(Limits::default()));
-            // PPMd holds its model, which is 64 KiB at the least.
+            // PPMd holds its model, which is 64 KiB at the least, and LZMA its
+            // window: the smaller of the dictionary and the folder, at most
+            // 10,251 bytes here.
             let limits = Limits {
                 max_buffer_bytes: if name.starts_with("ppmd") {
                     1 << 20
+                } else if name.contains("lzma") {
+                    16 * 1024
                 } else {
                     1000
                 },
@@ -567,31 +616,24 @@ mod tests {
         assert!(end.is_err_and(|h| !h.is_corrupt()));
     }
 
-    /// A folder decoded whole, as an encrypted one is, is held under the buffer
-    /// limit, read from where it is in the source.
+    /// An encrypted folder is read from where it is in a source that is not in
+    /// memory, and gives the members it gives when it is.
     #[cfg(feature = "decrypt")]
     #[test]
-    fn an_encrypted_folder_is_held_under_the_buffer_limit_and_read_from_the_source() {
-        let blob = fixture("aes_stored.7z");
-        let limits = Limits {
-            max_buffer_bytes: 4096,
-            ..Limits::default()
-        };
-        let budget = Budget::with_passwords(limits, vec!["hunter2".into()]);
-        let ((got, _), end) = walked_from(&cache_of(&blob), budget);
-        end.unwrap();
-        assert!(
-            got.iter()
-                .any(|(_, d, _)| d.windows(16).any(|w| w == b"EICAR-7Z-AES-MAR"))
-        );
-        // Under a limit the packed bytes do not fit, it is the limit.
-        let limits = Limits {
-            max_buffer_bytes: 32,
-            ..Limits::default()
-        };
-        let budget = Budget::with_passwords(limits, vec!["hunter2".into()]);
-        let (_, end) = walked_from(&cache_of(&blob), budget);
-        let hit = end.unwrap_err();
-        assert!(!hit.is_corrupt(), "{}", hit.reason);
+    fn an_encrypted_folder_is_read_from_a_source_that_is_not_in_memory() {
+        for name in ["aes_stored.7z", "aes_lzma2.7z", "aes_solid.7z"] {
+            let blob = fixture(name);
+            let words = || Budget::with_passwords(Limits::default(), vec!["hunter2".into()]);
+            let (held, _) = walked_from(&blob.as_slice(), words());
+            let (cached, end) = walked_from(&cache_of(&blob), words());
+            end.unwrap();
+            assert_eq!(held.0, cached.0, "{name}");
+            assert!(
+                held.0
+                    .iter()
+                    .any(|(_, d, _)| d.windows(16).any(|w| w == b"EICAR-7Z-AES-MAR")),
+                "{name}"
+            );
+        }
     }
 }

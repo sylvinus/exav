@@ -184,7 +184,7 @@ examine.
 | `--max-filesize=#n` | Skip files larger than this | `--max-input-bytes` | renamed | exav's default is **no limit**; ClamAV's is 100M. `--clamav-compat` sets 100M. Over the limit exav reports `LIMITS-EXCEEDED`, not a clean `OK`, unless `--partial-as ok` (which `--clamav-compat` sets). |
 | `--max-scansize=#n` | Max data scanned per container | `--max-matcher-bytes` | renamed | exav's default is 10G, ClamAV's 400M. exav scans a streamed member without holding it, so this bounds CPU time rather than memory. What a scan holds is a fixed 1 GiB, lowered by `--max-process-bytes`; `--clamav-compat` makes it 400M. |
 | `--max-files=#n` | Max files scanned per container | `--max-members` | renamed | exav's default is 100000 against ClamAV's 10000, because exav descends into nested archives ClamAV does not and so counts more members for the same file. `--clamav-compat` sets 10000. |
-| `--max-recursion=#n` | Max archive recursion depth | `--max-unpack-depth` | renamed | Different default too: exav 16, ClamAV 17. `--clamav-compat` sets 17. `0` is refused. |
+| `--max-recursion=#n` | Max archive recursion depth | `--max-unpack-depth` | renamed | Different default too: exav 16, ClamAV 17. `--clamav-compat` sets 17. `0` opens no container; clamscan 1.4 warns that it is not allowed and uses 17. |
 | `--max-dir-recursion=#n` | Max directory recursion depth | none | absent | exav's directory walk has no depth cap. |
 | `--max-embeddedpe=#n` | Max size checked for an embedded PE | none | absent | exav applies its global budgets instead of a per-subsystem cap. |
 | `--max-htmlnormalize=#n` | Max HTML size to normalize | none | absent | Same. |
@@ -194,7 +194,7 @@ examine.
 | `--max-partitions=#n` | Max partitions per disk image | none | absent | Same. |
 | `--max-iconspe=#n` | Max icons per PE | none | absent | Same. |
 | `--max-rechwp3=#n` | Max HWP3 parse recursion | none | absent | Same. |
-| `--pcre-match-limit=#n` | Max PCRE match calls | none | absent | exav's PCRE path has a bounded backtrack budget that is not operator-tunable. |
+| `--pcre-match-limit=#n` | Max PCRE match calls | none | absent | Not renamed: exav bounds PCRE by `--max-regex-steps`, counted in backtracks and bytes read instead of match calls. |
 | `--pcre-recmatch-limit=#n` | Max recursive PCRE match calls | none | absent | Same. |
 | `--pcre-max-filesize=#n` | Max file size for PCRE subsignatures | `--max-pcre-bytes` | renamed | Per object, as in ClamAV: a member under the limit is matched inside a larger archive. exav's default is no limit, since an object is matched without being copied; `--clamav-compat` makes it ClamAV's 100M. |
 | `--disable-cache` | Disable the clean-file hash cache | none | absent | exav has no scan cache, so there is nothing to disable. |
@@ -233,7 +233,7 @@ gives the flag or environment variable that does the same job, or "none".
 |---|---|---|---|
 | `LocalSocket` | Unix socket path to listen on | `--listen PATH` | A leading `/` is a socket path; the protocol defaults to `clamd`. |
 | `LocalSocketGroup` | Group owning the socket | none | The socket takes the daemon's own primary group; set that in the service unit (`Group=`) and pair it with `?mode=660`. |
-| `LocalSocketMode` | Socket permission bits | `--listen 'clamd:///path?mode=660'` | Same octal values, carried by the address because they are a property of *that* socket. exav's default is **0600** where clamd's is whatever the umask leaves (`Default: disabled (socket is world accessible)`), so widening it is explicit. The socket is created with no permissions and given the mode before it can be reached, so it never exists more open than asked for. |
+| `LocalSocketMode` | Socket permission bits | `--listen 'clamd:///path?mode=660'` | Same octal values, carried by the address because they are a property of *that* socket. exav's default is **0600** where clamd's is whatever the umask leaves (`Default: disabled (socket is world accessible)`), so widening it is explicit. The socket is bound in a directory beside its path that only the daemon's user can enter, given the mode there, and moved to its path, so it never exists more open than asked for. |
 | `FixStaleSocket` | Remove a leftover socket at startup | default | exav removes a stale socket before binding. |
 | `TCPSocket` | TCP port to listen on | `--listen ADDR` | One value carries protocol, host and port. |
 | `TCPAddr` | Address to bind | `--listen ADDR` | |
@@ -241,9 +241,9 @@ gives the flag or environment variable that does the same job, or "none".
 | `MaxThreads` | Worker thread count | `--workers N` | exav's default is one prefork **process** per CPU core; `--workers threads` selects the in-process thread model. |
 | `MaxQueue` | Max queued scan jobs | none | |
 | `IdleTimeout` | Idle thread timeout | none | |
-| `ReadTimeout` | Per-read socket timeout | none | Fixed at 60 s on the clamd listener. (ICAP's is `--icap-idle-secs`.) |
-| `CommandReadTimeout` | Command read timeout | none | Same 60 s. |
-| `SendBufTimeout` | Send-buffer timeout | none | |
+| `ReadTimeout` | Per-read socket timeout | `?idle-secs=` on the clamd address | Each read waits at most this (default 120 s, as clamd's); the whole command is bounded by `?request-secs=`. (ICAP's wait is `?idle-secs=` on its own address.) |
+| `CommandReadTimeout` | Command read timeout | `?request-secs=` on the address | The whole command, from its first byte to the end of its `INSTREAM` data (default 600 s); clamd's bounds the wait for the first command only. |
+| `SendBufTimeout` | Send-buffer timeout | `?idle-secs=` on the clamd address | Seconds, not milliseconds, and the same setting as the reads: the most one write of a reply waits for a client that is not reading (default 120 s), then the client is disconnected and the cut logged. `?reply-secs=` bounds a whole reply. Applies in the thread model and the pool. |
 | `Foreground` | Do not daemonize | default | exav always runs in the foreground. |
 | `User` | Drop privileges to this user | none | Set the user in the service unit. |
 | `PidFile` | Write the pid here | none | |
@@ -289,7 +289,7 @@ gives the flag or environment variable that does the same job, or "none".
 | `MaxDirectoryRecursion` | Max directory depth | none | |
 | `MaxEmbeddedPE`, `MaxHTMLNormalize`, `MaxHTMLNoTags`, `MaxScriptNormalize`, `MaxZipTypeRcg`, `MaxPartitions`, `MaxIconsPE`, `MaxRecHWP3` | Per-subsystem caps | none | exav applies its global budgets instead. |
 | `PCREMaxFileSize` | Max object size for PCRE subsignatures | `--max-pcre-bytes` | |
-| `PCREMatchLimit`, `PCRERecMatchLimit` | PCRE backtracking bounds | none | Bounded internally, not tunable. |
+| `PCREMatchLimit`, `PCRERecMatchLimit` | PCRE backtracking bounds | none | Bounded by `--max-regex-steps`, counted in backtracks and bytes read. |
 | `StreamMaxLength` | Max `INSTREAM` upload | `--max-input-bytes`, `--max-spill-bytes` | clamd defaults to 100M and refuses more; exav has **no default scan limit** on a stream. `--max-spill-bytes` (2G) bounds the temp space one streamed object may occupy, which is the closest thing to a per-upload ceiling. Set `--max-input-bytes` if a client relied on the daemon to bound its uploads. |
 | `StreamMinPort` / `StreamMaxPort` | Legacy `STREAM` port range | none | The `STREAM` command is removed from ClamAV too. |
 | `CacheSize` / `DisableCache` | Clean-file hash cache | none | exav has no scan cache. |
@@ -381,7 +381,7 @@ Two client-mode behaviours have no flag:
 | `--sig-sources <URL\|FILE>` | Where `--auto-update` fetches from: exact URLs, mirror bases (trailing `/`), or a file of either, which may be a `freshclam.conf`. |
 | `--db-url <URL>` | A prebuilt `.exavdb` to pull and serve instead of signature files. |
 | `--build-db <FILE>` | Compile the loaded signatures into a prebuilt `.exavdb` and exit. |
-| `--listen <ADDR>` | Serve on this address. `clamd://` and `icap://`; naming both serves both from one process over one database. |
+| `--listen <ADDR>` | Serve on this address. `clamd://` and `icap://`; naming both serves both from one process over one database. The address carries its listener's settings: for ICAP the service names, preview, keep-alive and the `X-Infection-Found` policy (see the [ICAP guide](/scanner/guides/icap/)). |
 | `--connect <ADDR>` | Scan by handing each file to a daemon already running here. |
 | `--send-as <WHAT>` | What that client hands over: `path`, `contents` or `fd`. |
 | `--auto-update` | Bootstrap, refresh and hot-reload the signature source for as long as the process runs. With no `--listen` and no paths it is an updater and nothing else. |
@@ -396,12 +396,18 @@ Two client-mode behaviours have no flag:
 | `--max-object-bytes <SIZE\|off>` | The most memory a single decoded object may use. |
 | `--max-matcher-bytes <SIZE\|off>` | Cumulative bytes fed to the matcher: a CPU bound, not a memory one. |
 | `--max-pe-emulation-steps <N\|off>` | Instructions the PE unpacking emulator may run across one top-level file. |
+| `--max-regex-steps <N\|off>` | The work one PCRE subsignature (lookaround or back reference) or one YARA regexp pattern may do on an object, counted in backtracks and bytes read. |
+| `--max-matcher-steps <N\|off>` | The verification work of body signatures with wildcards and gaps, per MiB of an object, and a 32nd of it for one group of signatures sharing an anchor. |
+| `--max-compression-ratio <N\|off>` | A member that decodes to more than N times its size, once it is past `--max-object-bytes`, is left out and the other members are still scanned. |
+| `--max-carved-executables <N\|off>`, `--max-carved-archives <N\|off>` | The most PE, ELF or Mach-O images (of each kind), and the most archives, carving takes from one object. |
+| `--max-base64-payloads <N\|off>`, `--max-base64-runs <N\|off>`, `--max-page-assets <N\|off>` | The most executables or archives decoded from the base64 runs of one text, the most runs decoded to find them, and the most base64 assets decoded from one page. |
 | `--spill-dir`, `--spill-threshold-bytes`, `--max-spill-bytes`, `--max-total-spill-bytes` | Where a streamed object, or an archive member past `--max-object-bytes`, waits while it is scanned, and how much RAM and temp space it may take. |
 | `--partial-as <POLICY>` | What becomes of an object exav could not fully examine: `partial` (default), `ok`, `found` or `error`, whole or per condition (`limits-exceeded=`, `unscannable=`, `password-protected=`). |
 | `--clamav-compat` | Preset reproducing a stock ClamAV build's limits and extractor set, for differential testing. Reduces detection on purpose. |
 | `--decode <LIST>` / `--no-decode <LIST>` | Encodings to recover a payload from before scanning it: `base64` today, meaning both a run long enough to hold an executable and the base64 assets a markup document embeds. On by default, unlike `--detect`. |
 | `--detect packed` | Report `Heuristics.Packed.*`, naming the packer wrapping an executable exav could not unpack. |
-| `--detect phishing` | Report `Heuristics.Phishing.Email.*` for display-versus-href link spoofing. Covers the checks ClamAV splits across `--alert-phishing-ssl` and `--alert-phishing-cloak`. |
+| `--detect phishing` | Report `Heuristics.Phishing.Email.*` for display-versus-href link spoofing. Covers the checks ClamAV splits across `--alert-phishing-ssl` and `--alert-phishing-cloak`, and judges the links of every document with a [text view](/scanner/reference/formats/#the-text-a-reader-sees) (Markdown, PDF, a DOCX's hyperlinks and the others), not only HTML. |
+| `--qr` | Read the [QR codes](/scanner/reference/formats/#qr-codes) in images, match their payloads and judge their links with `--detect phishing`. Feature `qr`, off by default. |
 | `--detect exav-heuristics` | Enable exav-exclusive structural / fuzzy / ML analysis. |
 | `--no-detect <LIST>` | Detectors to leave off, subtracted from `--detect`. |
 | `--passwords <PW>` | Password to try for encrypted members. Repeatable. |
@@ -410,7 +416,6 @@ Two client-mode behaviours have no flag:
 | `--profile` | Per-matcher timing breakdown: a CSV row per file when scanning, `MATCHERSTATS` through `STATS` on a listener. |
 | `--slow-scan-secs <SECS\|off>` | Log any scan taking longer, naming the object. |
 | `--metrics-secs <SECS\|off>` | Seconds between a listener's scan-totals log lines. |
-| `--icap-*` | The ICAP listener's settings: service names, preview, keep-alive, the `X-Infection-Found` policy. See the [ICAP guide](/scanner/guides/icap/). |
 
 ## Gaps this matrix surfaces
 

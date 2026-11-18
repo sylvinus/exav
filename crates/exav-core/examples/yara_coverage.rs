@@ -5,7 +5,7 @@
 //!
 //!   * total rules declared,
 //!   * rules that compiled clean,
-//!   * rules rejected — grouped into NORMALIZED buckets (per-module, per-pe
+//!   * rules rejected, grouped into NORMALIZED buckets (per-module, per-pe
 //!     field, floatN reads, wide-on-regexp, bare regex, include, …),
 //!   * files that failed to PARSE entirely (counted separately).
 //!
@@ -135,7 +135,7 @@ fn main() {
     println!();
 
     // Ranked rejection table. Note: import/include buckets count occurrences,
-    // not rules — but per-module rejection blocks every rule after the import
+    // not rules, but per-module rejection blocks every rule after the import
     // in that file, so it is the effective coverage lever. We report the
     // bucket rule-blocking counts as tallied.
     println!("--- Ranked rejection buckets (rules blocked) ---");

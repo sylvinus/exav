@@ -27,6 +27,14 @@ const LIST_STYLE: u32 = 2023;
 
 pub(crate) fn read(mut z: Zip<'_>, budget: &mut Budget) -> Result<Document> {
     let names = z.names();
+    // A password is told by its verifier, `.iwpv2`, or hint, `.iwph`, as in
+    // Numbers and Keynote.
+    if names.iter().any(|n| {
+        let leaf = n.rsplit('/').next().unwrap_or(n).to_ascii_lowercase();
+        leaf == ".iwpv2" || leaf == ".iwph"
+    }) {
+        return Err(Error::Encrypted);
+    }
     let max = budget.limits.max_part;
     let mut store = Store::default();
     let mut any = false;
@@ -39,7 +47,9 @@ pub(crate) fn read(mut z: Zip<'_>, budget: &mut Budget) -> Result<Document> {
                 .max_memory
                 .saturating_sub(budget.used())
                 .min(max) as usize;
-            let used = store.add(&d, left);
+            let used = store
+                .add(&d, left)
+                .map_err(|_| Error::TooLarge("an IWA stream"))?;
             budget.alloc(used as u64)?;
             any = true;
         }
@@ -57,7 +67,7 @@ pub(crate) fn read(mut z: Zip<'_>, budget: &mut Budget) -> Result<Document> {
         .ids_of(DOCUMENT)
         .first()
         .copied()
-        .ok_or(Error::Encrypted)?;
+        .ok_or_else(|| Error::Malformed("no document object".into()))?;
     let Some((_, d)) = store.get(doc_id) else {
         return Err(Error::Malformed("no document archive".into()));
     };
@@ -82,22 +92,44 @@ fn table(m: Option<Msg>) -> Vec<(u32, Option<u64>)> {
     .unwrap_or_default()
 }
 
-fn data_table(m: Option<Msg>) -> Vec<(u32, u32)> {
+fn data_table(m: Option<Msg>) -> Vec<(u32, Option<u64>)> {
     m.map(|t| {
         t.msgs(1)
             .take(1 << 20)
-            .map(|e| (e.uint(1).unwrap_or(0) as u32, e.uint(2).unwrap_or(0) as u32))
+            .map(|e| {
+                let v = e.uint(2).unwrap_or(0) as u32;
+                (e.uint(1).unwrap_or(0) as u32, Some(u64::from(v)))
+            })
             .collect()
     })
     .unwrap_or_default()
 }
 
-/// The entry in force at character `at`. An entry with no object keeps the
-/// one before it.
-fn at(t: &[(u32, Option<u64>)], at: u32) -> Option<u64> {
-    t.iter()
-        .take_while(|e| e.0 <= at)
-        .fold(None, |acc, e| e.1.or(acc))
+/// A table read at characters in increasing order, in one pass.
+struct Cursor<'t> {
+    t: &'t [(u32, Option<u64>)],
+    next: usize,
+    cur: Option<u64>,
+}
+
+impl<'t> Cursor<'t> {
+    fn new(t: &'t [(u32, Option<u64>)]) -> Self {
+        Cursor {
+            t,
+            next: 0,
+            cur: None,
+        }
+    }
+
+    /// The entry in force at character `at`, which is not below the one
+    /// asked before. An entry with no object keeps the one before it.
+    fn at(&mut self, at: u32) -> Option<u64> {
+        while let Some(e) = self.t.get(self.next).filter(|e| e.0 <= at) {
+            self.cur = e.1.or(self.cur);
+            self.next += 1;
+        }
+        self.cur
+    }
 }
 
 /// A PostScript font name to a family and its weight and slant.
@@ -441,21 +473,19 @@ impl<'a> Pages<'a> {
         let list_styles = table(st.msg(7));
         let char_styles = table(st.msg(8));
         let levels = data_table(st.msg(6));
+        let mut para_at = Cursor::new(&para_styles);
+        let mut list_at = Cursor::new(&list_styles);
+        let mut char_at = Cursor::new(&char_styles);
+        let mut level_at = Cursor::new(&levels);
         let mut start = 0usize;
         loop {
             let end = (start..chars.len())
                 .find(|&i| matches!(chars[i], '\n' | '\u{2029}'))
                 .unwrap_or(chars.len());
             self.b.paragraph(end - start)?;
-            let ps = at(&para_styles, start as u32);
-            let level = levels
-                .iter()
-                .take_while(|e| e.0 <= start as u32)
-                .last()
-                .map(|e| e.1)
-                .unwrap_or(0)
-                .min(8);
-            let list = at(&list_styles, start as u32);
+            let ps = para_at.at(start as u32);
+            let level = level_at.at(start as u32).unwrap_or(0).min(8) as u32;
+            let list = list_at.at(start as u32);
             let mut para = Para {
                 props: self.para_props(ps, level, list),
                 mark: self.run_props(ps, None),
@@ -473,7 +503,7 @@ impl<'a> Pages<'a> {
                     }
                 };
             for (i, &c) in chars.iter().enumerate().take(end).skip(start) {
-                let cs = at(&char_styles, i as u32);
+                let cs = char_at.at(i as u32);
                 let key = cs.map(|c| c as u32).unwrap_or(0);
                 if cur.as_ref().is_none_or(|(k, _)| *k != key) {
                     flush(&mut text, &cur, &mut runs);
@@ -518,15 +548,42 @@ impl<'a> Pages<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::office::common::iwa::proto::write::W;
+    use crate::formats::office::docs::limits::Limits;
 
     #[test]
     fn table_entries_without_an_object_keep_the_style_before() {
         let t = vec![(0, Some(7)), (5, None), (9, Some(8))];
-        assert_eq!(at(&t, 0), Some(7));
-        assert_eq!(at(&t, 6), Some(7));
-        assert_eq!(at(&t, 9), Some(8));
-        assert_eq!(at(&t, 100), Some(8));
-        assert_eq!(at(&[], 3), None);
+        let mut c = Cursor::new(&t);
+        assert_eq!(c.at(0), Some(7));
+        assert_eq!(c.at(6), Some(7));
+        assert_eq!(c.at(9), Some(8));
+        assert_eq!(c.at(100), Some(8));
+        assert_eq!(Cursor::new(&[]).at(3), None);
+    }
+
+    #[test]
+    fn styles_are_found_in_one_pass() {
+        // Many characters, each under a table of many entries.
+        let mut runs = W::default();
+        for _ in 0..1 << 17 {
+            runs = runs.msg(1, W::default().uint(1, 0).reference(2, 9));
+        }
+        let storage = W::default()
+            .bytes(3, "x".repeat(1 << 17).as_bytes())
+            .msg(8, runs);
+        let store = Store::of(&[(9, CHARACTER_STYLE, W::default())]);
+        let mut budget = Budget::new(Limits::default());
+        let mut r = Pages {
+            store: &store,
+            b: &mut budget,
+            doc: Document::default(),
+            nums: HashMap::new(),
+        };
+        let t = std::time::Instant::now();
+        r.storage(Msg(&storage.0)).unwrap();
+        assert!(t.elapsed().as_secs() < 2, "took {:?}", t.elapsed());
+        assert_eq!(r.doc.body.len(), 1);
     }
 
     #[test]

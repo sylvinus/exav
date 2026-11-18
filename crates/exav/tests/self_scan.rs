@@ -4,7 +4,7 @@
 //! A scanner is a file every other scanner reads. If the EICAR test string were
 //! stored as a literal anywhere in this repository, it would travel into the
 //! compiled binary, into the `.crate` tarballs on crates.io and into the
-//! container image — and Defender, or whatever watches the machine running
+//! container image, and Defender, or whatever watches the machine running
 //! `cargo add exav-core`, would quarantine all three. The failure looks like a
 //! broken release, not like the test string it is, and it arrives on the day of
 //! a release rather than in review. ClamAV keeps EICAR in a signature database
@@ -19,7 +19,7 @@
 //!    container-aware walk a real scan uses.
 //! 2. **A plain substring search**, as a backstop. exav is the thing under test
 //!    here, so a bug that stopped it detecting EICAR would also stop this file
-//!    noticing — pass 1 would go quiet exactly when it should shout. `grep` has
+//!    noticing: pass 1 would go quiet exactly when it should shout. `grep` has
 //!    no such coupling: it cannot regress with the engine.
 //!
 //! Fixtures are deliberately out of scope. Several are archives built *around*
@@ -56,8 +56,8 @@ fn repo_root() -> PathBuf {
 /// project ships and any of which can hold an old copy carrying the literal. The
 /// question here is what is *in the repository*, and git is what answers it.
 ///
-/// Fixture trees are dropped for the reason in the module docs — they exist to
-/// carry the string — as are binary extensions, leaving text a reviewer would
+/// Fixture trees are dropped for the reason in the module docs (they exist to
+/// carry the string), as are binary extensions, leaving text a reviewer would
 /// call source.
 fn source_files(root: &Path) -> Vec<PathBuf> {
     let out = Command::new("git")
@@ -65,7 +65,7 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
         .arg(root)
         .args(["ls-files", "-z"])
         .output()
-        .expect("run `git ls-files` — this test reads the tracked tree");
+        .expect("run `git ls-files`: this test reads the tracked tree");
     assert!(
         out.status.success(),
         "`git ls-files` failed: {}",
@@ -96,7 +96,7 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
 
     assert!(
         files.len() > 100,
-        "only {} tracked source files — the listing is broken, and a broken \
+        "only {} tracked source files: the listing is broken, and a broken \
          listing passes this test by checking nothing",
         files.len()
     );
@@ -118,10 +118,9 @@ fn exav_finds_nothing_in_its_own_binary_and_source() {
             .arg("--quiet")
             // The question is whether exav *detects* anything here, not whether
             // it can fully parse its own source. A parser's source tends to
-            // carry its own format's markers — `formats/xdp.rs` is typed as an
-            // XDP document and reported PARTIAL on the base64 that follows —
-            // and that would fail this test for a reason having nothing to do
-            // with what it is guarding. A detection still exits 1.
+            // carry its own format's markers, and a failed read of them would
+            // fail this test for a reason having nothing to do with what it is
+            // guarding. A detection still exits 1.
             .args(["--partial-as", "ok"])
             .args(batch)
             .output()
@@ -141,7 +140,7 @@ fn exav_finds_nothing_in_its_own_binary_and_source() {
 #[test]
 fn no_source_file_contains_the_test_string_as_a_literal() {
     // Built the same way the library builds it, so this file does not carry the
-    // literal either — which is the property being tested.
+    // literal either, which is the property being tested.
     let needle = exav_core::unpack::eicar();
 
     let root = repo_root();
@@ -157,7 +156,7 @@ fn no_source_file_contains_the_test_string_as_a_literal() {
     assert!(
         guilty.is_empty(),
         "the EICAR string is stored as a literal in:\n  {}\n\nAssemble it at \
-         run time instead — `exav_core::unpack::eicar()` — or every scanner \
+         run time instead (`exav_core::unpack::eicar()`), or every scanner \
          that reads this repository, its crates.io tarballs and its container \
          image will quarantine them.",
         guilty.join("\n  ")

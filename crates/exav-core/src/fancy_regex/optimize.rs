@@ -264,8 +264,8 @@ fn build_concat_repeat_triplet(left: Expr, middle: Expr, right: Expr) -> (Expr, 
     else {
         unreachable!("check_concat_repeat_triplet guarantees middle is a Repeat");
     };
-    let right_lo = if let Expr::Repeat { lo, .. } = &right {
-        *lo
+    let (right_lo, right_inner) = if let Expr::Repeat { lo, child, .. } = &right {
+        (*lo, child.clone())
     } else {
         unreachable!("check_concat_repeat_triplet guarantees right is a Repeat");
     };
@@ -296,10 +296,28 @@ fn build_concat_repeat_triplet(left: Expr, middle: Expr, right: Expr) -> (Expr, 
             greedy: true,
         };
         (optional_head, right)
+    } else if right_lo != 0 {
+        // Both repeats need one match (left_lo >= right_lo, both at most 1). Making the
+        // right repeat optional would drop its minimum when the middle is absent, so the
+        // tail chooses between the middle and right repeat, or the right minimum alone.
+        // E.g. `a+b?a+` → `a+(?:b{1}a+|a{1})`
+        let prefix = Expr::Repeat {
+            child: left_inner,
+            lo: left_lo,
+            hi: usize::MAX,
+            greedy: true,
+        };
+        let right_min = Expr::Repeat {
+            child: right_inner,
+            lo: right_lo,
+            hi: right_lo,
+            greedy: true,
+        };
+        let tail = Expr::Alt(vec![Expr::Concat(vec![mandatory_middle, right]), right_min]);
+        (prefix, tail)
     } else {
         // The left repeat is the less permissive (higher or equal lo) side — keep it as a
         // mandatory prefix. Make the middle and right repeat optional as a suffix.
-        // E.g. `\w+\.?\w+` → `\w+(?:\.{1}\w+)?`
         // E.g. `\w+\.?\w*` → `\w+(?:\.{1}\w*)?`
         let prefix = Expr::Repeat {
             child: left_inner,
@@ -365,7 +383,10 @@ fn check_repeated_concat(child: &Expr, outer_lo: usize) -> bool {
         return false;
     };
 
+    // With a prefix minimum of one the middle part could follow itself in the
+    // result (`(?:a+b?a*)+` cannot match `abba`, `a+(?:ba*)*` can).
     is_unbounded_simple_repeat(*prefix_lo, *prefix_hi, *prefix_greedy)
+        && *prefix_lo == 0
         && is_unbounded_simple_repeat(*right_lo, *right_hi, *right_greedy)
         && compatible_edge_repeat_bounds(*prefix_lo, *right_lo)
         && prefix_inner.as_ref() == right_inner.as_ref()

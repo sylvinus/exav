@@ -7,12 +7,12 @@
 //! The failure this pins is detection sharing a feature gate with the extractor.
 //! A disabled format would then be undetected rather than unopenable, the file
 //! would get a raw pattern scan over its compressed bytes, match nothing, and
-//! come back clean — the one outcome exav refuses.
+//! come back clean, the one outcome exav refuses.
 #![cfg(not(feature = "all-formats"))]
 
 use exav_unpack::{Budget, Limits, detect, extract};
 
-/// `(what it is, a blob that sniffs as it)`. Magic only — enough for `detect`,
+/// `(what it is, a blob that sniffs as it)`. Magic only: enough for `detect`,
 /// not a valid archive, which is deliberate: recognition must not need a
 /// well-formed file.
 fn samples() -> Vec<(&'static str, Vec<u8>)> {
@@ -72,7 +72,7 @@ fn extracting_it_reports_rather_than_yielding_nothing() {
             .unwrap_or_else(|e| panic!("{what}: extract errored: {e}"));
         assert!(
             !entries.is_empty(),
-            "{what}: yielded no members — indistinguishable from an empty archive"
+            "{what}: yielded no members, indistinguishable from an empty archive"
         );
         assert!(
             entries.iter().any(|e| e.unsupported.is_some()),

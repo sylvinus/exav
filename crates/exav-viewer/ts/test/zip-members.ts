@@ -1,6 +1,6 @@
 /**
  * A ZIP whose members are named and sized as given. Their bytes are not
- * stored: only the central directory is, which is all `zipMembers` reads.
+ * stored: only the central directory is, which is all `zipDirectory` reads.
  */
 export function zipOf(members: [string, number][]): Uint8Array {
   const names = members.map(([n]) => new TextEncoder().encode(n));
@@ -16,6 +16,7 @@ export function zipOf(members: [string, number][]): Uint8Array {
     at += 46 + names[i]!.length;
   });
   v.setUint32(at, 0x06054b50, true);
+  v.setUint16(at + 8, members.length, true);
   v.setUint16(at + 10, members.length, true);
   v.setUint32(at + 12, central, true);
   return out;

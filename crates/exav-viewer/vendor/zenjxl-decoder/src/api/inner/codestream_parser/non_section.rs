@@ -415,20 +415,29 @@ impl CodestreamParser {
         self.sections = sections.into_iter().collect();
         self.ready_section_data = 0;
 
-        // Move data from the pre-section buffer into the sections.
-        // Allocate with SECTION_PADDING extra zero bytes so BitReader::refill()
-        // always takes the fast 8-byte read path.
+        // Move data from the pre-section buffer into the sections. Only as
+        // much of each section as the pre-section buffer can fill is
+        // allocated: the TOC-declared length is untrusted (jxl-rs #856). A
+        // section that is completed here gets its final padded size, so
+        // BitReader::refill() always takes the fast 8-byte read path.
         for buf in self.sections.iter_mut() {
-            if self.non_section_buf.is_empty() {
+            let buffered = self.non_section_buf.len();
+            if buffered == 0 {
                 break;
             }
+            let readable = buf.len.min(buffered);
+            let target = if readable == buf.len {
+                buf.len + SECTION_PADDING
+            } else {
+                readable
+            };
             let mut data = Vec::new();
-            data.try_reserve_exact(buf.len + SECTION_PADDING)?;
-            data.resize(buf.len + SECTION_PADDING, 0);
+            data.try_reserve_exact(target)?;
+            data.resize(target, 0);
             buf.data = data;
             self.ready_section_data += self
                 .non_section_buf
-                .take(&mut [IoSliceMut::new(&mut buf.data[..buf.len])]);
+                .take(&mut [IoSliceMut::new(&mut buf.data[..readable])]);
         }
 
         self.section_state =

@@ -8,7 +8,7 @@
 //! before it.
 //!
 //! The failure mode that makes this worth testing is not an error. Decoding a
-//! solid member against a fresh window **succeeds** and produces bytes — just
+//! solid member against a fresh window **succeeds** and produces bytes, just
 //! not the file's bytes. A signature that does not match garbage looks exactly
 //! like a clean file, so these tests assert the decoded content, not merely that
 //! decoding did not fail.
@@ -28,7 +28,6 @@
 //! rar a -ma4 -v4k -m3 -ep vol_rar4.rar one.txt eicar.com
 //! ```
 
-use super::extract_each;
 use exav_unpack::{Budget, Entry, Format, Limits};
 
 /// `sha256sum` of the files that went into the archives.
@@ -53,20 +52,44 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 fn members(blob: &[u8]) -> Vec<Entry> {
+    members_with(blob, false)
+}
+
+/// Every member as the walk hands it over. One whose stream ends in an error
+/// is reported as the scan reports it: with checksums verified, any error;
+/// otherwise one that leaves content undecoded.
+fn members_with(blob: &[u8], verify: bool) -> Vec<Entry> {
     let mut out = Vec::new();
     let mut limits = Limits::default();
     limits.max_buffer_bytes = 8 * 1024 * 1024;
     limits.max_extracted_bytes = 16 * 1024 * 1024;
     let mut b = Budget::new(limits);
-    let _ = extract_each(
-        Format::Rar,
-        blob,
-        &mut b,
-        &mut |e: Entry, _: &mut Budget| {
-            out.push(e);
-            None::<()>
-        },
-    );
+    b.set_verify_checksums(verify);
+    let _ = exav_unpack::walk(Format::Rar, &blob, &mut b, &mut |meta, content, _| {
+        let mut unsupported = meta.unsupported;
+        let data = match content {
+            None => Vec::new(),
+            Some(exav_unpack::Member::Bytes(bytes)) => bytes,
+            Some(exav_unpack::Member::Stream(reader)) => {
+                let mut bytes = Vec::new();
+                if let Err(e) = reader.read_to_end(&mut bytes)
+                    && (verify || exav_unpack::decode_error_hides_content(&e))
+                {
+                    unsupported = Some("decode error");
+                }
+                bytes
+            }
+        };
+        out.push(Entry {
+            name: meta.name.clone(),
+            data,
+            comp_size: meta.comp_size,
+            encrypted: meta.encrypted,
+            unsupported,
+            ..Entry::default()
+        });
+        None::<()>
+    });
     out
 }
 
@@ -339,6 +362,76 @@ fn a_member_failing_only_its_crc_is_handed_over() {
     }
 }
 
+/// The members decoded after one that failed, and not handed over, are
+/// charged to the scan budget all the same: decoding them is work.
+#[test]
+fn members_decoded_and_not_handed_over_are_charged_to_the_scan() {
+    let scanned = |blob: &[u8]| {
+        let mut b = Budget::new(Limits::default());
+        let before = b.remaining_scan();
+        let mut sizes = Vec::new();
+        let _ = exav_unpack::walk(Format::Rar, &blob, &mut b, &mut |m, c, _| {
+            if let Some(exav_unpack::Member::Stream(r)) = c {
+                let mut v = Vec::new();
+                let _ = r.read_to_end(&mut v);
+                sizes.push((m.name.clone(), v.len() as u64));
+            }
+            None::<()>
+        });
+        (before - b.remaining_scan(), sizes)
+    };
+    for archive in ["solid_rar4.rar", "solid_rar5.rar"] {
+        let blob = fixture(archive);
+        let (_, sizes) = scanned(&blob);
+        let stale: u64 = sizes
+            .iter()
+            .filter(|(n, _)| n == "two.txt" || n == "three.txt")
+            .map(|(_, s)| s)
+            .sum();
+        assert!(stale > 0, "{archive}: {sizes:?}");
+        let mut broken = blob.clone();
+        let one = layout(&broken)
+            .into_iter()
+            .find(|m| m.name == b"one.txt")
+            .unwrap();
+        broken[one.data].fill(0xFF);
+        let (charged, _) = scanned(&broken);
+        assert!(charged >= stale, "{archive}: {charged} < {stale}");
+    }
+}
+
+/// What a walk charges for the members decoded and not handed over is all of
+/// it: with one byte less than the walk needs, it stops on the scan limit,
+/// in the member that crosses it.
+#[test]
+fn members_decoded_and_not_handed_over_stop_at_the_scan_limit() {
+    for archive in ["solid_rar4.rar", "solid_rar5.rar"] {
+        let mut blob = fixture(archive);
+        let one = layout(&blob)
+            .into_iter()
+            .find(|m| m.name == b"one.txt")
+            .unwrap();
+        blob[one.data].fill(0xFF);
+        let run = |max_scanned_bytes: u64| {
+            let mut limits = Limits::default();
+            limits.max_scanned_bytes = max_scanned_bytes;
+            let mut b = Budget::new(limits);
+            let r = exav_unpack::walk(Format::Rar, &blob.as_slice(), &mut b, &mut |_, c, _| {
+                if let Some(exav_unpack::Member::Stream(r)) = c {
+                    let _ = r.read_to_end(&mut Vec::new());
+                }
+                None::<()>
+            });
+            (r.map(|_| ()), max_scanned_bytes - b.remaining_scan())
+        };
+        let (r, needed) = run(Limits::default().max_scanned_bytes);
+        r.unwrap();
+        assert!(run(needed).0.is_ok(), "{archive}: exactly what it needs");
+        let hit = run(needed - 1).0.expect_err(archive);
+        assert!(hit.reason.contains("scan"), "{archive}: {}", hit.reason);
+    }
+}
+
 /// A member whose packed data does not decode leaves the solid window out of
 /// step with the stream, so the members after it decode against a fresh
 /// window, to bytes that are not theirs. Those are reported, never handed
@@ -392,22 +485,7 @@ fn a_member_failing_its_crc_is_reported_when_checksums_are_verified() {
 
 #[cfg(feature = "checksums")]
 fn members_verified(blob: &[u8]) -> Vec<Entry> {
-    let mut out = Vec::new();
-    let mut limits = Limits::default();
-    limits.max_buffer_bytes = 8 * 1024 * 1024;
-    limits.max_extracted_bytes = 16 * 1024 * 1024;
-    let mut b = Budget::new(limits);
-    b.set_verify_checksums(true);
-    let _ = extract_each(
-        Format::Rar,
-        blob,
-        &mut b,
-        &mut |e: Entry, _: &mut Budget| {
-            out.push(e);
-            None::<()>
-        },
-    );
-    out
+    members_with(blob, true)
 }
 
 #[cfg(feature = "checksums")]

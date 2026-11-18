@@ -1,55 +1,75 @@
-//! CHM (Microsoft Compiled HTML Help, `.chm`) extractor.
+//! CHM (Microsoft Compiled HTML Help, `.chm`) reader.
 //!
-//! A CHM file is the ITSS ("InfoTech Storage System") container Windows Help
-//! uses to ship a whole website — HTML topics, scripts, images and embedded
-//! objects — in one file. Malware routinely abuses it: a `.chm` can auto-run
-//! script/`.hhc` content or carry a dropper, so we enumerate the internal files
-//! and hand their bytes to the engine to scan.
+//! A CHM is the ITSS container Windows Help ships a website in: HTML topics,
+//! scripts, images and embedded objects in one file. A `.chm` can start a
+//! script or carry a dropper, so every file it lists is handed over to be
+//! scanned.
 //!
-//! Layout (all integers little-endian), from the public ITSS/ITSF container
-//! format (the LZX-compressed sections are decoded by the `lzxd` crate):
+//! Layout (all integers little-endian), from the public ITSS format; the
+//! LZX is decoded by the `lzxd` crate, which the cabinet reader uses too:
 //!
 //! ```text
 //! ITSF header @0        magic "ITSF", version, then a header-section table:
-//!   +0x38 i64 OffsetHS0  -> header section 0 (has the total file length)
-//!   +0x48 i64 OffsetHS1  -> header section 1 == the ITSP directory
-//!   +0x58 i64 OffsetCS0  -> content section 0 base (v3+; v1/2 computed)
+//!   +0x38 u64 OffsetHS0  header section 0 (has the total file length)
+//!   +0x48 u64 OffsetHS1  header section 1, the ITSP directory
+//!   +0x58 u64 OffsetCS0  content section 0 base (v3; v1 and v2 derive it)
 //! ITSP directory (HS1)  magic "ITSP":
-//!   +0x10 u32 chunk_size, +0x2c u32 num_chunks; entries live in PMGL chunks
-//!   that start at HS1+0x54. Each PMGL chunk:
-//!     +0x14.. entries, last u16 of the chunk = entry count.
-//!     entry = ENCINT name_len, name[name_len], ENCINT section, offset, length.
+//!   +0x10 u32 chunk_size, +0x2c u32 num_chunks; the chunks start 0x54 bytes
+//!   after HS1. Listing chunks (PMGL) hold the entries, index chunks (PMGI)
+//!   are skipped. A PMGL chunk has its entries from +0x14 and the number of
+//!   them in its last u16; an entry is ENCINT name_len, name, ENCINT
+//!   section, ENCINT offset, ENCINT length.
 //! ```
 //!
-//! Every named entry belongs to one of two content sections:
-//! - section 0 — stored uncompressed at `sec0_offset + offset`.
-//! - section 1 — the single LZX stream in
-//!   `::DataSpace/Storage/MSCompressed/Content`; a file's `offset`/`length`
-//!   index into the *decompressed* stream. LZX parameters come from
-//!   `.../ControlData` (window size, reset interval) and the per-frame reset
-//!   offsets from `.../Transform/{GUID}/InstanceData/ResetTable`. LZX is decoded
-//!   with the shared `lzxd` crate (same dependency the CAB extractor uses).
+//! A listed file is in one of two content sections:
+//! - section 0: stored, at `content-section-0 + offset`, and read where it
+//!   lies;
+//! - section 1: a range of the one LZX stream in
+//!   `::DataSpace/Storage/MSCompressed/Content`. `ControlData` gives the
+//!   window size and the reset interval, and the reset table the place of
+//!   each 32 KiB frame in the packed stream.
 //!
-//! Robustness: this is attacker-controlled input, so every offset/length is
-//! bounds-checked and clamped; a structurally invalid header returns `Ok(None)`,
-//! a file we can't decompress becomes an `Entry::unsupported` (never a panic and
-//! never a failed scan). If the LZX stream can't be decoded we still emit each
-//! uncompressed (section 0) file and mark the compressed ones unsupported.
+//! Nothing is read whole. The directory is read a chunk at a time into an
+//! index of the files (at most `max_members + 1` of them), and the files are
+//! handed over in the order they lie in their section, so the LZX stream is
+//! decoded once, front to back, restarting where a reset interval begins.
+//! What is held is the index, the decoder's window, one frame, and the
+//! packed bytes of the frame being decoded.
+//!
+//! The input is untrusted: every offset and length is checked against the
+//! source, and what cannot be read is reported rather than skipped.
 
-use crate::*;
+use crate::bytes::to_usize;
+use crate::source::{ByteSource, Reader};
+use crate::stream::{MemberMeta, Visit, emit_range, emit_stream};
+use crate::{Budget, LimitHit};
 use lzxd::{Lzxd, WindowSize};
+use std::borrow::Cow;
+use std::io::{self, Read};
 
-/// One LZX output frame is always 32 KiB (`LZX_FRAME_SIZE`).
-const LZX_FRAME_SIZE: usize = 0x8000;
+/// One LZX frame decodes to this many bytes.
+const FRAME: u64 = 0x8000;
 
-/// System-file names we need for LZX decompression.
-const CONTENT_NAME: &str = "::DataSpace/Storage/MSCompressed/Content";
-const CONTROL_NAME: &str = "::DataSpace/Storage/MSCompressed/ControlData";
-const SPANINFO_NAME: &str = "::DataSpace/Storage/MSCompressed/SpanInfo";
-const RTABLE_NAME: &str = "::DataSpace/Storage/MSCompressed/Transform/\
+/// The most packed bytes one frame is handed. A frame of 32 KiB packs to at
+/// most about 70 KiB (every symbol at its longest code), so a table that
+/// gives a frame more than this is wrong.
+const PACKED_FRAME_MAX: u64 = 4 * FRAME;
+
+/// System files needed for LZX decoding.
+const CONTENT_NAME: &[u8] = b"::DataSpace/Storage/MSCompressed/Content";
+const CONTROL_NAME: &[u8] = b"::DataSpace/Storage/MSCompressed/ControlData";
+const SPANINFO_NAME: &[u8] = b"::DataSpace/Storage/MSCompressed/SpanInfo";
+const RTABLE_NAME: &[u8] = b"::DataSpace/Storage/MSCompressed/Transform/\
 {7FC28940-9D31-11D0-9B27-00A0C91E9C7C}/InstanceData/ResetTable";
 
-// ---- little-endian readers, all bounds-checked (return None past EOF) --------
+const PAST_THE_END: &str = "CHM entry runs past the end of the file";
+const NOT_DECODABLE: &str = "CHM LZX decode failed";
+const OUTSIDE_STREAM: &str = "CHM entry lies outside the compressed stream";
+const UNKNOWN_SECTION: &str = "CHM unknown section";
+const BAD_HEADER: &str = "CHM header or directory damaged; its files are not listed";
+const BAD_LISTING: &str = "CHM directory damaged; the files after the damage are not listed";
+
+// ---- little-endian readers over a slice, None past its end -------------------
 
 fn u16at(d: &[u8], p: usize) -> Option<u16> {
     crate::bytes::at(d, p, 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
@@ -63,8 +83,8 @@ fn u64at(d: &[u8], p: usize) -> Option<u64> {
 }
 
 /// Read an ENCINT (big-endian base-128, high bit = continuation) from `d` at
-/// `*pos`, advancing `*pos`. Bounded to `end` and to 8 bytes (63 bits) so hostile
-/// data can neither run off the buffer nor spin. Returns `None` on truncation.
+/// `*pos`, advancing `*pos`. Bounded to `end` and to 9 bytes so hostile data
+/// can neither run off the buffer nor spin. `None` on truncation.
 fn read_encint(d: &[u8], pos: &mut usize, end: usize) -> Option<u64> {
     let mut result: u64 = 0;
     for _ in 0..9 {
@@ -81,150 +101,192 @@ fn read_encint(d: &[u8], pos: &mut usize, end: usize) -> Option<u64> {
     None
 }
 
-/// A named entry in the CHM directory.
-struct DirEntry {
-    name: String,
-    section: u64,
+// ---- the ITSF header and the directory ----------------------------------------
+
+/// Where the directory and content section 0 are in the source.
+struct Itss {
+    sec0: u64,
+    dir_start: u64,
+    chunk_size: u64,
+    num_chunks: u64,
+}
+
+/// Parse the ITSF header and the ITSP header. `None` when the file is not a
+/// structurally valid CHM.
+fn parse_itss(src: &dyn ByteSource) -> Option<Itss> {
+    let len = src.len() as u64;
+    let head = src.window(0, 0x60);
+    if !head.starts_with(b"ITSF") {
+        return None;
+    }
+    let off_hs1 = u64at(&head, 0x38 + 0x10)?;
+    if off_hs1 >= len {
+        return None;
+    }
+    // OffsetCS0 is in v3; for v1 and v2 it follows the directory.
+    let version = u32at(&head, 0x04)?;
+    let mut sec0 = u64at(&head, 0x38 + 0x20).unwrap_or(0);
+    let itsp = src.window(to_usize(off_hs1), 0x54);
+    if !itsp.starts_with(b"ITSP") {
+        return None;
+    }
+    let chunk_size = u64::from(u32at(&itsp, 0x10)?);
+    let num_chunks = u64::from(u32at(&itsp, 0x2c)?);
+    // A chunk is read whole, so its size is bounded.
+    if !(8..=0x40000).contains(&chunk_size) || num_chunks == 0 {
+        return None;
+    }
+    let dir_start = off_hs1.checked_add(0x54)?;
+    // The product is below 2^50.
+    let dir_end = dir_start.checked_add(chunk_size * num_chunks)?;
+    if dir_end > len {
+        return None;
+    }
+    if version < 3 {
+        sec0 = dir_end;
+    }
+    if sec0 > len {
+        return None;
+    }
+    Some(Itss {
+        sec0,
+        dir_start,
+        chunk_size,
+        num_chunks,
+    })
+}
+
+/// A file of content section 0 as the listing places it.
+#[derive(Clone, Copy)]
+struct Span {
     offset: u64,
     length: u64,
 }
 
-/// The parsed CHM directory: where content section 0 begins and every entry.
-struct ChmDir {
-    sec0_offset: usize,
-    entries: Vec<DirEntry>,
-    /// An entry of the listing could not be read: files after it are unknown.
-    listing_damaged: bool,
+/// A file of the listing, as kept until it is handed over.
+struct Listed {
+    section: u64,
+    offset: u64,
+    length: u64,
+    /// The directory chunk it is in, and where its name lies in the chunk.
+    chunk: u32,
+    name_at: u32,
+    name_len: u32,
 }
 
-/// Parse the ITSF header + ITSP directory. Returns `None` if this isn't a
-/// structurally valid CHM (so `detect` mis-fires or the file is too truncated).
-fn parse_chm(d: &[u8]) -> Option<ChmDir> {
-    if !d.starts_with(b"ITSF") {
-        return None;
-    }
-    // Header-section table follows the 0x38-byte ITSF header.
-    let off_hs1 = crate::bytes::to_usize(u64at(d, 0x38 + 0x10)?); // ITSP directory
-    // The directory offset must land inside the file. Bounding it here also keeps
-    // every `off_hs1 + <small const>` read below from overflowing `usize` on a
-    // crafted 64-bit offset (a `d.len() <= isize::MAX` invariant makes the adds
-    // safe once `off_hs1 < d.len()`).
-    if off_hs1 >= d.len() {
-        return None;
-    }
-    // OffsetCS0 (content section 0 base). Present in v3; for v1/2 we recompute
-    // it below from the directory geometry.
-    let version = u32at(d, 0x04)?;
-    let mut sec0_offset = crate::bytes::to_usize(u64at(d, 0x38 + 0x20).unwrap_or(0));
+#[derive(Default)]
+struct Listing {
+    content: Option<Span>,
+    control: Option<Span>,
+    reset: Option<Span>,
+    span_info: Option<Span>,
+    files: Vec<Listed>,
+    /// A chunk could not be read, or an entry of one could not: the files
+    /// after it are not in the list.
+    damaged: bool,
+}
 
-    // ITSP directory header.
-    if crate::bytes::at(d, off_hs1, 4)? != b"ITSP" {
-        return None;
-    }
-    let chunk_size = u32at(d, off_hs1 + 0x10)? as usize;
-    let num_chunks = u32at(d, off_hs1 + 0x2c)? as usize;
-    // Sanity bounds (arbitrary caps against memory blow-ups).
-    if !(8..=0x40000).contains(&chunk_size) || num_chunks == 0 || num_chunks > 100_000 {
-        return None;
-    }
-    let dir_start = off_hs1.checked_add(0x54)?;
-    // Directory must fit in the file.
-    let dir_bytes = chunk_size.checked_mul(num_chunks)?;
-    if dir_start.checked_add(dir_bytes)? > d.len() {
-        return None;
-    }
-    if version < 3 {
-        sec0_offset = dir_start + dir_bytes;
-    }
-    if sec0_offset > d.len() {
-        return None;
-    }
-
-    let mut entries = Vec::new();
-    let mut listing_damaged = false;
-    for cn in 0..num_chunks {
-        let cs = dir_start + cn * chunk_size;
-        let chunk = &d[cs..cs + chunk_size];
-        // Only PMGL (listing) chunks hold file entries; skip PMGI index chunks.
+/// Read the whole directory, a chunk at a time: the system files LZX decoding
+/// needs, and up to `cap` of the other files. System files (`::...`) and
+/// files with no length are not files to hand over. Of a system file named
+/// twice, the last wins.
+fn list(src: &dyn ByteSource, it: &Itss, cap: usize) -> Listing {
+    let mut l = Listing::default();
+    let chunk_size = to_usize(it.chunk_size);
+    for cn in 0..it.num_chunks {
+        // Inside the source: the directory was checked to fit.
+        let at = it.dir_start + cn * it.chunk_size;
+        let chunk = src.window(to_usize(at), chunk_size);
+        if chunk.len() < chunk_size {
+            l.damaged = true;
+            break;
+        }
+        // Only PMGL chunks hold entries; PMGI chunks are an index of them.
         if &chunk[0..4] != b"PMGL" {
             continue;
         }
-        // The entry region runs from +0x14 up to the quickref area; the very last
-        // u16 of the chunk is the entry count. Read encints bounded by `end`.
+        // The entry count is the last u16 of the chunk; entries are read up
+        // to it.
         let end = chunk_size - 2;
-        let Some(num_entries) = u16at(chunk, end).map(usize::from) else {
-            listing_damaged = true;
+        let Some(count) = u16at(&chunk, end) else {
+            l.damaged = true;
             continue;
         };
         let mut p = 0x14usize;
-        for _ in 0..num_entries {
-            // An entry that cannot be read ends this chunk's listing, and the
-            // listing is reported as damaged: what follows is not in the list.
-            let Some(name_len) = read_encint(chunk, &mut p, end).map(crate::bytes::to_usize) else {
-                listing_damaged = true;
+        for _ in 0..count {
+            let Some(name_len) = read_encint(&chunk, &mut p, end).map(to_usize) else {
+                l.damaged = true;
                 break;
             };
             if name_len > end.saturating_sub(p) {
-                listing_damaged = true;
-                break; // truncated / hostile name length
+                l.damaged = true;
+                break;
             }
-            let name = String::from_utf8_lossy(&chunk[p..p + name_len]).into_owned();
+            let name_at = p;
+            let name = &chunk[p..p + name_len];
             p += name_len;
             let (Some(section), Some(offset), Some(length)) = (
-                read_encint(chunk, &mut p, end),
-                read_encint(chunk, &mut p, end),
-                read_encint(chunk, &mut p, end),
+                read_encint(&chunk, &mut p, end),
+                read_encint(&chunk, &mut p, end),
+                read_encint(&chunk, &mut p, end),
             ) else {
-                listing_damaged = true;
+                l.damaged = true;
                 break;
             };
-            entries.push(DirEntry {
-                name,
-                section,
-                offset,
-                length,
-            });
+            let span = Span { offset, length };
+            match name {
+                CONTENT_NAME => l.content = Some(span),
+                CONTROL_NAME => l.control = Some(span),
+                RTABLE_NAME => l.reset = Some(span),
+                SPANINFO_NAME => l.span_info = Some(span),
+                n if n.starts_with(b"::") || length == 0 => {}
+                _ if l.files.len() >= cap => {}
+                // The sizes of a chunk are below 2^18 and its number below 2^32.
+                _ => l.files.push(Listed {
+                    section,
+                    offset,
+                    length,
+                    chunk: cn as u32,
+                    name_at: name_at as u32,
+                    name_len: name_len as u32,
+                }),
+            }
         }
     }
-
-    Some(ChmDir {
-        sec0_offset,
-        entries,
-        listing_damaged,
-    })
+    l
 }
 
-/// Read a section-0 (uncompressed) system file's bytes, bounds-checked against
-/// the whole CHM buffer.
-fn read_sec0<'a>(d: &'a [u8], sec0_offset: usize, e: &DirEntry) -> Option<&'a [u8]> {
-    let start = sec0_offset.checked_add(usize::try_from(e.offset).ok()?)?;
-    let len = usize::try_from(e.length).ok()?;
-    d.get(start..start.checked_add(len)?)
+/// The name of a listed file, read again from its chunk.
+fn name_of(src: &dyn ByteSource, it: &Itss, f: &Listed) -> String {
+    let at = it.dir_start + u64::from(f.chunk) * it.chunk_size + u64::from(f.name_at);
+    let raw = src.window(to_usize(at), f.name_len as usize);
+    String::from_utf8_lossy(&raw).into_owned()
 }
 
-/// LZX parameters carried by `ControlData`.
-struct LzxParams {
-    window: WindowSize,
-    reset_interval_frames: usize,
+// ---- the LZX stream ----------------------------------------------------------
+
+/// A section 0 file, if all of it lies in the source: its place there.
+fn placed(src: &dyn ByteSource, sec0: u64, s: Span) -> Option<(u64, u64)> {
+    let at = sec0.checked_add(s.offset)?;
+    let end = at.checked_add(s.length)?;
+    (end <= src.len() as u64).then_some((at, s.length))
 }
 
-fn parse_control(blob: &[u8]) -> Option<LzxParams> {
-    // struct: u32 len, u32 "LZXC", u32 version, u32 reset_interval, u32 window,...
+/// LZX parameters carried by `ControlData`: the window and how many frames
+/// make a reset interval.
+fn parse_control(blob: &[u8]) -> Option<(WindowSize, u64)> {
+    // u32 length, u32 "LZXC", u32 version, u32 reset interval, u32 window...
     if u32at(blob, 0x04)? != 0x4358_5A4C {
-        return None; // not "LZXC"
+        return None;
     }
-    let (mut reset_interval, window_size) = match u32at(blob, 0x08)? {
-        1 => (u32at(blob, 0x0c)? as u64, u32at(blob, 0x10)? as u64),
+    let (reset_interval, window_size) = match u32at(blob, 0x08)? {
+        1 => (u64::from(u32at(blob, 0x0c)?), u64::from(u32at(blob, 0x10)?)),
         2 => (
-            (u32at(blob, 0x0c)? as u64) * LZX_FRAME_SIZE as u64,
-            (u32at(blob, 0x10)? as u64) * LZX_FRAME_SIZE as u64,
+            u64::from(u32at(blob, 0x0c)?) * FRAME,
+            u64::from(u32at(blob, 0x10)?) * FRAME,
         ),
         _ => return None,
     };
-    // Guard against a zero/oversized window before the match below.
-    if window_size == 0 {
-        return None;
-    }
     let window = match window_size {
         0x0_8000 => WindowSize::KB32,
         0x1_0000 => WindowSize::KB64,
@@ -235,316 +297,458 @@ fn parse_control(blob: &[u8]) -> Option<LzxParams> {
         0x20_0000 => WindowSize::MB2,
         _ => return None,
     };
-    // reset_interval must be a whole number of frames, at least one.
-    if reset_interval == 0 || reset_interval % LZX_FRAME_SIZE as u64 != 0 {
-        // Fall back to a single reset interval spanning everything.
-        reset_interval = LZX_FRAME_SIZE as u64;
-    }
-    Some(LzxParams {
-        window,
-        reset_interval_frames: (reset_interval / LZX_FRAME_SIZE as u64).max(1) as usize,
-    })
+    // A whole number of frames, at least one; anything else is read as one
+    // frame.
+    let frames = if reset_interval == 0 || reset_interval % FRAME != 0 {
+        1
+    } else {
+        reset_interval / FRAME
+    };
+    Some((window, frames))
 }
 
-/// Parsed reset table: uncompressed stream length + per-entry compressed byte
-/// offsets. `per_frame` tells whether the offsets are indexed per 32 KiB frame
-/// (`num_entries >= total_frames`) or per reset interval.
+/// The reset table: the decoded length of the stream, and the place of each
+/// entry in the source, which is read when it is needed.
 struct ResetTable {
     uncomp_len: u64,
-    offsets: Vec<u64>,
+    /// Where entry 0 is in the source, the size of an entry (4 or 8) and
+    /// how many there are.
+    at: u64,
+    size: u64,
+    count: u64,
 }
 
-fn parse_reset_table(blob: &[u8]) -> Option<ResetTable> {
-    let num_entries = u32at(blob, 0x04)? as usize;
-    let entry_size = u32at(blob, 0x08)? as usize;
-    let table_off = u32at(blob, 0x0c)? as usize;
-    let uncomp_len = u64at(blob, 0x10)?;
-    if !(entry_size == 4 || entry_size == 8) || num_entries > 1_000_000 {
+/// The reset table file at `at`, `len` bytes long, in the source.
+fn parse_reset_table(src: &dyn ByteSource, at: u64, len: u64) -> Option<ResetTable> {
+    let head = src.window(to_usize(at), 0x18);
+    let count = u64::from(u32at(&head, 0x04)?);
+    let size = u64::from(u32at(&head, 0x08)?);
+    let table_off = u64::from(u32at(&head, 0x0c)?);
+    let uncomp_len = u64at(&head, 0x10)?;
+    if size != 4 && size != 8 {
         return None;
     }
-    let mut offsets = Vec::with_capacity(num_entries.min(4096));
-    for i in 0..num_entries {
-        let eo = table_off.checked_add(i.checked_mul(entry_size)?)?;
-        let v = if entry_size == 8 {
-            u64at(blob, eo)?
-        } else {
-            u32at(blob, eo)? as u64
-        };
-        offsets.push(v);
+    // Every entry the table declares is inside the file.
+    if table_off.checked_add(count.checked_mul(size)?)? > len {
+        return None;
     }
     Some(ResetTable {
         uncomp_len,
-        offsets,
+        at: at.checked_add(table_off)?,
+        size,
+        count,
     })
 }
 
-/// Decompress the section-1 LZX `content` stream into a single buffer (bounded
-/// to `cap` bytes). Returns the decoded buffer and, per 32 KiB frame, whether
-/// it decoded.
-///
-/// LZX in CHM is framed: the stream is padded up to a whole number of 32 KiB
-/// frames (padded to the reset interval), so every frame decodes to exactly
-/// `LZX_FRAME_SIZE` bytes — we must always ask the decoder for a full frame, not
-/// the reset table's "honest" (unpadded) length, or the last block ends mid-way
-/// and the decoder reports EOF.
-///
-/// The decoder is reset at the start of each reset interval and carried
-/// through its frames, each read from the compressed offset the reset table
-/// gives it. A table with fewer entries than frames gives only where each
-/// interval starts, so then only the first frame of each is decoded.
-fn decompress_content(
-    content: &[u8],
-    params: &LzxParams,
-    rt: &ResetTable,
-    cap: usize,
-) -> (Vec<u8>, Vec<bool>) {
-    let real_len = crate::bytes::to_usize(rt.uncomp_len);
-    if real_len == 0 || cap == 0 {
-        return (Vec::new(), Vec::new());
-    }
-    // Frames covering the real (unpadded) length — files never index past it.
-    let frames_needed = real_len.div_ceil(LZX_FRAME_SIZE);
-    // Hold whole frames only (never a partial frame — see doc comment), bounded
-    // by the caller's byte budget (always room for at least one frame if cap>0).
-    let max_frames = (cap / LZX_FRAME_SIZE).max(1).min(frames_needed);
-    let buf_len = max_frames * LZX_FRAME_SIZE;
-    let mut out = vec![0u8; buf_len];
-    let mut decoded = vec![false; max_frames];
-
-    let rif = params.reset_interval_frames.max(1);
-    let per_frame = rt.offsets.len() >= frames_needed;
-    // Where frame `f` starts in `content`, and the interval index `r` it opens.
-    let start_of = |f: usize, r: usize| -> Option<usize> {
-        if f == 0 && rt.offsets.is_empty() {
-            return Some(0);
+impl ResetTable {
+    fn entry(&self, src: &dyn ByteSource, i: u64) -> Option<u64> {
+        if i >= self.count {
+            return None;
         }
-        let o = if per_frame {
-            rt.offsets.get(f)
-        } else if f.is_multiple_of(rif) {
-            rt.offsets.get(r)
+        // Inside the source: the table was checked to fit.
+        let at = self.at + i * self.size;
+        let w = src.window(to_usize(at), to_usize(self.size));
+        if self.size == 8 {
+            u64at(&w, 0)
+        } else {
+            u32at(&w, 0).map(u64::from)
+        }
+    }
+}
+
+/// The LZX stream of section 1, decoded a frame at a time.
+///
+/// LZX in CHM is framed: the stream is padded to a whole number of 32 KiB
+/// frames, so every frame decodes to exactly `FRAME` bytes and the decoder is
+/// always asked for that many. It is reset at the start of each reset
+/// interval, and carries its state through the frames of one, each read from
+/// the packed offset the reset table gives it. A table with fewer entries
+/// than frames gives only where each interval starts, so then only the first
+/// frame of each can be found.
+struct LzxStream<'a> {
+    src: &'a dyn ByteSource,
+    /// The packed stream: its place in the source, cut at the source's end.
+    packed_at: u64,
+    packed_len: u64,
+    table: ResetTable,
+    /// The table has an entry for every frame.
+    per_frame: bool,
+    window: WindowSize,
+    /// Frames in a reset interval, at least one.
+    interval: u64,
+    /// Frames the decoded length covers.
+    frames: u64,
+    dec: Option<Lzxd>,
+    /// The interval `dec` is in, and the next frame it will decode.
+    dec_interval: Option<u64>,
+    next: u64,
+    /// The last frame decoded.
+    buf: Vec<u8>,
+    buf_frame: Option<u64>,
+    /// The frame at which decoding failed, and its interval: that frame and
+    /// those after it in the interval cannot be had.
+    failed: Option<(u64, u64)>,
+}
+
+/// The stream of section 1, if the system files that describe it are all
+/// there and sound.
+fn lzx_stream<'a>(src: &'a dyn ByteSource, sec0: u64, l: &Listing) -> Option<LzxStream<'a>> {
+    let content = l.content?;
+    let packed_at = sec0.checked_add(content.offset)?;
+    let avail = (src.len() as u64).checked_sub(packed_at)?;
+    let (cat, clen) = placed(src, sec0, l.control?)?;
+    let control = src.window(to_usize(cat), to_usize(clen.min(0x20)));
+    let (window, interval) = parse_control(&control)?;
+    // The reset table gives the frame offsets and the true decoded length;
+    // SpanInfo gives the length alone.
+    let table = l
+        .reset
+        .and_then(|s| placed(src, sec0, s))
+        .and_then(|(at, len)| parse_reset_table(src, at, len))
+        .or_else(|| {
+            let (at, _) = placed(src, sec0, l.span_info?)?;
+            let uncomp_len = u64at(&src.window(to_usize(at), 8), 0)?;
+            Some(ResetTable {
+                uncomp_len,
+                at: 0,
+                size: 8,
+                count: 0,
+            })
+        })?;
+    let frames = table.uncomp_len.div_ceil(FRAME);
+    if frames == 0 {
+        return None;
+    }
+    Some(LzxStream {
+        src,
+        packed_at,
+        packed_len: content.length.min(avail),
+        per_frame: table.count >= frames,
+        table,
+        window,
+        interval,
+        frames,
+        dec: None,
+        dec_interval: None,
+        next: 0,
+        buf: Vec::new(),
+        buf_frame: None,
+        failed: None,
+    })
+}
+
+impl<'a> LzxStream<'a> {
+    /// Whether `[offset, offset + len)` lies in the decoded stream.
+    fn covers(&self, offset: u64, len: u64) -> bool {
+        offset
+            .checked_add(len)
+            .is_some_and(|end| end <= self.frames.saturating_mul(FRAME))
+    }
+
+    /// Where frame `f` starts in the packed stream.
+    fn start_of(&self, f: u64) -> Option<u64> {
+        let o = if f == 0 && self.table.count == 0 {
+            Some(0)
+        } else if self.per_frame {
+            self.table.entry(self.src, f)
+        } else if f.is_multiple_of(self.interval) {
+            self.table.entry(self.src, f / self.interval)
         } else {
             None
         };
-        o.and_then(|&o| usize::try_from(o).ok())
-            .filter(|&o| o <= content.len())
-    };
+        o.filter(|&o| o <= self.packed_len)
+    }
 
-    let mut r = 0usize;
-    while let Some(first) = r.checked_mul(rif).filter(|&f| f < max_frames) {
-        let mut lzxd = Lzxd::new(params.window);
-        let frames = &mut decoded[first..(first + rif).min(max_frames)];
-        for (f, ok) in (first..).zip(frames) {
-            let Some(from) = start_of(f, r) else { break };
-            let to = match start_of(f + 1, r + 1) {
-                Some(to) if per_frame && to >= from => to,
-                _ => content.len(),
-            };
-            let Ok(bytes) = lzxd.decompress_next(&content[from..to], LZX_FRAME_SIZE) else {
-                break;
-            };
-            let out_pos = f * LZX_FRAME_SIZE;
-            let n = bytes.len().min(LZX_FRAME_SIZE);
-            out[out_pos..out_pos + n].copy_from_slice(&bytes[..n]);
-            *ok = n == LZX_FRAME_SIZE;
-            if !*ok {
-                break;
+    /// The packed bytes of frame `f`: up to where the next frame starts when
+    /// the table has every frame, else up to the end of the stream; and never
+    /// more than a frame can pack to.
+    fn packed(&self, f: u64) -> Option<Cow<'a, [u8]>> {
+        let from = self.start_of(f)?;
+        let to = if self.per_frame {
+            self.start_of(f + 1).filter(|&t| t >= from)
+        } else {
+            None
+        };
+        let to = to
+            .unwrap_or(self.packed_len)
+            .min(from.saturating_add(PACKED_FRAME_MAX));
+        Some(
+            self.src
+                .window(to_usize(self.packed_at + from), to_usize(to - from)),
+        )
+    }
+
+    fn blocked(&self, f: u64) -> bool {
+        self.failed
+            .is_some_and(|(interval, first)| interval == f / self.interval && f >= first)
+    }
+
+    fn failure(f: u64) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("CHM LZX frame {f} cannot be decoded"),
+        )
+    }
+
+    /// Decode frame `f` into `buf`. It must be the next frame of the decoder,
+    /// or the first of an interval, which resets it.
+    fn decode(&mut self, f: u64) -> io::Result<()> {
+        let interval = f / self.interval;
+        if self.blocked(f) {
+            return Err(Self::failure(f));
+        }
+        if f.is_multiple_of(self.interval) {
+            self.dec = Some(Lzxd::new(self.window));
+            self.dec_interval = Some(interval);
+            self.next = f;
+        }
+        let ready = self.dec_interval == Some(interval) && self.next == f;
+        let packed = if ready { self.packed(f) } else { None };
+        if let (Some(packed), Some(dec)) = (packed, self.dec.as_mut())
+            && let Ok(out) = dec.decompress_next(&packed, FRAME as usize)
+            && out.len() as u64 == FRAME
+        {
+            self.buf.clear();
+            self.buf.extend_from_slice(out);
+            self.buf_frame = Some(f);
+            self.next = f + 1;
+            return Ok(());
+        }
+        self.buf_frame = None;
+        self.failed = Some((interval, f));
+        Err(Self::failure(f))
+    }
+
+    /// Get the decoder ready to give frame `frame` as its next: frames of its
+    /// reset interval before it are decoded and dropped, and a decoder that
+    /// is in another interval, or past the frame, restarts at the start of
+    /// this one. What is dropped is charged to the scan budget, which bounds
+    /// the work a table or a listing can ask for.
+    fn position(&mut self, frame: u64, budget: &mut Budget) -> Result<(), LimitHit> {
+        if self.buf_frame == Some(frame) || self.blocked(frame) {
+            return Ok(());
+        }
+        let interval = frame / self.interval;
+        let from = if self.dec_interval == Some(interval) && self.next <= frame {
+            self.next
+        } else {
+            let first = interval * self.interval;
+            self.dec = None;
+            self.dec_interval = None;
+            self.buf_frame = None;
+            self.next = first;
+            first
+        };
+        let skip = frame - from;
+        if skip > 0 {
+            budget.charge_scan(skip.saturating_mul(FRAME))?;
+            for f in from..frame {
+                if self.decode(f).is_err() {
+                    break;
+                }
             }
         }
-        r += 1;
+        Ok(())
     }
-    (out, decoded)
 }
 
-pub(crate) fn extract_chm<R>(
-    data: &[u8],
+/// A file of section 1, read from the decoder a frame at a time.
+struct PackedFile<'s, 'a> {
+    lzx: &'s mut LzxStream<'a>,
+    pos: u64,
+    end: u64,
+}
+
+impl Read for PackedFile<'_, '_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() || self.pos >= self.end {
+            return Ok(0);
+        }
+        let f = self.pos / FRAME;
+        if self.lzx.buf_frame != Some(f) {
+            self.lzx.decode(f)?;
+        }
+        let at = self.pos % FRAME;
+        let n = (out.len() as u64).min(FRAME - at).min(self.end - self.pos) as usize;
+        out[..n].copy_from_slice(&self.lzx.buf[at as usize..at as usize + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+// ---- handing the files over ----------------------------------------------------
+
+/// A member with its content out of reach, reported.
+fn report(
+    meta: &MemberMeta,
+    reason: &'static str,
     budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    let dir = match parse_chm(data) {
-        Some(d) => d,
-        None => return Ok(None),
+    visit: Visit<()>,
+) -> Option<()> {
+    let m = MemberMeta {
+        unsupported: Some(reason),
+        ..meta.clone()
     };
+    visit(&m, None, budget)
+}
 
-    // Locate the system files needed for LZX decompression.
-    let mut content = None;
-    let mut control = None;
-    let mut rtable = None;
-    let mut spaninfo = None;
-    for e in &dir.entries {
-        match e.name.as_str() {
-            CONTENT_NAME => content = Some(e),
-            CONTROL_NAME => control = Some(e),
-            RTABLE_NAME => rtable = Some(e),
-            SPANINFO_NAME => spaninfo = Some(e),
-            _ => {}
-        }
+/// A file of section 0, read where it lies. A file that runs past the end of
+/// the source is handed over as far as it goes, and reported.
+fn emit_stored(
+    src: &dyn ByteSource,
+    it: &Itss,
+    f: &Listed,
+    name: String,
+    budget: &mut Budget,
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    let at = it.sec0.checked_add(f.offset);
+    let have = at
+        .map_or(0, |a| (src.len() as u64).saturating_sub(a))
+        .min(f.length);
+    let mut meta = MemberMeta {
+        name,
+        comp_size: f.length,
+        size: Some(f.length),
+        unsupported: (have < f.length).then_some(PAST_THE_END),
+        ..MemberMeta::default()
+    };
+    let Some(at) = at.filter(|_| have > 0) else {
+        return Ok(visit(&meta, None, budget));
+    };
+    let mut rd = Reader::range(src, to_usize(at), to_usize(at + have));
+    emit_range(&mut meta, (at, f.length), &mut rd, budget, visit)
+}
+
+/// A file of section 1, decoded as it is read.
+fn emit_packed(
+    lzx: Option<&mut LzxStream<'_>>,
+    f: &Listed,
+    name: String,
+    budget: &mut Budget,
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    let meta = MemberMeta {
+        name,
+        comp_size: f.length,
+        size: Some(f.length),
+        ..MemberMeta::default()
+    };
+    let Some(lzx) = lzx else {
+        return Ok(report(&meta, NOT_DECODABLE, budget, visit));
+    };
+    if !lzx.covers(f.offset, f.length) {
+        return Ok(report(&meta, OUTSIDE_STREAM, budget, visit));
     }
+    lzx.position(f.offset / FRAME, budget)?;
+    let mut rd = PackedFile {
+        lzx,
+        pos: f.offset,
+        end: f.offset + f.length,
+    };
+    emit_stream(&meta, &mut rd, budget, visit)
+}
 
-    // Decode the compressed content section once (shared by all section-1 files).
-    // Bounded to what the budget still allows so a huge declared length can't OOM.
-    let mut decompressed: Vec<u8> = Vec::new();
-    let mut frames_ok: Vec<bool> = Vec::new();
-    if let Some(content_e) = content
-        && let Some(content_bytes) = read_sec0(data, dir.sec0_offset, content_e)
-    {
-        let params = control
-            .and_then(|c| read_sec0(data, dir.sec0_offset, c))
-            .and_then(parse_control);
-        // Reset table gives the frame offsets + true uncompressed length;
-        // fall back to SpanInfo (length only) or the content length itself.
-        let rt = rtable
-            .and_then(|r| read_sec0(data, dir.sec0_offset, r))
-            .and_then(parse_reset_table)
-            .or_else(|| {
-                spaninfo
-                    .and_then(|s| read_sec0(data, dir.sec0_offset, s))
-                    .and_then(|b| u64at(b, 0))
-                    .map(|uncomp_len| ResetTable {
-                        uncomp_len,
-                        offsets: Vec::new(),
-                    })
-            });
-        if let (Some(params), Some(rt)) = (params, rt) {
-            let cap = budget.reserve().unwrap_or(0) as usize;
-            if cap > 0 {
-                (decompressed, frames_ok) = decompress_content(content_bytes, &params, &rt, cap);
-            }
-        }
+/// The report of a header or a directory that could not be read: files are
+/// in the container and not listed.
+fn emit_damaged(
+    src: &dyn ByteSource,
+    reason: &'static str,
+    budget: &mut Budget,
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    budget.count_entry()?;
+    let meta = MemberMeta {
+        name: "chm-directory".to_string(),
+        comp_size: src.len() as u64,
+        unsupported: Some(reason),
+        ..MemberMeta::default()
+    };
+    Ok(visit(&meta, None, budget))
+}
+
+pub(crate) fn walk(
+    src: &dyn ByteSource,
+    budget: &mut Budget,
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
+    if !src.window(0, 4).starts_with(b"ITSF") {
+        return Ok(None);
     }
-
-    // Emit every named file. System files (":: …") and directory placeholders are
-    // skipped; their bytes are the container plumbing, not user content.
-    for e in &dir.entries {
-        if e.length == 0 || e.name.starts_with("::") {
-            continue;
-        }
+    let Some(it) = parse_itss(src) else {
+        return emit_damaged(src, BAD_HEADER, budget, visit);
+    };
+    // One more than the members a scan may count: past it the walk ends with
+    // the member limit, so a longer list is never needed.
+    let cap = usize::try_from(budget.limits().max_members.saturating_add(1)).unwrap_or(usize::MAX);
+    let mut listing = list(src, &it, cap);
+    // In the order they lie in their section: the LZX stream is then decoded
+    // once, and stored files are read front to back.
+    listing.files.sort_by_key(|f| (f.section, f.offset));
+    let mut lzx = lzx_stream(src, it.sec0, &listing);
+    for f in &listing.files {
         budget.count_entry()?;
-        let cap = budget.reserve()?;
-
-        let (entry, committed) = if e.section == 0 {
-            // Uncompressed: slice straight out of the file.
-            match read_sec0(data, dir.sec0_offset, e) {
-                // Cutting the entry down to the cap and handing it over as the
-                // file is a silent truncation: the rest of the bytes are in the
-                // container, and a signature past the cut would never fire on a
-                // member that looks complete.
-                Some(bytes) if bytes.len() as u64 > cap => (
-                    Entry::unsupported(
-                        e.name.clone(),
-                        e.length,
-                        false,
-                        "CHM entry exceeds the per-member size budget",
-                    ),
-                    0,
-                ),
-                Some(bytes) => {
-                    let buf = bytes.to_vec();
-                    let n = buf.len() as u64;
-                    (Entry::new(e.name.clone(), buf), n)
-                }
-                None => (
-                    Entry::unsupported(e.name.clone(), e.length, false, "CHM entry out of bounds"),
-                    0,
-                ),
+        let name = name_of(src, &it, f);
+        let stopped = match f.section {
+            0 => emit_stored(src, &it, f, name, budget, visit)?,
+            1 => emit_packed(lzx.as_mut(), f, name, budget, visit)?,
+            _ => {
+                let meta = MemberMeta {
+                    name,
+                    comp_size: f.length,
+                    size: Some(f.length),
+                    ..MemberMeta::default()
+                };
+                report(&meta, UNKNOWN_SECTION, budget, visit)
             }
-        } else if e.section == 1 {
-            // Compressed: slice out of the decompressed LZX stream.
-            let start = usize::try_from(e.offset).ok();
-            let len = usize::try_from(e.length).ok();
-            // Every frame the entry covers decoded.
-            let decoded = start.zip(len).is_some_and(|(s, l)| {
-                let first = s / LZX_FRAME_SIZE;
-                let end = s.saturating_add(l).div_ceil(LZX_FRAME_SIZE);
-                frames_ok
-                    .get(first..end)
-                    .is_some_and(|f| f.iter().all(|&ok| ok))
-            });
-            match (decoded, start, len) {
-                // Same again for the compressed section: report rather than
-                // deliver a prefix dressed up as the whole entry.
-                (true, Some(_), Some(l)) if l as u64 > cap => (
-                    Entry::unsupported(
-                        e.name.clone(),
-                        e.length,
-                        false,
-                        "CHM entry exceeds the per-member size budget",
-                    ),
-                    0,
-                ),
-                (true, Some(s), Some(l))
-                    if s.checked_add(l)
-                        .is_some_and(|end| end <= decompressed.len()) =>
-                {
-                    let buf = decompressed[s..s + l].to_vec();
-                    let n = buf.len() as u64;
-                    (Entry::new(e.name.clone(), buf), n)
-                }
-                _ => (
-                    Entry::unsupported(e.name.clone(), e.length, false, "CHM LZX decode failed"),
-                    0,
-                ),
-            }
-        } else {
-            // Unknown section number.
-            (
-                Entry::unsupported(e.name.clone(), e.length, false, "CHM unknown section"),
-                0,
-            )
         };
-
-        budget.commit(committed);
-        if let Some(r) = visit(entry, budget) {
-            return Ok(Some(r));
+        if stopped.is_some() {
+            return Ok(stopped);
         }
     }
-
-    if dir.listing_damaged {
-        // Files the listing would have named are in the container, unseen.
-        budget.count_entry()?;
-        return Ok(visit(
-            Entry::unsupported(
-                "chm-directory".to_string(),
-                data.len() as u64,
-                false,
-                "CHM directory damaged; the files after the damage are not listed",
-            ),
-            budget,
-        ));
+    if listing.damaged {
+        return emit_damaged(src, BAD_LISTING, budget, visit);
     }
-
     Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Format, Limits, extract};
 
-    #[test]
-    fn non_chm_input_yields_nothing() {
+    fn names(blob: &[u8]) -> Vec<(String, Option<&'static str>)> {
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Chm, b"not a chm file at all", &mut budget).unwrap();
-        assert!(entries.is_empty());
+        extract(Format::Chm, &blob, &mut budget)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.unsupported))
+            .collect()
     }
 
     #[test]
-    fn truncated_itsf_does_not_panic() {
-        // Just the magic, nothing else — every downstream read must bail cleanly.
-        let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Chm, b"ITSF", &mut budget).unwrap();
-        assert!(entries.is_empty());
+    fn non_chm_input_yields_nothing() {
+        assert!(names(b"not a chm file at all").is_empty());
+    }
+
+    #[test]
+    fn truncated_itsf_is_reported() {
+        // Just the magic, nothing else: every read after it must bail.
+        let got = names(b"ITSF");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "chm-directory");
+        assert!(got[0].1.is_some());
     }
 
     #[test]
     fn random_bytes_after_magic_do_not_panic() {
         let mut blob = Vec::new();
         blob.extend_from_slice(b"ITSF");
-        // Fill with a pseudo-random-ish but deterministic pattern.
         for i in 0..4096u32 {
             blob.push((i.wrapping_mul(2654435761) >> 13) as u8);
         }
-        let mut budget = Budget::new(Limits::default());
-        // Must not panic; result is "not a valid CHM" (empty) or some entries.
-        let _ = extract(Format::Chm, &blob, &mut budget).unwrap();
+        // Must not panic; the header is not a valid one, which is reported.
+        assert!(names(&blob).iter().all(|(_, u)| u.is_some()));
     }
 
     #[test]
@@ -560,27 +764,46 @@ mod tests {
         assert_eq!(read_encint(&bad, &mut p, bad.len()), None);
     }
 
-    // Real-malware CHM fixtures live under tests/fixtures/chm and are exercised by
-    // the integration test in tests/chm.rs (kept out of unit tests so the crate
-    // still builds without the fixtures present).
+    // CHM fixtures live under tests/fixtures/chm and are exercised by the
+    // integration tests in tests/suites/chm.rs.
+
+    /// The list of files stops at `cap`, and the system files that follow it
+    /// in the directory are still found: the tables of the stream are needed
+    /// however long the list is.
+    #[test]
+    fn the_list_of_files_is_cut_at_the_cap_and_the_system_files_are_kept() {
+        let path = format!(
+            "{}/tests/fixtures/chm/benign-lzx.chm",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let blob = std::fs::read(path).unwrap();
+        let it = parse_itss(&blob).unwrap();
+        let all = list(&blob, &it, usize::MAX);
+        assert!(all.files.len() > 2);
+        let cut = list(&blob, &it, 2);
+        assert_eq!(cut.files.len(), 2);
+        assert!(cut.content.is_some() && cut.control.is_some() && cut.reset.is_some());
+        assert!(!cut.damaged);
+    }
 
     /// A crafted ITSF whose HS1 (ITSP) offset is `u64::MAX` must bail via the
-    /// `off_hs1 >= d.len()` guard rather than overflow any `off_hs1 + const` read.
+    /// `off_hs1 >= len` guard rather than overflow any offset sum.
     #[test]
-    fn hostile_hs1_offset_no_panic() {
+    fn hostile_hs1_offset_is_reported() {
         let mut d = vec![0u8; 0x200];
         d[0..4].copy_from_slice(b"ITSF");
         d[0x04..0x08].copy_from_slice(&3u32.to_le_bytes());
         d[0x48..0x50].copy_from_slice(&u64::MAX.to_le_bytes()); // OffsetHS1
-        let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Chm, &d, &mut budget).unwrap().is_empty());
+        let got = names(&d);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].1.is_some());
     }
 
     /// Valid ITSF+ITSP magic but hostile directory geometry (`chunk_size` and
-    /// `num_chunks` both `u32::MAX`) must be rejected without overflow / OOB in
-    /// `chunk_size * num_chunks` or `dir_start + cn * chunk_size`.
+    /// `num_chunks` both `u32::MAX`) must be rejected without overflow or an
+    /// out-of-bounds read.
     #[test]
-    fn hostile_itsp_geometry_no_panic() {
+    fn hostile_itsp_geometry_is_reported() {
         let hs1 = 0x60usize;
         let mut d = vec![0u8; 0x200];
         d[0..4].copy_from_slice(b"ITSF");
@@ -589,19 +812,16 @@ mod tests {
         d[hs1..hs1 + 4].copy_from_slice(b"ITSP");
         d[hs1 + 0x10..hs1 + 0x14].copy_from_slice(&u32::MAX.to_le_bytes()); // chunk_size
         d[hs1 + 0x2c..hs1 + 0x30].copy_from_slice(&u32::MAX.to_le_bytes()); // num_chunks
-        let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Chm, &d, &mut budget).unwrap().is_empty());
+        assert_eq!(names(&d).len(), 1);
 
-        // Also a well-formed geometry whose extent overruns the file: rejected by
-        // the `dir_start + dir_bytes > d.len()` guard, not by a panic.
+        // Also a well-formed geometry whose extent overruns the file.
         d[hs1 + 0x10..hs1 + 0x14].copy_from_slice(&0x1000u32.to_le_bytes());
         d[hs1 + 0x2c..hs1 + 0x30].copy_from_slice(&50u32.to_le_bytes());
-        let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Chm, &d, &mut budget).unwrap().is_empty());
+        assert_eq!(names(&d).len(), 1);
     }
 
     /// A valid PMGL chunk whose first entry declares a hostile ENCINT name length
-    /// (larger than the chunk) must `break` cleanly — never slice out of bounds.
+    /// (larger than the chunk) must stop cleanly, never slice out of bounds.
     #[test]
     fn hostile_entry_name_len_no_panic() {
         let chunk_size = 0x40usize;
@@ -622,11 +842,10 @@ mod tests {
         d[end..end + 2].copy_from_slice(&1u16.to_le_bytes());
         d[dir_start + 0x14] = 0x81;
         d[dir_start + 0x15] = 0x00;
-        let mut budget = Budget::new(Limits::default());
         // The listing is damaged, which is reported: no file is named.
-        let entries = extract(Format::Chm, &d, &mut budget).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].unsupported.is_some());
+        let got = names(&d);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].1.is_some());
     }
 
     /// An entry count past the entries a listing chunk holds runs the reader

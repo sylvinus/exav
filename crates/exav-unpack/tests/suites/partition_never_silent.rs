@@ -39,10 +39,15 @@ fn gpt(parts: &[(u64, u64)], num_entries: u32, entry_size: u32, entries_lba: u64
 }
 
 /// Collect every emitted member, including any produced before a mid-way error
-/// — the scanner consumes them through a visitor, so this is what it sees.
+/// (the scanner consumes them through a visitor, so this is what it sees).
 fn emitted(blob: &[u8]) -> Vec<Entry> {
+    emitted_within(blob, Limits::default())
+}
+
+/// [`emitted`] under `limits`.
+fn emitted_within(blob: &[u8], limits: Limits) -> Vec<Entry> {
     let mut out = Vec::new();
-    let mut b = Budget::new(Limits::default());
+    let mut b = Budget::new(limits);
     let _ = extract_each(
         Format::Partition,
         blob,
@@ -75,7 +80,7 @@ fn a_well_formed_table_is_walked_without_complaint() {
 #[test]
 fn an_implausible_entry_stride_is_reported_not_treated_as_empty() {
     // Refusing to walk a nonsense stride is right; returning "nothing found" is
-    // not — the partitions are still there, exav just didn't read them.
+    // not: the partitions are still there, exav just didn't read them.
     let img = gpt(&[(4, 8)], 1, 7, 2); // 7 is below the 128-byte minimum
     let e = emitted(&img);
     assert!(
@@ -104,18 +109,76 @@ fn an_entry_table_past_the_end_of_the_image_is_reported() {
 
 #[test]
 fn hitting_the_partition_cap_is_reported() {
-    // More used slots than the walk guard allows. Stopping quietly would leave
-    // the remaining partitions unscanned while the image could still be clean.
+    // More used slots than the member limit allows. Stopping quietly would
+    // leave the remaining partitions unscanned while the image could still be
+    // clean.
     let parts: Vec<(u64, u64)> = (0..200).map(|i| (4 + i * 2, 5 + i * 2)).collect();
-    // Declare more entries than MAX_PARTS so the cap, not the count, ends it.
     let img = gpt(&parts, 200, ENTRY_SIZE, 2);
-    let e = emitted(&img);
+    let mut limits = Limits::default();
+    limits.max_members = 100;
+    let e = emitted_within(&img, limits);
+    assert!(
+        reported(&e).iter().any(|r| r.contains("--max-members")),
+        "hitting the partition limit must surface, got {:?}",
+        reported(&e)
+    );
+    // Under the default limit all 200 are walked, and `off` lifts it too.
+    for max_members in [100_000, u64::MAX] {
+        let mut limits = Limits::default();
+        limits.max_members = max_members;
+        let e = emitted_within(&img, limits);
+        assert!(reported(&e).is_empty(), "{max_members}: {:?}", reported(&e));
+        assert!(!e.is_empty(), "{max_members}");
+    }
+}
+
+/// The array of entries is read whole, and a header that declares 4 billion of
+/// them must not ask for 500 GB: it is bounded by the buffer limit and by the
+/// image. With every limit lifted only the image is left, and the entries
+/// past it are reported.
+#[test]
+fn an_entry_array_of_billions_is_bounded_by_the_image_when_the_limits_are_off() {
+    let img = gpt(&[(4, 8), (10, 14)], u32::MAX, ENTRY_SIZE, 2);
+    let mut limits = Limits::default();
+    limits.max_members = u64::MAX;
+    limits.max_buffer_bytes = u64::MAX;
+    let e = emitted_within(&img, limits);
+    assert_eq!(
+        e.iter().filter(|x| x.unsupported.is_none()).count(),
+        2,
+        "{e:?}"
+    );
     assert!(
         reported(&e)
             .iter()
-            .any(|r| r.contains("too many GPT partitions")),
-        "hitting the partition cap must surface, got {:?}",
+            .any(|r| r.contains("past the end of the image")),
+        "{:?}",
         reported(&e)
+    );
+    // With the default limits the declared count is cut to what they allow,
+    // and said so.
+    let e = emitted(&img);
+    assert!(
+        reported(&e).iter().any(|r| r.contains("--max-members")),
+        "{:?}",
+        reported(&e)
+    );
+
+    // A buffer limit that holds 4 entries of the array cuts it to 4, with the
+    // member limit as it is.
+    let parts: Vec<(u64, u64)> = (0..6).map(|i| (4 + i * 2, 5 + i * 2)).collect();
+    let img = gpt(&parts, 6, ENTRY_SIZE, 2);
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 4 * u64::from(ENTRY_SIZE);
+    let e = emitted_within(&img, limits);
+    assert!(
+        e.iter().any(|x| x.name.contains("gpt-partitions-beyond-4")),
+        "{e:?}"
+    );
+    assert_eq!(
+        e.iter().filter(|x| x.unsupported.is_none()).count(),
+        4,
+        "{e:?}"
     );
 }
 
@@ -139,17 +202,23 @@ fn apm(declared: u32, real: usize) -> Vec<u8> {
 
 #[test]
 fn hitting_the_apm_partition_cap_is_reported() {
-    // Same clamp bug as GPT, in the Apple Partition Map path: `.min(MAX_PARTS)`
-    // on a parsed count discards the rest without a word.
+    // Same clamp as GPT, in the Apple Partition Map path: clamping a parsed
+    // count to the member limit discards the rest, so it is reported.
     let img = apm(500, 60);
-    let e = emitted(&img);
+    let mut limits = Limits::default();
+    limits.max_members = 40;
+    let e = emitted_within(&img, limits);
     assert!(
-        reported(&e)
-            .iter()
-            .any(|r| r.contains("too many APM partitions")),
-        "hitting the APM cap must surface, got {:?}",
+        reported(&e).iter().any(|r| r.contains("--max-members")),
+        "hitting the APM limit must surface, got {:?}",
         reported(&e)
     );
+    // `off` lifts it: nothing is reported.
+    let mut limits = Limits::default();
+    limits.max_members = u64::MAX;
+    let e = emitted_within(&img, limits);
+    assert!(reported(&e).is_empty(), "{:?}", reported(&e));
+    assert!(!e.is_empty());
 }
 
 #[test]
