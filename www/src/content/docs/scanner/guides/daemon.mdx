@@ -157,7 +157,8 @@ them; past any of these the request is answered with a JSON error. A file the
 daemon could not hold in full has what it held scanned and is answered
 `LIMITS-EXCEEDED` unless something is found; the rest of the request is still
 scanned. The reply carries `"truncated": true` when the request ended
-before its terminator, so some files never arrived.
+before its terminator, or when the daemon stopped reading it (a file more
+than 64 MiB past `--max-input-bytes`), so some files have no entry.
 
 Volumes that carry their own headers are rejoined too, by the format's own
 join and not by concatenation (which would produce garbage that still looks like

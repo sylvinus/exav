@@ -305,8 +305,8 @@ pub(crate) struct Found {
     /// Sorted by offset then length, without duplicates.
     pub matches: Vec<Match>,
     /// Every match was found: the pattern stayed under [`MAX_MATCHES`], was
-    /// searched through the whole object, and its regexp searches did not
-    /// reach the limit of their work.
+    /// searched through the whole object (at its offset, if it is anchored
+    /// there), and its regexp searches did not reach the limit of their work.
     pub complete: bool,
 }
 

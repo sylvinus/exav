@@ -422,7 +422,8 @@ impl<'r, 'd> ScanResults<'r, 'd> {
         self.steps_exhausted
     }
 
-    /// Whether every match of every pattern was recorded. A pattern keeps at
+    /// Whether every match of every pattern was recorded (of a pattern that
+    /// every use names at one offset, the match there). A pattern keeps at
     /// most a million matches, as yara-x does; past that the conditions see a
     /// partial list and the results are not to be trusted either way.
     pub fn complete(&self) -> bool {
@@ -507,7 +508,9 @@ impl<'a, 'r, 'd> Pattern<'a, 'r, 'd> {
         &self.res.rules.pattern_names[self.id]
     }
 
-    /// Iterator over this pattern's matches within the scanned data.
+    /// Iterator over this pattern's matches within the scanned data: of a
+    /// pattern that every use in the rules names at one offset, the match at
+    /// that offset alone, as yara-x reports it.
     pub fn matches(&self) -> Matches<'a, 'd> {
         Matches {
             data: self.res.data,

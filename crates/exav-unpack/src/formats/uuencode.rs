@@ -174,7 +174,14 @@ pub(crate) fn looks_like_uuencode(p: &crate::Probe) -> bool {
         return scan.finish();
     }
     let from = p.len.saturating_sub(TAIL).max(data.len());
-    let tail = p.window(from, p.len - from);
+    if from == data.len() {
+        // The end follows the start: the line the start ends in goes on.
+        scan.feed(&p.window(from, p.len - from));
+        return scan.finish();
+    }
+    // From the byte before the end read, so that a line starting at its first
+    // byte is whole.
+    let tail = p.window(from - 1, p.len - from + 1);
     let Some(line) = memchr::memchr(b'\n', &tail) else {
         return false;
     };
@@ -334,6 +341,51 @@ mod tests {
                     assert_eq!(found || bytes.finish(), want);
                 }
             }
+        }
+    }
+
+    /// The `end` line counts wherever it lies in the start or the end read:
+    /// across the start's last byte, right after it, ended by a newline past
+    /// it, and at the first byte of the end read when a gap lies between.
+    #[test]
+    fn the_terminator_counts_across_the_start_and_at_the_end() {
+        let head = crate::DETECT_HEAD;
+        // `begin`, one long line, then `last` starting at `at`, then `after`.
+        let text = |at: usize, last: &[u8], after: usize| {
+            let mut d = b"begin 644 f\n".to_vec();
+            d.resize(at - 1, b'x');
+            d.push(b'\n');
+            d.extend_from_slice(last);
+            d.resize(d.len() + after, b'y');
+            d
+        };
+        let cases: [(&str, Vec<u8>, bool); 6] = [
+            ("across the start's end", text(head - 2, b"end\n", 0), true),
+            ("right after the start", text(head, b"end\n", 0), true),
+            (
+                "its newline past the start",
+                text(head - 3, b"end\n", 0),
+                true,
+            ),
+            (
+                "the first line of the end read",
+                text(head + 4096, b"end\n", TAIL - 4),
+                true,
+            ),
+            (
+                "not a terminator",
+                text(head + 4096, b"enx\n", TAIL - 4),
+                false,
+            ),
+            ("in the start", text(1000, b"end\n", head), true),
+        ];
+        for (what, data, want) in cases {
+            assert_eq!(looks_like_uuencode(&data), want, "{what}");
+            assert_eq!(
+                crate::detect(&&data[..]) == Some(crate::Format::Uuencode),
+                want,
+                "{what}"
+            );
         }
     }
 

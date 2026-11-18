@@ -4060,8 +4060,9 @@ fn scan_payload_timed(
 /// Scan an INSTREAM chunk stream. The payload is materialized to a seekable
 /// source (RAM or a temp file) and given the full container-aware scan, so
 /// malware inside an archive sent over INSTREAM is detected, matching clamd (the
-/// old flat-only path missed it). Any unread chunks are drained so the connection
-/// stays in sync for the next command.
+/// old flat-only path missed it). Unread chunks are drained so the connection
+/// stays in sync for the next command, up to [`MAX_DRAIN_BYTES`]; past that it
+/// is closed after the reply ([`Rest::Unread`]).
 fn instream<R: Read>(
     db: &Scanner,
     opts: &ScanOptions,
@@ -4458,8 +4459,9 @@ impl<'a, R: Read> Instream<'a, R> {
         Ok(())
     }
 
-    /// Consume any remaining chunks up to the terminator (used when the scan
-    /// stopped early on a detection), up to [`MAX_DRAIN_BYTES`].
+    /// Consume any remaining chunks up to the terminator (after every stream:
+    /// a scan that stopped early, a stream past `--max-input-bytes` or the
+    /// spill budget), up to [`MAX_DRAIN_BYTES`].
     ///
     /// Draining is a courtesy (it lets the connection carry another command
     /// instead of being reset), and a courtesy with no bound is a way to hold a

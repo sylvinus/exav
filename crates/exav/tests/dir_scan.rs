@@ -133,8 +133,10 @@ fn exclude_applies_at_the_top_level_too() {
     let (db, dir) = tree();
     std::fs::write(dir.path().join("bad.txt"), eicar()).unwrap();
     // `--no-recursive` so the fixture's own infected file below is out of the
-    // way and this test is about the filter and nothing else.
-    let (code, stdout) = scan(&db, &dir, &["--no-recursive", "--exclude", "bad"]);
+    // way and this test is about the filter and nothing else. The pattern is
+    // matched against the whole path, and the temporary directory's name has
+    // random hex digits, which `bad` alone matched now and then.
+    let (code, stdout) = scan(&db, &dir, &["--no-recursive", "--exclude", r"/bad\.txt$"]);
     assert!(!stdout.contains("bad.txt"), "{stdout}");
     assert!(stdout.contains("clean.txt: OK"), "{stdout}");
     assert_eq!(code, 0, "{stdout}");

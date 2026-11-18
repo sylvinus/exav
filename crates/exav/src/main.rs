@@ -593,9 +593,10 @@ struct Cli {
     /// the prefork pool it is per scan job: on expiry the job is answered
     /// LIMITS-EXCEEDED and its worker replaced; it also caps CPU time
     /// (RLIMIT_CPU). In a one-shot run it bounds the whole run, which then
-    /// exits 3 saying so: running out of time is a scan that stopped short, not
-    /// a scanner that failed. The deterministic in-core caps still apply first
-    /// in every mode.
+    /// says so and exits as for what it found: 1 for a detection, else 2 for
+    /// an error, else as `--partial-as` sets for a scan that stopped short
+    /// (3 by default). The deterministic in-core caps still apply first in
+    /// every mode.
     /// [default in the pool: 120; unset otherwise]
     #[arg(
         long = "max-scan-secs",

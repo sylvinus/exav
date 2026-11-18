@@ -674,7 +674,10 @@ scanner's, and are not part of this aim.
 - **An XDP's chunk in a CDATA section, or with a comment in it, is not
   decoded.** The chunk is read by a byte scan that resolves character
   references; an XML reader also reads a CDATA section's text and drops
-  comments. The XDP is `UNSCANNABLE` then.
+  comments. The XDP is `UNSCANNABLE` then. The same scan reads only UTF-8
+  (an XDP in UTF-16 is not typed XDP), finds `<chunk>` without a namespace
+  prefix, and copies a chunk's text before it checks the budget (bounded by
+  the input).
 - **The buffer entry points do not apply `max_scan_size` or the object
   limit.** `analyze` and `analyze_all_with_outcome` scan a slice of any
   length whole, where `scan_seekable` reports the same bytes over
@@ -841,7 +844,11 @@ scanner's, and are not part of this aim.
   unanchored, still reaches it (`{ 00 00 }` in a file of zeros). The reason
   does not name the rule or the pattern. Decided for the next cycle: the
   verdict stays, and the reason names the rule and the pattern ("YARA rule R:
-  pattern $v1 has more than 1,000,000 matches").
+  pattern $v1 has more than 1,000,000 matches"). yara-x also anchors a
+  pattern used bare beside an `$a at K` that the whole condition needs
+  (`$a and $a at 0`, `all of them and $a at 0`), and takes any constant
+  expression as the offset; exav anchors only when every use names the
+  offset as a number.
 - **`--max-regex-steps` is a count of steps, not time**: on 6,921 corpus
   objects with the full ClamAV database its default moves none to `PARTIAL`
   (462 s against 535 s with `off`). Left: whether a signature whose prefilter

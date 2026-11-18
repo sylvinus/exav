@@ -1783,9 +1783,10 @@ pub enum Settled {
     Is(Format),
     /// No check could have found it a container: none asked for the rest.
     Not,
-    /// Not a format the start says, and a check that reads the rest of an
-    /// object (a footer, an end record, a search through it) would have run:
-    /// whether it is a container is not known.
+    /// Not a format the start says, and a check that reads past what was read
+    /// (a footer, an end record, the bytes after an executable's image, the
+    /// rest of a start being searched) would have run: whether it is a
+    /// container is not known.
     Unsettled,
 }
 
@@ -1893,8 +1894,9 @@ pub fn detect(src: &dyn ByteSource) -> Option<Format> {
 
 /// [`detect`] for the start of an object that cannot be read any further, a
 /// member decoded as it is read: `head` is what has been read, and the
-/// checks that read the end of an object or search through it have nothing to
-/// read. Where one of them would have run, the answer is
+/// checks that read past it (the end of the object, the bytes after an
+/// executable's image, the rest of a start) have nothing to read. Where one of
+/// them would have run, the answer is
 /// [`Settled::Unsettled`] rather than "not a container".
 ///
 /// A format the start says it is wins, whatever such a check would have said.
@@ -2284,8 +2286,7 @@ fn detect_probe(p: &Probe) -> Option<Format> {
         return Some(Format::AiModel);
     }
     // An InstallShield installer: a PE whose payload the generic SFX carve
-    // would mis-slice. Ahead of the checks that search the whole object for a
-    // marker.
+    // would mis-slice. Ahead of the checks that search the start for a marker.
     if formats::sniff::is_in(p, Format::IshieldMsi) {
         return Some(Format::IshieldMsi);
     }
@@ -2336,7 +2337,7 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     // 6, and the fields of its level) and the MBR `55 AA` signature (which
     // `is_partition` only accepts with a plausible entry). An executable is
     // neither of the first two. After every rule above, and before those that
-    // search the object: a disk image holds the files it holds.
+    // search the start: a disk image holds the files it holds.
     let exe = data.starts_with(b"MZ") || data.starts_with(b"\x7fELF");
     if !exe && formats::sniff::is_in(p, Format::Ext) {
         return Some(Format::Ext);
@@ -2348,8 +2349,9 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     if is_partition(p) {
         return Some(Format::Partition);
     }
-    // Compiled AutoIt3: the AU3!EA05/EA06 marker after the script GUID, anywhere
-    // in the object (embedded in a PE), or the marker at its start.
+    // Compiled AutoIt3: the AU3!EA05/EA06 marker after the script GUID, in the
+    // start or in the bytes after an executable's image (embedded in a PE), or
+    // the marker at its start.
     #[cfg(feature = "autoit")]
     if is_autoit(p) {
         return Some(Format::Autoit);
@@ -2379,7 +2381,7 @@ fn detect_probe(p: &Probe) -> Option<Format> {
         return Some(Format::Zip);
     }
     // The rest are texts told by a string they hold, the shortest last. Each
-    // finds it in the object's first kilobytes or all through it, so whatever
+    // finds it in the object's first kilobytes or in its start, so whatever
     // has a header of its own or a structure is typed before them.
     //
     // BinHex 4.0: a marker line (no byte-0 magic) in the first kilobyte.
@@ -2392,8 +2394,8 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     if looks_like_xdp(data) {
         return Some(Format::Xdp);
     }
-    // Microsoft Script Encoder: the `#@~^` marker (VBScript/JScript.Encode),
-    // anywhere in the object.
+    // Microsoft Script Encoder: the `#@~^` marker (VBScript/JScript.Encode) at
+    // the object's first byte, or with its blob header in the start.
     #[cfg(feature = "screnc")]
     if looks_like_screnc(p) {
         return Some(Format::Screnc);

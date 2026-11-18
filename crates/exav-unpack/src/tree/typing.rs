@@ -281,8 +281,9 @@ impl Typing {
                 }
             }
         }
-        // Packed, which no magic says: the check reads all of the executable
-        // (a PE too large to hold: its image).
+        // Packed, which no magic says: the packer check reads all of the
+        // executable (a PE too large to hold: its image), the UPX check its
+        // start.
         let Some(image) = seen.executable(kind) else {
             return Typed::Unchecked(packer_not_checked(hold));
         };

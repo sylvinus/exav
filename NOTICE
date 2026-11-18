@@ -753,9 +753,9 @@ and given to the public domain (CC0-1.0). The others are public domain, CC0,
 CC-BY, MIT, BSD or Apache files, each credited with its author, its
 source and the page that states its licence in examples.json, NOTICE.md and
 https://exav.org/viewer/examples/. The small ones are committed; the rest are
-downloaded by `npm run demo:examples` from pinned addresses and checked against
-their SHA-256. They are test inputs only and are not part of any published
-package.
+kept in https://github.com/sylvinus/exav-samples (viewer/), downloaded from
+there by `npm run demo:examples` and checked against their SHA-256. They are
+test inputs only and are not part of any published package.
 
 
 -------------------------------------------------------------------------------

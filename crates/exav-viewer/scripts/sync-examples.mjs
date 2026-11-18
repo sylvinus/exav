@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Put the demo's example files in demo/public/examples/ (not committed): the
 // small ones are copied from demo/examples/files/, the others from the
-// examples/ folder of github.com/sylvinus/exav-samples, and each is checked
+// viewer/ folder of github.com/sylvinus/exav-samples, and each is checked
 // against its size and SHA-256 in demo/examples/examples.json. Where each one
 // was first downloaded from (`fetched`) and its licence are in that manifest
 // and in demo/examples/NOTICE.md.
@@ -21,8 +21,8 @@ const from = path.join(pkg, "demo", "examples");
 const out = path.join(pkg, "demo", "public", "examples");
 const offline = process.argv.includes("--offline") || process.env.EXAV_EXAMPLES_OFFLINE === "1";
 const USER_AGENT = "exav-examples/1.0 (https://github.com/sylvinus/exav)";
-const MIRROR = "https://raw.githubusercontent.com/sylvinus/exav-samples/main/examples/";
-const samples = process.env.EXAV_SAMPLES ? path.join(process.env.EXAV_SAMPLES, "examples") : null;
+const MIRROR = "https://raw.githubusercontent.com/sylvinus/exav-samples/main/viewer/";
+const samples = process.env.EXAV_SAMPLES ? path.join(process.env.EXAV_SAMPLES, "viewer") : null;
 
 const sha256 = (data) => crypto.createHash("sha256").update(data).digest("hex");
 const { examples } = JSON.parse(fs.readFileSync(path.join(from, "examples.json"), "utf8"));

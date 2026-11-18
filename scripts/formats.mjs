@@ -61,8 +61,7 @@ export function streamingFormats() {
 }
 
 export function unpackFeatures() {
-  const toml = read("crates/exav-unpack/Cargo.toml");
-  const section = toml.slice(toml.indexOf("[features]"));
+  const section = tomlSection(read("crates/exav-unpack/Cargo.toml"), "features");
   return new Set([...section.matchAll(/^([a-z0-9][a-z0-9-]*)\s*=/gm)].map((m) => m[1]));
 }
 

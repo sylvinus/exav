@@ -53,7 +53,7 @@ program that opens it.
 - Rust 1.95 or later (it was 1.92); every crate is edition 2024.
 - Refused now: a `.cvd` whose header md5 does not match or that is cut short,
   a source with no end (`exav /dev/zero`, it was `OK`), a YARA rule nested
-  more than 10 parentheses deep (12 before), and an HTTP answer whose
+  more than 10 parentheses deep, and an HTTP answer whose
   `Content-Range` is not the one asked for.
 - A one-shot scan that `--max-scan-secs` ends keeps the exit status of what it
   found (`1`, then `2`), else follows `--partial-as`; it was always `3`.
@@ -95,8 +95,9 @@ program that opens it.
   `--object-cache-block-bytes` and `--http-request-bytes`.
 - Daemon: `--listen-health ADDR`, a listener that answers while the workers
   are busy, and a `STATS` that reports the whole pool. Each listener's
-  address takes `?idle-secs=` (120; reads waited a fixed 60 seconds, writes
-  forever), `?request-secs=` (600), `?session-secs=` and `?reply-secs=`.
+  address takes `?idle-secs=` (120 for clamd, 600 for ICAP; reads waited a
+  fixed 60 seconds, writes forever), `?request-secs=` (600), `?session-secs=`
+  and `?reply-secs=`.
 - HTTP: `--http-timeout-secs`, `--http-max-redirects`,
   `--http-redirect-private`, `--http-spill`. A server that does not answer
   range requests has the object downloaded whole, up to `--max-input-bytes`.
@@ -115,8 +116,8 @@ program that opens it.
   LZVN and InstallShield Z in-tree; camera RAW, DDS, ICO, PLY, OBJ, glTF and
   more TIFF variants.
 - Libraries: `exav_unpack::tree` (`Walker`, `Visitor`, `Typing`,
-  `type_object`), the one walk of nested containers exav, exav-grep,
-  `exav-unpack -r` and the wasm share; `MemberMeta::reason_kind`,
+  `type_object`), the one walk of nested containers exav, exav-grep and
+  `exav-unpack -r` share; `MemberMeta::reason_kind`,
   `Budget::set_rasters`.
 - Viewer: detection by exav in a worker (`sniffBytes`, `sniffTimeoutMs`,
   `FormatMismatch`); a ZIP's directory checked before it is opened
@@ -132,11 +133,10 @@ program that opens it.
 
 ### Changed
 
-- **Limits leave a part out and go on.** A member over the compression ratio
-  or `--max-object-bytes` is left out, the members after it are scanned, and
-  the container is `LIMITS-EXCEEDED` unless something is found. The ratio is
-  asked only of a member that decodes past `--max-object-bytes` (it was
-  4 MiB).
+- **Limits leave a part out and go on.** A member that decodes past
+  `--max-object-bytes` at more than the compression ratio is left out, the
+  members after it are scanned, and the container is `LIMITS-EXCEEDED` unless
+  something is found. The ratio was asked of every member past 4 MiB.
 - A member left out for its size is `LIMITS-EXCEEDED`, not `UNSCANNABLE`; a
   file a reader cannot parse is `UNSCANNABLE`, not `LIMITS-EXCEEDED`; a panic
   in a member is reported there and the rest of its container is scanned.
@@ -152,27 +152,29 @@ program that opens it.
 - `--max-unpack-depth 0` opens no container, in every CLI (exav refused it;
   the others reported every archive unreadable).
 - exav-grep walks as the scanner does (depth limit, members read where they
-  lie, split files, appended ZIPs) and holds a file up to `--max-object-bytes`
-  (it was 16 MiB). exav-unpack's `--max-memory` and `--max-size` are
-  `--max-object-bytes` and `--max-extracted-bytes`; the old names still work.
+  lie, split files, appended ZIPs) and reads a file past `--max-object-bytes`
+  where it lies (it reported it unreadable). exav-unpack's `--max-memory` and
+  `--max-size` are `--max-object-bytes` and `--max-extracted-bytes`; the old
+  names still work.
 - Names in reasons and locations have control and bidirectional characters
   replaced by `_` and are cut at 200 characters, in every CLI.
 - `--build-db` counts as unsupported a logical signature whose PCRE neither
   regex engine builds.
 - A daemon setting given only by its `EXAV_*` variable to a run without that
   listener is ignored with a warning.
-- The Docker image runs as a named user (65532), read-only, with every
-  capability dropped and `no-new-privileges`, on Alpine 3.23; the examples
-  publish the ports on localhost only.
+- The Docker image names its user (65532) and is built on Alpine 3.23; the
+  compose example runs it read-only, with every capability dropped and
+  `no-new-privileges`.
 - YARA: `pe.number_of_exports` counts the exports by ordinal alone too, as
   yara-x does.
 - Dependencies at their latest versions, except the image decoders pinned to
-  libclamav 1.5.4's and `zip` below 9.1. Seven crates fewer, and the QR reader
-  is rqrr 0.11.0 vendored as `exav-qr` with `forbid(unsafe_code)`.
+  libclamav 1.5.4's and `zip` below 9.1. The `exav` binary builds 19 crates
+  fewer, and the QR reader is rqrr 0.11.0 vendored as `exav-qr` with
+  `forbid(unsafe_code)`.
   `fuzzy_img` JPEGs are decoded by zune-jpeg 0.5.15: the hashes differ from
   libclamav's 0.5.8 only for baseline JPEGs with a scan for each component.
 - Viewer: text, CSV, TSV and a ZIP's directory are read by exav's readers in
-  a worker; a CSV past 16,384 columns or 1,048,576 rows is refused.
+  a worker; a CSV or TSV past 250,000 fields or 64 MiB of memory is refused.
 
 ### Fixed
 
@@ -191,7 +193,8 @@ program that opens it.
 - **A string a format is found by** (a PDF header, an XDP tag, the BinHex,
   AutoIt and Script Encoder markers) no longer takes the type of a file whose
   own header gives one. A text that names XDP's tags is no longer
-  `UNSCANNABLE`, and an XDP's character references are read.
+  `UNSCANNABLE`, an XDP's character references are read, and an element
+  whose name starts with `chunk` (`<chunk-id>`) is no longer read as a chunk.
 - **Detection reads a file's start, its end and the places its structure
   names, never all of it.** A Script Encoder marker, an NSIS, AutoIt or
   self-extractor payload and a UPX header are looked for in the first 4 MiB,

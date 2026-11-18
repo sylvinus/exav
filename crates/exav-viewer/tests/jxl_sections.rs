@@ -15,10 +15,14 @@ struct Counting;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// The largest block asked for, granted or not: a host that refuses a
+/// gigabyte must not let the test pass.
+static ASKED: AtomicUsize = AtomicUsize::new(0);
 
 // SAFETY: every call is the system allocator's, with the sizes counted around it.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ASKED.fetch_max(layout.size(), Ordering::Relaxed);
         // SAFETY: the caller's contract for `alloc` is `System.alloc`'s.
         let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
@@ -48,12 +52,15 @@ fn a_section_the_file_declares_huge_is_not_allocated() {
         let data = std::fs::read(&path).unwrap();
         let before = LIVE.load(Ordering::Relaxed);
         PEAK.store(before, Ordering::Relaxed);
+        ASKED.store(0, Ordering::Relaxed);
         // As much as the viewer lets an image decode take.
         let decoded = exav_render::image::decode_any(&data, 256 << 20);
         let grew = PEAK.load(Ordering::Relaxed) - before;
+        let asked = ASKED.load(Ordering::Relaxed);
         assert!(decoded.is_err(), "{name} decoded");
         // The decoder's own tables, its 4 MiB LZ77 window the largest; the
         // declared section was about 1 GiB.
         assert!(grew < 16 << 20, "{name}: {} MB allocated", grew >> 20);
+        assert!(asked < 16 << 20, "{name}: {} MB asked for", asked >> 20);
     }
 }
