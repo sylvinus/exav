@@ -1,0 +1,629 @@
+---
+// One section of the Stats page: its charts and the figures behind them,
+// from www/src/data/stats/ (see ../data/stats.ts).
+import BarChart from './BarChart.astro';
+import LineChart from './LineChart.astro';
+import { bench, clamscan, compact, count, exav, latest, releases, seconds, size, times, type Engine } from '../data/stats';
+
+interface Props {
+  view: 'summary' | 'speed' | 'memory' | 'start' | 'lines' | 'dependencies' | 'unsafe' | 'tests' | 'formats' | 'binaries' | 'wasm' | 'setup';
+}
+const { view } = Astro.props;
+
+type Release = (typeof releases)[number];
+type Series = { label: string; values: (number | null)[]; estimated?: boolean[] };
+
+const versions = releases.map((r) => r.version);
+const runs = exav.map((e) => e.version);
+const engines: Engine[] = [clamscan, ...exav];
+const name = (e: Engine) => `${e.name} ${e.version}`;
+const newest = exav[exav.length - 1];
+const unfinished = (e: Engine) =>
+  e.failed && `did not finish: stopped by ${e.failed.signal} after ${count(e.failed.files)} of ${count(bench.dataset.files)} files`;
+const failed = engines.filter((e) => e.failed);
+/** A run's scan time, or its estimate when it did not finish. */
+const scanned = (e: Engine) => e.scan ?? e.estimate?.scan;
+const approx = (e: Engine, text: string) => (e.failed ? `≈ ${text}` : text);
+const mb = (n: number) => (n / 1e6).toFixed(1);
+const gb = (n: number) => (n / 1e9).toFixed(2);
+/** The series that have a value somewhere. */
+const shown = (series: Series[]) => series.filter((s) => s.values.some((v) => v != null));
+const inRepo = (r: Release) => r.rust_lines.code + r.rust_lines.tests + r.rust_lines.tools + r.rust_lines.vendored;
+const memory = [
+  { label: 'Scanning the files', of: (e: Engine) => e.memory_scan },
+  { label: 'Signatures loaded', of: (e: Engine) => e.memory_loaded },
+  { label: 'Loaded from the .exavdb', of: (e: Engine) => e.memory_exavdb },
+];
+const memorySeries = shown(memory.map((m) => ({ label: m.label, values: exav.map((e) => m.of(e) ?? null) })));
+// clamscan's figure beside the line of exav's that measures the same.
+const memoryRefs = memory.flatMap((m) => {
+  const v = m.of(clamscan);
+  const s = memorySeries.findIndex((x) => x.label === m.label);
+  return v === undefined ? [] : [{ label: `clamscan, ${m.label.toLowerCase()}: ${size(v)}`, value: v, s: s < 0 ? undefined : s }];
+});
+
+const LINUX = 'x86_64-unknown-linux-musl';
+/** The binaries whose third-party crates are counted, in the order they are shown. */
+const BUILT = [...new Set(releases.flatMap((r) => Object.keys(r.built_from)))].sort(
+  (a, b) => (a === 'exav' ? -1 : b === 'exav' ? 1 : a.localeCompare(b)),
+);
+const TARGETS: Record<string, string> = {
+  'x86_64-unknown-linux-musl': 'Linux x86_64',
+  'aarch64-unknown-linux-musl': 'Linux arm64',
+  'x86_64-apple-darwin': 'macOS x86_64',
+  'aarch64-apple-darwin': 'macOS arm64',
+  'x86_64-pc-windows-msvc': 'Windows x86_64',
+};
+const binaryNames = [...new Set(releases.flatMap((r) => Object.values(r.sizes.binaries).flatMap(Object.keys)))].sort(
+  (a, b) => (a === 'exav' ? -1 : b === 'exav' ? 1 : a.localeCompare(b)),
+);
+const packages = [...new Set(releases.flatMap((r) => Object.keys(r.sizes.npm)))].sort();
+const wasmTotal = (r: Release, pkg: string) => {
+  const p = r.sizes.npm[pkg];
+  return p ? Object.values(p.wasm).reduce((a, b) => a + b, 0) : null;
+};
+const withFormats = releases.filter((r) => r.formats);
+const derived = withFormats.filter((r) => r.formats!.from);
+const tests = (r: Release) => r.tests.rust + r.tests.js + r.tests.e2e;
+const signatures = Object.values(bench.signatures).reduce((a, s) => a + s.signatures, 0);
+const DATABASES = ['main', 'daily', 'bytecode'];
+const databases = Object.entries(bench.signatures).sort(
+  ([a], [b]) => (DATABASES.indexOf(a) + 1 || 99) - (DATABASES.indexOf(b) + 1 || 99),
+);
+---
+
+{
+  view === 'summary' && (
+    <dl class="summary not-content">
+      {newest.scan !== undefined && (
+        <div>
+          <dt>
+            <a href="#speed">{times(clamscan.scan / newest.scan)}</a>
+          </dt>
+          <dd>faster than clamscan, in wall time</dd>
+        </div>
+      )}
+      {newest.memory_scan !== undefined && (
+        <div>
+          <dt>
+            <a href="#memory">{size(newest.memory_scan)}</a>
+          </dt>
+          <dd>peak memory scanning the files, against {size(clamscan.memory_scan)} for clamscan</dd>
+        </div>
+      )}
+      {newest.start_exavdb !== undefined && (
+        <div>
+          <dt>
+            <a href="#start-time">{seconds(newest.start_exavdb)}</a>
+          </dt>
+          <dd>to start from a prebuilt database</dd>
+        </div>
+      )}
+      <div>
+        <dt>
+          <a href="#lines-of-rust">{compact(inRepo(latest))}</a>
+        </dt>
+        <dd>lines of Rust in the repository, {compact(inRepo(latest) + latest.rust_lines.dependencies)} with the dependencies</dd>
+      </div>
+      <div>
+        <dt>
+          <a href="#dependencies">{count(latest.built_from.exav!.crates)}</a>
+        </dt>
+        <dd>third-party crates in the exav binary</dd>
+      </div>
+      <div>
+        <dt>
+          <a href="#unsafe">{count(latest.unsafe.code)}</a>
+        </dt>
+        <dd>
+          <code>unsafe</code> in exav's code
+        </dd>
+      </div>
+      <div>
+        <dt>
+          <a href="#tests">{count(tests(latest))}</a>
+        </dt>
+        <dd>tests, and {latest.tests.fuzz_targets} fuzz targets</dd>
+      </div>
+      {latest.formats && (
+        <div>
+          <dt>
+            <a href="#formats">{count(latest.formats.registry)}</a>
+          </dt>
+          <dd>formats, {latest.formats.viewer} of them shown by the viewer</dd>
+        </div>
+      )}
+      {latest.sizes.binaries[LINUX]?.exav && (
+        <div>
+          <dt>
+            <a href="#binary-size">{size(latest.sizes.binaries[LINUX].exav)}</a>
+          </dt>
+          <dd>the exav binary on Linux x86_64</dd>
+        </div>
+      )}
+    </dl>
+  )
+}
+
+{
+  view === 'speed' && (
+    <>
+      <LineChart
+        title={`How many times faster than clamscan ${clamscan.version} each release scans the ${count(bench.dataset.files)} files, in wall time`}
+        categories={runs}
+        series={[
+          {
+            label: 'exav',
+            values: exav.map((e) => (scanned(e) === undefined ? null : clamscan.scan / scanned(e)!)),
+            estimated: exav.map((e) => !!e.failed),
+          },
+        ]}
+        refs={[{ label: `clamscan ${clamscan.version}, 1.0×`, value: 1 }]}
+        format={times}
+      />
+      <table>
+        <thead>
+          <tr>
+            <th>Engine</th>
+            <th>Scan</th>
+            <th>Files/s</th>
+            <th>MB/s</th>
+            <th>Faster than clamscan</th>
+            <th>Detections</th>
+          </tr>
+        </thead>
+        <tbody>
+          {engines.map((e) => {
+            const s = scanned(e);
+            return s === undefined ? (
+              <tr>
+                <td>{name(e)}</td>
+                <td colspan="5">{unfinished(e)}</td>
+              </tr>
+            ) : (
+              <tr>
+                <td>{name(e)}</td>
+                <td>{approx(e, seconds(s))}</td>
+                <td>{approx(e, (bench.dataset.files / s).toFixed(1))}</td>
+                <td>{approx(e, (bench.dataset.bytes / s / 1e6).toFixed(1))}</td>
+                <td>{e === clamscan ? '' : approx(e, times(clamscan.scan / s))}</td>
+                <td>{e.found === undefined ? '' : count(e.found)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {failed.map((e) => (
+        <p>
+          {name(e)} {unfinished(e)}
+          {e.estimate &&
+            `; its figures (≈) are its time on ${e.failed!.bytes ? size(e.failed!.bytes) : 'the files it went through'}, scaled to the ${size(bench.dataset.bytes)} of all of them`}
+          .
+        </p>
+      ))}
+    </>
+  )
+}
+
+{
+  view === 'memory' && (
+    <>
+      <LineChart
+        title="Peak resident memory of exav, in GB, against clamscan's (dashed)"
+        categories={runs}
+        series={memorySeries}
+        refs={memoryRefs}
+        format={gb}
+      />
+      <table>
+        <thead>
+          <tr>
+            <th>Engine</th>
+            {memory.map((m) => (
+              <th>{m.label}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {engines.map((e) => (
+            <tr>
+              <td>{name(e)}</td>
+              {memory.map((m) => {
+                const v = m.of(e);
+                return <td>{v !== undefined ? size(v) : m.label === memory[0].label && e.failed ? 'did not finish' : ''}</td>;
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
+  )
+}
+
+{
+  view === 'start' && (
+    <>
+      <LineChart
+        title="Seconds to build the .exavdb from the raw signatures, and to start from it and scan one small file"
+        categories={runs}
+        series={[
+          { label: 'Build the .exavdb', values: exav.map((e) => e.build_exavdb ?? null) },
+          { label: 'Start from the .exavdb', values: exav.map((e) => e.start_exavdb ?? null) },
+        ]}
+        format={(s) => s.toFixed(1)}
+      />
+      <table>
+        <thead>
+          <tr>
+            <th>Engine</th>
+            <th>Build the .exavdb</th>
+            <th>Start from the .exavdb</th>
+          </tr>
+        </thead>
+        <tbody>
+          {exav.map((e) => (
+            <tr>
+              <td>{name(e)}</td>
+              <td>{e.build_exavdb === undefined ? '' : seconds(e.build_exavdb)}</td>
+              <td>{e.start_exavdb === undefined ? '' : seconds(e.start_exavdb)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
+  )
+}
+
+{
+  view === 'lines' && (
+    <>
+      <BarChart
+        title="Lines of Rust in each release, blank lines and comments left out"
+        categories={versions}
+        series={[
+          { label: 'Code', values: releases.map((r) => r.rust_lines.code) },
+          { label: 'Tests', values: releases.map((r) => r.rust_lines.tests) },
+          { label: 'Other programs', values: releases.map((r) => r.rust_lines.tools) },
+          { label: 'Vendored', values: releases.map((r) => r.rust_lines.vendored) },
+          { label: 'Dependencies', values: releases.map((r) => r.rust_lines.dependencies) },
+        ]}
+      />
+      <table>
+        <thead>
+          <tr>
+            <th>Release</th>
+            <th>Code</th>
+            <th>Tests</th>
+            <th>Other programs</th>
+            <th>Vendored</th>
+            <th>In the repository</th>
+            <th>Dependencies</th>
+            <th>Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          {releases.map((r) => (
+            <tr>
+              <td>{r.version}</td>
+              <td>{count(r.rust_lines.code)}</td>
+              <td>{count(r.rust_lines.tests)}</td>
+              <td>{count(r.rust_lines.tools)}</td>
+              <td>{count(r.rust_lines.vendored)}</td>
+              <td>{count(inRepo(r))}</td>
+              <td>{count(r.rust_lines.dependencies)}</td>
+              <td>{count(inRepo(r) + r.rust_lines.dependencies)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
+  )
+}
+
+{
+  view === 'dependencies' && (
+    <>
+      <LineChart
+        title="Third-party crates: those of the exav binary, those exav's crates name, and every one of what is published"
+        categories={versions}
+        series={[
+          { label: 'Crates in the exav binary', values: releases.map((r) => r.built_from.exav!.crates) },
+          { label: "Named by exav's crates", values: releases.map((r) => r.built_from.exav!.direct) },
+          { label: 'All third-party crates', values: releases.map((r) => r.dependencies.all) },
+        ]}
+      />
+      <table>
+        <thead>
+          <tr>
+            <th>Release</th>
+            <th>Crates in exav</th>
+            <th>Named by exav's crates</th>
+            <th>All third-party crates</th>
+            <th>npm packages of the viewer</th>
+          </tr>
+        </thead>
+        <tbody>
+          {releases.map((r) => (
+            <tr>
+              <td>{r.version}</td>
+              <td>{count(r.built_from.exav!.crates)}</td>
+              <td>{count(r.built_from.exav!.direct)}</td>
+              <td>{count(r.dependencies.all)}</td>
+              <td>
+                {r.dependencies.viewer_npm
+                  ? `${r.dependencies.viewer_npm.required} required, ${r.dependencies.viewer_npm.optional} optional`
+                  : ''}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
+  )
+}
+
+{
+  view === 'unsafe' && (
+    <>
+      <LineChart
+        title="unsafe keywords in exav's code and in the crates it vendors"
+        categories={versions}
+        series={[
+          { label: 'Code', values: releases.map((r) => r.unsafe.code) },
+          { label: 'Vendored', values: releases.map((r) => r.unsafe.vendored) },
+        ]}
+      />
+      <LineChart
+        title="unsafe keywords in the third-party crates each binary is built from"
+        categories={versions}
+        series={BUILT.map((b) => ({ label: `Crates of ${b}`, values: releases.map((r) => r.built_from[b]?.unsafe ?? null) }))}
+      />
+      <table>
+        <thead>
+          <tr>
+            <th>Release</th>
+            <th>Code</th>
+            <th>Vendored</th>
+            {BUILT.map((b) => (
+              <th>Crates of {b}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {releases.map((r) => (
+            <tr>
+              <td>{r.version}</td>
+              <td>{count(r.unsafe.code)}</td>
+              <td>{count(r.unsafe.vendored)}</td>
+              {BUILT.map((b) => {
+                const c = r.built_from[b];
+                return <td>{c ? `${count(c.unsafe)}, in ${c.unsafe_crates} of ${c.crates} crates` : ''}</td>;
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
+  )
+}
+
+{
+  view === 'tests' && (
+    <>
+      <LineChart
+        title="Tests in each release"
+        categories={versions}
+        series={[
+          { label: 'Rust tests', values: releases.map((r) => r.tests.rust) },
+          { label: 'JavaScript tests', values: releases.map((r) => r.tests.js) },
+          { label: 'End-to-end tests', values: releases.map((r) => r.tests.e2e) },
+        ]}
+      />
+      <LineChart
+        title="Fuzz targets in each release"
+        categories={versions}
+        series={[{ label: 'Fuzz targets', values: releases.map((r) => r.tests.fuzz_targets) }]}
+      />
+      <table>
+        <thead>
+          <tr>
+            <th>Release</th>
+            <th>Rust</th>
+            <th>JavaScript</th>
+            <th>End-to-end</th>
+            <th>Fuzz targets</th>
+          </tr>
+        </thead>
+        <tbody>
+          {releases.map((r) => (
+            <tr>
+              <td>{r.version}</td>
+              <td>{count(r.tests.rust)}</td>
+              <td>{count(r.tests.js)}</td>
+              <td>{count(r.tests.e2e)}</td>
+              <td>{count(r.tests.fuzz_targets)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
+  )
+}
+
+{
+  view === 'formats' && (
+    <>
+      <LineChart
+        title="Formats of the format registry"
+        categories={withFormats.map((r) => r.version)}
+        series={[
+          { label: 'Known', values: withFormats.map((r) => r.formats!.registry) },
+          { label: 'Extracted', values: withFormats.map((r) => r.formats!.extractor) },
+          { label: 'Shown by the viewer', values: withFormats.map((r) => r.formats!.viewer) },
+        ]}
+      />
+      <table>
+        <thead>
+          <tr>
+            <th>Release</th>
+            <th>Known</th>
+            <th>Extracted</th>
+            <th>Shown by the viewer</th>
+          </tr>
+        </thead>
+        <tbody>
+          {withFormats.map((r) => (
+            <tr>
+              <td>
+                {r.version}
+                {r.formats!.from && ' *'}
+              </td>
+              <td>{count(r.formats!.registry)}</td>
+              <td>{count(r.formats!.extractor)}</td>
+              <td>{count(r.formats!.viewer)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {derived.length > 0 && (
+        <p>
+          * Counted from the code of {derived.map((r) => r.version).join(' and ')}, against the registry of{' '}
+          {derived[0].formats!.from}: the entries for which it had an extractor reader, a scanner type, or a viewer
+          extension.
+        </p>
+      )}
+    </>
+  )
+}
+
+{
+  view === 'binaries' && (
+    <>
+      <LineChart
+        title="Size of each binary for Linux x86_64, in MB"
+        categories={versions}
+        series={binaryNames.map((b) => ({
+          label: b,
+          values: releases.map((r) => r.sizes.binaries[LINUX]?.[b] ?? null),
+        }))}
+        format={mb}
+      />
+      <table>
+        <thead>
+          <tr>
+            <th>{latest.version}</th>
+            {Object.keys(TARGETS).map((t) => (
+              <th>{TARGETS[t]}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {binaryNames.map((b) => (
+            <tr>
+              <td>{b}</td>
+              {Object.keys(TARGETS).map((t) => (
+                <td>{latest.sizes.binaries[t]?.[b] ? size(latest.sizes.binaries[t][b]) : ''}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {latest.sizes.wasi && (
+        <p>
+          The WASI module of exav {latest.version} (<code>wasm32-wasip1</code>) is {size(latest.sizes.wasi)}.
+        </p>
+      )}
+    </>
+  )
+}
+
+{
+  view === 'wasm' && (
+    <>
+      <LineChart
+        title="WebAssembly in each npm package, all .wasm files together, in MB"
+        categories={versions}
+        series={packages.map((p) => ({ label: p, values: releases.map((r) => wasmTotal(r, p)) }))}
+        format={mb}
+      />
+      <table>
+        <thead>
+          <tr>
+            <th>{latest.version}</th>
+            <th>File</th>
+            <th>Size</th>
+          </tr>
+        </thead>
+        <tbody>
+          {packages.flatMap((p) =>
+            Object.entries(latest.sizes.npm[p]?.wasm ?? {}).map(([file, bytes]) => (
+              <tr>
+                <td>{p}</td>
+                <td>
+                  <code>{file}</code>
+                </td>
+                <td>{size(bytes)}</td>
+              </tr>
+            )),
+          )}
+        </tbody>
+      </table>
+    </>
+  )
+}
+
+{
+  view === 'setup' && (
+    <ul>
+      <li>
+        Measured on {bench.date}, on {bench.machine.cores} cores of {bench.machine.arch}
+        {bench.machine.cpu && ` (${bench.machine.cpu})`} with {Math.round(bench.machine.memory / 2 ** 30)} GiB of memory,
+        Linux {bench.machine.kernel}.
+      </li>
+      <li>
+        Signatures: {databases.map(([db, s]) => `${db} ${s.version}`).join(', ')}, {count(signatures)} in all.
+      </li>
+      <li>
+        Files: {count(bench.dataset.files)} ({size(bench.dataset.bytes)}), {count(bench.dataset.malware)} MalwareBazaar
+        samples and {count(bench.dataset.files - bench.dataset.malware)} other files.
+      </li>
+      <li>Each figure is the median of {bench.runs} runs.</li>
+    </ul>
+  )
+}
+
+<style>
+  .summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
+    gap: 1rem;
+    margin-block: 1.5rem;
+  }
+  .summary div {
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.5rem;
+  }
+  .summary dt {
+    font-size: var(--sl-text-2xl);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.2;
+  }
+  .summary dt a {
+    color: var(--sl-color-white);
+    text-decoration: none;
+  }
+  .summary dt a:hover,
+  .summary dt a:focus-visible {
+    color: var(--sl-color-text-accent);
+  }
+  .summary dd {
+    margin: 0.25rem 0 0;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-3);
+  }
+  td {
+    font-variant-numeric: tabular-nums;
+  }
+</style>

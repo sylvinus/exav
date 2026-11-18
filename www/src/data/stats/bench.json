@@ -1,0 +1,87 @@
+{
+  "date": "2026-11-18",
+  "machine": {
+    "cpu": "Apple",
+    "arch": "aarch64",
+    "cores": 3,
+    "memory": 16752128000,
+    "kernel": "6.12.95+deb13-cloud-arm64"
+  },
+  "signatures": {
+    "bytecode": {
+      "version": 339,
+      "signatures": 80
+    },
+    "daily": {
+      "version": 28187,
+      "signatures": 355874
+    },
+    "main": {
+      "version": 63,
+      "signatures": 3287027
+    }
+  },
+  "dataset": {
+    "files": 5820,
+    "bytes": 1696168185,
+    "malware": 5704
+  },
+  "runs": 3,
+  "engines": [
+    {
+      "name": "clamscan",
+      "version": "1.4.3",
+      "start": 5.49,
+      "scan": 1259.99,
+      "cpu": 1258.79,
+      "memory_scan": 1386295296,
+      "found": 1355,
+      "exit": [
+        1
+      ]
+    },
+    {
+      "name": "exav",
+      "version": "0.0.1",
+      "start": 41.35,
+      "build_exavdb": 43.74,
+      "start_exavdb": 7.77,
+      "failed": {
+        "signal": "SIGKILL",
+        "files": 5183,
+        "bytes": 1401178980
+      },
+      "estimate": {
+        "scan": 1129.36
+      }
+    },
+    {
+      "name": "exav",
+      "version": "0.0.2",
+      "start": 11.16,
+      "build_exavdb": 11.55,
+      "start_exavdb": 0.75,
+      "scan": 290.48,
+      "cpu": 280.75,
+      "memory_scan": 1485455360,
+      "found": 1475,
+      "exit": [
+        1
+      ]
+    },
+    {
+      "name": "exav",
+      "version": "0.0.3",
+      "start": 10.2,
+      "build_exavdb": 10.48,
+      "start_exavdb": 0.76,
+      "scan": 283.09,
+      "cpu": 277.54,
+      "memory_scan": 1483370496,
+      "found": 1476,
+      "exit": [
+        1
+      ]
+    }
+  ]
+}

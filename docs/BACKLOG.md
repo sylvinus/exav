@@ -607,6 +607,23 @@ scanner's, and are not part of this aim.
 
 ## CI
 
+- **No build path in a released file (blocks the next release).** The 0.0.3
+  npm packages were built on a workstation, and their `.wasm` files hold its
+  home directory: the cargo registry's path in panic locations, and in the
+  viewer's the checkout's too (exav-render, exav-unpack). The release
+  workflow's files hold the runners' (`C:\Users\runneradmin`, `/Users/runner`,
+  `/home/runner` in the WASI module); the musl builds, and so the images, only
+  the `/cargo` of `cross`. To do:
+  - every build of a released file maps `$CARGO_HOME` and the checkout to
+    fixed names (`--remap-path-prefix`; Cargo's `trim-paths` once it is stable
+    in the MSRV);
+  - a gate, in `scripts/release.sh` and in the release workflow before any
+    upload, refuses a crate, npm tarball, binary, WASI module, image or chart
+    that holds an absolute path of the machine that built it (`/Users/`,
+    `/home/`, `C:\Users\`, the checkout, `$CARGO_HOME`);
+  - npm and the release carry the same bytes: the npm packages published from
+    the tarballs the release workflow builds (the viewer's to add), or the
+    Rust and wasm-opt versions pinned for every wasm build.
 - **Two native tests time a debug build.** `the_cpu_limit_is_per_job_not_per_worker`
   (`exav/tests/daemon_client.rs`) gives a scan of 8 MiB of random bytes
   `--max-scan-secs 1`, and its first job passed it once under a full

@@ -1,0 +1,130 @@
+{
+  "version": "0.0.3",
+  "date": "2026-11-18",
+  "rust_lines": {
+    "code": 236188,
+    "tests": 149080,
+    "tools": 3574,
+    "vendored": 41918,
+    "dependencies": 863074
+  },
+  "unsafe": {
+    "code": 64,
+    "tests": 56,
+    "tools": 0,
+    "vendored": 7
+  },
+  "built_from": {
+    "exav": {
+      "crates": 130,
+      "direct": 58,
+      "lines": 863074,
+      "unsafe": 4379,
+      "unsafe_crates": 73
+    },
+    "exav-unpack": {
+      "crates": 61,
+      "direct": 30,
+      "lines": 346111,
+      "unsafe": 2123,
+      "unsafe_crates": 35
+    }
+  },
+  "dependencies": {
+    "all": 296,
+    "lockfile": 291,
+    "viewer_npm": {
+      "required": 0,
+      "optional": 6
+    }
+  },
+  "formats": {
+    "registry": 126,
+    "extractor": 88,
+    "viewer": 84
+  },
+  "tests": {
+    "rust": 5567,
+    "js": 993,
+    "e2e": 294,
+    "fuzz_targets": 50
+  },
+  "sizes": {
+    "binaries": {
+      "aarch64-apple-darwin": {
+        "exav": 14819808,
+        "exav-grep": 7497824,
+        "exav-imagehash": 2133008,
+        "exav-pe-emu": 1099664,
+        "exav-qr": 9278240,
+        "exav-unpack": 4842576
+      },
+      "aarch64-unknown-linux-musl": {
+        "exav": 16047320,
+        "exav-grep": 8272320,
+        "exav-imagehash": 2376416,
+        "exav-pe-emu": 1263832,
+        "exav-qr": 10164720,
+        "exav-unpack": 5341232
+      },
+      "x86_64-pc-windows-msvc": {
+        "exav": 15997440,
+        "exav-grep": 8361984,
+        "exav-imagehash": 2128896,
+        "exav-pe-emu": 884736,
+        "exav-qr": 10335744,
+        "exav-unpack": 5220864
+      },
+      "x86_64-unknown-linux-musl": {
+        "exav": 17745008,
+        "exav-grep": 9209512,
+        "exav-imagehash": 2605088,
+        "exav-pe-emu": 1297864,
+        "exav-qr": 11352872,
+        "exav-unpack": 5748880
+      }
+    },
+    "wasi": 12493173,
+    "npm": {
+      "@exav/unpack-wasm": {
+        "tarball": 1042100,
+        "unpacked": 2352476,
+        "wasm": {
+          "pkg/exav_unpack_wasm_bg.wasm": 2254769
+        }
+      },
+      "@exav/viewer": {
+        "tarball": 19449376,
+        "unpacked": 44381931,
+        "wasm": {
+          "assets/pdfjs/absent.wasm": 0,
+          "dist/frame/app/docx_parser_bg.wasm": 2247012,
+          "dist/frame/app/exav-viewer/pdfjs/6.4.299/wasm-59003dc790/jbig2.wasm": 0,
+          "dist/frame/app/exav-viewer/pdfjs/6.4.299/wasm-59003dc790/openjpeg.wasm": 0,
+          "dist/frame/app/exav-viewer/pdfjs/6.4.299/wasm-59003dc790/qcms_bg.wasm": 96589,
+          "dist/frame/app/exav_unpack_wasm_bg.wasm": 2254769,
+          "dist/frame/app/exav_viewer_docs_bg.wasm": 1073437,
+          "dist/frame/app/exav_viewer_dwg_bg.wasm": 968328,
+          "dist/frame/app/exav_viewer_image_bg.wasm": 2190671,
+          "dist/frame/app/exav_viewer_model_bg.wasm": 449553,
+          "dist/frame/app/exav_viewer_sheets_bg.wasm": 1281311,
+          "dist/frame/app/exav_viewer_slides_bg.wasm": 1069610,
+          "dist/frame/app/exav_viewer_sniff_bg.wasm": 170328,
+          "dist/frame/app/exav_viewer_table_bg.wasm": 265268,
+          "dist/frame/app/exav_viewer_text_bg.wasm": 228068,
+          "dist/frame/app/pptx_parser_bg.wasm": 1991557,
+          "dist/frame/app/xlsx_parser_bg.wasm": 1913474,
+          "wasm/exav_viewer_docs_bg.wasm": 1073437,
+          "wasm/exav_viewer_dwg_bg.wasm": 968328,
+          "wasm/exav_viewer_image_bg.wasm": 2190671,
+          "wasm/exav_viewer_model_bg.wasm": 449553,
+          "wasm/exav_viewer_sheets_bg.wasm": 1281311,
+          "wasm/exav_viewer_slides_bg.wasm": 1069610,
+          "wasm/exav_viewer_sniff_bg.wasm": 170328,
+          "wasm/exav_viewer_table_bg.wasm": 265268,
+          "wasm/exav_viewer_text_bg.wasm": 228068
+        }
+      }
+    }
+  }
+}

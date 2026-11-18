@@ -1,0 +1,123 @@
+---
+title: Stats
+description: "Figures of each exav release: scan speed and memory against clamscan, start time, lines of Rust, dependencies, unsafe, tests, formats, and the size of the binaries and of the WebAssembly published on npm."
+---
+
+import Stat from '../../../components/Stat.astro';
+
+The figures of each release of exav, the latest one's first. Each heading is a
+link to its section.
+
+<Stat view="summary" />
+
+## Speed
+
+Each release's `exav` and `clamscan` scan the same files with the same
+signatures, each as one process, with the files in the page cache. The time to
+load the signatures is measured on its own and taken off, so the figures are
+the time to scan. They are measured again at each release, every release in
+the same run, so they compare with each other but not with those of an earlier
+run. The setup is [below](#how-the-figures-are-made).
+
+<Stat view="speed" />
+
+## Memory
+
+The most resident memory the process held, at three points:
+
+- **Scanning the files**: over the whole run of the speed figures, one process
+  that loads the raw signatures, then scans every file one after the other.
+- **Signatures loaded**: a process that loads the raw signatures and scans one
+  small file, about what a daemon holds when it is idle.
+- **Loaded from the .exavdb**: the same, from the
+  [prebuilt database](/scanner/guides/prebuilt-database/).
+
+<Stat view="memory" />
+
+## Start time
+
+`--build-db` reads the raw signatures `freshclam` keeps, builds exav's index
+and writes it to a [prebuilt database](/scanner/guides/prebuilt-database/)
+(`.exavdb`); each release builds its own, in its own format. Starting from it
+is the time to load it and scan one small file.
+
+<Stat view="start" />
+
+## Lines of Rust
+
+Lines that hold code, blank lines and comments left out. Tests are the
+integration tests, the benchmarks, the fuzz targets and the `#[cfg(test)]`
+modules; other programs are the examples and the tools. Dependencies are the
+crates the `exav` binary is built from for Linux x86_64 with its default
+features, without their tests and build scripts.
+
+<Stat view="lines" />
+
+## Dependencies
+
+The crates of the `exav` binary are those it is built from for Linux x86_64
+with its default features, procedural macros left out; the
+[Dependencies](/project/dependencies/) page describes them. All third-party
+crates are those of everything published, the workspace and the crates of the
+two npm packages, for every system and feature, those of the tests and tools
+included. The npm packages the viewer works with are all optional.
+
+<Stat view="dependencies" />
+
+## `unsafe`
+
+The `unsafe` keywords (blocks, functions, implementations) in exav's code and
+in the crates it vendors, and in the third-party crates the `exav` and
+`exav-unpack` binaries are each built from (for Linux x86_64, with the features
+the binary needs, their own tests left out). The
+[Dependencies](/project/dependencies/#memory-safety-posture) page says where
+exav uses it.
+
+<Stat view="unsafe" />
+
+## Tests
+
+Rust tests are the `#[test]` functions; JavaScript tests are run by Vitest,
+end-to-end tests by Playwright in a browser. Each fuzz target is a program the
+nightly fuzzing runs.
+
+<Stat view="tests" />
+
+## Formats
+
+The formats of the [format registry](/formats/): all those exav knows, those
+the extractor takes apart, and those the viewer shows. The registry came with
+0.0.3; the releases before it are counted from their code against it.
+
+<Stat view="formats" />
+
+## Binary size
+
+The binaries attached to each GitHub release, unpacked.
+
+<Stat view="binaries" />
+
+## WebAssembly size
+
+The `.wasm` files of each npm package, as published.
+
+<Stat view="wasm" />
+
+## How the figures are made
+
+`scripts/stats.py` writes them into `www/src/data/stats/`. Once a release's
+tag, GitHub release and npm packages are out, `scripts/stats.py release
+<version>` counts its lines, crates, tests, formats and sizes, from its tag and
+what it published; those figures do not change after. `scripts/stats.py bench`
+measures speed, memory and start time, at each release, for every release
+again:
+
+<Stat view="setup" />
+
+The files are listed by SHA-256 in `scripts/stats-dataset.txt`: the
+MalwareBazaar samples up to 1 MiB of the project's corpus, and the example
+files of the viewer, from
+[exav-samples](https://github.com/sylvinus/exav-samples). The machine is a
+virtual machine; a pause of it lengthens one run, which the median leaves out.
+The figures say nothing of other machines or files,
+nor of the daemons, which load the signatures once and scan in parallel.

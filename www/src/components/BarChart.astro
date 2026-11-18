@@ -1,0 +1,96 @@
+---
+// Stacked bars drawn when the site is built: one bar per category, the series
+// on top of each other, the total above.
+import ChartFrame from './ChartFrame.astro';
+import { axis, categoryAxis, LEFT, TOP, W } from './chart';
+import { compact } from '../data/stats';
+
+interface Props {
+  title: string;
+  categories: string[];
+  series: { label: string; values: number[] }[];
+  format?: (n: number) => string;
+}
+
+const { title, categories, series, format = compact } = Astro.props;
+
+const plotW = W - LEFT - 8;
+const group = plotW / categories.length;
+const { tilt, bottom } = categoryAxis(categories, group);
+const H = 212 + bottom;
+const plotH = H - TOP - bottom;
+const totals = categories.map((_, c) => series.reduce((sum, s) => sum + s.values[c], 0));
+const { ceiling, ticks } = axis(Math.max(...totals));
+const y = (v: number) => TOP + plotH - (v / ceiling) * plotH;
+const bar = Math.min(72, group * 0.5);
+
+const rects = categories.flatMap((_, c) => {
+  const x = LEFT + c * group + (group - bar) / 2;
+  let base = 0;
+  return series.flatMap((s, i) => {
+    const v = s.values[c];
+    if (!v) return [];
+    const h = y(base) - y(base + v);
+    const rect = { x, y: y(base + v), h, s: i, label: format(v), inside: h >= 16 && bar >= 40 };
+    base += v;
+    return [rect];
+  });
+});
+---
+
+<ChartFrame title={title} legend={series.map((s) => s.label)}>
+  <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label={title}>
+    {
+      ticks.map((t) => (
+        <g>
+          <line class="grid" x1={LEFT} x2={W - 8} y1={y(t)} y2={y(t)} />
+          <text class="tick" x={LEFT - 6} y={y(t) + 4} text-anchor="end">
+            {format(t)}
+          </text>
+        </g>
+      ))
+    }
+    {rects.map((r) => <rect class={`s${r.s}`} x={r.x} y={r.y} width={bar} height={Math.max(r.h, 0.5)} />)}
+    {
+      rects
+        .filter((r) => r.inside)
+        .map((r) => (
+          <text class="inside" x={r.x + bar / 2} y={r.y + r.h / 2 + 4} text-anchor="middle">
+            {r.label}
+          </text>
+        ))
+    }
+    {
+      categories.map((c, i) => {
+        const x = LEFT + i * group + group / 2;
+        return (
+          <>
+            <text class="value" x={x} y={y(totals[i]) - 6} text-anchor="middle">
+              {format(totals[i])}
+            </text>
+            {tilt ? (
+              <text class="category" x={x} y={TOP + plotH + 14} text-anchor="end" transform={`rotate(-35 ${x} ${TOP + plotH + 14})`}>
+                {c}
+              </text>
+            ) : (
+              <text class="category" x={x} y={H - 8} text-anchor="middle">
+                {c}
+              </text>
+            )}
+          </>
+        );
+      })
+    }
+  </svg>
+</ChartFrame>
+
+<style>
+  rect {
+    fill: var(--c);
+  }
+  .inside {
+    fill: #101114;
+    font-size: 11px;
+    font-weight: 600;
+  }
+</style>

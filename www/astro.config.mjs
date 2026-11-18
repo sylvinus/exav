@@ -271,6 +271,7 @@ export default defineConfig({
               { label: 'Security', slug: 'project/security' },
               { label: 'License', slug: 'project/license' },
               { label: 'Dependencies', slug: 'project/dependencies' },
+              { label: 'Stats', slug: 'project/stats' },
             ],
           },
         ]),

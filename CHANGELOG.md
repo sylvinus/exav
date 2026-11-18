@@ -6,6 +6,12 @@ follow [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- exav.org/project/stats/: the figures of each release, from speed and
+  memory against `clamscan` to lines of Rust, dependencies, `unsafe`, tests,
+  formats and sizes, written by `scripts/stats.py`.
+
 ## [0.0.3] - 2026-11-18
 
 Many more formats and installers read, in place and in bounded memory at any

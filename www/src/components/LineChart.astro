@@ -1,0 +1,141 @@
+---
+// Lines drawn when the site is built: one point per category (a release), a
+// line per series, broken where a value is missing, dashed into an estimate.
+// A reference is a dashed horizontal line (clamscan's figure), named in the
+// legend. The last value of each line is written at its end; the others are
+// in the table under the chart.
+import ChartFrame from './ChartFrame.astro';
+import { axis, categoryAxis, LEFT, TOP, W } from './chart';
+import { compact } from '../data/stats';
+
+interface Props {
+  title: string;
+  categories: string[];
+  series: { label: string; values: (number | null)[]; estimated?: boolean[] }[];
+  refs?: { label: string; value: number; s?: number }[];
+  format?: (n: number) => string;
+}
+
+const { title, categories, series, refs = [], format = compact } = Astro.props;
+
+const RIGHT = 64;
+const plotW = W - LEFT - RIGHT;
+const step = plotW / categories.length;
+const { tilt, bottom } = categoryAxis(categories, step);
+const H = 212 + bottom;
+const plotH = H - TOP - bottom;
+const values = [...series.flatMap((s) => s.values.filter((v): v is number => v != null)), ...refs.map((r) => r.value)];
+const { ceiling, ticks } = axis(Math.max(0, ...values));
+const x = (i: number) => LEFT + (i + 0.5) * step;
+const y = (v: number) => TOP + plotH - (v / ceiling) * plotH;
+
+type Point = { i: number; v: number; estimate: boolean };
+const lines = series.map((s, n) => {
+  const points: Point[] = s.values.flatMap((v, i) => (v == null ? [] : [{ i, v, estimate: s.estimated?.[i] ?? false }]));
+  // Consecutive points only: a missing value breaks the line.
+  const segments = points.slice(1).flatMap((p, k) => {
+    const q = points[k];
+    return p.i === q.i + 1 ? [{ from: q, to: p, dashed: p.estimate || q.estimate }] : [];
+  });
+  return { n, label: s.label, points, segments };
+});
+
+// The last value of each line at its right, moved apart so they do not overlap.
+const ends = lines
+  .filter((l) => l.points.length)
+  .map((l) => {
+    const p = l.points[l.points.length - 1];
+    return { n: l.n, x: x(p.i) + 9, y: y(p.v) + 4, text: `${p.estimate ? '≈' : ''}${format(p.v)}` };
+  })
+  .sort((a, b) => a.y - b.y);
+for (let k = 1; k < ends.length; k++) {
+  if (ends[k].x === ends[k - 1].x && ends[k].y - ends[k - 1].y < 14) ends[k].y = ends[k - 1].y + 14;
+}
+---
+
+<ChartFrame title={title} legend={series.map((s) => s.label)} refs={refs}>
+  <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label={title}>
+    {
+      ticks.map((t) => (
+        <g>
+          <line class="grid" x1={LEFT} x2={LEFT + plotW} y1={y(t)} y2={y(t)} />
+          <text class="tick" x={LEFT - 6} y={y(t) + 4} text-anchor="end">
+            {format(t)}
+          </text>
+        </g>
+      ))
+    }
+    {
+      refs.map((r) => (
+        <line class={`ref${r.s === undefined ? '' : ` s${r.s}`}`} x1={LEFT} x2={LEFT + plotW} y1={y(r.value)} y2={y(r.value)} />
+      ))
+    }
+    {
+      lines.map((l) => (
+        <g class={`s${l.n}`}>
+          {l.segments.map((s) => (
+            <line
+              class={s.dashed ? 'dashed' : ''}
+              x1={x(s.from.i)}
+              y1={y(s.from.v)}
+              x2={x(s.to.i)}
+              y2={y(s.to.v)}
+            />
+          ))}
+          {l.points.map((p) => (
+            <circle class={p.estimate ? 'estimate' : ''} cx={x(p.i)} cy={y(p.v)} r="4">
+              <title>{`${l.label}, ${categories[p.i]}: ${p.estimate ? '≈' : ''}${format(p.v)}`}</title>
+            </circle>
+          ))}
+        </g>
+      ))
+    }
+    {
+      ends.map((e) => (
+        <text class={`value end s${e.n}`} x={e.x} y={e.y}>
+          {e.text}
+        </text>
+      ))
+    }
+    {
+      categories.map((c, i) =>
+        tilt ? (
+          <text class="category" x={x(i)} y={TOP + plotH + 14} text-anchor="end" transform={`rotate(-35 ${x(i)} ${TOP + plotH + 14})`}>
+            {c}
+          </text>
+        ) : (
+          <text class="category" x={x(i)} y={H - 8} text-anchor="middle">
+            {c}
+          </text>
+        ),
+      )
+    }
+  </svg>
+</ChartFrame>
+
+<style>
+  line:not(.grid):not(.ref) {
+    stroke: var(--c);
+    stroke-width: 2.5;
+  }
+  line.dashed {
+    stroke-dasharray: 5 4;
+  }
+  circle {
+    fill: var(--c);
+    stroke: var(--c);
+    stroke-width: 2;
+  }
+  circle.estimate {
+    fill: var(--sl-color-black);
+  }
+  .value.end {
+    fill: var(--c);
+    font-weight: 600;
+  }
+  .ref {
+    stroke: var(--c, var(--sl-color-gray-3));
+    stroke-width: 1.5;
+    stroke-dasharray: 6 4;
+  }
+</style>

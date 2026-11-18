@@ -1,7 +1,7 @@
 # Releasing
 
 Everything to do between "the fixes are in" and a published version, in order.
-`scripts/release.sh` is the last step and checks the artifact; this page is the
+`scripts/release.sh` checks the artifact and publishes it; this page is the
 rest. Do not start a step before the one above it is green: a version number
 published to crates.io is gone for good.
 
@@ -118,7 +118,25 @@ One edit of each, all to the same number:
   tag's version when it is packaged; the `helm` workflow fails if the tag and
   the workspace version differ.
 
-## 8. Gate and publish
+## 8. The new version against the earlier ones
+
+With the versions bumped and committed, on the machine of the Stats page,
+plugged in (a laptop on battery runs slower) and doing nothing else:
+
+- `python3 -I scripts/stats.py candidate` builds what the release workflow
+  builds (each binary for this machine's musl target, the WASI module, both
+  npm packages), counts HEAD as `release` counts a tag, measures its `exav`
+  in the same run as every release's against clamscan, and prints every
+  figure of each release and of the new version side by side, with the change
+  from the last release (`scripts/stats.py compare` prints it again). It needs
+  `rustup target add <arch>-unknown-linux-musl`, what the npm builds need
+  (wasm-pack, wasm-bindgen-cli, wasm-opt, and `npm ci` run on this machine in
+  both package directories) and what `bench` needs, and takes about three
+  hours. Its sizes are those of this machine's toolchain, not the workflow's.
+- Each figure that got worse (slower, more memory, larger, more crates or
+  `unsafe`, fewer tests or formats) is fixed or understood before the gate.
+
+## 9. Gate and publish
 
 - `scripts/release.sh --gate-only`, then `make publish-check` (the gate and
   `cargo publish --dry-run` of every crate), then `make publish`.
@@ -135,3 +153,18 @@ One edit of each, all to the same number:
 - After: install from the registry in a clean directory (`cargo install exav`,
   `npm install @exav/viewer`), run `exav --version` and scan the EICAR test
   file; check the release page's assets and the image.
+
+## 10. Stats
+
+Once the release workflow has attached every binary and both npm packages are
+out, on the machine that measured the earlier releases, plugged in and doing
+nothing else:
+
+- `python3 -I scripts/stats.py release X.Y.Z` writes
+  `www/src/data/stats/X.Y.Z.json` (lines, crates, `unsafe`, tests, formats,
+  sizes), from the tag and what was published.
+- `python3 -I scripts/stats.py bench` measures every release again against
+  clamscan and rewrites `bench.json` (about two hours; the corpus and the
+  signatures of `freshclam` are needed, and `--work` has to be on a local
+  disk).
+- Commit both: the site's Stats page reads them when it is built.

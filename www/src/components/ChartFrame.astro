@@ -1,0 +1,130 @@
+---
+// A chart of the Stats page: its legend, the SVG of BarChart or LineChart,
+// its caption, and the colours of its series (class s0 to s5). `refs` are a
+// LineChart's reference lines, dashed in the legend, in the colour of the
+// series `s` they go with, if one.
+interface Props {
+  title: string;
+  legend: string[];
+  refs?: { label: string; s?: number }[];
+}
+const { title, legend, refs = [] } = Astro.props;
+---
+
+<figure class="chart not-content">
+  {
+    legend.length + refs.length > 1 && (
+      <ul class="legend">
+        {legend.map((label, i) => (
+          <li>
+            <span class={`swatch s${i}`} />
+            {label}
+          </li>
+        ))}
+        {refs.map((r) => (
+          <li>
+            <span class={`swatch ref${r.s === undefined ? '' : ` s${r.s}`}`} />
+            {r.label}
+          </li>
+        ))}
+      </ul>
+    )
+  }
+  <div class="plot"><slot /></div>
+  <figcaption>{title}</figcaption>
+</figure>
+
+<style>
+  .chart {
+    --c0: #2bb3a3;
+    --c1: #e3a53b;
+    --c2: #9b8cf0;
+    --c3: #e9735a;
+    --c4: #5aa8e6;
+    --c5: #b8c46a;
+    margin-block: 1.25rem;
+  }
+  .plot {
+    overflow-x: auto;
+  }
+  .chart :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 30rem;
+    height: auto;
+    font-family: var(--__sl-font);
+    font-variant-numeric: tabular-nums;
+  }
+  .chart :global(.grid) {
+    stroke: var(--sl-color-gray-5);
+    stroke-width: 1;
+  }
+  .chart :global(.tick) {
+    fill: var(--sl-color-gray-3);
+    font-size: 12px;
+  }
+  .chart :global(.category) {
+    fill: var(--sl-color-gray-2);
+    font-size: 12px;
+  }
+  .chart :global(.value) {
+    fill: var(--sl-color-white);
+    font-size: 12px;
+  }
+  .chart :global(.note) {
+    fill: var(--sl-color-gray-3);
+    font-size: 12px;
+    font-style: italic;
+  }
+  .chart :global(.s0) {
+    --c: var(--c0);
+  }
+  .chart :global(.s1) {
+    --c: var(--c1);
+  }
+  .chart :global(.s2) {
+    --c: var(--c2);
+  }
+  .chart :global(.s3) {
+    --c: var(--c3);
+  }
+  .chart :global(.s4) {
+    --c: var(--c4);
+  }
+  .chart :global(.s5) {
+    --c: var(--c5);
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 1rem;
+    margin: 0 0 0.5rem;
+    padding: 0;
+    list-style: none;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-2);
+  }
+  .legend li {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .swatch {
+    width: 0.75rem;
+    height: 0.75rem;
+    border-radius: 2px;
+    background: var(--c);
+  }
+  .swatch.ref {
+    width: 1.25rem;
+    height: 0;
+    border-radius: 0;
+    border-top: 2px dashed var(--c, var(--sl-color-gray-3));
+    background: none;
+  }
+  figcaption {
+    margin-top: 0.4rem;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-3);
+  }
+</style>

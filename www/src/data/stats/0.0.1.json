@@ -1,0 +1,79 @@
+{
+  "version": "0.0.1",
+  "date": "2026-09-16",
+  "rust_lines": {
+    "code": 73684,
+    "tests": 31812,
+    "tools": 2490,
+    "vendored": 0,
+    "dependencies": 647463
+  },
+  "unsafe": {
+    "code": 39,
+    "tests": 2,
+    "tools": 0,
+    "vendored": 0
+  },
+  "built_from": {
+    "exav": {
+      "crates": 139,
+      "direct": 59,
+      "lines": 647463,
+      "unsafe": 5244,
+      "unsafe_crates": 83
+    },
+    "exav-unpack": {
+      "crates": 80,
+      "direct": 40,
+      "lines": 370091,
+      "unsafe": 2506,
+      "unsafe_crates": 46
+    }
+  },
+  "dependencies": {
+    "all": 260,
+    "lockfile": 251,
+    "viewer_npm": null
+  },
+  "formats": {
+    "registry": 93,
+    "extractor": 79,
+    "viewer": 0,
+    "from": "0.0.3"
+  },
+  "tests": {
+    "rust": 1432,
+    "js": 5,
+    "e2e": 22,
+    "fuzz_targets": 13
+  },
+  "sizes": {
+    "binaries": {
+      "aarch64-apple-darwin": {
+        "exav": 17136832
+      },
+      "aarch64-unknown-linux-musl": {
+        "exav": 18920288
+      },
+      "x86_64-apple-darwin": {
+        "exav": 18377304
+      },
+      "x86_64-pc-windows-msvc": {
+        "exav": 15917056
+      },
+      "x86_64-unknown-linux-musl": {
+        "exav": 20757504
+      }
+    },
+    "wasi": null,
+    "npm": {
+      "@exav/unpack-wasm": {
+        "tarball": 693471,
+        "unpacked": 1654667,
+        "wasm": {
+          "pkg/exav_unpack_wasm_bg.wasm": 1566023
+        }
+      }
+    }
+  }
+}

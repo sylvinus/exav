@@ -1,0 +1,122 @@
+{
+  "version": "0.0.2",
+  "date": "2026-10-12",
+  "rust_lines": {
+    "code": 129966,
+    "tests": 66795,
+    "tools": 3126,
+    "vendored": 0,
+    "dependencies": 887228
+  },
+  "unsafe": {
+    "code": 55,
+    "tests": 13,
+    "tools": 0,
+    "vendored": 0
+  },
+  "built_from": {
+    "exav": {
+      "crates": 148,
+      "direct": 69,
+      "lines": 887228,
+      "unsafe": 5394,
+      "unsafe_crates": 83
+    },
+    "exav-unpack": {
+      "crates": 83,
+      "direct": 42,
+      "lines": 494731,
+      "unsafe": 3073,
+      "unsafe_crates": 46
+    }
+  },
+  "dependencies": {
+    "all": 258,
+    "lockfile": 255,
+    "viewer_npm": {
+      "required": 0,
+      "optional": 6
+    }
+  },
+  "formats": {
+    "registry": 105,
+    "extractor": 81,
+    "viewer": 24,
+    "from": "0.0.3"
+  },
+  "tests": {
+    "rust": 2744,
+    "js": 309,
+    "e2e": 98,
+    "fuzz_targets": 26
+  },
+  "sizes": {
+    "binaries": {
+      "aarch64-apple-darwin": {
+        "exav": 17223552,
+        "exav-grep": 7224144,
+        "exav-imagehash": 2538176,
+        "exav-pe-emu": 1133296,
+        "exav-unpack": 4954672
+      },
+      "aarch64-unknown-linux-musl": {
+        "exav": 18907640,
+        "exav-grep": 8067896,
+        "exav-imagehash": 2859048,
+        "exav-pe-emu": 1304432,
+        "exav-unpack": 5546944
+      },
+      "x86_64-apple-darwin": {
+        "exav": 18016736,
+        "exav-grep": 7561640,
+        "exav-imagehash": 2649200,
+        "exav-pe-emu": 1116272,
+        "exav-unpack": 5150144
+      },
+      "x86_64-pc-windows-msvc": {
+        "exav": 15491584,
+        "exav-grep": 6583296,
+        "exav-imagehash": 2189312,
+        "exav-pe-emu": 834560,
+        "exav-unpack": 4445696
+      },
+      "x86_64-unknown-linux-musl": {
+        "exav": 20149456,
+        "exav-grep": 8720096,
+        "exav-imagehash": 3052160,
+        "exav-pe-emu": 1331368,
+        "exav-unpack": 5831792
+      }
+    },
+    "wasi": 12738521,
+    "npm": {
+      "@exav/unpack-wasm": {
+        "tarball": 890820,
+        "unpacked": 2241566,
+        "wasm": {
+          "pkg/exav_unpack_wasm_bg.wasm": 2153875
+        }
+      },
+      "@exav/viewer": {
+        "tarball": 13110295,
+        "unpacked": 28672807,
+        "wasm": {
+          "assets/pdfjs/absent.wasm": 0,
+          "dist/frame/app/docx_parser_bg.wasm": 1947090,
+          "dist/frame/app/exav-viewer/pdfjs/6.4.299/wasm-36e98dc0d2/jbig2.wasm": 0,
+          "dist/frame/app/exav-viewer/pdfjs/6.4.299/wasm-36e98dc0d2/openjpeg.wasm": 0,
+          "dist/frame/app/exav-viewer/pdfjs/6.4.299/wasm-36e98dc0d2/qcms_bg.wasm": 96589,
+          "dist/frame/app/exav_unpack_wasm_bg.wasm": 2153875,
+          "dist/frame/app/exav_viewer_dwg_bg.wasm": 843003,
+          "dist/frame/app/exav_viewer_image_bg.wasm": 1115084,
+          "dist/frame/app/exav_viewer_model_bg.wasm": 310417,
+          "dist/frame/app/pptx_parser_bg.wasm": 1826626,
+          "dist/frame/app/xlsx_parser_bg.wasm": 1725510,
+          "wasm/exav_viewer_dwg_bg.wasm": 843003,
+          "wasm/exav_viewer_image_bg.wasm": 1115084,
+          "wasm/exav_viewer_model_bg.wasm": 310417
+        }
+      }
+    }
+  }
+}
