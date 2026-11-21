@@ -81,7 +81,7 @@ export const ENGINES: Readonly<Record<string, Engine>> = {
   },
   sheets: { formats: ["xls", "ods", "numbers"], needs: ["convert", "xlsx"], shows: ["xlsx"], files: ["sheets.worker.js", "exav_viewer_sheets_bg.wasm"] },
   slides: { formats: ["ppt", "odp", "keynote", "odg", "visio"], needs: ["convert", "pptx"], shows: ["pptx"], files: ["slides.worker.js", "exav_viewer_slides_bg.wasm"] },
-  docs: { formats: ["rtf", "doc", "odt"], needs: ["convert", "docx"], shows: ["docx"], files: ["docs.worker.js", "exav_viewer_docs_bg.wasm"] },
+  docs: { formats: ["rtf", "doc", "odt", "pages"], needs: ["convert", "docx"], shows: ["docx"], files: ["docs.worker.js", "exav_viewer_docs_bg.wasm"] },
   text: { formats: ["text"], entries: ["ts/text/"], files: ["text.worker.js", "exav_viewer_text_bg.wasm"] },
   archive: {
     formats: ["archive"],

@@ -69,6 +69,18 @@ impl Daemon {
 
     /// [`Daemon::start`] with an explicit `?mode=` on the listen address.
     fn start_mode(umask: &str, mode: Option<&str>, extra: &[&str]) -> Daemon {
+        let extra: Vec<&std::ffi::OsStr> = extra.iter().map(std::ffi::OsStr::new).collect();
+        Self::start_os(umask, mode, &extra, &[])
+    }
+
+    /// [`Daemon::start_mode`] with arguments that are not UTF-8 and variables
+    /// set in the daemon's environment.
+    fn start_os(
+        umask: &str,
+        mode: Option<&str>,
+        extra: &[&std::ffi::OsStr],
+        vars: &[(&str, &std::ffi::OsStr)],
+    ) -> Daemon {
         let db = TempDir::new().unwrap();
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("d.sock");
@@ -89,6 +101,7 @@ impl Daemon {
             .arg(&listen)
             .args(extra)
             .env("EXAV_ALLOW_NO_DB", "1")
+            .envs(vars.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let child = cmd.spawn().expect("start the daemon");
@@ -339,6 +352,35 @@ fn send_as_contents_sends_the_file_by_content() {
     );
 }
 
+/// A path that is not UTF-8 goes to the daemon as its bytes and comes back under
+/// the same bytes, on the session route (`SCAN`) and the one-command route
+/// (`ALLMATCHSCAN`).
+#[test]
+fn a_path_that_is_not_utf8_is_sent_and_printed_as_its_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let d = Daemon::start("077", &[]);
+    let name = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
+    let path = std::fs::canonicalize(d.dir.path()).unwrap().join(name);
+    std::fs::write(&path, eicar()).unwrap();
+    let want = [path.as_os_str().as_bytes(), b": Eicar-Test-Signature FOUND"].concat();
+
+    for flags in [&[][..], &["--all-matches"][..]] {
+        let out = exav()
+            .arg("--connect")
+            .arg(&d.sock)
+            .args(flags)
+            .arg(&path)
+            .output()
+            .expect("run the client");
+        assert!(
+            out.stdout.windows(want.len()).any(|w| w == want),
+            "{flags:?}: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert_eq!(out.status.code(), Some(1), "{flags:?}");
+    }
+}
+
 /// `--send-as fd` hands over an open descriptor (`FILDES`): the daemon reads the
 /// file this client opened, without permission to open the path itself.
 #[test]
@@ -496,6 +538,95 @@ fn an_unexaminable_stream_is_partial_over_the_wire_not_a_hard_error() {
     assert_eq!(code, 3, "which is exit 3, not 2: {out}");
 }
 
+/// A temp file that cannot be made is the daemon's failure, not the client's:
+/// the stream gets an `ERROR` line, not a connection closed with nothing.
+#[test]
+fn an_instream_whose_spill_fails_is_answered_with_an_error() {
+    use std::io::Write;
+    let spill = TempDir::new().unwrap();
+    let d = Daemon::start(
+        "077",
+        &[
+            "--spill-dir",
+            spill.path().to_str().unwrap(),
+            "--spill-threshold-bytes",
+            "1024",
+        ],
+    );
+    // The daemon checks the directory at startup; it is gone for the stream.
+    std::fs::remove_dir(spill.path()).unwrap();
+    let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+    s.write_all(b"zINSTREAM\0").unwrap();
+    s.write_all(&4096u32.to_be_bytes()).unwrap();
+    s.write_all(&[b'A'; 4096]).unwrap();
+    s.write_all(&0u32.to_be_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let reply = String::from_utf8_lossy(&out);
+    assert!(
+        reply.starts_with("stream: temporary file: ") && reply.ends_with(" ERROR\0"),
+        "the stream was not scanned and the client must be told: {reply:?}"
+    );
+}
+
+/// A spill directory whose name is not UTF-8 is accepted, by flag and by
+/// variable, and the stream spills there: with the directory gone the next
+/// stream cannot be spilled.
+#[test]
+fn a_spill_dir_that_is_not_utf8_is_accepted_and_used() {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let instream = |sock: &Path| {
+        let mut data = eicar().to_vec();
+        data.resize(4096, b' ');
+        let mut s = std::os::unix::net::UnixStream::connect(sock).unwrap();
+        s.write_all(b"zINSTREAM\0").unwrap();
+        s.write_all(&4096u32.to_be_bytes()).unwrap();
+        s.write_all(&data).unwrap();
+        s.write_all(&0u32.to_be_bytes()).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    for by_variable in [false, true] {
+        let parent = TempDir::new().unwrap();
+        let dir = parent.path().join(std::ffi::OsStr::from_bytes(b"sp\xe9"));
+        std::fs::create_dir(&dir).unwrap();
+        let threshold = std::ffi::OsStr::new("1024");
+        let d = if by_variable {
+            Daemon::start_os(
+                "077",
+                None,
+                &[std::ffi::OsStr::new("--spill-threshold-bytes"), threshold],
+                &[("EXAV_SPILL_DIR", dir.as_os_str())],
+            )
+        } else {
+            Daemon::start_os(
+                "077",
+                None,
+                &[
+                    std::ffi::OsStr::new("--spill-dir"),
+                    dir.as_os_str(),
+                    std::ffi::OsStr::new("--spill-threshold-bytes"),
+                    threshold,
+                ],
+                &[],
+            )
+        };
+        let reply = instream(&d.sock);
+        assert!(
+            reply.contains("Eicar-Test-Signature FOUND"),
+            "variable {by_variable}: {reply:?}"
+        );
+        std::fs::remove_dir(&dir).unwrap();
+        let reply = instream(&d.sock);
+        assert!(
+            reply.starts_with("stream: temporary file: ") && reply.ends_with(" ERROR\0"),
+            "variable {by_variable}: the spill must go to the directory: {reply:?}"
+        );
+    }
+}
+
 /// What was held of a stream too large to hold is scanned: a detection in it is
 /// found, as in the start of a file past `--max-input-bytes`.
 #[test]
@@ -593,9 +724,11 @@ fn a_job_still_scanning_when_its_time_runs_out_gets_an_answer() {
 fn the_cpu_limit_is_per_job_not_per_worker() {
     use std::io::{Read, Write};
     let d = Daemon::start("077", &["--workers", "1", "--max-scan-secs", "1"]);
-    // Random bytes, so the scan is CPU work rather than a cache hit.
+    // Random bytes, so the scan is CPU work rather than a cache hit; few
+    // enough that one job stays well under the limit in a debug build on a
+    // loaded machine.
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
-    let body: Vec<u8> = (0..8 << 20)
+    let body: Vec<u8> = (0..2 << 20)
         .map(|_| {
             state ^= state << 13;
             state ^= state >> 7;

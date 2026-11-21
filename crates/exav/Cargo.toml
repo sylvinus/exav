@@ -12,9 +12,9 @@ homepage.workspace = true
 # Named explicitly because this package has no library: docs.rs, which crates.io
 # links by default, would render an empty page. The library crates leave it unset
 # and get their docs.rs link.
-documentation = "https://exav.org"
+documentation = "https://exav.org/scanner/getting-started/quick-start/"
 keywords.workspace = true
-categories = ["command-line-utilities", "filesystem"]
+categories.workspace = true
 readme = "README.md"
 # Only the fuzz crate compiles `src/fuzzing.rs` (see `[lints.rust]` below): not
 # worth publishing.

@@ -4,6 +4,7 @@
  * into lines. What the bytes are as text (their encoding, whether they are
  * text at all) is decided by the text module, `engine.ts`.
  */
+import { isHidden } from "../core/hidden.generated.js";
 
 /** Bytes of a file that are read. */
 export const MAX_BYTES = 2 * 1024 * 1024;
@@ -13,17 +14,12 @@ export const MAX_LINES = 50_000;
 export const MAX_LINE = 10_000;
 
 /**
- * What is not shown as itself: C0 controls but tab, line feed and carriage
- * return, DEL, C1 controls, the line and paragraph separators, and the
- * bidirectional embeddings, overrides and isolates (CVE-2021-42574).
+ * What is not shown as itself: what a name may not show (`isHidden` of
+ * hidden.generated.ts: controls, the line and paragraph separators, the
+ * bidirectional marks, embeddings, overrides and isolates, CVE-2021-42574),
+ * but tab, line feed and carriage return.
  */
-const isHidden = (c: number) =>
-  (c < 0x20 && c !== 9 && c !== 10 && c !== 13) ||
-  (c >= 0x7f && c <= 0x9f) ||
-  c === 0x2028 ||
-  c === 0x2029 ||
-  (c >= 0x202a && c <= 0x202e) ||
-  (c >= 0x2066 && c <= 0x2069);
+const hidden = (c: number) => c !== 9 && c !== 10 && c !== 13 && isHidden(c);
 
 /**
  * C0 controls and DEL show as their Control Pictures glyph (U+2400 and up, one
@@ -34,7 +30,7 @@ export function sanitize(text: string): string {
   let from = 0;
   for (let i = 0; i < text.length; i++) {
     const c = text.charCodeAt(i);
-    if (!isHidden(c)) continue;
+    if (!hidden(c)) continue;
     out += text.slice(from, i);
     if (c < 0x20) out += String.fromCharCode(0x2400 + c);
     else if (c === 0x7f) out += String.fromCharCode(0x2421);

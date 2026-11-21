@@ -2,9 +2,10 @@
 //! spans, lists and fields, with paragraph, text and list styles resolved
 //! into explicit DrawingML properties.
 
-use super::styles::{ListDef, ListLevel, Props, Styles, len, percent};
+use super::styles::{ListDef, ListLevel, Props, PropsExt, Styles, len, percent};
 use crate::formats::office::common::xml::{Child, Node};
 use crate::formats::office::slides::model::*;
+use std::rc::Rc;
 
 /// What a shape's text is resolved against.
 pub struct TextCtx<'a> {
@@ -12,7 +13,7 @@ pub struct TextCtx<'a> {
     /// The shape's own style, text and paragraph properties included.
     pub base: &'a Props,
     /// Per outline level (1-based) presentation styles, for outlines.
-    pub levels: &'a dyn Fn(usize) -> Option<Props>,
+    pub levels: &'a dyn Fn(usize) -> Option<Rc<Props>>,
     /// The shape style's list style.
     pub list: Option<&'a ListDef>,
     pub slide_number: usize,
@@ -29,7 +30,7 @@ pub struct TextCtx<'a> {
 fn font_size(p: &Props, inherited: f64) -> f64 {
     let mut size = inherited;
     // Each property set once per level, so the last value is the one.
-    if let Some(v) = p.get("fo:font-size") {
+    if let Some(v) = p.get("text/fo:font-size") {
         if let Some(f) = percent(v) {
             size *= f;
         } else if let Some(e) = len(v) {
@@ -39,25 +40,27 @@ fn font_size(p: &Props, inherited: f64) -> f64 {
     size.clamp(1.0, 4000.0)
 }
 
+/// A font face: the declared face, else the family.
+fn face(p: &Props, name: &str, family: &str, styles: &Styles) -> Option<String> {
+    p.get(name).map(|n| styles.font(n)).or_else(|| {
+        p.get(family)
+            .map(|f| f.trim_matches(['\'', '"']).to_string())
+    })
+}
+
 /// Text properties as run properties, `size` already resolved.
 pub fn run_props(p: &Props, size: f64, styles: &Styles, auto_color: Rgb) -> RunProps {
-    let font = p
-        .get("style:font-name")
-        .map(|n| styles.font(n))
-        .or_else(|| {
-            p.get("fo:font-family")
-                .map(|f| f.trim_matches(['\'', '"']).to_string())
-        });
-    let bold = p.get("fo:font-weight").map(|w| match w {
+    let font = face(p, "text/style:font-name", "text/fo:font-family", styles);
+    let bold = p.get("text/fo:font-weight").map(|w| match w {
         "bold" => true,
         "normal" => false,
         n => n.parse::<u32>().map(|v| v >= 600).unwrap_or(false),
     });
     let italic = p
-        .get("fo:font-style")
+        .get("text/fo:font-style")
         .map(|s| s == "italic" || s == "oblique");
-    let underline = p.get("style:text-underline-style").map(|u| {
-        let double = p.is("style:text-underline-type", "double");
+    let underline = p.get("text/style:text-underline-style").map(|u| {
+        let double = p.is("text/style:text-underline-type", "double");
         match (u, double) {
             ("none", _) => "none",
             (_, true) => "dbl",
@@ -70,22 +73,22 @@ pub fn run_props(p: &Props, size: f64, styles: &Styles, auto_color: Rgb) -> RunP
             _ => "sng",
         }
     });
-    let strike = p.get("style:text-line-through-style").map(|s| {
+    let strike = p.get("text/style:text-line-through-style").map(|s| {
         if s == "none" {
             "noStrike"
-        } else if p.is("style:text-line-through-type", "double") {
+        } else if p.is("text/style:text-line-through-type", "double") {
             "dblStrike"
         } else {
             "sngStrike"
         }
     });
-    let auto = p.is("style:use-window-font-color", "true");
+    let auto = p.is("text/style:use-window-font-color", "true");
     let color = p
-        .color("fo:color")
-        .filter(|_| !auto || p.get("fo:color").is_some())
+        .color("text/fo:color")
+        .filter(|_| !auto || p.get("text/fo:color").is_some())
         .map(Color::rgb)
         .or(auto.then(|| Color::rgb(auto_color)));
-    let baseline = p.get("style:text-position").and_then(|t| {
+    let baseline = p.get("text/style:text-position").and_then(|t| {
         let first = t.split_whitespace().next()?;
         match first {
             "super" => Some(33_000),
@@ -95,15 +98,15 @@ pub fn run_props(p: &Props, size: f64, styles: &Styles, auto_color: Rgb) -> RunP
                 .filter(|&b| b != 0),
         }
     });
-    let caps = if p.is("fo:font-variant", "small-caps") {
+    let caps = if p.is("text/fo:font-variant", "small-caps") {
         Some("small")
-    } else if p.is("fo:text-transform", "uppercase") {
+    } else if p.is("text/fo:text-transform", "uppercase") {
         Some("all")
     } else {
         None
     };
     let shadow = p
-        .get("fo:text-shadow")
+        .get("text/fo:text-shadow")
         .filter(|s| *s != "none")
         .map(|_| Shadow {
             color: Color {
@@ -122,18 +125,28 @@ pub fn run_props(p: &Props, size: f64, styles: &Styles, auto_color: Rgb) -> RunP
         strike,
         color,
         font,
-        ea_font: p.get("style:font-name-asian").map(|n| styles.font(n)),
-        cs_font: p.get("style:font-name-complex").map(|n| styles.font(n)),
+        ea_font: face(
+            p,
+            "text/style:font-name-asian",
+            "text/style:font-family-asian",
+            styles,
+        ),
+        cs_font: face(
+            p,
+            "text/style:font-name-complex",
+            "text/style:font-family-complex",
+            styles,
+        ),
         baseline,
         caps,
         spacing: p
-            .get("fo:letter-spacing")
+            .get("text/fo:letter-spacing")
             .filter(|s| *s != "normal")
             .and_then(len)
             .map(|e| (e as f64 / 127.0).round() as i32),
         shadow,
         highlight: p
-            .get("fo:background-color")
+            .get("text/fo:background-color")
             .filter(|c| *c != "transparent")
             .and_then(super::styles::color)
             .map(Color::rgb),
@@ -141,14 +154,14 @@ pub fn run_props(p: &Props, size: f64, styles: &Styles, auto_color: Rgb) -> RunP
     }
 }
 
-fn spacing_of(p: &Props, k: &str) -> Option<Spacing> {
-    let e = p.len(k)?;
+fn spacing_of(v: Option<&str>) -> Option<Spacing> {
+    let e = len(v?)?;
     Some(Spacing::Pts((e as f64 / 127.0).round().max(0.0) as i32))
 }
 
 /// Paragraph properties without list properties.
 pub fn para_props(p: &Props) -> ParaProps {
-    let line = p.get("fo:line-height").and_then(|v| {
+    let line = p.get("paragraph/fo:line-height").and_then(|v| {
         if v == "normal" {
             Some(Spacing::Pct(100_000))
         } else if let Some(f) = percent(v) {
@@ -158,23 +171,23 @@ pub fn para_props(p: &Props) -> ParaProps {
         }
     });
     let line = line.or_else(|| {
-        p.len("style:line-height-at-least")
+        p.len("paragraph/style:line-height-at-least")
             .map(|e| Spacing::Pts((e as f64 / 127.0).round() as i32))
     });
     ParaProps {
-        align: p.get("fo:text-align").map(|a| match a {
+        align: p.get("paragraph/fo:text-align").map(|a| match a {
             "center" => "ctr",
             "end" | "right" => "r",
             "justify" => "just",
             _ => "l",
         }),
-        margin: p.len("fo:margin-left"),
-        indent: p.len("fo:text-indent"),
+        margin: p.margin("paragraph", "left").and_then(len),
+        indent: p.len("paragraph/fo:text-indent"),
         line_spacing: line,
-        space_before: spacing_of(p, "fo:margin-top"),
-        space_after: spacing_of(p, "fo:margin-bottom"),
+        space_before: spacing_of(p.margin("paragraph", "top")),
+        space_after: spacing_of(p.margin("paragraph", "bottom")),
         rtl: p
-            .get("style:writing-mode")
+            .get("paragraph/style:writing-mode")
             .is_some_and(|m| m.starts_with("rl")),
         ..ParaProps::default()
     }
@@ -211,35 +224,38 @@ fn scheme(fmt: &str, suffix: &str, prefix_paren: bool) -> &'static str {
 /// A list level's bullet and the margins it sets.
 fn bullet(lv: &ListLevel, styles: &Styles) -> (Option<Bullet>, Option<Emu>, Option<Emu>) {
     let p = &lv.props;
-    let font = p
-        .get("style:font-name")
-        .map(|n| styles.font(n))
-        .or_else(|| {
-            p.get("fo:font-family")
-                .map(|f| f.trim_matches(['\'', '"']).to_string())
-        });
+    let font = face(p, "text/style:font-name", "text/fo:font-family", styles);
     let color = p
-        .color("fo:color")
-        .filter(|_| !p.is("style:use-window-font-color", "true"))
+        .color("text/fo:color")
+        .filter(|_| !p.is("text/style:use-window-font-color", "true"))
         .map(Color::rgb);
     let size = p
-        .get("fo:font-size")
+        .get("text/fo:font-size")
         .and_then(percent)
         .map(|f| (f * 100_000.0).round().clamp(25_000.0, 400_000.0) as u32);
+    let num_format = lv.attr("style:num-format").unwrap_or("");
     let b = match lv.kind {
         "bullet" => Some(Bullet::Char {
-            ch: lv.bullet.filter(|c| !c.is_control()).unwrap_or('\u{2022}'),
+            ch: lv
+                .attr("text:bullet-char")
+                .and_then(|s| s.chars().next())
+                .filter(|c| !c.is_control())
+                .unwrap_or('\u{2022}'),
             font,
             color,
             size,
         }),
-        "number" if !lv.num_format.is_empty() => Some(Bullet::AutoNum {
+        "number" if !num_format.is_empty() => Some(Bullet::AutoNum {
             scheme: scheme(
-                &lv.num_format,
-                &lv.num_suffix,
-                p.is("style:num-prefix", "("),
+                num_format,
+                lv.attr("style:num-suffix").unwrap_or(""),
+                lv.attr("style:num-prefix") == Some("("),
             ),
-            start: lv.start.max(1),
+            start: lv
+                .attr("text:start-value")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1),
             font,
             color,
             size,
@@ -254,15 +270,16 @@ fn bullet(lv: &ListLevel, styles: &Styles) -> (Option<Bullet>, Option<Emu>, Opti
         _ => Some(Bullet::None),
     };
     // Label width and position, or label alignment.
-    let (margin, indent) = if let Some(m) = p
-        .len("fo:margin-left")
-        .filter(|_| p.get("text:list-level-position-and-space-mode") == Some("label-alignment"))
-    {
-        (Some(m), p.len("fo:text-indent"))
+    let (margin, indent) = if let Some(m) = p.len("label-alignment/fo:margin-left").filter(|_| {
+        p.get("list-level/text:list-level-position-and-space-mode") == Some("label-alignment")
+    }) {
+        (Some(m), p.len("label-alignment/fo:text-indent"))
     } else {
-        let before = p.len("text:space-before").unwrap_or(0);
-        let width = p.len("text:min-label-width").unwrap_or(0);
-        if p.get("text:space-before").is_some() || p.get("text:min-label-width").is_some() {
+        let before = p.len("list-level/text:space-before").unwrap_or(0);
+        let width = p.len("list-level/text:min-label-width").unwrap_or(0);
+        if p.get("list-level/text:space-before").is_some()
+            || p.get("list-level/text:min-label-width").is_some()
+        {
             (Some(before + width), Some(-width))
         } else {
             (None, None)
@@ -356,7 +373,7 @@ impl Inline<'_, '_> {
                     "text:span" => {
                         let mut p = props.clone();
                         let sp = self.ctx.styles.chain("text", k.attr("text:style-name"));
-                        p.overlay(&sp.0);
+                        p.overlay_props(&sp);
                         let size = font_size(&sp, size);
                         self.walk(k, &p, size, depth + 1);
                     }
@@ -473,10 +490,10 @@ fn paragraph(p: &Node, ctx: &mut TextCtx, list_level: usize, list: Option<&ListD
     if list_level > 0
         && let Some(l) = (ctx.levels)(lv)
     {
-        props.overlay(&l.0);
+        props.overlay_props(&l);
     }
     let ps = ctx.styles.chain("paragraph", p.attr("text:style-name"));
-    props.overlay(&ps.0);
+    props.overlay_props(&ps);
     let mut size = font_size(ctx.base, 18.0);
     if list_level > 0
         && let Some(l) = (ctx.levels)(lv)
@@ -496,7 +513,13 @@ fn paragraph(p: &Node, ctx: &mut TextCtx, list_level: usize, list: Option<&ListD
         match level {
             Some((_, lvl)) => {
                 let (mut b, margin, indent) = bullet(lvl, ctx.styles);
-                if let (Some(img), "image") = (&lvl.image, lvl.kind) {
+                // The picture of an image bullet: its package path, or
+                // "data:" and its base64 text.
+                let image = lvl
+                    .attr("xlink:href")
+                    .map(str::to_string)
+                    .or_else(|| lvl.data.as_ref().map(|d| format!("data:{d}")));
+                if let (Some(img), "image") = (&image, lvl.kind) {
                     let size = match &b {
                         Some(Bullet::Char { size, .. }) => *size,
                         _ => None,

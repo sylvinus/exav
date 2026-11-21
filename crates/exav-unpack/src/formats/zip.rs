@@ -5,6 +5,7 @@
 )]
 #[cfg(feature = "decrypt")]
 use super::zip_crypto;
+use crate::zip_dir::{self, Shift, directory_shift_within};
 use crate::zip_end::{EndRecord, end_records};
 use crate::*;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
@@ -24,49 +25,27 @@ pub struct EncryptedMember {
     pub dos_time_hi: Option<u8>,
 }
 
-/// Classify an error from the `zip` crate for one member.
-///
-/// Only a genuine I/O failure is a budget stop. A codec we have no decoder for,
-/// or a header that doesn't parse, is not: the member is present and simply
-/// unread, which is `UNSCANNABLE`. The distinction decides what happens next:
-/// a `corrupt` stop is damage to this archive, while a budget stop aborts the
-/// archive and, with it, the container holding it.
-///
-/// That containing scan is the reason this matters beyond the wording. A Word
-/// document with an embedded ZIP whose central directory points outside the
-/// carved slice raises `InvalidArchive` on entry 0; classifying it as a budget
-/// stop propagated out of the ZIP, out of the OLE walk, and made the whole
-/// document `LIMITS-EXCEEDED`, so its macro artifacts were never scanned and
-/// every `Target:2` `Doc.*` signature was skipped on a document that carried a
-/// live VBA project.
-pub(crate) fn zip_entry_error(i: usize, e: &::zip::result::ZipError) -> LimitHit {
-    let msg = format!("zip entry {i}: {e}");
-    match e {
-        ::zip::result::ZipError::Io(_) => LimitHit::new(msg),
-        _ => LimitHit::corrupt(msg),
-    }
-}
-
 /// Read the raw stored bytes of an encrypted member and classify its encryption
-/// scheme + underlying compression method. For WinZip AES the member's
-/// `compression()` is the `AesCrypto` wrapper, so the *real* method comes from
-/// the 0x9901 AES extra field (parsed from the member's local extra data).
+/// scheme and underlying compression method. For WinZip AES the directory's
+/// method is 99 and the real one is in its 0x9901 extra field; without that
+/// field the method is the directory's when it is Stored or Deflated.
 pub fn read_encrypted_member(
-    file: &mut ::zip::read::ZipFile<'_, impl Read>,
+    entry: &zip_dir::Entry,
+    data: &mut dyn Read,
     max_buffer: u64,
 ) -> Result<EncryptedMember, std::io::Error> {
-    // The `zip` crate models a WinZip-AES member's `compression()` as a special
-    // `Aes` method and stores the real method in the 0x9901 extra field.
-    let (aes_strength, method) = parse_aes_extra(file.extra_data().as_deref())
-        .map(|(s, m)| (Some(s), m))
-        .unwrap_or((None, compression_to_u16(file.compression())));
+    let (aes_strength, method) = match entry.aes {
+        Some((strength, method)) => (Some(strength), method),
+        None if matches!(entry.method, 0 | 8) => (None, entry.method),
+        None => (None, 0xffff),
+    };
     // High byte of the 16-bit DOS mod-time: the ZipCrypto check byte for
-    // data-descriptor archives (captured before the body is consumed).
-    let dos_time_hi = file.last_modified().map(|dt| (dt.timepart() >> 8) as u8);
+    // data-descriptor archives.
+    let dos_time_hi = entry.dos_time_hi();
     // Bound the whole-member ciphertext read by the global peak-buffer limit;
     // the declared member size is attacker-controlled.
     let mut raw = Vec::new();
-    crate::source::read_capped(&mut *file, &mut raw, max_buffer.saturating_add(1))?;
+    crate::source::read_capped(data, &mut raw, max_buffer.saturating_add(1))?;
     if raw.len() as u64 > max_buffer {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -81,49 +60,6 @@ pub fn read_encrypted_member(
     })
 }
 
-/// A member's name for reporting: the decoded name, or the raw bytes read as
-/// lossy UTF-8 when the archive's name does not decode.
-fn member_name<R: Read>(file: &::zip::read::ZipFile<'_, R>) -> String {
-    match file.name() {
-        Ok(n) => n.into_owned(),
-        Err(_) => String::from_utf8_lossy(file.name_raw()).into_owned(),
-    }
-}
-
-/// Map the crate's `CompressionMethod` to the ZIP numeric method code we need
-/// for post-decrypt decompression. Only Store/Deflate are decoded; anything else
-/// is reported as Store (the bytes are passed through and scanned raw).
-pub fn compression_to_u16(m: ::zip::CompressionMethod) -> u16 {
-    match m {
-        ::zip::CompressionMethod::Stored => 0,
-        ::zip::CompressionMethod::Deflated => 8,
-        _ => 0xffff,
-    }
-}
-
-/// The ZIP numeric method code for a `CompressionMethod`, preserving the codec
-/// identity (LZMA/BZIP2/ZSTD/XZ/PPMd) so [`raw_decoder`] can pick the right
-/// decoder (APPNOTE 4.4.5).
-// `CompressionMethod::Unsupported` is deprecated in the `zip` crate, but it is
-// the only way to recover the raw method number for a codec the crate can't
-// decode, which is exactly what we need to route to our own decoders.
-#[allow(deprecated)]
-pub(crate) fn zip_method_code(m: &::zip::CompressionMethod) -> u16 {
-    use ::zip::CompressionMethod as C;
-    // With only the `deflate-flate2` feature the crate collapses every codec it
-    // can't handle (LZMA 14, BZIP2 12, ZSTD 93, XZ 95, PPMd 98, …) into
-    // `Unsupported(code)`, so the real method number comes through there.
-    match m {
-        C::Stored => 0,
-        C::Shrink => 1,
-        C::Reduce(n) => 1 + u16::from(*n),
-        C::Implode => 6,
-        C::Deflated => 8,
-        C::Unsupported(n) => *n,
-        _ => 0xffff,
-    }
-}
-
 /// The general-purpose flags of the local header `head` starts with.
 fn local_flags(head: &[u8]) -> Option<u16> {
     (head.len() >= 8 && head.starts_with(b"PK\x03\x04"))
@@ -135,17 +71,8 @@ fn defined_method(method: u16) -> bool {
     matches!(method, 0..=6 | 8 | 9 | 10 | 12 | 14 | 16 | 18 | 19 | 20 | 93..=99)
 }
 
-/// Shrink, Reduce and Implode (methods 1-6) are decoded whole by the `zip`
-/// crate: it reads the compressed bytes whole, then reserves the declared
-/// size for the output. Both sizes come from the archive, so both have to fit
-/// the buffer limit before the member is opened.
-fn decoded_whole_too_big(method: u16, comp: u64, size: u64, max_buffer: u64) -> bool {
-    (1..=6).contains(&method) && comp.max(size) > max_buffer
-}
-
-/// Deflate64 decoded as it is read. The crate's own reader ends with `Ok(0)`
-/// when its input runs out mid-stream, the same as at the end of the stream;
-/// this one returns `UnexpectedEof`, as [`crate::inflate::Inflate`] does.
+/// Deflate64 decoded as it is read. Input that runs out mid-stream is
+/// `UnexpectedEof`, as [`crate::inflate::Inflate`] gives it.
 struct Deflate64<R> {
     inner: BufReader<R>,
     inflater: Box<deflate64::InflaterManaged>,
@@ -197,16 +124,18 @@ pub(crate) enum RawRefusal {
     TooBig,
 }
 
-/// A decoder, over a member's RAW compressed bytes, for a method the `zip`
-/// crate itself can't decode, using exav's own decoders, so a payload behind
-/// a codec the crate lacks is still scanned. The member is decoded as it is
-/// read. `usz` is the declared uncompressed size (LZMA's and PPMd's decode
-/// target), `None` when unknown: those two then decode to their end marker.
+/// A decoder, over a member's RAW compressed bytes, for a method other than
+/// Stored and Deflated, using exav's own decoders. The member is decoded as it
+/// is read. `usz` is the declared uncompressed size (LZMA's and PPMd's decode
+/// target, where the PKZIP 1.x methods stop), `None` when unknown: those then
+/// decode to their end marker or their input's end. `flags` are the general
+/// purpose bits of the member's header (Implode's window and trees).
 /// `max_buffer` bounds what a decoder allocates up front.
 #[allow(unused_variables, unused_mut)]
 pub(crate) fn raw_decoder<'a, R: Read + 'a>(
     method: u16,
     mut raw: R,
+    flags: u16,
     usz: Option<u64>,
     max_buffer: u64,
 ) -> Result<Box<dyn Read + 'a>, RawRefusal> {
@@ -217,6 +146,10 @@ pub(crate) fn raw_decoder<'a, R: Read + 'a>(
         _ => MALFORMED,
     };
     match method {
+        // Shrink, Reduce and Implode.
+        1..=6 => {
+            super::zip_legacy::decoder(method, Box::new(raw), flags, usz).map_err(short_header)
+        }
         // Method 9 = Deflate64 ("enhanced deflate"): deflate with a 64 KiB
         // window, length code 285 redefined to take 16 extra bits (lengths up to
         // 65538), and distance codes 30/31 made valid (14 extra bits, distances
@@ -293,24 +226,6 @@ fn zip_ppmd_params(hdr: [u8; 2]) -> Option<(u32, u32, super::ppmd8::RestoreMetho
         _ => return None,
     };
     (order >= super::ppmd8::PPMD8_MIN_ORDER).then_some((order, mem_mb << 20, restore))
-}
-
-/// Parse the WinZip-AES 0x9901 extra field: `len(2)=7, ver(2), "AE"(2),
-/// strength(1), method(2)`. Returns `(strength, real_method)`.
-pub(crate) fn parse_aes_extra(extra: Option<&[u8]>) -> Option<(u8, u16)> {
-    let mut data = extra?;
-    while data.len() >= 4 {
-        let id = u16::from_le_bytes([data[0], data[1]]);
-        let len = u16::from_le_bytes([data[2], data[3]]) as usize;
-        let body = crate::bytes::at(data, 4, len)?;
-        if id == 0x9901 && body.len() >= 7 {
-            let strength = body[4];
-            let method = u16::from_le_bytes([body[5], body[6]]);
-            return Some((strength, method));
-        }
-        data = &data[4 + len..];
-    }
-    None
 }
 
 /// The body of the first extra field `id` in `extra`, a run of `id(2),
@@ -459,43 +374,6 @@ pub fn decrypt_zip_member(
     Ok(Decrypted::Locked)
 }
 
-/// Open a ZIP whose offsets may count from an earlier start than the
-/// archive's, as in a self-extractor or an archive appended to another file.
-///
-/// The crate takes the archive's start from the first central header at or
-/// after the declared directory offset. With two archives back to back, that
-/// is the first one's directory, and every member of the second reads at the
-/// wrong place. The directory ends where the end record starts, so its real
-/// position is the end record's less its size, as Info-ZIP reckons it; that is
-/// tried first when a central header is there, and the crate's search after.
-///
-/// Or only the end record's directory offset is wrong, the members' offsets
-/// counting from the start of the file. The crate applies one offset to both,
-/// so it is given the file with the end record pointing where the directory
-/// is. `unzip` reads such an archive, warning of "extra bytes".
-fn open_archive<R: Read + Seek + Clone>(
-    mut reader: R,
-) -> ::zip::result::ZipResult<::zip::ZipArchive<Patched<R>>> {
-    match directory_shift(&mut reader) {
-        Some(Shift::Prepended(n)) => {
-            let config = ::zip::read::Config {
-                archive_offset: ::zip::read::ArchiveOffset::Known(n),
-            };
-            if let Ok(zip) = ::zip::ZipArchive::with_config(config, Patched::new(reader.clone())) {
-                return Ok(zip);
-            }
-        }
-        Some(Shift::Misplaced { field, directory }) => {
-            let patched = Patched::with(reader.clone(), field, directory.to_le_bytes());
-            if let Ok(zip) = ::zip::ZipArchive::new(patched) {
-                return Ok(zip);
-            }
-        }
-        None => {}
-    }
-    ::zip::ZipArchive::new(Patched::new(reader))
-}
-
 /// Where a ZIP begins when it is appended to something else: the bytes before
 /// it count in no offset of its, and `unzip` finds it by its end record, which
 /// is at the end of the file. `None` for a file that is not one, or that starts
@@ -593,55 +471,51 @@ pub fn directory_in_tail(tail: &[u8], size: u64) -> TailDirectory {
         return TailDirectory::NotZip;
     };
     let missed = std::rc::Rc::new(std::cell::Cell::new(None));
-    let reader = TailReader {
+    let mut reader = TailReader {
         tail,
         start,
         size,
         pos: 0,
         missed: missed.clone(),
     };
-    let Ok(zip) = open_archive(reader) else {
+    let Ok(dir) = zip_dir::open(&mut reader) else {
         return missed
             .get()
             .map_or(TailDirectory::NotZip, TailDirectory::Needs);
     };
-    let mut members = Vec::with_capacity(zip.len());
-    for i in 0..zip.len() {
-        let Ok(m) = zip.by_index_data(i) else {
-            return TailDirectory::NotZip;
-        };
-        members.push(DirectoryMember {
-            name: entry_name(&m),
-            size: m.size(),
-            compressed: m.compressed_size(),
-            header: m.header_start(),
-        });
-    }
+    let members = dir
+        .entries
+        .iter()
+        .map(|e| DirectoryMember {
+            name: entry_name(&e.name),
+            size: e.size,
+            compressed: e.compressed,
+            header: e.header,
+        })
+        .collect();
     let end = tail_end(
         tail,
         start,
         Opened {
-            dir_start: zip.central_directory_start(),
-            archive_start: zip.offset(),
-            entries: zip.len() as u64,
-            comment: zip.comment(),
+            dir_start: dir.start,
+            archive_start: dir.archive_start,
+            entries: dir.entries.len() as u64,
+            comment: &dir.comment,
         },
     );
     TailDirectory::Found(Directory { members, end })
 }
 
 /// The name of a member of an opened directory, as its bytes give it.
-fn entry_name(m: &::zip::read::ZipFileEntry<'_>) -> String {
-    String::from_utf8_lossy(m.name_raw()).into_owned()
+fn entry_name(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw).into_owned()
 }
 
 /// The member names of the central directory of `src`, read as `walk` opens
 /// it; `None` when the reader opens none.
 pub fn member_names(src: &dyn crate::source::ByteSource) -> Option<Vec<String>> {
-    let zip = open_archive(crate::source::Reader::new(src)).ok()?;
-    (0..zip.len())
-        .map(|i| zip.by_index_data(i).ok().map(|m| entry_name(&m)))
-        .collect()
+    let dir = zip_dir::open(&mut crate::source::Reader::new(src)).ok()?;
+    Some(dir.entries.iter().map(|e| entry_name(&e.name)).collect())
 }
 
 /// The names of the local headers of `src` that `keep` wants, each header
@@ -775,7 +649,7 @@ impl Read for TailReader<'_> {
             if self.missed.get().is_none() {
                 self.missed.set(Some(self.pos));
             }
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
+            return Err(std::io::Error::other("bytes before the tail are not held"));
         }
         let from = (self.pos - self.start) as usize;
         let n = buf.len().min(self.tail.len() - from);
@@ -795,130 +669,6 @@ impl Seek for TailReader<'_> {
         self.pos = pos.ok_or(std::io::ErrorKind::InvalidInput)?;
         Ok(self.pos)
     }
-}
-
-/// Where a ZIP's central directory is, against where its end record says.
-enum Shift {
-    /// `n` bytes precede the archive, and every offset counts from its start.
-    Prepended(u64),
-    /// The directory is at `directory`, the end record's offset field at
-    /// `field` says otherwise, and the members' offsets are right.
-    Misplaced { field: u64, directory: u32 },
-}
-
-/// A reader over `inner` that reads the four bytes at `at` as `bytes`.
-#[derive(Clone)]
-pub(crate) struct Patched<R> {
-    inner: R,
-    at: u64,
-    bytes: [u8; 4],
-}
-
-impl<R> Patched<R> {
-    fn new(inner: R) -> Self {
-        Self::with(inner, u64::MAX, [0; 4])
-    }
-
-    fn with(inner: R, at: u64, bytes: [u8; 4]) -> Self {
-        Patched { inner, at, bytes }
-    }
-}
-
-impl<R: Read + Seek> Read for Patched<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let pos = self.inner.stream_position()?;
-        let n = self.inner.read(buf)?;
-        for (i, b) in self.bytes.iter().enumerate() {
-            let Some(p) = self.at.checked_add(i as u64) else {
-                break;
-            };
-            if let Some(slot) = p
-                .checked_sub(pos)
-                .and_then(|d| usize::try_from(d).ok())
-                .and_then(|d| buf[..n].get_mut(d))
-            {
-                *slot = *b;
-            }
-        }
-        Ok(n)
-    }
-}
-
-impl<R: Seek> Seek for Patched<R> {
-    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.inner.seek(to)
-    }
-}
-
-/// How the archive sits against its offsets, by the last end-of-central-
-/// directory record in the file whose comment ends within it: the one the
-/// crate tries first. `None` for ZIP64, an empty archive, or no central header
-/// where that record puts the directory.
-fn directory_shift<R: Read + Seek>(r: &mut R) -> Option<Shift> {
-    directory_shift_within(r, u64::MAX)
-}
-
-/// [`directory_shift`] looking at the last `reach` bytes of the file and no
-/// further back. An end record that closes an archive stapled to the end of a
-/// file is within the longest comment of it, so a search for one that reads
-/// the whole of a large file is a pass over it for nothing.
-fn directory_shift_within<R: Read + Seek>(r: &mut R, reach: u64) -> Option<Shift> {
-    use std::io::SeekFrom;
-    const CHUNK: u64 = 1 << 16;
-    let len = r.seek(SeekFrom::End(0)).ok()?;
-    let mut rec = [0u8; EndRecord::LEN];
-    let mut buf = Vec::new();
-    // Chunks back from the end, each running 3 bytes into the next so a
-    // signature across the seam is seen.
-    let mut end = len;
-    let found = 'found: loop {
-        let start = end.saturating_sub(CHUNK);
-        r.seek(SeekFrom::Start(start)).ok()?;
-        buf.clear();
-        r.by_ref().take(end - start).read_to_end(&mut buf).ok()?;
-        for p in memchr::memmem::rfind_iter(&buf, b"PK\x05\x06") {
-            let at = start + p as u64;
-            r.seek(SeekFrom::Start(at)).ok()?;
-            if r.read_exact(&mut rec).is_err() {
-                continue;
-            }
-            if let Some(found) = EndRecord::parse(at, &rec, len - at) {
-                break 'found found;
-            }
-        }
-        if start == 0 || len - start >= reach {
-            return None;
-        }
-        end = start + 3;
-    };
-    if !found.has_directory() {
-        return None;
-    }
-    let at = found.at;
-    let cd = at.checked_sub(u64::from(found.size))?;
-    let n = cd.checked_sub(u64::from(found.offset))?;
-    let mut head = [0u8; 46];
-    r.seek(SeekFrom::Start(cd)).ok()?;
-    r.read_exact(&mut head).ok()?;
-    if !head.starts_with(b"PK\x01\x02") {
-        return None;
-    }
-    // The first member's local header says which: shifted with the directory,
-    // or where its offset puts it.
-    let local = u64::from(u32::from_le_bytes([head[42], head[43], head[44], head[45]]));
-    let mut is_local_header = |at: u64| {
-        let mut sig = [0u8; 4];
-        r.seek(SeekFrom::Start(at)).is_ok()
-            && r.read_exact(&mut sig).is_ok()
-            && sig == *b"PK\x03\x04"
-    };
-    if n > 0 && !is_local_header(local.saturating_add(n)) && is_local_header(local) {
-        return Some(Shift::Misplaced {
-            field: at + 16,
-            directory: u32::try_from(cd).ok()?,
-        });
-    }
-    Some(Shift::Prepended(n))
 }
 
 /// A ZIP whose central directory will not open: the members its local headers
@@ -962,6 +712,12 @@ fn scan_orphan_locals(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::E
 /// Byte length of a ZIP local file header before the name/extra fields
 /// (APPNOTE 4.3.7).
 const LFH_LEN: usize = 30;
+
+/// Whether the file holds a local header's signature and its fixed part at `at`.
+fn has_local_signature(src: &dyn crate::source::ByteSource, at: u64) -> bool {
+    let h = src.window(crate::bytes::to_usize(at), LFH_LEN);
+    h.len() == LFH_LEN && h.starts_with(b"PK\x03\x04")
+}
 
 /// ZIP compression methods defined by APPNOTE 4.4.5. Used as a plausibility
 /// signal, so it lists methods exav cannot decode as well as those it can.
@@ -1011,11 +767,13 @@ pub fn overlapping_local_records(data: &dyn crate::source::ByteSource) -> usize 
     // in the tool that produced it), while a bare pile of local records carrying
     // no directory is not something a normal writer emits.
     let declared: Option<std::collections::HashSet<usize>> =
-        open_archive(crate::source::Reader::new(data))
+        zip_dir::open(&mut crate::source::Reader::new(data))
             .ok()
-            .map(|mut z| {
-                (0..z.len())
-                    .filter_map(|i| z.by_index_raw(i).ok().map(|f| f.header_start() as usize))
+            .map(|dir| {
+                dir.entries
+                    .iter()
+                    .filter(|e| has_local_signature(data, e.header))
+                    .map(|e| crate::bytes::to_usize(e.header))
                     .collect()
             });
 
@@ -1075,12 +833,8 @@ pub fn overlapping_local_records(data: &dyn crate::source::ByteSource) -> usize 
 /// an earlier start, as they do in an archive appended to another file. ZIP64
 /// is not followed, so answers `false`.
 pub fn directory_is_consistent(data: &[u8]) -> bool {
-    const CDH_LEN: usize = 46;
     let u16_at = |p: usize| {
         crate::bytes::at(data, p, 2).map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
-    };
-    let u32_at = |p: usize| {
-        crate::bytes::at(data, p, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
     let tail = data
         .len()
@@ -1104,21 +858,14 @@ pub fn directory_is_consistent(data: &[u8]) -> bool {
     let base = cd_start as i64 - cd_off as i64;
     let mut p = cd_start;
     for _ in 0..entries {
-        if crate::bytes::at(data, p, 4) != Some(b"PK\x01\x02") {
-            return false;
-        }
-        let (Some(n), Some(e), Some(c), Some(local)) = (
-            u16_at(p + 28),
-            u16_at(p + 30),
-            u16_at(p + 32),
-            u32_at(p + 42),
-        ) else {
+        let Some(head) = data.get(p..).and_then(zip_dir::Header::parse) else {
             return false;
         };
-        let Some(name) = crate::bytes::at(data, p + CDH_LEN, n) else {
+        let n = head.name_len;
+        let Some(name) = crate::bytes::at(data, p + zip_dir::Header::LEN, n) else {
             return false;
         };
-        let Ok(lo) = usize::try_from(base + local as i64) else {
+        let Ok(lo) = usize::try_from(base + i64::from(head.local)) else {
             return false;
         };
         if crate::bytes::at(data, lo, 4) != Some(b"PK\x03\x04")
@@ -1127,7 +874,7 @@ pub fn directory_is_consistent(data: &[u8]) -> bool {
         {
             return false;
         }
-        p += CDH_LEN + n + e + c;
+        p += zip_dir::Header::LEN + head.variable_len();
     }
     p == eocd
 }
@@ -1474,7 +1221,7 @@ fn parse_local_member(
             (present.to_vec(), why)
         }
         // Exav's own decoders, salvaging as the deflate arm does.
-        _ => match raw_decoder(method, raw, usz, cap) {
+        _ => match raw_decoder(method, raw, flags, usz, cap) {
             Ok(r) => {
                 // Every stream of a bzip2 member, as the walk reads it.
                 #[cfg(feature = "bzip2")]
@@ -1532,32 +1279,29 @@ const PART_WAY: &str =
 const PAST_END: &str =
     "zip member runs past the end of the data it was found in; the bytes present were scanned";
 
-/// A cleartext member's content. Stored and deflated members are decoded here
-/// rather than by the crate: its deflate reader drops what it decoded in the
-/// call that meets damage, and its CRC-32 failure is not told apart from
-/// damage. Other codecs go through the crate as before. A deflated member
-/// declaring 0 bytes compressed and uncompressed is empty (Civil 3D writes
-/// them; Python's zipfile reads them so), not a stream cut before its first
-/// block.
-#[inline(never)]
-pub(crate) fn member_reader<'a, R: Read + Seek>(
-    zip: &'a mut ::zip::ZipArchive<R>,
-    i: usize,
-) -> ::zip::result::ZipResult<Box<dyn Read + 'a>> {
+/// The bytes of a member in the archive: `compressed` of them from `start`, or
+/// as many as the file holds.
+fn member_bytes(src: &dyn crate::source::ByteSource, start: u64, compressed: u64) -> impl Read {
+    let from = crate::bytes::to_usize(start);
+    crate::source::Reader::range(src, from, src.len()).take(compressed)
+}
+
+/// The content of a Stored or Deflated member whose bytes in the archive are
+/// `raw`, its CRC-32 checked at the end. `empty` is a deflated member that
+/// declares no bytes either way, which is empty and not a stream cut before its
+/// first block (Civil 3D writes them; Python's zipfile reads them so).
+pub(crate) fn plain_reader<'a>(
+    raw: Box<dyn Read + 'a>,
+    stored: bool,
+    crc: u32,
+    empty: bool,
+) -> Box<dyn Read + 'a> {
     use crate::inflate::{CrcCheck, Inflate};
-    use ::zip::CompressionMethod as C;
-    let method = zip.by_index_raw(i)?.compression();
-    if !matches!(method, C::Stored | C::Deflated) {
-        return Ok(Box::new(zip.by_index(i)?));
-    }
-    let raw = zip.by_index_raw(i)?;
-    let crc = raw.crc32();
-    let empty = raw.compressed_size() == 0 && raw.size() == 0;
-    Ok(if method == C::Stored || empty {
+    if stored || empty {
         Box::new(CrcCheck::new(raw, crc))
     } else {
         Box::new(CrcCheck::new(Inflate::new(BufReader::new(raw)), crc))
-    })
+    }
 }
 
 /// A local header's `(compressed, uncompressed)` sizes, and whether it has a
@@ -1645,38 +1389,32 @@ fn self_delimited_extent(tail: &[u8], method: u16) -> Option<u64> {
 /// A member the directory omits lies in the space between the ones it names, so
 /// those are the only places worth reading. On a well-formed archive, where the
 /// members are laid out end to end, this is empty and costs nothing.
-fn unclaimed_spans<R: Read + Seek>(
-    zip: &mut ::zip::ZipArchive<R>,
-    read: &dyn Fn(u64, usize) -> Vec<u8>,
+fn unclaimed_spans(
+    dir: &zip_dir::Directory,
+    src: &dyn crate::source::ByteSource,
 ) -> (Vec<(u64, u64)>, std::collections::HashSet<u64>) {
-    let cd = zip.central_directory_start();
-    let mut claimed: Vec<(u64, u64)> = Vec::with_capacity(zip.len());
-    let mut known = std::collections::HashSet::with_capacity(zip.len());
-    for i in 0..zip.len() {
-        if let Ok(f) = zip.by_index_raw(i) {
-            let start = f.header_start();
-            // A member the local header describes otherwise is read as the
-            // local header says too, by the orphan scan: it is not known, and
-            // it claims no space, least of all the bytes of another member.
-            if !local_header_agrees(
-                read,
-                start,
-                f.name_raw(),
-                zip_method_code(&f.compression()),
-                f.compressed_size(),
-            ) {
-                continue;
-            }
-            known.insert(start);
-            // A member using a trailing data descriptor declares no data start,
-            // so its extent is not knowable here. Claiming only the header
-            // under-counts, which opens a gap that gets read and found to hold
-            // this same member, which `known` is what rejects.
-            let end = f
-                .data_start()
-                .map_or(start, |d| d.saturating_add(f.compressed_size()));
-            claimed.push((start, end.min(cd)));
+    let cd = dir.start;
+    let read = |at: u64, len: usize| {
+        usize::try_from(at).map_or_else(|_| Vec::new(), |at| src.window(at, len).into_owned())
+    };
+    let mut reader = crate::source::Reader::new(src);
+    let mut claimed: Vec<(u64, u64)> = Vec::with_capacity(dir.entries.len());
+    let mut known = std::collections::HashSet::with_capacity(dir.entries.len());
+    for entry in &dir.entries {
+        // A local header that does not read claims nothing.
+        let Some(data_start) = zip_dir::local_data_start(&mut reader, entry.header) else {
+            continue;
+        };
+        let start = entry.header;
+        // A member the local header describes otherwise is read as the
+        // local header says too, by the orphan scan: it is not known, and
+        // it claims no space, least of all the bytes of another member.
+        if !local_header_agrees(&read, start, &entry.name, entry.method, entry.compressed) {
+            continue;
         }
+        known.insert(start);
+        let end = data_start.saturating_add(entry.compressed);
+        claimed.push((start, end.min(cd)));
     }
     claimed.sort_unstable();
 
@@ -1702,7 +1440,7 @@ fn unclaimed_spans<R: Read + Seek>(
 /// directory says: its name, its method, and its compressed size when the
 /// header carries one.
 ///
-/// Readers differ in which they believe. The `zip` crate decodes with the
+/// Readers differ in which they believe. The walk decodes with the
 /// directory's method and size, and Info-ZIP `unzip` with the local header's, so
 /// an archive whose two disagree holds one thing for one and another for the
 /// other. `read(offset, len)` returns what is there, short at the end of the
@@ -1836,95 +1574,11 @@ fn read_spans<R: Read + Seek>(
 /// otherwise turn opening it into a full read.
 const MAX_ORPHAN_SCAN: u64 = 16 * 1024 * 1024;
 
-/// When a member was last modified: the Unix time of its extended-timestamp
-/// or NTFS extra field, as `unzip` prefers, else its DOS wall-clock time.
-fn zip_mtime<'a>(
-    extra: impl Iterator<Item = &'a ::zip::ExtraField>,
-    dos: Option<::zip::DateTime>,
-) -> Option<crate::Mtime> {
-    // FILETIME counts 100 ns ticks from 1601; the Unix epoch is this many
-    // seconds later.
-    const FILETIME_EPOCH: i64 = 11_644_473_600;
-    let unix = extra
-        .filter_map(|x| match x {
-            ::zip::ExtraField::ExtendedTimestamp(t) => t.mod_time().map(i64::from),
-            ::zip::ExtraField::Ntfs(n) => i64::try_from(n.mtime() / 10_000_000)
-                .ok()
-                .map(|s| s - FILETIME_EPOCH),
-            _ => None,
-        })
-        .next();
-    unix.map(crate::Mtime::Unix).or_else(|| {
-        dos.map(|d| crate::Mtime::Local {
-            year: d.year(),
-            month: d.month(),
-            day: d.day(),
-            hour: d.hour(),
-            minute: d.minute(),
-            second: d.second(),
-        })
-    })
-}
-
 /// Walk a ZIP off its source. Only the central directory and the members
-/// actually read are fetched. A cleartext member is handed over as the
-/// crate's decompressing reader, so a member decompressing to any size is
-/// never held. An encrypted member is decrypted whole (decryption needs the
-/// full ciphertext), bounded by the buffer limit.
-/// What `walk` takes from the directory entry of a member.
-struct RawEntry {
-    name: String,
-    is_dir: bool,
-    encrypted: bool,
-    comp: u64,
-    size: u64,
-    method: u16,
-    mtime: Option<crate::Mtime>,
-    mode: Option<u32>,
-    local: Option<u16>,
-    /// Where the member's data starts in the source.
-    data_start: Option<u64>,
-}
-
-// The three below open a `ZipFile`, which holds the decoders of every codec
-// inline: tens of kilobytes. Opened in `walk` itself, one would be in its frame
-// for as long as a member is scanned, and a ZIP inside a ZIP inside a ZIP
-// takes that once for each level.
-
-#[inline(never)]
-fn raw_entry<R: Read + Seek>(
-    zip: &mut ::zip::ZipArchive<R>,
-    src: &dyn crate::source::ByteSource,
-    i: usize,
-) -> ::zip::result::ZipResult<RawEntry> {
-    let f = zip.by_index_raw(i)?;
-    Ok(RawEntry {
-        name: member_name(&f),
-        is_dir: f.is_dir(),
-        encrypted: f.encrypted(),
-        comp: f.compressed_size(),
-        size: f.size(),
-        method: zip_method_code(&f.compression()),
-        mtime: zip_mtime(f.extra_data_fields(), f.last_modified()),
-        mode: f.unix_mode(),
-        local: local_flags(&src.window(f.header_start() as usize, 8)),
-        data_start: f.data_start(),
-    })
-}
-
-#[inline(never)]
-fn header_parses<R: Read + Seek>(
-    zip: &mut ::zip::ZipArchive<R>,
-    i: usize,
-) -> ::zip::result::ZipResult<()> {
-    zip.by_index_raw(i).map(|_| ())
-}
-
-#[inline(never)]
-fn member_decodes<R: Read + Seek>(zip: &mut ::zip::ZipArchive<R>, i: usize) -> bool {
-    zip.by_index(i).is_ok()
-}
-
+/// actually read are fetched. A cleartext member is handed over as a
+/// decompressing reader, so a member decompressing to any size is never held.
+/// An encrypted member is decrypted whole (decryption needs the full
+/// ciphertext), bounded by the buffer limit.
 pub(crate) fn walk(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
@@ -1936,53 +1590,54 @@ pub(crate) fn walk(
     // headers are still in the file. Fall back to reading the archive whole
     // and the local-header salvage, so a malformed archive still has its
     // members scanned rather than being written off (matching clamd).
-    let mut zip = match open_archive(crate::source::Reader::new(src)) {
-        Ok(z) => z,
+    let mut reader = crate::source::Reader::new(src);
+    let dir = match zip_dir::open(&mut reader) {
+        Ok(d) => d,
         Err(_) => return whole(Format::Zip, src, budget, visit),
     };
     // A member left unread for a limit is reported after the rest are scanned
     // (`Budget::skip`).
-    for i in 0..zip.len() {
+    for (i, entry) in dir.entries.iter().enumerate() {
         budget.count_entry()?;
-        // Peek metadata with the RAW reader: it never invokes the crate
-        // decryptor, so it succeeds for encrypted members too.
-        // A member whose header will not parse costs only itself. Abandoning
-        // the walk here would strand every later member: `hidden_members`
-        // skips them as listed, so a payload behind one bad directory pointer
-        // would never be scanned.
-        if let Err(e) = header_parses(&mut zip, i) {
-            let hit = zip_entry_error(i, &e);
-            if !hit.is_corrupt() {
-                return Err(hit);
+        // A member whose local header is not there costs only itself.
+        // Abandoning the walk here would strand every later member:
+        // `hidden_members` skips them as listed, so a payload behind one bad
+        // directory pointer would never be scanned.
+        //
+        // Only a failing source is a budget stop, which aborts the archive and
+        // the container holding it. A header that is absent is damage to this
+        // archive (`UNSCANNABLE`): an embedded ZIP whose directory points
+        // outside the carved slice must not make the whole document
+        // `LIMITS-EXCEEDED`, which would skip the scan of its macros.
+        let data_start = match zip_dir::local_header(&mut reader, entry.header) {
+            Ok(Some(start)) => start,
+            Ok(None) => {
+                let meta = MemberMeta {
+                    name: format!("zip entry {i}"),
+                    unsupported: Some("ZIP member header will not parse"),
+                    ..MemberMeta::default()
+                };
+                if let Some(t) = visit(&meta, None, budget) {
+                    return Ok(Some(t));
+                }
+                continue;
             }
-            let meta = MemberMeta {
-                name: format!("zip entry {i}"),
-                unsupported: Some("ZIP member header will not parse"),
-                ..MemberMeta::default()
-            };
-            if let Some(t) = visit(&meta, None, budget) {
-                return Ok(Some(t));
-            }
-            continue;
-        }
-        let RawEntry {
-            name,
-            is_dir,
-            encrypted,
-            comp,
-            size,
-            method,
-            mtime,
-            mode,
-            local,
-            data_start,
-        } = raw_entry(&mut zip, src, i).map_err(|e| zip_entry_error(i, &e))?;
+            Err(e) => return Err(LimitHit::new(format!("zip entry {i}: i/o error: {e}"))),
+        };
+        let (name, comp, size, method) = (
+            entry.name_text().into_owned(),
+            entry.compressed,
+            entry.size,
+            entry.method,
+        );
+        let (mtime, mode) = (entry.mtime(), entry.unix_mode());
+        let local = local_flags(&src.window(crate::bytes::to_usize(entry.header), 8));
         // `is_dir()` is true purely because the name ends in '/'. A JAR packer
         // buys exactly that: `kingDavid/9.class/` holds a real deflate-compressed
         // class that the JVM loads by name, while every ZIP tool discards it as a
         // folder. Skip only what carries nothing at all: a "directory" with
         // content is content.
-        if is_dir && comp == 0 {
+        if entry.is_dir() && comp == 0 {
             // Counted toward the file budget above, and handed over only to
             // a caller that makes directories.
             if budget.visit_directories {
@@ -2002,47 +1657,32 @@ pub(crate) fn walk(
             name,
             comp_size: comp,
             size: Some(size),
-            encrypted,
+            encrypted: entry.encrypted(),
             zip_local_flags: local,
             mtime,
             mode,
             zip_method: Some(method),
             ..MemberMeta::default()
         };
-        if encrypted {
-            if let Some(t) = walk_encrypted(&mut zip, i, meta, budget, visit)? {
+        if entry.encrypted() {
+            if let Some(t) = walk_encrypted(src, entry, data_start, meta, budget, visit)? {
                 return Ok(Some(t));
             }
             continue;
         }
-        let max_buffer = budget.limits.max_buffer_bytes;
-        if decoded_whole_too_big(method, comp, size, max_buffer) {
-            budget.skip(format_args!(
-                "zip member '{}' is decoded whole and is larger than \
-                 --max-object-bytes {max_buffer}",
-                crate::tree::quoted(&meta.name)
-            ));
+        // Stored and Deflated are read here. Every other method goes to
+        // `walk_raw_decode`, which decodes the raw bytes with exav's own codecs.
+        if !matches!(method, 0 | 8) {
+            if let Some(t) = walk_raw_decode(src, entry, data_start, meta, budget, visit)? {
+                return Ok(Some(t));
+            }
             continue;
         }
-        // A codec the `zip` crate lacks fails here rather than in our own
-        // decoder, so fall back to the raw bytes and decode them ourselves.
-        // Probe first so the borrow of `zip` ends before the fallback needs it.
-        let mut file = match member_decodes(&mut zip, i) {
-            true => member_reader(&mut zip, i).map_err(|e| zip_entry_error(i, &e))?,
-            false => {
-                let out = walk_raw_decode(&mut zip, src, i, meta, budget, visit)?;
-                if let Some(t) = out {
-                    return Ok(Some(t));
-                }
-                continue;
-            }
-        };
-        // A stored member is its bytes in the archive, as `member_reader` reads
-        // them.
-        let out = match data_start {
-            Some(start) if method == 0 => {
-                emit_range(&mut meta, (start, comp), &mut file, budget, visit)?
-            }
+        let raw = Box::new(member_bytes(src, data_start, comp));
+        let mut file = plain_reader(raw, method == 0, entry.crc, comp == 0 && size == 0);
+        // A stored member is its bytes in the archive.
+        let out = match method {
+            0 => emit_range(&mut meta, (data_start, comp), &mut file, budget, visit)?,
             _ => emit_stream(&meta, &mut file, budget, visit)?,
         };
         if let Some(t) = out {
@@ -2051,7 +1691,7 @@ pub(crate) fn walk(
     }
     // Members left out of the central directory while their local headers and
     // data stay in the file, which is what the target extracts.
-    for entry in hidden_members(zip, src, budget)? {
+    for entry in hidden_members(&dir, src, budget)? {
         if let Some(t) = emit_entry(entry, budget, visit)? {
             return Ok(Some(t));
         }
@@ -2059,79 +1699,52 @@ pub(crate) fn walk(
     Ok(None)
 }
 
-/// A member's raw bytes behind the decoder for its method.
-struct RawMember<'a> {
-    method: u16,
-    usz: u64,
-    data_start: Option<u64>,
-    decoder: Result<Box<dyn Read + 'a>, RawRefusal>,
-}
-
-/// Opens member `i` raw and puts its decoder on it. Kept out of
-/// `walk_raw_decode`: a `ZipFile` is tens of kilobytes, and a frame that held
-/// one would stay on the stack while the member is scanned.
+/// Decode a member that is neither Stored nor Deflated, from its RAW bytes,
+/// using exav's own codec set, as it is read. The member is visited once:
+/// decoded, or as a marker saying why it could not be. A decoder needing more
+/// memory than the buffer limit leaves the member unread, and the limit is
+/// left for the walk to report once the other members are scanned
+/// (`Budget::skip`).
 #[inline(never)]
-fn raw_member<'a, R: Read + Seek>(
-    zip: &'a mut ::zip::ZipArchive<R>,
-    i: usize,
-    cap: u64,
-) -> Option<RawMember<'a>> {
-    let f = zip.by_index_raw(i).ok()?;
-    let method = zip_method_code(&f.compression());
-    let usz = f.size();
-    let data_start = f.data_start();
-    Some(RawMember {
-        method,
-        usz,
-        data_start,
-        decoder: raw_decoder(method, f, Some(usz), cap),
-    })
-}
-
-/// Decode a member the `zip` crate refused, from its RAW bytes, using exav's own
-/// codec set, as it is read. The member is visited once: decoded, or as a
-/// marker saying why it could not be. A decoder needing more memory than the
-/// buffer limit leaves the member unread, and the limit is left for the walk to
-/// report once the other members are scanned (`Budget::skip`).
-#[inline(never)]
-fn walk_raw_decode<R: Read + Seek>(
-    zip: &mut ::zip::ZipArchive<R>,
+fn walk_raw_decode(
     src: &dyn crate::source::ByteSource,
-    i: usize,
+    entry: &zip_dir::Entry,
+    data_start: u64,
     mut meta: crate::stream::MemberMeta,
     budget: &mut Budget,
     visit: crate::stream::Visit<()>,
 ) -> Result<Option<()>, LimitHit> {
     let cap = budget.limits.max_buffer_bytes;
-    let Some(RawMember {
-        method,
-        usz,
-        data_start,
-        decoder,
-    }) = raw_member(zip, i, cap)
-    else {
-        meta.unsupported = Some("ZIP member header will not parse");
-        return Ok(visit(&meta, None, budget));
+    let (method, usz) = (entry.method, entry.size);
+    let raw = member_bytes(src, data_start, entry.compressed);
+    let decoder = raw_decoder(method, raw, entry.flags, Some(usz), cap);
+    // These methods end at the declared size, with nothing in the stream to
+    // say the data is whole: the checksum does.
+    let decoder = match decoder {
+        Ok(d) if (1..=6).contains(&method) => {
+            Ok(Box::new(crate::inflate::CrcCheck::new(d, entry.crc)) as Box<dyn Read + '_>)
+        }
+        d => d,
     };
     match decoder {
         // Every stream of a bzip2 member, as the `.bz2` reader reads them: a
         // reader of the first alone leaves the others undecoded and unsaid.
         #[cfg(feature = "bzip2")]
-        Ok(_) if method == 12 && data_start.is_some() => {
-            let start = crate::bytes::to_usize(data_start.unwrap_or(0));
+        Ok(_) if method == 12 => {
+            let start = crate::bytes::to_usize(data_start);
             let member =
                 crate::source::Sub::new(src, start, crate::bytes::to_usize(meta.comp_size));
             let mut r = super::bzip2::content_reader(&member, cap);
             crate::stream::emit_stream(&meta, &mut r, budget, visit)
         }
         Ok(mut r) => crate::stream::emit_stream(&meta, &mut r, budget, visit),
-        Err(RawRefusal::Unsupported(_)) if !defined_method(method) && data_start.is_some() => {
+        Err(RawRefusal::Unsupported(_)) if !defined_method(method) => {
             // A method no ZIP specification defines is no codec at all.
             // Android's reader takes such a member as stored, its declared
             // uncompressed size long, and APK packers give the manifest a
             // made-up method so that other readers skip it. Read it as
             // Android does.
-            let start = data_start.unwrap_or(0) as usize;
+            let start = crate::bytes::to_usize(data_start);
             let len = (usz as usize).min(src.len().saturating_sub(start));
             let name = crate::tree::quoted(&meta.name);
             let member = format_args!("zip member '{name}'");
@@ -2170,9 +1783,10 @@ fn walk_raw_decode<R: Read + Seek>(
 /// plaintext on success, else a metadata-only unsupported member, so the
 /// caller reports it without masking later members.
 #[inline(never)]
-fn walk_encrypted<R: Read + Seek>(
-    zip: &mut ::zip::ZipArchive<R>,
-    i: usize,
+fn walk_encrypted(
+    src: &dyn crate::source::ByteSource,
+    entry: &zip_dir::Entry,
+    data_start: u64,
     meta: crate::stream::MemberMeta,
     budget: &mut Budget,
     visit: crate::stream::Visit<()>,
@@ -2186,11 +1800,11 @@ fn walk_encrypted<R: Read + Seek>(
     // Disprove the flag BEFORE any `decrypt` gating: the check decrypts nothing,
     // it proves by CRC-32 that these bytes were never ciphertext.
     let max_buffer = budget.limits.max_buffer_bytes;
-    let (crc, enc) = {
-        let mut f = zip.by_index_raw(i).map_err(|e| zip_entry_error(i, &e))?;
-        let crc = f.crc32();
-        match read_encrypted_member(&mut f, max_buffer) {
-            Ok(e) => (crc, e),
+    let crc = entry.crc;
+    let enc = {
+        let mut data = member_bytes(src, data_start, entry.compressed);
+        match read_encrypted_member(entry, &mut data, max_buffer) {
+            Ok(e) => e,
             Err(_) => return Ok(visit(&unsupported_meta, None, budget)),
         }
     };
@@ -2225,25 +1839,23 @@ fn walk_encrypted<R: Read + Seek>(
     }
 }
 
-/// The members `zip`'s central directory omits, decoded, for a walk that has
+/// The members the central directory `dir` omits, decoded, for a walk that has
 /// already been through the ones it lists.
 ///
-/// Over the same bounded search [`ZipMembers`] uses: only the space the
-/// directory leaves unaccounted for is read, up to [`MAX_ORPHAN_SCAN`], and a
-/// search that stops there yields a member saying so.
+/// Only the space the directory leaves unaccounted for is read, up to
+/// [`MAX_ORPHAN_SCAN`], and a search that stops there yields a member saying
+/// so.
 #[inline(never)]
-pub(crate) fn hidden_members<Rd: Read + Seek>(
-    mut zip: ::zip::ZipArchive<Rd>,
+pub(crate) fn hidden_members(
+    dir: &zip_dir::Directory,
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
 ) -> Result<Vec<Entry>, LimitHit> {
-    let (gaps, known) = unclaimed_spans(&mut zip, &|at, len| {
-        usize::try_from(at).map_or_else(|_| Vec::new(), |at| src.window(at, len).into_owned())
-    });
+    let (gaps, known) = unclaimed_spans(dir, src);
     if gaps.is_empty() {
         return Ok(Vec::new());
     }
-    let mut reader = zip.into_inner();
+    let mut reader = crate::source::Reader::new(src);
     let (unclaimed, truncated) = read_spans(&mut reader, &gaps, MAX_ORPHAN_SCAN)?;
     let mut out = Vec::new();
     for (span, off) in find_orphans(&unclaimed, &known) {
@@ -2572,9 +2184,9 @@ mod directory_tests {
     use std::io::Write;
 
     fn two_member_zip() -> Vec<u8> {
-        let mut z = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let mut z = crate::zip_write::ZipWriter::new(Cursor::new(Vec::new()));
         for name in ["a.txt", "b.txt"] {
-            z.start_file(name, ::zip::write::SimpleFileOptions::default())
+            z.start_file(name, crate::zip_write::FileOptions::default())
                 .unwrap();
             z.write_all(b"hello").unwrap();
         }
@@ -2595,6 +2207,76 @@ mod directory_tests {
             let v = u32::from_le_bytes(zip[p..p + 4].try_into().unwrap()) + by;
             zip[p..p + 4].copy_from_slice(&v.to_le_bytes());
         }
+    }
+
+    /// A member whose local header is not where the directory says costs only
+    /// itself: it is listed as one that will not parse, the others are read, and
+    /// the member behind the bad pointer comes from the search of the space the
+    /// directory leaves unclaimed.
+    #[test]
+    fn a_member_with_no_local_header_costs_only_itself() {
+        let mut z = crate::zip_write::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, data) in [("a.txt", "first"), ("b.txt", "second"), ("c.txt", "third")] {
+            z.start_file(name, crate::zip_write::FileOptions::default())
+                .unwrap();
+            z.write_all(data.as_bytes()).unwrap();
+        }
+        let mut zip = z.finish().unwrap().into_inner();
+        let second = zip
+            .windows(4)
+            .enumerate()
+            .filter(|(_, w)| *w == b"PK\x01\x02")
+            .map(|(p, _)| p)
+            .nth(1)
+            .unwrap();
+        // Into the data of the first member, 35 bytes in.
+        zip[second + 42..second + 46].copy_from_slice(&36u32.to_le_bytes());
+        let mut budget = Budget::new(Limits::default());
+        let entries = crate::extract(Format::Zip, &zip, &mut budget).unwrap();
+        let seen: Vec<_> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.unsupported, &e.data[..]))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("a.txt", None, &b"first"[..]),
+                (
+                    "zip entry 1",
+                    Some("ZIP member header will not parse"),
+                    &b""[..]
+                ),
+                ("c.txt", None, &b"third"[..]),
+                ("b.txt", None, &b"second"[..]),
+            ]
+        );
+    }
+
+    /// A member whose size runs to the end of the file reads the end record as
+    /// the file has it, though the directory was found by the way a record
+    /// that points elsewhere is read.
+    #[test]
+    fn a_member_running_into_the_end_record_reads_the_files_own_bytes() {
+        let mut z = crate::zip_write::ZipWriter::new(Cursor::new(Vec::new()));
+        let stored =
+            crate::zip_write::FileOptions::default().method(crate::zip_write::Method::Stored);
+        z.start_file("a.txt", stored).unwrap();
+        z.write_all(b"hello").unwrap();
+        let mut zip = z.finish().unwrap().into_inner();
+        let end = zip.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
+        let entry = zip.windows(4).rposition(|w| w == b"PK\x01\x02").unwrap();
+        // The record's directory offset is wrong, the member's right.
+        let directory = u32::from_le_bytes(zip[end + 16..end + 20].try_into().unwrap());
+        zip[end + 16..end + 20].copy_from_slice(&(directory - 7).to_le_bytes());
+        // The member's sizes take it to the end of the file.
+        let to_end = (zip.len() - 35) as u32;
+        zip[entry + 20..entry + 24].copy_from_slice(&to_end.to_le_bytes());
+        zip[entry + 24..entry + 28].copy_from_slice(&to_end.to_le_bytes());
+        let mut budget = Budget::new(Limits::default());
+        let entries = crate::extract(Format::Zip, &zip, &mut budget).unwrap();
+        let first = &entries[0];
+        assert_eq!(first.name, "a.txt");
+        assert_eq!(&first.data[..], &zip[35..]);
     }
 
     #[test]
@@ -2638,8 +2320,8 @@ mod directory_tests {
 
     #[test]
     fn a_directory_is_checked_against_the_limits_an_extraction_has() {
-        let mut z = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let options = ::zip::write::SimpleFileOptions::default();
+        let mut z = crate::zip_write::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = crate::zip_write::FileOptions::default();
         z.start_file("zeros.bin", options).unwrap();
         z.write_all(&vec![0u8; 5 << 20]).unwrap();
         for name in ["a", "b"] {
@@ -2685,7 +2367,7 @@ mod directory_tests {
     }
 }
 
-/// The walk over a member of a codec the `zip` crate does not decode.
+/// The walk over a member that is neither Stored nor Deflated.
 #[cfg(all(test, feature = "bzip2"))]
 mod raw_codec_tests {
     use super::*;
@@ -2808,7 +2490,7 @@ mod zip_ppmd_tests {
         usz: Option<u64>,
         cap: u64,
     ) -> Option<crate::Salvaged> {
-        match raw_decoder(method, raw, usz, cap) {
+        match raw_decoder(method, raw, 0, usz, cap) {
             Ok(r) => bounded_read_salvage(r, cap, true).ok(),
             Err(RawRefusal::TooBig) => Some(crate::Salvaged {
                 data: Vec::new(),
@@ -2860,7 +2542,7 @@ mod zip_ppmd_tests {
         let s = decode_zip_raw(98, &raw, Some(64), 1 << 20).unwrap();
         assert!(s.over_cap && s.data.is_empty() && !s.undecoded);
         assert!(matches!(
-            raw_decoder(98, &raw[..], Some(64), 1 << 20),
+            raw_decoder(98, &raw[..], 0, Some(64), 1 << 20),
             Err(RawRefusal::TooBig)
         ));
     }

@@ -92,9 +92,11 @@ Enough Windows that a stub cannot tell, and nothing more:
 
 ## Bounds
 
-An instruction budget, a resident-page cap, a dump-size cap, and a progress check
-that ends a stub spinning in an anti-emulation delay loop, all set through
-`EmuLimits`. The defaults (200 million instructions, 192 MiB of pages, a 64 MiB
-dump) suit one sample on its own; the scanner uses tighter per-stub budgets
-(120 million, 64 MiB, 32 MiB) and also caps the total across every packed
-executable in one file (`--max-pe-emulation-steps`).
+An instruction budget, a resident-page cap, a dump-size cap, and an idle window
+(`max_idle_ticks`) that ends a stub spinning in an anti-emulation delay loop, all
+set through `EmuLimits`. The defaults (200 million instructions, 192 MiB of
+pages, a 64 MiB dump, 64 million instructions without a new page written) suit
+one sample on its own. The scanner runs each stub with 500 million instructions
+(`--max-pe-stub-steps`), 64 MiB of pages, a 32 MiB dump and the same idle window
+(`--max-pe-idle-steps`), and also caps the total across every packed executable
+in one file (`--max-pe-emulation-steps`).

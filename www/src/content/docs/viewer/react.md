@@ -103,10 +103,10 @@ import { SandboxedViewer, SandboxedViewerProvider } from "@exav/viewer/react/san
 <SandboxedViewer sandbox={{ url: "https://viewer-frame.example-files.com/exav-frame/index.html" }} file={file} locale="fr" />
 ```
 
-`sandbox` is `{ url, formats?, options?, confirmLink?, linkQuietMs?, startTimeoutMs?, sniffTimeoutMs?, sniffBytes?, maxExtractedBytes?, maxMembers?, maxCompressionRatio?, delivery?, origins?, keys?, theme? }`
+`sandbox` is `{ url, formats?, options?, confirmLink?, linkQuietMs?, startTimeoutMs?, frameTimeoutMs?, sniffTimeoutMs?, sniffBytes?, maxExtractedBytes?, maxMembers?, maxCompressionRatio?, delivery?, origins?, keys?, theme? }`
 ([Core API](/viewer/api/#the-viewer-in-a-sandboxed-frame), [Security](/viewer/security/)),
 read once. The question before a document's link opens is the `link_confirm`
-string; `confirmLink` replaces it. `SandboxedViewerProvider` takes the
+string (`link_confirm_mail` for a `mailto:` one); `confirmLink` replaces it. `SandboxedViewerProvider` takes the
 provider's `locale`, `translate` and `components`.
 
 In the sandboxed mode the rails, pager, archive list and dialog are the

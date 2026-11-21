@@ -6,6 +6,7 @@
 use std::io::Cursor;
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader, scan_seekable};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use md5::{Digest, Md5};
 
 /// What a thunk of [`pe`] holds.
@@ -670,9 +671,8 @@ fn a_tlsh_line_for_an_installer_executable_over_the_size_an_object_is_held_at() 
     let seen = verdict(&none, &autoit);
     assert!(matches!(seen, Verdict::LimitsExceeded { .. }), "{seen:?}");
 
-    let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let deflated = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    let deflated = FileOptions::default().method(Method::Deflated);
     z.start_file("a.txt", deflated).unwrap();
     z.write_all(b"a member of the self-extractor, nothing more")
         .unwrap();
@@ -694,9 +694,8 @@ fn a_tlsh_line_for_an_installer_executable_over_the_size_an_object_is_held_at() 
 fn a_member_of_an_installer_is_found_before_its_tlsh_line() {
     use std::io::Write;
     let member = b"a member of the self-extractor, nothing more";
-    let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let deflated = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    let deflated = FileOptions::default().method(Method::Deflated);
     z.start_file("a.txt", deflated).unwrap();
     z.write_all(member).unwrap();
     let mut sfx = two_hashes().remove(0).1;
@@ -749,9 +748,8 @@ fn a_member_of_an_installer_is_found_before_its_executable() {
     use std::io::Write;
     let member = b"a member of the self-extractor, nothing more";
     let archive = |content: &[u8]| {
-        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let deflated = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+        let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+        let deflated = FileOptions::default().method(Method::Deflated);
         z.start_file("a.txt", deflated).unwrap();
         z.write_all(content).unwrap();
         z.finish().unwrap().into_inner()

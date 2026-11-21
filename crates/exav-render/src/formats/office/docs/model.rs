@@ -871,7 +871,21 @@ fn over<T: Clone>(a: &mut Option<T>, b: &Option<T>) {
     }
 }
 
+/// Deleted and inserted text is drawn in this colour, whoever made the change.
+const REVISION_COLOR: u32 = 0xC00000;
+
 impl RunProps {
+    /// A tracked change, as an editor shows it: in [`REVISION_COLOR`], the
+    /// deleted text struck through, the inserted text underlined.
+    pub fn revision(&mut self, deleted: bool) {
+        self.color = Some(Color::Rgb(REVISION_COLOR));
+        if deleted {
+            self.strike = Some(true);
+        } else {
+            self.underline = Some("single");
+        }
+    }
+
     /// `o`'s set properties over these.
     pub fn overlay(&mut self, o: &RunProps) {
         over(&mut self.style, &o.style);

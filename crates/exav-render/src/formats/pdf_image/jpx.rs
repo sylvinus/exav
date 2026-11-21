@@ -78,7 +78,7 @@ pub fn decode_jpx(
     };
     // In a JP2 file of its own with no colour specification: hayro-jpeg2000
     // then takes any number of components as they are (a bare codestream of
-    // five or more it refuses).
+    // three with subsampled chroma it would convert from YCC).
     let wrapped = bare_jp2(codestream);
     let image =
         Image::new(&wrapped, &settings).map_err(|_| Error::new("Failed to read the header"))?;
@@ -572,7 +572,8 @@ impl Siz {
     /// full-resolution coordinates, which agree only with no image area
     /// offset, and for a subsampled component only in a single tile;
     /// otherwise it panics or leaves samples out. It also panics on a column
-    /// of tiles that is empty at that size.
+    /// of tiles that is empty at that size. (0.5.0 no longer panics on these
+    /// layouts; whether it places their samples right is not checked.)
     fn reducible(&self, power: u32) -> bool {
         let g = &self.grid;
         let x = u64::from(g.x);

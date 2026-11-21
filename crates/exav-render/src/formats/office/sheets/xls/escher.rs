@@ -10,7 +10,6 @@ use crate::formats::office::sheets::error::Result;
 use crate::formats::office::sheets::geom::Grid;
 use crate::formats::office::sheets::limits::Budget;
 use crate::formats::office::sheets::model::*;
-use std::io::Read;
 
 pub(crate) struct Blip {
     pub ext: &'static str,
@@ -125,10 +124,8 @@ fn blip(h: &Rh, d: &[u8]) -> Option<Blip> {
     let body = d.get(skip + 34..)?;
     let data = if hdr[32] == 0 {
         let mut out = Vec::new();
-        flate2::read::ZlibDecoder::new(body)
-            .take(MAX_METAFILE)
-            .read_to_end(&mut out)
-            .ok()?;
+        let mut z = flate2::read::ZlibDecoder::new(body);
+        exav_unpack::source::read_capped(&mut z, &mut out, MAX_METAFILE).ok()?;
         out
     } else {
         body.to_vec()

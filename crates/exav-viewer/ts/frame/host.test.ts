@@ -21,14 +21,27 @@ vi.mock("../core/sniff-engine.js", async () => {
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
+/** Waits for what a test expects to have happened, as long as it takes up to a limit well under the test's. */
+const until = <T>(check: () => T): Promise<T> => vi.waitFor(check, { timeout: 2000, interval: 2 });
+
+/**
+ * A set wait, for a step that must NOT happen: no condition can be waited
+ * for, so it gives the step time to (wrongly) happen. Used only after a step
+ * that must have happened is waited for.
+ */
+const quiet = (ms = 5) => tick(ms);
+
 interface Frame {
   session: Session;
   iframe: HTMLIFrameElement;
   /** What the host sent over the port. */
   received: any[];
+  /** Hands a message to the host, and returns once the host has handled it (or has ended). What the host then sends back arrives later: wait for it with `got` or `until`. */
   send(message: unknown): Promise<void>;
   /** As `send`, but handed to the host as it is: a port clones a message, which a bitmap cannot survive here. */
   inject(message: unknown): Promise<void>;
+  /** Waits until the host has sent `count` messages of this type, and returns all of them. */
+  got(type: string, count?: number): Promise<any[]>;
   controllers(): Controllers;
 }
 
@@ -42,6 +55,7 @@ afterEach(() => {
   hosts = [];
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 beforeEach(() => {
   vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -105,21 +119,39 @@ async function mountWith(
     iframe,
     received,
     async send(message) {
+      const hostPort = channels[0]!.port1;
+      let stop = () => {};
+      const handled = new Promise<void>((resolve) => {
+        // The host's listener was added first, so it has run when this one does.
+        hostPort.addEventListener("message", () => resolve(), { once: true });
+        // A host that has ended has closed its port, and handles nothing more.
+        const watch = setInterval(() => iframe.isConnected || resolve(), 5);
+        stop = () => clearInterval(watch);
+      });
       port.postMessage(message);
-      await tick(5);
+      await handled;
+      stop();
     },
     async inject(message) {
       channels[0]!.port1.onmessage?.({ data: message } as MessageEvent);
-      await tick(5);
+    },
+    async got(type, count = 1) {
+      return until(() => {
+        const messages = received.filter((m) => m.type === type);
+        expect(messages.length, `messages of type ${type}`).toBeGreaterThanOrEqual(count);
+        return messages;
+      });
     },
     controllers: () => session.controllers.get(),
   };
-  if (ready) await frame.send({ type: "ready", protocol: PROTOCOL, policy, formats: null });
-  await tick(5);
-  // The host asks what the file is once the frame is ready, then opens it.
-  while (answering.length) {
-    await Promise.all(answering.splice(0));
-    await tick(5);
+  if (ready) {
+    await frame.send({ type: "ready", protocol: PROTOCOL, policy, formats: null });
+    // The host asks what the file is, or opens it, or ends in an error.
+    const over = () => received.some((m) => m.type === "open") || session.status.get().phase === "error";
+    await until(() => expect(over() || received.some((m) => m.type === "sniff")).toBe(true));
+    while (answering.length) await Promise.all(answering.splice(0));
+    // A frame that never answers leaves the host to its timeout: the test goes on at once.
+    if (sniffAnswer !== "silent" && received.some((m) => m.type === "sniff")) await until(() => expect(over()).toBe(true));
   }
   return frame;
 }
@@ -172,6 +204,13 @@ describe("the frame element", () => {
     expect(f.session.status.get()).toEqual({ phase: "error", error: { code: "file" } });
   });
 
+  it("is given the file once, however many times it says it is ready", async () => {
+    const f = await mount();
+    await f.send({ type: "ready", protocol: PROTOCOL, policy: null, formats: null });
+    await quiet();
+    expect(f.received.filter((m) => m.type === "open")).toHaveLength(1);
+  });
+
   it("is dropped when it loads a second time: it navigated away", async () => {
     const f = await mount();
     f.iframe.dispatchEvent(new Event("load"));
@@ -183,28 +222,29 @@ describe("the frame element", () => {
     const f = await mount({}, "plan.dwg", false);
     await f.send({ type: "ready", protocol: PROTOCOL + 1, policy: null, formats: null });
     expect(f.session.status.get().phase).toBe("error");
+    await quiet();
     expect(f.received.find((m) => m.type === "open")).toBeUndefined();
 
     const viewer = createSandboxedViewer({ url: "https://frame.test/", startTimeoutMs: 20 });
     const host = document.createElement("div");
     hosts.push(host);
     const s = viewer.mount(host, { id: "x", name: "a.pdf", source: { bytes: new Uint8Array(1) } });
-    await tick(60);
-    expect(s.status.get()).toMatchObject({ phase: "error", error: { code: "pdf" } });
+    await until(() => expect(s.status.get()).toMatchObject({ phase: "error", error: { code: "pdf" } }));
   });
 
   it("is dropped when it was published without the format of the file, and says so", async () => {
     const f = await mount({}, "plan.dwg", false);
     await f.send({ type: "ready", protocol: PROTOCOL, policy: null, formats: ["pdf", "image"] });
+    await until(() => expect(f.session.status.get()).toMatchObject({ phase: "error", error: { code: "drawing" } }));
+    await quiet();
     expect(f.received.find((m) => m.type === "open")).toBeUndefined();
-    expect(f.session.status.get()).toMatchObject({ phase: "error", error: { code: "drawing" } });
     expect(f.session.status.get()).toMatchObject({ error: { cause: { message: expect.stringContaining("published without dwg") } } });
 
     // One that was published with it, or for all of them, is given the file.
     for (const formats of [["dwg", "dxf"] as const, null]) {
       const g = await mount({}, "plan.dwg", false);
       await g.send({ type: "ready", protocol: PROTOCOL, policy: null, formats });
-      expect(g.received.find((m) => m.type === "open")).toBeDefined();
+      await until(() => expect(g.received.find((m) => m.type === "open")).toBeDefined());
     }
   });
 
@@ -212,6 +252,72 @@ describe("the frame element", () => {
     const f = await mount();
     f.session.destroy();
     expect(f.iframe.isConnected).toBe(false);
+  });
+
+  it("is pinged a third of frameTimeoutMs apart, and dropped when a ping stays unanswered that long", async () => {
+    const f = await mount({ frameTimeoutMs: 240 });
+    // The next ping is sent once the last is answered.
+    await f.got("ping");
+    await f.send({ type: "pong" });
+    await f.got("ping", 2);
+    await quiet(30);
+    expect(f.session.status.get().phase).not.toBe("error");
+    // The second stays unanswered.
+    await until(() => expect(f.session.status.get()).toMatchObject({ phase: "error", error: { cause: { message: "the frame did not answer in 240 ms" } } }));
+    expect(f.iframe.isConnected).toBe(false);
+  });
+
+  it("is not dropped for a late tick: the gap is not counted, the ping is sent again and the wait starts over", async () => {
+    // Only the interval is played; the clock the host reads is the test's.
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let clock = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    const f = await mount({ frameTimeoutMs: 240 });
+    const tick = (ms: number) => {
+      clock += ms;
+      vi.advanceTimersByTime(80);
+    };
+    tick(80);
+    await f.got("ping");
+    tick(80);
+    expect(f.session.status.get().phase).not.toBe("error");
+    // A tick a second after the one before, the ping still unanswered.
+    tick(1000);
+    await f.got("ping", 2);
+    expect(f.session.status.get().phase).not.toBe("error");
+    // Ticks on time: the new wait is 240 ms, so the third of them ends it.
+    tick(80);
+    tick(80);
+    expect(f.session.status.get().phase).not.toBe("error");
+    tick(80);
+    expect(f.session.status.get()).toMatchObject({ phase: "error", error: { cause: { message: "the frame did not answer in 240 ms" } } });
+  });
+
+  it("is not pinged with frameTimeoutMs 0", async () => {
+    const f = await mount({ frameTimeoutMs: 0 });
+    await quiet(100);
+    expect(f.received.filter((m) => m.type === "ping")).toEqual([]);
+    expect(() => createSandboxedViewer({ url: "https://frame.test/", frameTimeoutMs: -1 })).toThrow(RangeError);
+  });
+
+  it("is pinged no more once its session is destroyed", async () => {
+    const set = vi.spyOn(globalThis, "setInterval");
+    const clear = vi.spyOn(globalThis, "clearInterval");
+    const f = await mount({ frameTimeoutMs: 240 });
+    const pinger = set.mock.results.find((r, i) => set.mock.calls[i]![1] === 80)!.value;
+    f.session.destroy();
+    expect(clear).toHaveBeenCalledWith(pinger);
+  });
+
+  it("is dropped when the page's policy refuses it, and not for a report only, another address or another directive", async () => {
+    const f = await mount({}, "plan.dwg", false);
+    const violation = (init: object) => document.dispatchEvent(Object.assign(new Event("securitypolicyviolation"), { effectiveDirective: "frame-src", disposition: "enforce", ...init }));
+    violation({ blockedURI: "https://other.test/index.html" });
+    violation({ blockedURI: "https://frame.test/index.html", disposition: "report" });
+    violation({ blockedURI: "https://frame.test/index.html", effectiveDirective: "img-src" });
+    expect(f.session.status.get().phase).not.toBe("error");
+    violation({ blockedURI: "https://frame.test/index.html" });
+    expect(f.session.status.get()).toMatchObject({ phase: "error", error: { cause: { message: "the page's Content-Security-Policy blocks the frame: add https://frame.test to its frame-src (to its child-src or default-src when it has no frame-src)" } } });
   });
 });
 
@@ -282,14 +388,13 @@ describe("the controllers the host gets", () => {
     await f.send({ type: "controllers", session: 0, values: { drag: { mode: "pan", available: true } }, statics: {} });
     f.controllers().drag!.choose("select");
     expect(f.controllers().drag!.get()).toEqual({ mode: "select", available: true });
-    await tick(5);
-    await f.send({ type: "done", call: f.received.filter((m) => m.type === "command")[0].call, ok: true });
+    const [first] = await f.got("command");
+    await f.send({ type: "done", call: first.call, ok: true });
     await f.send({ type: "state", session: 0, key: "drag", value: { mode: "select", available: false } });
     f.controllers().drag!.choose("pan");
     // Nothing to choose: the frame keeps selecting, and so does what is shown.
     expect(f.controllers().drag!.get()).toEqual({ mode: "select", available: false });
-    await tick(5);
-    const commands = f.received.filter((m) => m.type === "command");
+    const commands = await f.got("command", 2);
     expect(commands.map(({ target, action, args }) => [target, action, args])).toEqual([
       ["drag", "choose", ["select"]],
       ["drag", "choose", ["pan"]],
@@ -311,8 +416,7 @@ describe("the controllers the host gets", () => {
     expect(c.pages!.next).toBeUndefined();
     let selected = false;
     void c.layouts!.select("A3").then(() => (selected = true));
-    await tick(5);
-    const commands = f.received.filter((m) => m.type === "command");
+    const commands = await f.got("command", 3);
     expect(commands.map(({ target, action, args }) => [target, action, args])).toEqual([
       ["layers", "setVisible", ["WALLS", false]],
       ["pages", "goTo", [2]],
@@ -320,7 +424,7 @@ describe("the controllers the host gets", () => {
     ]);
     expect(selected).toBe(false);
     await f.send({ type: "done", call: commands[2].call, ok: true });
-    expect(selected).toBe(true);
+    await until(() => expect(selected).toBe(true));
   });
 
   it("show an archive's member as a session of its own", async () => {
@@ -357,8 +461,7 @@ describe("the controllers the host gets", () => {
     media.setMuted(true);
     media.setRate(2);
     media.pause();
-    await tick(5);
-    const commands = f.received.filter((m) => m.type === "command");
+    const commands = await f.got("command", 6);
     expect(commands.map(({ target, action, args }) => [target, action, args])).toEqual([
       ["media", "play", []],
       ["media", "seek", [4]],
@@ -370,7 +473,7 @@ describe("the controllers the host gets", () => {
     // `play` resolves once the frame has tried.
     expect(played).toBe(false);
     await f.send({ type: "done", call: commands[0].call, ok: true });
-    expect(played).toBe(true);
+    await until(() => expect(played).toBe(true));
     await f.send({ type: "state", session: 0, key: "media", value: { ...MEDIA, paused: false, currentTime: 4 } });
     expect(media.get()).toMatchObject({ paused: false, currentTime: 4 });
     // A volume past 1 is no state of a player.
@@ -385,8 +488,8 @@ describe("the controllers the host gets", () => {
     const c = f.controllers().sheets!;
     expect(c.get()).toEqual(sheets);
     void c.select(1);
-    await tick(5);
-    expect(f.received.filter((m) => m.type === "command").map(({ target, action, args }) => [target, action, args])).toEqual([["sheets", "select", [1]]]);
+    const commands = await f.got("command");
+    expect(commands.map(({ target, action, args }) => [target, action, args])).toEqual([["sheets", "select", [1]]]);
     await f.send({ type: "state", session: 0, key: "sheets", value: { ...sheets, current: 1 } });
     expect(c.get().current).toBe(1);
   });
@@ -423,8 +526,7 @@ describe("pictures of pages", () => {
     expect(pictures.get()).toEqual(PAGE);
     const region = { x: 0.1, y: 0.1, width: 0.5, height: 0.5 };
     const drawn = pictures.raster(2, { width: 40, height: 20, region, fit: "cover", background: "transparent" });
-    await tick(5);
-    const [m] = asked(f);
+    const [m] = await f.got("raster");
     expect(m).toMatchObject({ type: "raster", session: 0, page: 2, options: { width: 40, height: 20, region, fit: "cover", background: "transparent" } });
     // An answer to nothing asked is dropped (and its bitmap freed); the one asked for resolves.
     const stray = new FakeBitmap(40, 20);
@@ -441,7 +543,7 @@ describe("pictures of pages", () => {
     await f.send({ type: "controllers", session: 0, values: { pictures: PAGE }, statics: {} });
     const pictures = f.controllers().pictures!;
     const drawn = pictures.render(2, 300);
-    await tick(5);
+    await f.got("raster");
     expect(asked(f)[0]).toMatchObject({ page: 2, options: { longEdge: 300 } });
     await f.send({ type: "rastered", id: asked(f)[0].id, result: { ok: false, code: "failed" } });
     expect(await drawn).toBeNull();
@@ -452,11 +554,12 @@ describe("pictures of pages", () => {
     await f.send({ type: "controllers", session: 0, values: { pictures: PAGE }, statics: {} });
     const pictures = f.controllers().pictures!;
     const code = async (options: Parameters<typeof pictures.raster>[1], answer: (id: number) => unknown) => {
+      const before = asked(f).length;
       const p = pictures.raster(1, options).then(
         () => "drawn",
         (e) => (e as { code: string }).code,
       );
-      await tick(5);
+      await f.got("raster", before + 1);
       await f.inject(answer(asked(f).at(-1).id));
       return p;
     };
@@ -484,11 +587,12 @@ describe("pictures of pages", () => {
     const pictures = f.controllers().pictures!;
     const abort = new AbortController();
     const drawn = pictures.raster(1, { longEdge: 100, signal: abort.signal }).catch((e) => e.code);
-    await tick(5);
-    const id = asked(f)[0].id;
+    const [{ id }] = await f.got("raster");
     abort.abort();
     expect(await drawn).toBe("aborted");
-    await tick(5);
+    await f.got("unraster");
+    // Told once: a second would arrive after the first.
+    await quiet();
     expect(f.received.filter((m) => m.type === "unraster")).toEqual([{ type: "unraster", id }]);
     const late = new FakeBitmap(100, 50);
     await f.inject(done(id, late));
@@ -507,7 +611,9 @@ describe("pictures of pages", () => {
     expect(await pictures.raster(100, { longEdge: 300 }).catch((e) => e.code)).toBe("invalid");
     const waiting = Array.from({ length: MAX_DRAWS }, (_, i) => pictures.raster(i + 1, { longEdge: 100 }).catch((e) => e.code));
     expect(await pictures.raster(50, { longEdge: 100 }).catch((e) => e.message)).toMatch(/more than 8 pictures/);
-    await tick(5);
+    await f.got("raster", MAX_DRAWS);
+    // The ninth, refused, would arrive after the eighth.
+    await quiet();
     expect(asked(f)).toHaveLength(MAX_DRAWS);
     f.session.destroy();
     expect(await Promise.all(waiting)).toEqual(Array(MAX_DRAWS).fill("aborted"));
@@ -523,7 +629,7 @@ describe("pictures of pages", () => {
     expect(asked(f)).toHaveLength(0);
     // jsdom has no canvas, so the encoding fails; the frame's bitmap is closed all the same.
     const blob = pictures.toBlob(1, { longEdge: 10 }).catch((e) => e.code);
-    await tick(5);
+    await f.got("raster");
     const bitmap = new FakeBitmap(10, 5);
     await f.inject(done(asked(f)[0].id, bitmap, { page: 1 }));
     expect(await blob).toBe("too-large");
@@ -551,7 +657,7 @@ describe("pictures of pages", () => {
       () => "drawn",
       (e) => e,
     );
-    await tick(5);
+    await f.got("raster");
     await f.send({ type: "rastered", id: asked(f)[0].id, result: { ok: false, code: "invalid" } });
     const error = await drawn;
     expect(error).toMatchObject({ name: "RasterError", code: "invalid" });
@@ -561,6 +667,7 @@ describe("pictures of pages", () => {
 describe("the viewport", () => {
   const VIEW = { space: "page", page: 2, region: { x: 0, y: 0.5, width: 1, height: 0.5 } };
   const told = (f: Frame) => f.received.filter((m) => m.type === "watch" || m.type === "unwatch");
+  const toldTimes = (f: Frame, count: number) => until(() => expect(told(f), `${count} messages of watch or unwatch`).toHaveLength(count));
 
   async function withViewport() {
     const f = await mount({}, "report.pdf");
@@ -580,24 +687,25 @@ describe("the viewport", () => {
     const store = f.controllers().viewport!;
     const seen: unknown[] = [];
     const a = store.subscribe((v) => seen.push(v));
-    await tick(5);
+    await toldTimes(f, 1);
     expect(told(f)).toEqual([{ type: "watch", session: 0, key: "viewport" }]);
     const b = store.subscribe(() => {});
     await f.send({ type: "state", session: 0, key: "viewport", value: VIEW });
     expect(seen).toEqual([VIEW]);
     a();
     a();
-    await tick(5);
+    // One listener is left: nothing is told.
+    await quiet();
     expect(told(f)).toHaveLength(1);
     b();
-    await tick(5);
+    await toldTimes(f, 2);
     expect(told(f)).toEqual([
       { type: "watch", session: 0, key: "viewport" },
       { type: "unwatch", session: 0, key: "viewport" },
     ]);
     // Followed again later: watched again.
     store.subscribe(() => {})();
-    await tick(5);
+    await toldTimes(f, 4);
     expect(told(f).map((m) => m.type)).toEqual(["watch", "unwatch", "watch", "unwatch"]);
   });
 
@@ -605,17 +713,17 @@ describe("the viewport", () => {
     const f = await withViewport();
     const store = f.controllers().viewport!;
     expect(store.get()).toBeNull();
-    await tick(5);
+    await toldTimes(f, 2);
     expect(told(f).map((m) => m.type)).toEqual(["watch", "unwatch"]);
     await f.send({ type: "state", session: 0, key: "viewport", value: VIEW });
     expect(store.get()).toEqual(VIEW);
-    await tick(5);
-    expect(told(f)).toHaveLength(4);
+    await toldTimes(f, 4);
     // While it is followed, a read asks for nothing more.
     const stop = store.subscribe(() => {});
     store.get();
     store.get();
-    await tick(5);
+    await toldTimes(f, 5);
+    await quiet();
     expect(told(f)).toHaveLength(5);
     stop();
   });
@@ -630,10 +738,12 @@ describe("the viewport", () => {
     // The new listener comes before the old one leaves.
     const stopSecond = second.subscribe(() => {});
     stopFirst();
-    await tick(5);
+    await toldTimes(f, 1);
+    // The first listener left with the second there: no unwatch.
+    await quiet();
     expect(told(f).map((m) => m.type)).toEqual(["watch"]);
     stopSecond();
-    await tick(5);
+    await toldTimes(f, 2);
     expect(told(f).map((m) => m.type)).toEqual(["watch", "unwatch"]);
   });
 
@@ -641,12 +751,13 @@ describe("the viewport", () => {
     const f = await withViewport();
     const store = f.controllers().viewport!;
     const stop = store.subscribe(() => {});
-    await tick(5);
+    await toldTimes(f, 1);
     f.session.destroy();
     stop();
     store.get();
     store.subscribe(() => {})();
-    await tick(5);
+    // Nothing more is told: a message would arrive after the first.
+    await quiet();
     expect(told(f).map((m) => m.type)).toEqual(["watch"]);
   });
 });
@@ -698,12 +809,11 @@ describe("the theme", () => {
     const open = f.received.find((m) => m.type === "open");
     expect(open.theme).toEqual({ tokens: { "--exav-viewer-text": "#123456", "--exav-viewer-radius": "4px" }, scheme: "dark" });
     viewer.restyle();
-    await tick(5);
-    expect(f.received.filter((m) => m.type === "theme")).toEqual([{ type: "theme", theme: open.theme }]);
+    expect(await f.got("theme")).toEqual([{ type: "theme", theme: open.theme }]);
     // A frame that has ended is not restyled.
     f.session.destroy();
     viewer.restyle();
-    await tick(5);
+    await quiet();
     expect(f.received.filter((m) => m.type === "theme")).toHaveLength(1);
   });
 
@@ -720,18 +830,42 @@ describe("links", () => {
     const open = vi.spyOn(window, "open").mockImplementation(() => null);
     const f = await mount({ confirmLink });
     for (const url of ["javascript:alert(1)", "/relative", "data:text/html,x", "file:///etc/passwd", "x".repeat(3000)]) await f.send({ type: "link", url });
+    // The question would be asked a step after the link is handled.
+    await quiet();
     expect(confirmLink).not.toHaveBeenCalled();
     await f.send({ type: "link", url: "https://example.com/a" });
+    await until(() => expect(confirmLink).toHaveBeenCalledTimes(1));
     await f.send({ type: "link", url: "https://example.com/b" });
+    await quiet();
     expect(confirmLink).toHaveBeenCalledTimes(1);
     expect(confirmLink.mock.calls[0]![0]).toBe("https://example.com/a");
     answer(true);
-    await tick(5);
-    expect(open).toHaveBeenCalledWith("https://example.com/a", "_blank", "noopener,noreferrer");
+    await until(() => expect(open).toHaveBeenCalledWith("https://example.com/a", "_blank", "noopener,noreferrer"));
     await f.send({ type: "link", url: "https://example.com/c" });
     answer(false);
-    await tick(5);
+    await quiet();
     expect(open).toHaveBeenCalledTimes(1);
+  });
+
+  it("to an email address open the mail program after the host's question", async () => {
+    const confirmLink = vi.fn(async (_url: string) => true);
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    const f = await mount({ confirmLink });
+    await f.send({ type: "link", url: "mailto:someone@example.com" });
+    await until(() => expect(open).toHaveBeenCalledWith("mailto:someone@example.com", "_blank", "noopener,noreferrer"));
+    expect(confirmLink.mock.calls[0]![0]).toBe("mailto:someone@example.com");
+  });
+
+  it("are asked about with the file on screen, the one the last replacement showed", async () => {
+    const confirmLink = vi.fn(async (_url: string, _file: ViewerFile) => false);
+    const f = await mount({ confirmLink });
+    const replaced = f.session.replace({ id: "f1", name: "next.dwg", source: { bytes: new Uint8Array([4, 5, 6]) } });
+    const [replacement] = await f.got("replace");
+    await f.send({ type: "replaced", call: replacement.call, ok: true });
+    expect(await replaced).toBe(true);
+    await f.send({ type: "link", url: "https://example.com/a" });
+    await until(() => expect(confirmLink).toHaveBeenCalledTimes(1));
+    expect(confirmLink.mock.calls[0]![1].name).toBe("next.dwg");
   });
 
   it("are dropped for a moment after each answer, so that a frame cannot ask again at once", async () => {
@@ -740,18 +874,16 @@ describe("links", () => {
     const confirmLink = vi.fn(async (_url: string) => false);
     const f = await mount({ confirmLink });
     await f.send({ type: "link", url: "https://example.com/a" });
-    await tick(5);
-    expect(confirmLink).toHaveBeenCalledTimes(1);
+    await until(() => expect(confirmLink).toHaveBeenCalledTimes(1));
     await f.send({ type: "link", url: "https://example.com/b" });
-    await tick(5);
     now += LINK_QUIET_MS - 1;
     await f.send({ type: "link", url: "https://example.com/c" });
-    await tick(5);
+    // The question would be asked a step after the link is handled.
+    await quiet();
     expect(confirmLink).toHaveBeenCalledTimes(1);
     now += 1;
     await f.send({ type: "link", url: "https://example.com/d" });
-    await tick(5);
-    expect(confirmLink).toHaveBeenCalledTimes(2);
+    await until(() => expect(confirmLink).toHaveBeenCalledTimes(2));
     expect(confirmLink.mock.calls[1]![0]).toBe("https://example.com/d");
   });
 
@@ -760,10 +892,9 @@ describe("links", () => {
     const confirmLink = vi.fn(async (_url: string) => false);
     const f = await mount({ confirmLink, linkQuietMs: 0 });
     await f.send({ type: "link", url: "https://example.com/a" });
-    await tick(5);
+    await until(() => expect(confirmLink).toHaveBeenCalledTimes(1));
     await f.send({ type: "link", url: "https://example.com/b" });
-    await tick(5);
-    expect(confirmLink).toHaveBeenCalledTimes(2);
+    await until(() => expect(confirmLink).toHaveBeenCalledTimes(2));
   });
 
   it("are dropped with no question unless the user just clicked or pressed a key", async () => {
@@ -773,12 +904,12 @@ describe("links", () => {
       const confirmLink = vi.fn(async (_url: string) => false);
       const f = await mount({ confirmLink, linkQuietMs: 0 });
       await f.send({ type: "link", url: "https://example.com/a" });
-      await tick(5);
+      // The question would be asked a step after the link is handled.
+      await quiet();
       expect(confirmLink).not.toHaveBeenCalled();
       activation.isActive = true;
       await f.send({ type: "link", url: "https://example.com/b" });
-      await tick(5);
-      expect(confirmLink).toHaveBeenCalledTimes(1);
+      await until(() => expect(confirmLink).toHaveBeenCalledTimes(1));
       expect(confirmLink.mock.calls[0]![0]).toBe("https://example.com/b");
     } finally {
       Reflect.deleteProperty(navigator, "userActivation");
@@ -789,7 +920,8 @@ describe("links", () => {
     const confirmLink = vi.fn(async (_url: string) => false);
     const f = await mount({ confirmLink });
     await f.send({ type: "link", url: "https://bank.example@evil.example/" });
-    await tick(5);
+    // The question would be asked a step after the link is handled.
+    await quiet();
     expect(confirmLink).not.toHaveBeenCalled();
   });
 });
@@ -845,18 +977,18 @@ describe("the files around the one shown", () => {
     opened.length = 0;
     const f = await mountTree();
     await f.send({ type: "fetch", id: 1, path: "site/title.dwg" });
-    expect([...new Uint8Array(answer(f, 1).data)]).toEqual([7, 8, 9]);
+    await until(() => expect([...new Uint8Array(answer(f, 1).data)]).toEqual([7, 8, 9]));
     // Not in the list, and not a path of the list in another spelling: never opened.
     await f.send({ type: "fetch", id: 2, path: "site/secret.dwg" });
     await f.send({ type: "fetch", id: 3, path: "SITE/TITLE.DWG" });
-    expect(answer(f, 2)).toEqual({ type: "bytes", id: 2, error: "refused" });
-    expect(answer(f, 3)).toEqual({ type: "bytes", id: 3, error: "refused" });
+    await until(() => expect(answer(f, 2)).toEqual({ type: "bytes", id: 2, error: "refused" }));
+    await until(() => expect(answer(f, 3)).toEqual({ type: "bytes", id: 3, error: "refused" }));
     expect(opened).toEqual(["site/title.dwg"]);
     // Listed and unreadable, or past the size the host reads for the frame.
     await f.send({ type: "fetch", id: 4, path: "site/gone.dwg" });
     await f.send({ type: "fetch", id: 5, path: "site/big.bin" });
-    expect(answer(f, 4)).toEqual({ type: "bytes", id: 4, error: "failed" });
-    expect(answer(f, 5)).toEqual({ type: "bytes", id: 5, error: "refused" });
+    await until(() => expect(answer(f, 4)).toEqual({ type: "bytes", id: 4, error: "failed" }));
+    await until(() => expect(answer(f, 5)).toEqual({ type: "bytes", id: 5, error: "refused" }));
   });
 
   it("are judged by the size they state before they are read, all fetches together", async () => {
@@ -870,23 +1002,55 @@ describe("the files around the one shown", () => {
     const f = await mountWith(createSandboxedViewer({ url: "https://frame.test/index.html" }), "a.dwg", true, { bytes: new Uint8Array([1]) }, null, sized);
     // Past the limit: refused without a byte read.
     await f.send({ type: "fetch", id: 1, path: "huge.bin" });
-    await tick(5);
-    expect(answer(f, 1)).toEqual({ type: "bytes", id: 1, error: "refused" });
+    await until(() => expect(answer(f, 1)).toEqual({ type: "bytes", id: 1, error: "refused" }));
     expect(read).not.toHaveBeenCalled();
     // Within it, read; another that would take the fetches together past it, refused while the first is read.
     await f.send({ type: "fetch", id: 2, path: "b.bin" });
-    await tick(5);
-    expect(read).toHaveBeenCalledTimes(1);
+    await until(() => expect(read).toHaveBeenCalledTimes(1));
     await f.send({ type: "fetch", id: 3, path: "c.bin" });
-    await tick(5);
-    expect(answer(f, 3)).toEqual({ type: "bytes", id: 3, error: "refused" });
+    await until(() => expect(answer(f, 3)).toEqual({ type: "bytes", id: 3, error: "refused" }));
     expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it("are read up to the limit when they state no size, all fetches together, and refused past it", async () => {
+    const MiB = 1024 * 1024;
+    const chunk = new Uint8Array(MiB);
+    const pulled: Record<string, number> = {};
+    // A file at an address with no Content-Length: endless, or of `size` MiB.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        const name = new URL(url).pathname.slice(1);
+        const size = name === "endless.bin" ? Infinity : 150;
+        pulled[name] = 0;
+        const body = new ReadableStream<Uint8Array>({
+          async pull(c) {
+            // Slow enough for two downloads to overlap.
+            await tick(1);
+            if (pulled[name]! >= size) return c.close();
+            pulled[name]! += 1;
+            c.enqueue(chunk);
+          },
+        });
+        return new Response(body, { status: 200 });
+      }),
+    );
+    const at: FileTree = { path: "a.dwg", paths: ["a.dwg", "endless.bin", "b.bin", "c.bin"], open: async (path) => ({ url: `https://files.test/${path}` }) };
+    const f = await mountWith(createSandboxedViewer({ url: "https://frame.test/index.html" }), "a.dwg", true, { bytes: new Uint8Array([1]) }, null, at);
+    await f.send({ type: "fetch", id: 1, path: "endless.bin" });
+    await until(() => expect(answer(f, 1)).toEqual({ type: "bytes", id: 1, error: "refused" }));
+    expect(pulled["endless.bin"]).toBeLessThan(TREE.maxFileBytes / MiB + 4);
+    // Two of 150 MiB: the second passes the limit with the first's bytes.
+    await f.send({ type: "fetch", id: 2, path: "b.bin" });
+    await f.send({ type: "fetch", id: 3, path: "c.bin" });
+    await until(() => expect([answer(f, 2), answer(f, 3)].every(Boolean)).toBe(true));
+    expect([answer(f, 2), answer(f, 3)].filter((m) => m.error === "refused")).toHaveLength(1);
   });
 
   it("are refused to a file that has none", async () => {
     const f = await mount();
     await f.send({ type: "fetch", id: 1, path: "site/title.dwg" });
-    expect(answer(f, 1)).toEqual({ type: "bytes", id: 1, error: "refused" });
+    await until(() => expect(answer(f, 1)).toEqual({ type: "bytes", id: 1, error: "refused" }));
   });
 
   it("are read once for an id in use, and no more once the fetch is cancelled", async () => {
@@ -894,14 +1058,17 @@ describe("the files around the one shown", () => {
     const slow: FileTree = { path: "a.dwg", paths: ["a.dwg", "b.dwg"], open: (_p, s) => (signals.push(s), new Promise(() => undefined)) };
     const f = await mountWith(createSandboxedViewer({ url: "https://frame.test/index.html" }), "a.dwg", true, { bytes: new Uint8Array([1]) }, null, slow);
     await f.send({ type: "fetch", id: 9, path: "b.dwg" });
+    await until(() => expect(signals).toHaveLength(1));
     await f.send({ type: "fetch", id: 9, path: "b.dwg" });
+    // A second read of the id would start a step after it is handled.
+    await quiet();
     expect(signals).toHaveLength(1);
     await f.send({ type: "cancel", id: 9 });
     expect(signals[0]!.aborted).toBe(true);
     // The ones that stay open are limited as reads are.
     for (let i = 0; i < READS.maxReads; i++) await f.send({ type: "fetch", id: 100 + i, path: "b.dwg" });
     await f.send({ type: "fetch", id: 200, path: "b.dwg" });
-    expect(answer(f, 200)).toEqual({ type: "bytes", id: 200, error: "refused" });
+    await until(() => expect(answer(f, 200)).toEqual({ type: "bytes", id: 200, error: "refused" }));
   });
 });
 
@@ -915,7 +1082,7 @@ describe("a file read by ranges", () => {
     };
     const f = await mount({}, "big.pdf", true, { ranges });
     await f.send({ type: "read", id: 1, generation: 0, offset: 0, length: kept.length });
-    await vi.waitFor(() => expect(answer(f, 1)).toBeTruthy());
+    await until(() => expect(answer(f, 1)).toBeTruthy());
     expect(kept.byteLength).toBe(200_000);
   });
 
@@ -937,40 +1104,59 @@ describe("a file read by ranges", () => {
       [4, 0, READS.maxLength + 1],
     ];
     for (const [id, offset, length] of refusals) await f.send({ type: "read", id, generation: 0, offset, length });
-    for (const [id] of refusals) expect(answer(f, id), String(id)).toEqual({ type: "bytes", id, error: "refused" });
+    for (const [id] of refusals) await until(() => expect(answer(f, id), String(id)).toEqual({ type: "bytes", id, error: "refused" }));
     expect(held.reads).toHaveLength(0);
 
     // As many bytes at once as the limit: the next is refused until one is answered.
     const big = READS.maxBytes / READS.maxLength;
     for (let i = 0; i < big; i++) await f.send({ type: "read", id: 10 + i, generation: 0, offset: (i + 1) * READS.maxLength, length: READS.maxLength });
-    expect(held.reads).toHaveLength(big);
+    await until(() => expect(held.reads).toHaveLength(big));
     await f.send({ type: "read", id: 20, generation: 0, offset: 0, length: 1 });
-    expect(answer(f, 20)).toEqual({ type: "bytes", id: 20, error: "refused" });
+    await until(() => expect(answer(f, 20)).toEqual({ type: "bytes", id: 20, error: "refused" }));
     held.reads[0]!.release();
-    await tick(5);
-    expect(same(answer(f, 10).data, pattern(READS.maxLength, READS.maxLength))).toBe(true);
+    await until(() => expect(same(answer(f, 10).data, pattern(READS.maxLength, READS.maxLength))).toBe(true));
     // As many reads at once as the limit.
     for (let i = 0; i < READS.maxReads - (big - 1); i++) await f.send({ type: "read", id: 30 + i, generation: 0, offset: 1000 + i, length: 1 });
     await f.send({ type: "read", id: 40, generation: 0, offset: 0, length: 1 });
-    expect(answer(f, 40)).toEqual({ type: "bytes", id: 40, error: "refused" });
+    await until(() => expect(answer(f, 40)).toEqual({ type: "bytes", id: 40, error: "refused" }));
     // An id in use is not read twice.
     await f.send({ type: "read", id: 30, generation: 0, offset: 5, length: 1 });
+    // A second read would start a step after the message is handled.
+    await quiet();
     expect(held.reads.filter((r) => r.offset === 5)).toHaveLength(0);
 
     // A cancelled read stops, and is answered.
     await f.send({ type: "cancel", id: 11 });
     expect(held.reads[1]!.signal.aborted).toBe(true);
-    expect(answer(f, 11)).toEqual({ type: "bytes", id: 11, error: "failed" });
-    // The session's end stops the rest.
+    await until(() => expect(answer(f, 11)).toEqual({ type: "bytes", id: 11, error: "failed" }));
+    // The session's end stops the rest: every read not answered yet.
     f.session.destroy();
-    expect(held.reads.every((r) => r.signal.aborted)).toBe(true);
+    expect(held.reads.slice(1).every((r) => r.signal.aborted)).toBe(true);
+  });
+
+  it("is read in a browser without AbortSignal.any, and its reads still end with the session", async () => {
+    const any = AbortSignal.any;
+    (AbortSignal as { any?: unknown }).any = undefined;
+    try {
+      const held = heldRanges(100 * 1024 * 1024);
+      const f = await mount({}, "big.pdf", true, { ranges: held.ranges });
+      await f.send({ type: "read", id: 1, generation: 0, offset: 10, length: 5 });
+      await f.send({ type: "read", id: 2, generation: 0, offset: 20, length: 5 });
+      await until(() => expect(held.reads).toHaveLength(2));
+      held.reads[0]!.release();
+      await until(() => expect(answer(f, 1).data.byteLength).toBe(5));
+      f.session.destroy();
+      expect(held.reads[1]!.signal.aborted).toBe(true);
+    } finally {
+      AbortSignal.any = any;
+    }
   });
 
   it("is the only file a read is answered for", async () => {
     const f = await mount();
     expect(f.received.find((m) => m.type === "open").source.kind).toBe("blob");
     await f.send({ type: "read", id: 1, generation: 0, offset: 0, length: 1 });
-    expect(answer(f, 1)).toEqual({ type: "bytes", id: 1, error: "refused" });
+    await until(() => expect(answer(f, 1)).toEqual({ type: "bytes", id: 1, error: "refused" }));
   });
 
   it("is read for the document it names: after a replacement the old one's reads are refused, and the new one's answered from its bytes", async () => {
@@ -979,23 +1165,22 @@ describe("a file read by ranges", () => {
     const second = heldRanges(size + 1);
     const f = await mount({}, "big.pdf", true, { ranges: first.ranges });
     const replacing = f.session.replace({ id: "f1", name: "big.pdf", source: { ranges: second.ranges } });
-    await tick(5);
-    const message = f.received.find((m) => m.type === "replace");
+    const [message] = await f.got("replace");
     expect(message).toMatchObject({ type: "replace", generation: 1, file: { name: "big.pdf", format: "pdf" }, source: { kind: "ranges", size: size + 1 } });
     // Both alive until the frame answers: the document being replaced is still drawn from its own bytes.
     await f.send({ type: "read", id: 1, generation: 0, offset: size - 5, length: 5 });
     await f.send({ type: "read", id: 2, generation: 1, offset: size, length: 1 });
-    expect(first.reads.map((r) => r.offset)).toEqual([size - 5]);
-    expect(second.reads.map((r) => r.offset)).toEqual([size]);
+    await until(() => expect(first.reads.map((r) => r.offset)).toEqual([size - 5]));
+    await until(() => expect(second.reads.map((r) => r.offset)).toEqual([size]));
     await f.send({ type: "replaced", call: message.call, ok: true });
     expect(await replacing).toBe(true);
     // Now only the new one: the old generation, and one that was never given, are refused.
     await f.send({ type: "read", id: 3, generation: 0, offset: 0, length: 1 });
     await f.send({ type: "read", id: 4, generation: 7, offset: 0, length: 1 });
-    expect(answer(f, 3)).toEqual({ type: "bytes", id: 3, error: "refused" });
-    expect(answer(f, 4)).toEqual({ type: "bytes", id: 4, error: "refused" });
+    await until(() => expect(answer(f, 3)).toEqual({ type: "bytes", id: 3, error: "refused" }));
+    await until(() => expect(answer(f, 4)).toEqual({ type: "bytes", id: 4, error: "refused" }));
     await f.send({ type: "read", id: 5, generation: 1, offset: size, length: 1 });
-    expect(second.reads.map((r) => r.offset)).toEqual([size, size]);
+    await until(() => expect(second.reads.map((r) => r.offset)).toEqual([size, size]));
     expect(first.reads.every((r) => r.signal.aborted === false)).toBe(true);
   });
 });
@@ -1030,8 +1215,7 @@ describe("highlights in the frame", () => {
     await f.send({ type: "controllers", session: 0, values: { highlights: { items: [], current: null } }, statics: {} });
     f.controllers().highlights!.set([{ text: "délai", label: "Délai" }]);
     f.controllers().highlights!.goTo("0");
-    await tick(5);
-    const commands = f.received.filter((m) => m.type === "command");
+    const commands = await f.got("command", 2);
     expect(commands.map(({ target, action, args }) => [target, action, args])).toEqual([
       ["highlights", "set", [[{ id: "0", text: "délai", label: "Délai" }]]],
       ["highlights", "goTo", ["0"]],
@@ -1049,8 +1233,7 @@ describe("replacing the document in the frame", () => {
     const f = await mount();
     const first = f.session.file;
     const done = f.session.replace({ ...next(), type: "image/vnd.dwg" });
-    await tick(5);
-    const [m] = replacements(f);
+    const [m] = await f.got("replace");
     expect(m).toMatchObject({ type: "replace", generation: 1, file: { name: "plan.dwg", type: "image/vnd.dwg", path: "plan.dwg", format: "dwg" }, source: { kind: "blob" } });
     // Not the session's file until the frame has taken it.
     expect(f.session.file).toBe(first);
@@ -1063,13 +1246,14 @@ describe("replacing the document in the frame", () => {
     const f = await mount();
     const first = f.session.file;
     const refused = f.session.replace(next());
-    await tick(5);
-    await f.send({ type: "replaced", call: replacements(f)[0].call, ok: false });
+    const [message] = await f.got("replace");
+    await f.send({ type: "replaced", call: message.call, ok: false });
     expect(await refused).toBe(false);
     expect(f.session.file).toBe(first);
     // Another format, or no bytes: the caller starts over, and the frame is not asked.
     expect(await f.session.replace({ id: "f1", name: "report.pdf", source: { bytes: new Uint8Array(1) } })).toBe(false);
     expect(await f.session.replace({ id: "f1", name: "plan.dwg", source: null })).toBe(false);
+    await quiet();
     expect(replacements(f)).toHaveLength(1);
   });
 
@@ -1078,7 +1262,7 @@ describe("replacing the document in the frame", () => {
     expect(await early.session.replace(next())).toBe(false);
     const f = await mount();
     const pending = f.session.replace(next());
-    await tick(5);
+    await f.got("replace");
     f.session.destroy();
     expect(await pending).toBe(false);
     expect(await f.session.replace(next())).toBe(false);
@@ -1087,15 +1271,16 @@ describe("replacing the document in the frame", () => {
   it("is one at a time: a newer call supersedes one still being read, and waits for one the frame has", async () => {
     const f = await mount();
     const one = f.session.replace(next("plan.dwg", [1]));
-    await tick(5);
+    await f.got("replace");
     expect(replacements(f)).toHaveLength(1);
     // Two more while the first is with the frame: only the last is sent after it.
     const two = f.session.replace(next("plan.dwg", [2]));
     const three = f.session.replace(next("plan.dwg", [3]));
-    await tick(5);
+    // A send of either would come a step after the file is read.
+    await quiet();
     expect(replacements(f)).toHaveLength(1);
     await f.send({ type: "replaced", call: replacements(f)[0].call, ok: true });
-    await tick(5);
+    await f.got("replace", 2);
     expect(replacements(f)).toHaveLength(2);
     await f.send({ type: "replaced", call: replacements(f)[1].call, ok: true });
     expect(await Promise.all([one, two, three])).toEqual([true, true, true]);
@@ -1111,9 +1296,10 @@ describe("replacing the document in the frame", () => {
     expect(f.received.find((m) => m.type === "open").source.kind).toBe("url");
     const blob = f.session.replace({ id: "f1", name: "a.png", source: { bytes: new Uint8Array([1]) } });
     expect(await blob).toBe(false);
+    await quiet();
     expect(replacements(f)).toHaveLength(0);
     const url = f.session.replace({ id: "f1", name: "a.png", source: { url: "https://media.test/b.png" } });
-    await tick(5);
+    await f.got("replace");
     expect(replacements(f)[0]).toMatchObject({ source: { kind: "url", url: "https://media.test/b.png" } });
     await f.send({ type: "replaced", call: replacements(f)[0].call, ok: true });
     expect(await url).toBe(true);
@@ -1148,11 +1334,14 @@ describe("delivery by URL", () => {
     // The page asked for nothing: a video given by its address is told by its name and type.
     expect(fetched).toEqual([]);
     expect(f.received.some((m) => m.type === "sniff")).toBe(false);
-    // Another origin, a URL with `init`, an image only the frame's decoders draw: read whole by the host.
+    // Another origin, a URL with `init`, an image only the frame's decoders
+    // draw, an address longer than the frame takes (a long signed URL): read
+    // whole by the host.
     for (const [name, source] of [
       ["clip.mp4", { url: "https://other.test/clip.mp4" }],
       ["clip.mp4", { url: `${MEDIA}/clip.mp4`, init: { headers: { authorization: "x" } } }],
       ["scan.tif", { url: `${MEDIA}/scan.tif` }],
+      ["clip.mp4", { url: `${MEDIA}/clip.mp4?sig=${"s".repeat(3000)}` }],
     ] as [string, FileSource][]) {
       f = await mount({ origins }, name, true, source, policy(origins));
       expect(f.received.find((m) => m.type === "open").source.kind, name).toBe("blob");
@@ -1270,8 +1459,7 @@ describe("a file whose bytes say one format and whose name says another", () => 
     sniffAnswer = "pdf";
     const f = await mount({}, "plan.dwg", false);
     await f.send({ type: "ready", protocol: PROTOCOL, policy: null, formats: ["dwg"] });
-    await tick(20);
-    expect(f.received.find((m) => m.type === "open")).toMatchObject({ file: { name: "plan.dwg", format: "dwg" } });
+    await until(() => expect(f.received.find((m) => m.type === "open")).toMatchObject({ file: { name: "plan.dwg", format: "dwg" } }));
     expect(f.session.format).toBe("dwg");
   });
 
@@ -1280,7 +1468,7 @@ describe("a file whose bytes say one format and whose name says another", () => 
     const replacements = () => f.received.filter((m) => m.type === "replace");
     const same = f.session.replace({ id: "f1", name: "b.png", source: { bytes: pdf } });
     // The detection runs in a worker: wait for its answer, not a set time.
-    await vi.waitFor(() => expect(replacements()[0]).toMatchObject({ file: { name: "b.png", format: "pdf" } }));
+    await until(() => expect(replacements()[0]).toMatchObject({ file: { name: "b.png", format: "pdf" } }));
     await f.send({ type: "replaced", call: replacements()[0].call, ok: true });
     expect(await same).toBe(true);
     // A picture named .pdf is another format than the document on show.
@@ -1304,11 +1492,12 @@ describe("a file whose bytes say one format and whose name says another", () => 
 
   it("asks the frame within sniffTimeoutMs, the name and the type deciding past it, and runs no detection of its own", async () => {
     sniffAnswer = "silent";
-    const f = await mount({ sniffTimeoutMs: 50 }, "plan.png", true, { bytes: pdf });
-    expect(f.received.find((m) => m.type === "sniff").sniff).toEqual({ timeoutMs: 50, bytes: 65536 });
+    // Long enough that a stalled process does not pass it before the check
+    // that no `open` came yet.
+    const f = await mount({ sniffTimeoutMs: 200 }, "plan.png", true, { bytes: pdf });
+    expect(f.received.find((m) => m.type === "sniff").sniff).toEqual({ timeoutMs: 200, bytes: 65536 });
     expect(f.received.some((m) => m.type === "open")).toBe(false);
-    await tick(80);
-    expect(f.received.find((m) => m.type === "open")).toMatchObject({ file: { name: "plan.png", format: "image" } });
+    await until(() => expect(f.received.find((m) => m.type === "open")).toMatchObject({ file: { name: "plan.png", format: "image" } }));
     expect(createSniffer).not.toHaveBeenCalled();
   });
 });

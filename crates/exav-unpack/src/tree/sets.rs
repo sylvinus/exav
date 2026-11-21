@@ -28,6 +28,9 @@ pub struct Rejoined {
     /// Why the set is not whole, when it is not: its parts are bytes of an
     /// archive nothing can read.
     pub incomplete: Option<Reason>,
+    /// `data` is a buffer the set made, not the bytes of one part as it was
+    /// read.
+    pub joined: bool,
 }
 
 impl Sets {
@@ -89,6 +92,7 @@ impl Sets {
             data: j.data,
             parts: j.parts,
             incomplete: None,
+            joined: true,
         });
         let unjoined = done.unjoined.into_iter().map(|u| Rejoined {
             parts: vec![u.name.clone()],
@@ -99,6 +103,7 @@ impl Sets {
                 text: why.to_string(),
                 at: String::new(),
             }),
+            joined: false,
         });
         joined.chain(unjoined)
     }

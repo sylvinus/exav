@@ -16,12 +16,12 @@ mod jpx;
 
 #[cfg(feature = "ccitt")]
 pub use ccitt::{CcittParams, decode_ccitt};
-#[cfg(feature = "jbig2")]
-pub use jbig2::decode_jbig2;
 #[cfg(all(feature = "jbig2", feature = "image"))]
 pub(crate) use jbig2::region_pixels;
 #[cfg(feature = "qr")]
 pub(crate) use jbig2::{declared_page_pixels, declared_pixels};
+#[cfg(feature = "jbig2")]
+pub use jbig2::{decode_jbig2, decode_jbig2_strict};
 #[cfg(feature = "jp2")]
 pub use jpx::{JpxImage, JpxParams, decode_jpx};
 

@@ -96,6 +96,7 @@ const CHECKS: &[(&str, Check)] = &[
     ("visio", Check::Zip),
     ("keynote", Check::Zip),
     ("numbers", Check::Zip),
+    ("pages", Check::Zip),
     ("archive", Check::Zip),
     ("pdf", Check::Pdf),
 ];

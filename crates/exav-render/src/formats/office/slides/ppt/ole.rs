@@ -10,14 +10,12 @@ use crate::formats::office::slides::limits::Budget;
 /// The object's compound file.
 fn storage(stg: &Rec, budget: &mut Budget) -> Result<Vec<u8>> {
     use crate::formats::office::slides::error::Error;
-    use std::io::Read;
     let max = budget.limits.max_part;
     let out = if stg.inst == 1 {
         let body = stg.data.get(4..).unwrap_or_default();
         let mut out = Vec::new();
-        let n = flate2::read::ZlibDecoder::new(body)
-            .take(max + 1)
-            .read_to_end(&mut out);
+        let mut z = flate2::read::ZlibDecoder::new(body);
+        let n = exav_unpack::source::read_capped(&mut z, &mut out, max + 1);
         if n.is_err() {
             return Ok(vec![]);
         }
@@ -60,13 +58,14 @@ mod tests {
     use crate::formats::office::slides::ppt::records::build::rec;
     use crate::formats::office::slides::ppt::records::read_at;
     use exav_unpack::cfb::build;
+    use exav_unpack::zip_write::{FileOptions, ZipWriter};
     use std::io::Write;
 
     const CHART: &str = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:chart="urn:oasis:names:tc:opendocument:xmlns:chart:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"><office:body><office:chart><chart:chart chart:class="chart:bar" svg:width="8cm" svg:height="6cm"><chart:plot-area table:cell-range-address="local-table.$A$1:.$B$2" chart:data-source-has-labels="both"><chart:axis chart:dimension="x" chart:name="primary-x"><chart:categories table:cell-range-address="local-table.$A$2:.$A$2"/></chart:axis><chart:axis chart:dimension="y" chart:name="primary-y"/><chart:series chart:values-cell-range-address="local-table.$B$2:.$B$2" chart:label-cell-address="local-table.$B$1" chart:class="chart:bar"/></chart:plot-area><table:table table:name="local-table"><table:table-header-rows><table:table-row><table:table-cell/><table:table-cell office:value-type="string"><text:p>Sales</text:p></table:table-cell></table:table-row></table:table-header-rows><table:table-rows><table:table-row><table:table-cell office:value-type="string"><text:p>Q1</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="42"><text:p>42</text:p></table:table-cell></table:table-row></table:table-rows></table:table></chart:chart></office:chart></office:body></office:document-content>"#;
 
     fn package(content: &str) -> Vec<u8> {
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let opts = zip::write::SimpleFileOptions::default();
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = FileOptions::default();
         z.start_file("content.xml", opts).unwrap();
         z.write_all(content.as_bytes()).unwrap();
         z.finish().unwrap().into_inner()

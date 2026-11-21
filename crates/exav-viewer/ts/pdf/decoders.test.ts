@@ -163,15 +163,19 @@ describe("JBIG2Decode and CCITTFaxDecode", () => {
   });
 
   it("fails where PDFium fails", async () => {
+    const empty = new Uint8Array(0);
+    expect(bilevel(await ours.jbig2, empty, 120, 64).failed).toBe(true);
+    expect(bilevel(await theirs.jbig2, empty, 120, 64).failed).toBe(true);
+  });
+
+  it("draws a white page where PDFium fails on symbols it lacks", async () => {
+    // Text regions without the symbols of their /JBIG2Globals: PDFium fails,
+    // hayro-jbig2 decodes the regions with no symbol to draw.
     const symbols = fixture("symbol.jbig2");
-    // Text regions without the symbols of their /JBIG2Globals; no data.
-    for (const [what, bytes] of [
-      ["no globals", symbols],
-      ["empty", new Uint8Array(0)],
-    ] as const) {
-      expect(bilevel(await ours.jbig2, bytes, 120, 64).failed, what).toBe(true);
-      expect(bilevel(await theirs.jbig2, bytes, 120, 64).failed, what).toBe(true);
-    }
+    expect(bilevel(await theirs.jbig2, symbols, 120, 64).failed).toBe(true);
+    const page = bilevel(await ours.jbig2, symbols, 120, 64);
+    expect(page.failed).toBe(false);
+    expect(page.data!.every((b) => b === 0xff)).toBe(true);
   });
 });
 

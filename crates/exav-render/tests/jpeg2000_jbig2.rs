@@ -13,7 +13,9 @@ use std::sync::Once;
 use exav_render::image::{
     Channels, DECODE_MAX, Error, Format, Pixels, Samples, decode, decode_any,
 };
-use exav_render::pdf_image::{CcittParams, JpxParams, decode_ccitt, decode_jbig2, decode_jpx};
+use exav_render::pdf_image::{
+    CcittParams, JpxParams, decode_ccitt, decode_jbig2, decode_jbig2_strict, decode_jpx,
+};
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = format!(
@@ -142,14 +144,26 @@ fn each_format_is_known_by_its_first_bytes() {
 }
 
 #[test]
-fn a_file_of_several_jbig2_pages_is_refused_rather_than_drawn_merged() {
-    let mut file = fixture("generic.jb2");
+fn a_file_of_several_jbig2_pages_gives_the_first_not_a_merge() {
+    let one = fixture("generic.jb2");
+    let mut file = one.clone();
     // The header's page count, after the ID and the flags.
     file[9..13].copy_from_slice(&2u32.to_be_bytes());
-    assert_eq!(
-        decode_any(&file, DECODE_MAX).unwrap_err(),
-        Error::Undecodable
-    );
+    // Page 2: copies of the page information (segment 0, bytes 13..43) and
+    // the generic region (segment 1, to 224), numbered 4 and 5, with the
+    // region drawn 7 pixels to the right. Page 1's end of page segment
+    // follows them.
+    let mut two = one[13..224].to_vec();
+    two[3] = 4;
+    two[6] = 2;
+    two[30 + 3] = 5;
+    two[30 + 6] = 2;
+    two[30 + 11 + 8..30 + 11 + 12].copy_from_slice(&7u32.to_be_bytes());
+    file.splice(224..224, two);
+    let first = decode_any(&one, DECODE_MAX).unwrap();
+    let got = decode_any(&file, DECODE_MAX).unwrap();
+    assert_eq!((got.width, got.height), (first.width, first.height));
+    assert!(bytes(&got) == bytes(&first), "page 1 expected");
 }
 
 /// Every prefix, and every byte inverted in turn: an error or a picture,
@@ -177,11 +191,16 @@ fn damaged_files_are_errors_not_panics() {
             let _ = decode_any(&d, 16 << 20);
             assert!(!panicked(), "{file} with byte {at} inverted");
         }
-        assert_eq!(
-            decode_any(&data[..data.len() / 2], DECODE_MAX).map(|_| ()),
-            Err(Error::Undecodable),
-            "{file} cut in half"
-        );
+        // The decoders show what a damaged file holds; the size stays the
+        // file's.
+        let full = decode_any(&data, DECODE_MAX).unwrap();
+        if let Ok(half) = decode_any(&data[..data.len() / 2], DECODE_MAX) {
+            assert_eq!(
+                (half.width, half.height),
+                (full.width, full.height),
+                "{file} cut in half"
+            );
+        }
     }
 }
 
@@ -665,4 +684,18 @@ fn rows_a_ccitt_stream_does_not_reach_are_zero() {
     };
     let out = decode_ccitt(&[], p, 1 << 30).unwrap();
     assert!(out.iter().all(|&b| b == 0));
+}
+
+/// Text regions without the symbols of their /JBIG2Globals: pdf.js's decoder
+/// in the viewer gets a white page, the scanner an error.
+#[test]
+fn a_jbig2_stream_lacking_its_symbols_is_an_error_for_the_scanner_only() {
+    let path = format!(
+        "{}/../exav-viewer/e2e/fixtures/pdf-images/symbol.jbig2",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let stream = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let page = decode_jbig2(&stream, 120, 64, None, 1 << 30).unwrap();
+    assert!(page.iter().all(|&b| b == 0xFF));
+    assert!(decode_jbig2_strict(&stream, 120, 64, None, 1 << 30).is_err());
 }

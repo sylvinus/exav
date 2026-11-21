@@ -6,7 +6,7 @@ mod props;
 mod table;
 mod text;
 
-use crate::formats::office::common::odf::{Attrs, Props, Styles};
+use crate::formats::office::common::odf::{self, Attrs, Props, Styles};
 use crate::formats::office::common::package::Zip;
 use crate::formats::office::common::xml::{self, Node};
 use crate::formats::office::docs::error::{Error, Result};
@@ -153,6 +153,7 @@ fn convert(
         .ok_or_else(|| Error::NotFormat("no text body".into()))?;
     o.collect_annotation_ends(body);
     o.body(body)?;
+    o.charge_styles()?;
     o.doc.settings.even_and_odd_headers = o.even_odd;
     Ok(o.doc)
 }
@@ -267,7 +268,8 @@ impl<'a> Odt<'a> {
         let mut cur = Some(name.to_string());
         let mut named: Option<String> = None;
         while let Some(n) = cur.take() {
-            if chain.len() > 32 {
+            // An automatic style met again (its own parent) ends the chain.
+            if chain.len() > 32 || chain.contains(&n) {
                 break;
             }
             let Some(def) = self.styles().get(family, &n) else {
@@ -325,22 +327,31 @@ impl<'a> Odt<'a> {
                 cur = def.parent.clone();
             }
         }
+        let base = self.base_size(family, named.as_deref());
         a.style = named.map(|n| self.style_id(family, &n));
         a.master = master.filter(|m| !m.is_empty());
         a.list_style = list_style.filter(|l| !l.is_empty());
         a.break_after = props.get("paragraph/fo:break-after") == Some("page");
-        let base = self.base_size(family, name);
         let rpr = props::run_props(&props, self.styles(), base);
         a.rpr = rpr;
         a.tabs = tabs;
         a.props = props;
         self.applied.insert(key, a.clone());
+        // Over the limit, the budget refuses what comes next, and the end of
+        // the conversion asks again.
+        let _ = self.charge_styles();
         a
     }
 
-    /// The font size (half points) percentages of `family`'s style refer to.
-    fn base_size(&self, family: &str, name: &str) -> u32 {
-        let p = self.styles().resolve(family, Some(name));
+    /// Charges the memory the resolved styles took to the budget.
+    fn charge_styles(&mut self) -> Result<()> {
+        self.b.alloc(self.cs.take_charge() + self.ms.take_charge())
+    }
+
+    /// The font size (half points) the percentages of a style refer to: the
+    /// size of its parent (the default style when it has none).
+    fn base_size(&self, family: &str, parent: Option<&str>) -> u32 {
+        let p = self.styles().resolve(family, parent);
         p.pt("text/fo:font-size")
             .map(|v| (v * 2.0) as u32)
             .filter(|v| *v > 0)
@@ -355,7 +366,7 @@ impl<'a> Odt<'a> {
             .get("paragraph")
             .cloned()
             .unwrap_or_default();
-        let dp = Props(dflt);
+        let dp = Props::from(dflt);
         let mut rpr = props::run_props(&dp, &self.cs, 24);
         if rpr.size.is_none() {
             rpr.size = Some(24);
@@ -385,8 +396,27 @@ impl<'a> Odt<'a> {
             let parent = def.parent.clone();
             let next = def.next.clone();
             let children = def.children.clone();
-            let props = Props(def.props.clone());
+            let mut raw = def.props.clone();
             let id = self.style_id(&family, &name);
+            // Named styles keep raw properties and the consumer inherits
+            // through `based_on`; a percentage margin is the one value that
+            // needs the parent's, so it is written as a length here.
+            if family == "paragraph" {
+                let own = Props::from(raw.clone());
+                let resolved = self.cs.resolve(&family, Some(&name));
+                for side in ["left", "right", "top", "bottom"] {
+                    let key = format!("paragraph/fo:margin-{side}");
+                    if own
+                        .margin("paragraph", side)
+                        .and_then(odf::percent)
+                        .is_some()
+                        && let Some(v) = resolved.get(&key).filter(|v| odf::percent(v).is_none())
+                    {
+                        raw.push((key, v.to_string()));
+                    }
+                }
+            }
+            let props = Props::from(raw);
             let display = def_attrs
                 .iter()
                 .find(|a| a.0 == "style:display-name")
@@ -409,13 +439,16 @@ impl<'a> Odt<'a> {
                 },
                 kind,
             );
+            let base = self.base_size(&family, parent.as_deref());
             st.based_on = parent.map(|p| self.style_id(&family, &p));
             st.next = next.map(|p| self.style_id(&family, &p));
-            let base = self.base_size(&family, &name);
             st.rpr = props::run_props(&props, &self.cs, base);
             if kind == StyleKind::Paragraph {
                 st.ppr = props::para_props(&props, false);
-                let left = props.twips("paragraph/fo:margin-left").unwrap_or(0);
+                let left = props
+                    .margin("paragraph", "left")
+                    .and_then(crate::formats::office::common::odf::twips)
+                    .unwrap_or(0);
                 st.ppr.tabs = props::tabs(&children, left);
                 if let Some(l) = def_attrs
                     .iter()
@@ -664,6 +697,7 @@ impl<'a> Odt<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::office::docs::limits::Limits;
 
     #[test]
     fn style_names_are_decoded() {
@@ -672,5 +706,157 @@ mod tests {
         assert_eq!(decode_name("plain"), "plain");
         assert_eq!(decode_name("a_zz_b"), "a_zz_b");
         assert_eq!(decode_name("_20"), "_20");
+    }
+
+    /// The first paragraph of a flat document whose automatic styles are
+    /// `styles`: a paragraph of style "C" holding one run.
+    fn paragraph_of(styles: &str) -> Para {
+        let x = format!(
+            r#"<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:mimetype="application/vnd.oasis.opendocument.text"><office:automatic-styles>{styles}</office:automatic-styles><office:body><office:text><text:p text:style-name="C">x</text:p></office:text></office:body></office:document>"#
+        );
+        let mut b = Budget::new(Limits::default());
+        let d = read_fodt(x.as_bytes(), &mut b).unwrap();
+        d.body
+            .iter()
+            .find_map(|b| match b {
+                Block::Para(p) => Some(p.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn first_run(p: &Para) -> &Run {
+        p.content
+            .iter()
+            .find_map(|i| match i {
+                Inline::Run(r) => Some(r),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_shorthand_of_a_style_replaces_the_sides_of_its_parent() {
+        let p = paragraph_of(
+            r##"<style:style style:name="P" style:family="paragraph"><style:paragraph-properties fo:border-left="2pt solid #ff0000" fo:border-top="2pt solid #ff0000"/></style:style><style:style style:name="C" style:family="paragraph" style:parent-style-name="P"><style:paragraph-properties fo:border="1pt solid #0000ff" fo:border-top="1pt solid #00ff00"/></style:style>"##,
+        );
+        let b = &p.props.borders;
+        let color = |s: &Option<Border>| s.as_ref().map(|b| b.color);
+        // The style's own side stays, the others are its shorthand.
+        assert_eq!(color(&b.top), Some(Color::Rgb(0x00FF00)));
+        assert_eq!(color(&b.left), Some(Color::Rgb(0x0000FF)));
+        assert_eq!(color(&b.right), Some(Color::Rgb(0x0000FF)));
+    }
+
+    #[test]
+    fn the_nearer_style_gives_the_colour_whichever_way() {
+        let p = paragraph_of(
+            r##"<style:style style:name="P" style:family="paragraph"><style:text-properties style:use-window-font-color="true"/></style:style><style:style style:name="C" style:family="paragraph" style:parent-style-name="P"><style:text-properties fo:color="#ff0000"/></style:style>"##,
+        );
+        assert_eq!(first_run(&p).props.color, Some(Color::Rgb(0xFF0000)));
+    }
+
+    #[test]
+    fn a_percentage_size_is_taken_of_the_size_of_the_parent_style() {
+        let p = paragraph_of(
+            r##"<style:style style:name="P" style:family="paragraph"><style:text-properties fo:font-size="20pt"/></style:style><style:style style:name="C" style:family="paragraph" style:parent-style-name="P"><style:text-properties fo:font-size="50%"/></style:style>"##,
+        );
+        assert_eq!(first_run(&p).props.size, Some(20));
+    }
+
+    #[test]
+    fn a_margin_shorthand_gives_the_four_margins_and_replaces_the_sides_of_the_parent() {
+        let p = paragraph_of(
+            r##"<style:style style:name="P" style:family="paragraph"><style:paragraph-properties fo:margin-left="2cm" fo:margin-top="2cm"/></style:style><style:style style:name="C" style:family="paragraph" style:parent-style-name="P"><style:paragraph-properties fo:margin="1cm" fo:margin-top="3cm"/></style:style>"##,
+        );
+        let p = &p.props;
+        // The style's own side stays, the others are its shorthand.
+        assert_eq!(p.space_before, Some(1701));
+        assert_eq!(p.ind_left, Some(567));
+        assert_eq!(p.ind_right, Some(567));
+        assert_eq!(p.space_after, Some(567));
+    }
+
+    #[test]
+    fn a_margin_percentage_is_taken_of_the_margin_of_the_parent_style() {
+        let p = paragraph_of(
+            r##"<style:style style:name="P" style:family="paragraph"><style:paragraph-properties fo:margin-left="2cm"/></style:style><style:style style:name="C" style:family="paragraph" style:parent-style-name="P"><style:paragraph-properties fo:margin="50%"/></style:style>"##,
+        );
+        assert_eq!(p.props.ind_left, Some(567));
+        // No margin to take it of: a percentage gives no margin.
+        assert_eq!(p.props.ind_right, None);
+    }
+
+    #[test]
+    fn a_margin_percentage_of_a_named_style_is_taken_of_the_margin_of_its_parent() {
+        let x = r#"<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:mimetype="application/vnd.oasis.opendocument.text"><office:styles><style:style style:name="P" style:family="paragraph"><style:paragraph-properties fo:margin-left="2cm"/></style:style><style:style style:name="C" style:family="paragraph" style:parent-style-name="P"><style:paragraph-properties fo:margin="50%"/></style:style></office:styles><office:body><office:text><text:p>x</text:p></office:text></office:body></office:document>"#;
+        let mut b = Budget::new(Limits::default());
+        let d = read_fodt(x.as_bytes(), &mut b).unwrap();
+        let c = d.styles.iter().find(|s| s.name == "C").unwrap();
+        assert_eq!(c.ppr.ind_left, Some(567));
+        // No margin to take it of: a percentage gives no margin.
+        assert_eq!(c.ppr.ind_right, None);
+    }
+
+    #[test]
+    fn a_font_family_of_the_asian_script_replaces_the_font_face_of_the_parent() {
+        let p = paragraph_of(
+            r##"<style:style style:name="P" style:family="paragraph"><style:text-properties style:font-name-asian="Mincho"/></style:style><style:style style:name="C" style:family="paragraph" style:parent-style-name="P"><style:text-properties style:font-family-asian="Gothic"/></style:style>"##,
+        );
+        assert_eq!(
+            first_run(&p).props.fonts.east_asia.as_deref(),
+            Some("Gothic")
+        );
+    }
+
+    #[test]
+    fn a_complex_script_percentage_size_is_taken_of_the_size_of_the_parent_style() {
+        let p = paragraph_of(
+            r##"<style:style style:name="P" style:family="paragraph"><style:text-properties style:font-size-complex="20pt"/></style:style><style:style style:name="C" style:family="paragraph" style:parent-style-name="P"><style:text-properties style:font-size-complex="50%"/></style:style>"##,
+        );
+        assert_eq!(first_run(&p).props.size_cs, Some(20));
+    }
+
+    #[test]
+    fn the_underline_attributes_go_together() {
+        let underline = |parent: &str, child: &str| {
+            let p = paragraph_of(&format!(
+                r##"<style:style style:name="P" style:family="paragraph"><style:text-properties {parent}/></style:style><style:style style:name="C" style:family="paragraph" style:parent-style-name="P"><style:text-properties {child}/></style:style>"##
+            ));
+            first_run(&p).props.underline
+        };
+        // A style drops the parent's type.
+        assert_eq!(
+            underline(
+                r#"style:text-underline-style="solid" style:text-underline-type="double""#,
+                r#"style:text-underline-style="solid""#
+            ),
+            Some("single")
+        );
+        // A type drops the parent's style, and with it the line.
+        assert_eq!(
+            underline(
+                r#"style:text-underline-style="solid""#,
+                r#"style:text-underline-type="double""#
+            ),
+            None
+        );
+        // A colour alone keeps the parent's line and changes its colour.
+        let p = paragraph_of(
+            r##"<style:style style:name="P" style:family="paragraph"><style:text-properties style:text-underline-style="solid" style:text-underline-color="#ff0000"/></style:style><style:style style:name="C" style:family="paragraph" style:parent-style-name="P"><style:text-properties style:text-underline-color="#0000ff"/></style:style>"##,
+        );
+        let r = &first_run(&p).props;
+        assert_eq!(r.underline, Some("single"));
+        assert_eq!(r.underline_color, Some(Color::Rgb(0x0000FF)));
+    }
+
+    #[test]
+    fn the_line_through_attributes_go_together() {
+        let p = paragraph_of(
+            r##"<style:style style:name="P" style:family="paragraph"><style:text-properties style:text-line-through-style="solid" style:text-line-through-type="double"/></style:style><style:style style:name="C" style:family="paragraph" style:parent-style-name="P"><style:text-properties style:text-line-through-style="solid"/></style:style>"##,
+        );
+        let r = &first_run(&p).props;
+        assert_eq!(r.strike, Some(true));
+        assert_eq!(r.dstrike, None);
     }
 }

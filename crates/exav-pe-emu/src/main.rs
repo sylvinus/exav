@@ -54,9 +54,11 @@ fn parse_args() -> Result<Opts, String> {
         trace: false,
         ticks: 120_000_000,
     };
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        // Flags are read as text; a path keeps its bytes.
+        let a = arg.to_string_lossy();
+        match a.as_ref() {
             "-h" | "--help" => return Err(String::new()),
             "-V" | "--version" => {
                 println!("exav-pe-emu {}", env!("CARGO_PKG_VERSION"));
@@ -70,13 +72,14 @@ fn parse_args() -> Result<Opts, String> {
                 o.ticks = args
                     .next()
                     .ok_or("--ticks needs a number")?
+                    .to_string_lossy()
                     .parse()
                     .map_err(|_| "--ticks needs a number")?
             }
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(format!("unknown option {other}"));
             }
-            other => o.files.push(other.into()),
+            _ => o.files.push(arg.clone().into()),
         }
     }
     if o.files.is_empty() {

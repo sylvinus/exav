@@ -11,7 +11,7 @@
 //! recovered image, a bounded run, and nothing invented when there is nothing
 //! to recover.
 
-use exav_unpack::{Budget, Format, Limits, extract, is_pepack};
+use exav_unpack::{Budget, Format, Limits, extract, is_pepack, walk};
 
 const IMAGE_BASE: u32 = 0x0040_0000;
 const DEST_RVA: u32 = 0x1000;
@@ -253,4 +253,113 @@ fn emulation_respects_the_extraction_budget() {
             e.data.len()
         );
     }
+}
+
+/// A stub that writes one byte to each of 21 pages of the image (84 KiB, past
+/// the floor for a partial reconstruction), waits `delay` instructions, then
+/// either jumps into what it wrote or spins.
+fn paging_stub(delay: u32, spin: bool) -> Vec<u8> {
+    let first = IMAGE_BASE + DEST_RVA + 0x800;
+    let mut stub: Vec<u8> = vec![0xb0, 0x90]; // mov al, 0x90
+    stub.push(0xbf); // mov edi, first
+    stub.extend_from_slice(&first.to_le_bytes());
+    stub.push(0xb9); // mov ecx, 21
+    stub.extend_from_slice(&21u32.to_le_bytes());
+    // mov [edi], al ; add edi, 0x1000 ; loop back
+    stub.extend_from_slice(&[0x88, 0x07, 0x81, 0xc7, 0x00, 0x10, 0x00, 0x00, 0xe2, 0xf6]);
+    stub.push(0xb9); // mov ecx, delay
+    stub.extend_from_slice(&delay.to_le_bytes());
+    stub.extend_from_slice(&[0xe2, 0xfe]); // loop $
+    if spin {
+        stub.extend_from_slice(&[0xeb, 0xfe]); // jmp $
+    } else {
+        let jmp_at = IMAGE_BASE + STUB_RVA + stub.len() as u32;
+        stub.push(0xe9);
+        stub.extend_from_slice(&first.wrapping_sub(jmp_at + 5).to_le_bytes());
+    }
+    stub
+}
+
+/// The names of the members a walk of `file` visited, and how it ended.
+fn walked(file: &[u8], limits: Limits) -> (Vec<String>, Result<Option<()>, exav_unpack::LimitHit>) {
+    let mut names = Vec::new();
+    let mut b = Budget::new(limits);
+    let end = walk::<()>(Format::PePacked, &file, &mut b, &mut |meta, _, _| {
+        names.push(meta.name.clone());
+        None
+    });
+    (names, end)
+}
+
+#[test]
+fn the_per_stub_budgets_have_their_defaults() {
+    let l = Limits::default();
+    assert_eq!(l.max_pe_stub_steps, 500_000_000);
+    assert_eq!(l.max_pe_idle_steps, 64_000_000);
+}
+
+/// A run the per-stub budget cuts short is not a clean scan: the partial image
+/// is still handed over, then the scan ends on the limit, named by its flag.
+#[test]
+fn a_stub_cut_by_the_stub_budget_is_limits_exceeded_with_its_partial_image_scanned() {
+    let file = packed_pe(&paging_stub(100_000, false), &[0; 0x8000]);
+    let mut limits = Limits::default();
+    limits.max_pe_stub_steps = 10_000;
+    let (names, end) = walked(&file, limits);
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].ends_with("-emulated-partial"), "{names:?}");
+    let hit = end.expect_err("the cut is a limit, not a clean scan");
+    assert!(!hit.is_corrupt());
+    assert!(hit.reason.contains("--max-pe-stub-steps"), "{}", hit.reason);
+
+    // The scan-wide budget, when it is the one that ran out, names its own flag.
+    let mut limits = Limits::default();
+    limits.max_pe_emulation_steps = 10_000;
+    let hit = walked(&file, limits).1.expect_err("a limit");
+    assert!(
+        hit.reason.contains("--max-pe-emulation-steps"),
+        "{}",
+        hit.reason
+    );
+}
+
+/// `off` (`u64::MAX`) lets the same stub run to its end, as the defaults do.
+#[test]
+fn off_lets_a_stub_reach_its_end() {
+    let file = packed_pe(&paging_stub(100_000, false), &[0; 0x8000]);
+    let mut limits = Limits::default();
+    limits.max_pe_stub_steps = u64::MAX;
+    limits.max_pe_idle_steps = u64::MAX;
+    let (names, end) = walked(&file, limits);
+    assert!(end.expect("no limit hit").is_none());
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].ends_with("-emulated"), "{names:?}");
+
+    let (names, end) = walked(&file, Limits::default());
+    assert!(end.expect("no limit hit").is_none());
+    assert!(names[0].ends_with("-emulated"), "{names:?}");
+}
+
+/// A stub that spins without writing a new page is stopped by the idle window,
+/// well before its step budget. That is not a limit reached: the partial image
+/// is scanned and the scan ends clean. Without the window the same stub runs
+/// into the step budget.
+#[test]
+fn a_tiny_idle_window_stops_a_stub_that_spins() {
+    let file = packed_pe(&paging_stub(1, true), &[0; 0x8000]);
+    let mut limits = Limits::default();
+    limits.max_pe_stub_steps = 200_000;
+    limits.max_pe_idle_steps = 5_000;
+    let (names, end) = walked(&file, limits);
+    assert!(end.expect("the idle window is not a limit hit").is_none());
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].ends_with("-emulated-partial"), "{names:?}");
+
+    let mut limits = Limits::default();
+    limits.max_pe_stub_steps = 200_000;
+    limits.max_pe_idle_steps = u64::MAX;
+    let hit = walked(&file, limits)
+        .1
+        .expect_err("the step budget ends it");
+    assert!(hit.reason.contains("--max-pe-stub-steps"), "{}", hit.reason);
 }

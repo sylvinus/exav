@@ -12,9 +12,9 @@ homepage = "https://exav.org"
 # Checked by `make msrv` rather than asserted: a floor nothing verifies drifts.
 #
 # The number is set by dependencies, not by this code: exav-unpack's LHA reader
-# delharc 0.8 declares 1.95 (if-let guards), `sevenz-rust2` 0.24 1.93,
-# exav-render's image decoders hayro-jpeg2000 0.4, hayro-jbig2 0.3.1 and
-# hayro-ccitt 0.4 1.92, and `yara-x-parser` 1.91, so cargo refuses to build them
+# delharc 0.8 declares 1.95 (if-let guards), `sevenz-rust2` 0.25 1.93,
+# exav-render's image decoders hayro-jpeg2000 0.5, hayro-jbig2 0.4 and
+# hayro-ccitt 0.5 1.92, and `yara-x-parser` 1.91, so cargo refuses to build them
 # on anything older. exav's own source needs only 1.88 (`slice::as_chunks`,
 # `is_multiple_of`, and the let-chains the `zip` dependency uses). Worth
 # rechecking when those dependencies move; lowering it means confirming with

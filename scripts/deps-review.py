@@ -157,13 +157,16 @@ class Graph:
 
 _BLOCK = re.compile(r"/\*.*?\*/", re.S)
 _LINE = re.compile(r"//.*$", re.M)
-_UNSAFE = re.compile(r"\bunsafe\b")
+# The `unsafe` keyword, and what the `unsafe_code` lint flags without it in
+# edition 2021 code. A plain `extern` block is not counted: calling what it
+# declares needs `unsafe`.
+_UNSAFE = re.compile(r"\bunsafe\b|#\[\s*(?:no_mangle|export_name|link_section)\b|\bglobal_asm!")
 _FORBID = re.compile(r"#!\[(forbid|deny)\(\s*unsafe_code\s*\)\]")
 _GATED = re.compile(r"#!\[cfg_attr\(([^\]]*?),\s*(?:forbid|deny)\(\s*unsafe_code\s*\)\s*\)\]", re.S)
 
 
 def unsafe_uses(pkg):
-    """(count of the `unsafe` keyword in src/ with comments stripped, how it is forbidden).
+    """(count of `_UNSAFE` in src/ with comments stripped, how it is forbidden).
 
     The second is "", "forbid", "deny", or "forbid when <cfg>" for a crate that forbids
     it only under a condition (its SIMD feature off): then the count is code

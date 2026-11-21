@@ -28,7 +28,10 @@ exav-fuzz-support = { path = "support" }
 # `image-hash` is `fuzzy_img#` subsignatures. `visible-text` (and `-pdf`) is a
 # document's text view.
 exav-core = { path = "../crates/exav-core", default-features = false, features = ["unstable-internals", "all-formats", "decrypt", "dlp", "phishing", "yara", "image-hash", "visible-text", "visible-text-pdf", "visible-text-office", "checksums"] }
-exav-unpack = { path = "../crates/exav-unpack", default-features = false, features = ["all-formats", "decrypt", "checksums"] }
+exav-unpack = { path = "../crates/exav-unpack", default-features = false, features = ["all-formats", "decrypt", "checksums", "zip-write"] }
+# The reader the scanner takes a PDF's text from, run against exav-unpack's own
+# (the `pdf_readers` target). The version the scanner builds.
+hayro-syntax = "=0.9.0"
 # The clamd and ICAP parsers, over memory (`exav_cli::fuzzing`): the source of
 # the `exav` binary built as a library, which `exav` itself does not ship.
 exav-cli = { path = "exav-cli" }
@@ -54,8 +57,6 @@ exav-imagehash = { path = "../crates/exav-imagehash", default-features = false, 
 # writer the PPT and DOC targets store their input with.
 exav-render = { path = "../crates/exav-render", default-features = false, features = ["dwg", "image", "raw", "jp2", "jbig2", "ccitt", "jxl", "ifc", "stl", "obj", "ply", "gltf", "markdown", "text-pdf", "text-office", "office", "office-test-util"] }
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder"] }
-# `zip` wraps the Numbers target's input and reads the XLSX back.
-zip = { version = ">=9.0.5, <9.1", default-features = false, features = ["deflate-flate2"] }
 
 # Keep fuzz binaries debuggable while optimized.
 [profile.release]
@@ -432,6 +433,13 @@ bench = false
 [[bin]]
 name = "docs_pages"
 path = "fuzz_targets/docs_pages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pdf_readers"
+path = "fuzz_targets/pdf_readers.rs"
 test = false
 doc = false
 bench = false

@@ -354,3 +354,38 @@ fn stdin_gets_the_options_a_file_gets() {
         assert_eq!(code, 1, "{how}: {out}");
     }
 }
+
+/// A RAR archive with an encrypted member and a member whose dictionary is
+/// over the object limit: a limit reported as found beats password protection, whichever way
+/// the archive arrives and in `--all-matches`; without it the scan is
+/// `PASSWORD-PROTECTED`.
+#[test]
+fn a_limit_reported_as_found_beats_password_protection() {
+    let sigs = sig_dir();
+    let blob = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../exav-core/tests/fixtures/rar_locked_and_over_limit.rar"
+    ))
+    .unwrap();
+    let limit = ["--max-object-bytes", "4096", "--spill-dir", "off"];
+    let alert = "Heuristics.Limits.Exceeded.MaxFileSize FOUND";
+    let found = [&limit[..], &["--partial-as", "limits-exceeded=found"]].concat();
+    for extra in [&[][..], &["--all-matches"]] {
+        for (how, code, out) in cli_verdicts(sigs.path(), &blob, &[&found[..], extra].concat()) {
+            assert!(out.contains(alert), "{how} {extra:?}: {out}");
+            assert_eq!(code, 1, "{how} {extra:?}: {out}");
+        }
+    }
+    for (how, code, out) in cli_verdicts(sigs.path(), &blob, &limit) {
+        assert!(out.contains("PASSWORD-PROTECTED"), "{how}: {out}");
+        assert_eq!(code, 3, "{how}: {out}");
+    }
+
+    let d = Daemon::start(sigs.path(), &found);
+    let f = d._dir.path().join("locked.rar");
+    std::fs::write(&f, &blob).unwrap();
+    for verb in ["SCAN", "ALLMATCHSCAN"] {
+        let out = d.command(&format!("{verb} {}", f.display()));
+        assert!(out.contains(alert), "{verb}: {out}");
+    }
+}

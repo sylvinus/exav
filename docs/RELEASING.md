@@ -48,8 +48,17 @@ rewritten at the end of this step.
 - `make test`: the native matrix, wasm32, the JS suites, the viewer (vitest,
   package, gates, playwright) and the site. `make test-native` alone is the
   Rust half. Read the output for skipped suites: a test that needs a tool that
-  is missing reports green having checked nothing (`make test-yara-diff` is the
-  one to name).
+  is missing reports green having checked nothing. `make test-yara-diff` fails
+  instead, so run it with yara-x's `yr` and the rule corpus
+  (`EXAV_DEBUG_YARA_CORPUS`).
+- The viewer on every file of its demo: `make test-viewer` runs
+  `e2e/examples.spec.ts`, which opens each example and each sidebar sample in
+  headless Chromium, in the sandboxed frame and in the page, and fails on a
+  file that is not shown (an "unsupported" one that is), on an error in the
+  console and on a policy violation. CI runs the frame's half only
+  (`EXAV_EXAMPLES_MODES=sandbox`), so the page's half is run here. Its list is the demo's
+  (`demo/examples/examples.json`, exav-samples' `viewer/samples.json`): a
+  file added there is tested with the next run.
 - `scripts/check-features.sh`: each format feature of `exav-unpack` builds
   alone.
 - `make av-audit` when fixtures changed (no EICAR literal committed unmasked).
@@ -144,15 +153,47 @@ plugged in (a laptop on battery runs slower) and doing nothing else:
   clippy, the tests, the MSRV, the package contents, that the manifests of the
   packages with a binary carry the workspace's `[profile.release]` and
   `[profile.fast-build]` (the script copies them in, as `cargo install` reads
-  only a package's own), that the published tarballs build on their own, and
-  that no EICAR literal is in a tarball or in the tracked tree. It stops for a
-  human before the first upload.
+  only a package's own), that the published tarballs build on their own, that
+  no crate tarball or the binary built from them holds a path of the machine
+  (see below), and that no EICAR literal is in a tarball or in the tracked
+  tree. It stops for a human before the first upload.
 - Tag `vX.Y.Z` and push the tag: `.github/workflows/release.yml` builds the
-  binaries and the npm tarball, `docker.yml` the image. The npm packages are
-  published from their crate directories, not from `pkg/`.
+  binaries, the WASI module and the two npm tarballs (`@exav/unpack-wasm`,
+  `@exav/viewer`), `docker.yml` the image. The npm packages are published from
+  those tarballs, downloaded from the release page, and never built or packed
+  on another machine, so that npm and the release carry the same bytes:
+  `npm publish exav-unpack-wasm-X.Y.Z.tgz`, then `npm publish
+  exav-viewer-X.Y.Z.tgz` (the workflow ran the `prepublishOnly` checks of both
+  before packing; publishing a tarball does not run them).
 - After: install from the registry in a clean directory (`cargo install exav`,
   `npm install @exav/viewer`), run `exav --version` and scan the EICAR test
-  file; check the release page's assets and the image.
+  file; check the release page's assets and the image. Each npm package is the
+  release's tarball: `npm pack @exav/viewer@X.Y.Z` in a clean directory gives a
+  file `cmp` finds identical to the asset.
+
+No build path in a released file: every build of one maps the checkout, the
+cargo home and the rustup home to `/exav`, `/cargo` and `/rustup`
+(`scripts/build-flags.sh` prints the `RUSTFLAGS`; `release.sh`, the workflows,
+`npm run build` in `crates/exav-unpack-wasm`, `crates/exav-viewer/scripts/build-wasm.sh`
+and `stats.py candidate` use it). Cargo's `trim-paths` is not stable in any
+Cargo up to 1.99, the MSRV is 1.95. `scripts/check-build-paths.py` refuses a
+file that holds `/Users/`, `/home/`, `C:\Users\` or this machine's checkout,
+cargo home, rustup home or home directory, looking inside archives (tarballs,
+zips, a saved image); `--source` is for crate tarballs, whose tests name
+`/home/x` as an example. It runs in `release.sh` (the crates and the binary built
+from them), in the release workflow (the archives of the binaries before the first
+upload, the npm tarballs and the WASI module), in `docker.yml` (the binaries the
+image is made of, in the job that builds them and in the one that pushes) and in
+`helm.yml` (the chart). A build made by hand without the flags fails it. The
+viewer ships three wasm parsers of `@silurus/ooxml` and pdf.js's worker as they
+were published, and the gate lists them by name (`--except`); a new version of
+either that holds a path of its own is a decision, not a gate to loosen.
+`scripts/test-build-paths.sh` tests the script (it is in `make test-native`).
+- Once the site is deployed, the viewer again on every file of the demo, as
+  the deployed server sends them (its headers and compression are not the
+  preview server's): from `crates/exav-viewer`, with the demo's files copied
+  in (`npm run demo:showcase`, `npm run demo:examples`),
+  `E2E_BASE_URL=https://exav.org/viewer/demo/ npx playwright test e2e/examples.spec.ts --project=chromium`.
 
 ## 10. Stats
 

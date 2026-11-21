@@ -153,6 +153,59 @@ fn a_split_archive_in_a_directory_is_rejoined_and_reported() {
     assert_eq!(archive["status"], "FOUND", "{objs:#?}");
 }
 
+/// `--all-matches` lists every signature the archive of a set matches, where a
+/// scan without it reports the first. Each part holds half of each marker, so
+/// only the rejoin finds them.
+#[test]
+fn all_matches_lists_every_signature_of_a_split_archive() {
+    let db = TempDir::new().unwrap();
+    std::fs::write(
+        db.path().join("two.ndb"),
+        "Test.Alpha:0:*:6e6565646c652d616c706861\nTest.Beta:0:*:6e6565646c652d62657461\n",
+    )
+    .unwrap();
+    let dir = TempDir::new().unwrap();
+    let blob = zip_with("payload.txt", b"needle-alpha and needle-beta");
+    let at = |marker: &[u8]| {
+        blob.windows(marker.len())
+            .position(|w| w == marker)
+            .unwrap()
+    };
+    let (a, b) = (at(b"needle-alpha") + 6, at(b"needle-beta") + 6);
+    for (i, part) in [&blob[..a], &blob[a..b], &blob[b..]].iter().enumerate() {
+        std::fs::write(dir.path().join(format!("m.zip.{:03}", i + 1)), part).unwrap();
+    }
+    let scan = |extra: &[&str]| -> serde_json::Value {
+        let out = exav()
+            .arg("-d")
+            .arg(db.path())
+            .arg("--json")
+            .args(extra)
+            .arg(dir.path())
+            .output()
+            .expect("run exav");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|o| o["file"].as_str().unwrap_or("").ends_with("/m.zip"))
+            .unwrap_or_else(|| panic!("no line for the archive: {stdout}"))
+    };
+    let first = scan(&[]);
+    assert_eq!(first["status"], "FOUND", "{first}");
+    assert!(first["signature"].as_str().unwrap().starts_with("Test."));
+    assert!(first.get("signatures").is_none(), "{first}");
+    let all = scan(&["--all-matches"]);
+    let mut sigs: Vec<&str> = all["signatures"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no signatures: {all}"))
+        .iter()
+        .map(|s| s["signature"].as_str().unwrap())
+        .collect();
+    sigs.sort();
+    assert_eq!(sigs, ["Test.Alpha", "Test.Beta"], "{all}");
+}
+
 #[test]
 fn a_set_with_a_hole_is_reported_never_clean() {
     // Its bytes belong to an archive nothing can now read, not us, not the tool

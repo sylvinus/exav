@@ -301,12 +301,12 @@ mod tests {
     fn archive() -> (Vec<u8>, usize, usize) {
         use std::io::Write;
         let mut buf = std::io::Cursor::new(Vec::new());
-        let mut zip = ::zip::ZipWriter::new(&mut buf);
-        let stored = ::zip::write::SimpleFileOptions::default()
-            .compression_method(::zip::CompressionMethod::Stored);
+        let mut zip = crate::zip_write::ZipWriter::new(&mut buf);
+        let stored =
+            crate::zip_write::FileOptions::default().method(crate::zip_write::Method::Stored);
         for (name, n) in [("a.bin", 3000), ("b.txt", 10), ("c/d.bin", 5000)] {
             let opts = match name {
-                "b.txt" => ::zip::write::SimpleFileOptions::default(),
+                "b.txt" => crate::zip_write::FileOptions::default(),
                 _ => stored,
             };
             zip.start_file(name, opts).unwrap();

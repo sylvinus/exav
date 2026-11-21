@@ -128,6 +128,8 @@ sets each; the crate's, the command's and the WebAssembly package's are under
 | recursion depth | archives inside archives | `--max-unpack-depth` 16 |
 | matcher bytes | bytes fed to the matcher across the tree, a CPU bound | `--max-matcher-bytes` 10G |
 | emulation steps | instructions the PE unpacking emulator runs across the tree | `--max-pe-emulation-steps` 1,000,000,000 |
+| emulation steps per stub | instructions one packed executable's stub may run | `--max-pe-stub-steps` 500,000,000 |
+| idle steps | instructions a stub may run without writing a new page | `--max-pe-idle-steps` 64,000,000 |
 
 Reserving first keeps the peak bounded: a "1 GB from 4 KB" member never
 allocates 1 GB and then gets rejected.

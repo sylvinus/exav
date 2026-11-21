@@ -11,7 +11,7 @@
 //! above a floor. Both numbers are what the emulator does today, so any change
 //! that loses a packer fails here rather than in a campaign three weeks later.
 //!
-//! Marked `#[ignore]`: running 69 stubs to completion takes minutes, which does
+//! Marked `#[ignore]`: running every stub to completion takes minutes, which does
 //! not belong in a suite people run on every edit. Run it after touching the
 //! emulator:
 //!
@@ -19,7 +19,7 @@
 //! cargo test --release -p exav-unpack --test all -- --ignored pe_emulation_corpus
 //! ```
 
-use exav_unpack::{Budget, Format, Limits, extract};
+use exav_unpack::{Budget, Format, Limits, read_entry, walk};
 use std::path::{Path, PathBuf};
 
 /// Packers where every sample is expected to yield a reconstructed image.
@@ -27,6 +27,7 @@ const MUST_UNPACK: &[&str] = &[
     "ASPack",
     "BeRoEXEPacker",
     "EXpressor",
+    "Exe32pack",
     "FSG",
     "MEW",
     "MPRESS",
@@ -34,6 +35,7 @@ const MUST_UNPACK: &[&str] = &[
     "NSPack",
     "Neolite",
     "PECompact",
+    "PEtite",
     "Packman",
     "RLPack",
     "UPX",
@@ -41,14 +43,34 @@ const MUST_UNPACK: &[&str] = &[
     "Yoda-Crypter",
 ];
 
-/// Fraction of *all* samples that must come back as a complete image. Below the
-/// 78% measured over 276 samples from 23 packers, to leave room for the sample
-/// set changing without turning this into noise.
+/// Packers where every sample must give a member named `<name>-emulated`: the
+/// stub ran to the program's start, which is stricter than a full-size image
+/// (`-emulated-partial` and allocation members do not count).
+const MUST_REACH_START: &[&str] = &[
+    "ASPack",
+    "Alienyze",
+    "BeRoEXEPacker",
+    "EXpressor",
+    "Exe32pack",
+    "FSG",
+    "MPRESS",
+    "Molebox",
+    "NSPack",
+    "PECompact",
+    "PEtite",
+    "Packman",
+    "UPX",
+    "Yoda-Crypter",
+];
+
+/// Fraction of *all* samples that must come back as a complete image: what 276
+/// samples from 23 packers gave (234 of them, 84.8%), rounded down to two
+/// digits.
 ///
-/// The per-packer list above is the sharper check: those packers work on every
-/// sample, so one failure there is a regression, where a percentage point of
-/// the total is drift.
-const FLOOR: f64 = 0.70;
+/// The per-packer lists above are the sharper check: those packers work on
+/// every sample, so one failure there is a regression, where a percentage point
+/// of the total is drift.
+const FLOOR: f64 = 0.84;
 
 fn corpus() -> Option<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -57,23 +79,32 @@ fn corpus() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-/// Run one sample through the unpacker exactly as the scanner would, returning
-/// the largest member it produced.
+/// Run one sample through the unpacker exactly as the scanner would: every
+/// member the walk handed over counts, including those of a run a budget cut
+/// short, which the scan examines before it ends on the limit. Returns the
+/// largest member's size and whether a member named `<name>-emulated` came
+/// back, which is the stub having reached the program's start (not
+/// `-emulated-partial`, not an allocation member).
 ///
 /// Size is the check that matters, not merely "a member came back". A packed
 /// file decompresses to *more* than it occupies on disk, so a recovered image
 /// smaller than the input is a run that stopped part-way, which is exactly how
 /// a too-eager entry-point heuristic fails: it reports success while handing
 /// back a half-decompressed image.
-fn largest_recovered(file: &[u8]) -> usize {
+fn run_sample(file: &[u8]) -> (usize, bool) {
     let mut limits = Limits::default();
     limits.max_extracted_bytes = 1 << 30;
     limits.max_buffer_bytes = 1 << 30;
     let mut b = Budget::new(limits);
-    match extract(Format::PePacked, &file, &mut b) {
-        Ok(entries) => entries.iter().map(|e| e.data.len()).max().unwrap_or(0),
-        Err(_) => 0,
-    }
+    let (mut largest, mut reached_start) = (0usize, false);
+    let _ = walk::<()>(Format::PePacked, &file, &mut b, &mut |meta, content, b| {
+        reached_start |= meta.name.ends_with("-emulated");
+        if let Ok(e) = read_entry(meta, content, b) {
+            largest = largest.max(e.data.len());
+        }
+        None
+    });
+    (largest, reached_start)
 }
 
 #[test]
@@ -86,6 +117,8 @@ fn real_packed_samples_still_unpack() {
     let mut total = 0usize;
     let mut recovered = 0usize;
     let mut regressions: Vec<String> = Vec::new();
+    let mut lost_start: Vec<String> = Vec::new();
+    let mut reached = 0usize;
 
     let mut packers: Vec<_> = std::fs::read_dir(&root)
         .expect("read corpus/packers")
@@ -94,9 +127,13 @@ fn real_packed_samples_still_unpack() {
         .collect();
     packers.sort_by_key(|e| e.file_name());
 
+    let started = std::time::Instant::now();
     for packer in packers {
         let name = packer.file_name().to_string_lossy().to_string();
         let must = MUST_UNPACK.contains(&name.as_str());
+        let must_start = MUST_REACH_START.contains(&name.as_str());
+        let (mut seen, mut done, mut started_at) = (0usize, 0usize, 0usize);
+        let packer_started = std::time::Instant::now();
         for sample in std::fs::read_dir(packer.path()).expect("read packer dir") {
             let Ok(sample) = sample else { continue };
             let Ok(data) = std::fs::read(sample.path()) else {
@@ -106,9 +143,17 @@ fn real_packed_samples_still_unpack() {
                 continue;
             }
             total += 1;
-            let biggest = largest_recovered(&data);
+            seen += 1;
+            let (biggest, reached_start) = run_sample(&data);
             if biggest >= data.len() {
                 recovered += 1;
+                done += 1;
+            }
+            if reached_start {
+                reached += 1;
+                started_at += 1;
+            } else if must_start {
+                lost_start.push(format!("{name}/{}", sample.file_name().to_string_lossy()));
             }
             if must && biggest < data.len() {
                 regressions.push(format!(
@@ -118,12 +163,24 @@ fn real_packed_samples_still_unpack() {
                 ));
             }
         }
+        eprintln!(
+            "{name:<16} {done:>2}/{seen:<2} start {started_at:>2}/{seen:<2} {:>6} ms",
+            packer_started.elapsed().as_millis()
+        );
     }
+    eprintln!(
+        "all: {recovered}/{total} start {reached}/{total} in {} ms",
+        started.elapsed().as_millis()
+    );
 
     assert!(total > 0, "corpus/packers exists but holds no PE samples");
     assert!(
         regressions.is_empty(),
         "packers that used to give back a full image no longer do: {regressions:?}"
+    );
+    assert!(
+        lost_start.is_empty(),
+        "packers whose every sample used to reach the program's start no longer do: {lost_start:?}"
     );
     let ratio = recovered as f64 / total as f64;
     assert!(

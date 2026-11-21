@@ -17,6 +17,7 @@ use exav_core::{
     AllMatchOutcome, ScanOptions, Scanner, Verdict, analyze_all_seekable, loader, scan_path,
     scan_seekable,
 };
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::io::Write;
 use std::sync::Arc;
 
@@ -94,9 +95,8 @@ fn scan_path_refuses_the_same_container() {
 fn an_oversize_streamed_container_or_member_is_a_limit() {
     let db = scanner();
     let zip_of = |members: &[(String, Vec<u8>)]| {
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let stored = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let stored = FileOptions::default().method(Method::Stored);
         for (name, body) in members {
             z.start_file(name.as_str(), stored).unwrap();
             z.write_all(body).unwrap();

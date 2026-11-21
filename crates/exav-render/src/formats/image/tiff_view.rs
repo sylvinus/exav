@@ -239,8 +239,10 @@ fn read(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
     })
 }
 
-/// Strips of CCITT fax (compression 2, 3 and 4) through hayro-ccitt: the
-/// decoder reads Group 4 only, and not with a fill order of 2. A white run is
+/// Strips of CCITT fax (compression 2, 3 and 4) through hayro-ccitt, with the
+/// `ccitt` feature: the TIFF decoder reads Group 4 only, and not with a fill
+/// order of 2; Group 3 (one or two-dimensional, with or without fill bits) and
+/// the modified Huffman coding of compression 2 are read here. A white run is
 /// a 0 bit, which is white or black as the photometric interpretation says.
 #[cfg(feature = "ccitt")]
 fn fax(

@@ -4,6 +4,7 @@
 use std::io::Write;
 
 use exav_core::{ScanOptions, Scanner, Verdict, scan_path, scan_seekable};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()
@@ -23,12 +24,11 @@ fn both(blob: &[u8], opts: &ScanOptions) -> [(&'static str, Verdict); 2] {
 }
 
 fn zip_with(member: &[u8], comment: &str) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     z.set_comment(comment).unwrap();
     z.start_file(
         "member.bin",
-        zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated),
+        FileOptions::default().method(Method::Deflated),
     )
     .unwrap();
     z.write_all(member).unwrap();
@@ -90,5 +90,44 @@ fn an_oversize_container_gets_the_same_passes_everywhere() {
             matches!(v, Verdict::LimitsExceeded { .. }),
             "{entry}: {v:?}"
         );
+    }
+}
+
+/// A path that is a FIFO when it is opened (whatever it was when the caller
+/// looked) is refused by both path entry points, and neither waits for a
+/// writer: an open that waits holds the scan forever.
+#[cfg(unix)]
+#[test]
+fn a_fifo_named_as_the_path_is_refused_without_waiting_for_a_writer() {
+    use std::io::ErrorKind;
+    let dir = crate::tmpfile::TempDir::new().unwrap();
+    let fifo = dir.path().join("pipe");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = fifo.clone();
+    std::thread::spawn(move || {
+        let (db, opts) = (Scanner::builtin(), ScanOptions::default());
+        let single = scan_path(&db, &path, &opts).err().map(|e| e.kind());
+        let all = exav_core::analyze_all_path(&db, &path, &opts)
+            .err()
+            .map(|e| e.kind());
+        let _ = tx.send((single, all));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok((single, all)) => {
+            assert_eq!(single, Some(ErrorKind::Unsupported), "scan_path");
+            assert_eq!(all, Some(ErrorKind::Unsupported), "analyze_all_path");
+        }
+        Err(_) => {
+            // Lets the open that is waiting for a writer return.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("the open of a FIFO waited for a writer");
+        }
     }
 }

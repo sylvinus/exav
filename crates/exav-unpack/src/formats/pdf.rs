@@ -12,8 +12,10 @@ use super::pdf_parse::crypt::{CryptDict, Decoder};
 use super::pdf_parse::filters;
 use super::pdf_parse::lex::{Lexer, Token};
 use super::pdf_parse::parse::{
-    parse_indirect_object_body, parse_object, parse_stream_head, skip_stream_data,
+    MAX_DEPTH, parse_indirect_object_body, parse_indirect_object_with, parse_object,
+    parse_stream_head, skip_stream_data,
 };
+use super::pdf_parse::predictor::{self, Undone};
 use super::pdf_parse::types::Primitive;
 use super::pdf_raster::{self, Decrypt};
 
@@ -94,7 +96,9 @@ pub fn has_obfuscated_name_object(data: &[u8]) -> bool {
 /// The objects are found by scanning for `N G obj`, so a broken xref, common in
 /// malicious PDFs, does not stop extraction. The objects inside object streams
 /// are read from the decoded streams. The parser is depth-bounded
-/// (`MAX_DEPTH`), avoiding nested-object stack overflow.
+/// (`MAX_DEPTH`), avoiding nested-object stack overflow. A value past that
+/// bound, or past the depth of the harvest, is not read and the scan ends
+/// unscannable.
 ///
 /// The active content is emitted after the scan, whatever ended it: a limit is
 /// reported once the content found before it has been seen.
@@ -176,6 +180,9 @@ pub(crate) fn extract_pdf(data: &[u8], budget: &mut Budget, visit: Sink) -> crat
     // A limit that ended the scan does not take the content found before it
     // away: the members are seen first and the limit is reported after them.
     let mut end = walked;
+    // A value the walk passed over for its depth is not a clean read: reported
+    // once the members are seen, unless a limit ended the scan first.
+    let passed_over = harvest.passed_over();
     for (name, acc) in [("pdf-javascript", harvest.js), ("pdf-uris", harvest.uri)] {
         if acc.is_empty() {
             continue;
@@ -187,7 +194,10 @@ pub(crate) fn extract_pdf(data: &[u8], budget: &mut Budget, visit: Sink) -> crat
             return Ok(Some(r));
         }
     }
-    end
+    match (end, passed_over) {
+        (Ok(None), Some(text)) => Err(LimitHit::corrupt(text)),
+        (end, _) => end,
+    }
 }
 
 /// The scan of [`extract_pdf`]: hands each stream object, decoded, to `visit`
@@ -218,7 +228,11 @@ fn walk_objects(
     let mut objects = Objects::new(data, &decrypt, budget.limits().max_buffer_bytes);
     while let Some((obj_id, r#gen, obj_start)) = lex.find_next_obj() {
         lex.set_pos(obj_start);
-        let Some((obj, end)) = parse_indirect_object_body(&mut lex) else {
+        let parsed = parse_indirect_object_with(&mut lex, &mut |id| objects.length_of(id));
+        if lex.take_passed_over() {
+            harvest.unparsed.get_or_insert(obj_id);
+        }
+        let Some((obj, end)) = parsed else {
             // An object that does not parse (an unterminated string in it runs
             // to the end of the file) is not the end of the document: the scan
             // goes on from its start, as a reader going by the cross-reference
@@ -255,6 +269,7 @@ fn walk_objects(
         objects.entries = budget.limits().max_members.saturating_sub(budget.files);
         harvest_actions(
             &obj,
+            obj_id,
             Source::Object(obj_id, r#gen),
             &mut objects,
             budget,
@@ -386,6 +401,10 @@ fn walk_objects(
     Ok(None)
 }
 
+/// How deep the harvest looks into an object for active content: as deep as
+/// the parser reads, so whatever is parsed is searched.
+const HARVEST_DEPTH: u32 = MAX_DEPTH as u32;
+
 /// PDF dictionary keys whose values carry executable/active content.
 const JS_KEYS: &[&str] = &["JS", "JavaScript"];
 /// Keys whose values carry a URI / launch target / submitted URL.
@@ -400,9 +419,36 @@ struct Harvest {
     /// A string did not fit in the room the budget has left, so nothing more
     /// is taken and the scan reports a limit.
     full: bool,
+    /// The first object with a value the parser passed over for its depth
+    /// ([`MAX_DEPTH`]); a script or link in it is not harvested.
+    unparsed: Option<u32>,
+    /// The first object with a value the harvest passed over for its depth
+    /// ([`HARVEST_DEPTH`]).
+    unharvested: Option<u32>,
 }
 
 impl Harvest {
+    /// What the scan did not read of the document for the depth of values, if
+    /// anything: one text for the parser's bound and one for the harvest's,
+    /// the latter left out when it is the object the former names.
+    fn passed_over(&self) -> Option<String> {
+        let mut texts = Vec::new();
+        if let Some(n) = self.unparsed {
+            texts.push(format!(
+                "PDF object {n}: a value nested past {MAX_DEPTH} levels is not read"
+            ));
+        }
+        if let Some(n) = self.unharvested
+            && self.unparsed != Some(n)
+        {
+            texts.push(format!(
+                "PDF object {n}: a value nested past {HARVEST_DEPTH} levels is not \
+                 searched for scripts and links"
+            ));
+        }
+        (!texts.is_empty()).then(|| texts.join("; "))
+    }
+
     /// Adds `string` to the targets (`uri`) or to the scripts, and charges it
     /// to the budget. A string that the budget has no room for, or that would
     /// take a member past `max_buffer_bytes`, is not added: the harvest is
@@ -424,18 +470,23 @@ impl Harvest {
 
 /// Recursively walk a parsed object, collecting the strings of the keys of
 /// active content (`/JS`, `/JavaScript`) and of URI/launch targets into `out`.
-/// `held` says how the strings of `obj` are encrypted. Depth-bounded to match
-/// the parser and to bound crafted nesting.
+/// `held` says how the strings of `obj` are encrypted; `number` is the number of
+/// the object. Depth-bounded ([`HARVEST_DEPTH`]) to bound crafted nesting; the
+/// first object with a container past it is kept in `out`.
 fn harvest_actions(
     obj: &Primitive,
+    number: u32,
     held: Source,
     objects: &mut Objects<'_>,
     budget: &mut Budget,
     out: &mut Harvest,
 ) {
-    harvest_inner(obj, held, objects, budget, out, 0);
+    if harvest_inner(obj, held, objects, budget, out, 0) {
+        out.unharvested.get_or_insert(number);
+    }
 }
 
+/// Returns whether a container past [`HARVEST_DEPTH`] was passed over.
 fn harvest_inner(
     obj: &Primitive,
     held: Source,
@@ -443,10 +494,17 @@ fn harvest_inner(
     budget: &mut Budget,
     out: &mut Harvest,
     depth: u32,
-) {
-    if depth > 32 || out.full {
-        return;
+) -> bool {
+    if out.full {
+        return false;
     }
+    if depth > HARVEST_DEPTH {
+        return matches!(
+            obj,
+            Primitive::Dictionary(_) | Primitive::Stream { .. } | Primitive::Array(_)
+        );
+    }
+    let mut passed_over = false;
     match obj {
         Primitive::Dictionary(d) | Primitive::Stream { info: d, .. } => {
             for (key, val) in d {
@@ -455,16 +513,17 @@ fn harvest_inner(
                 } else if URI_KEYS.contains(&key.as_str()) {
                     harvest_value(val, true, held, objects, budget, out);
                 }
-                harvest_inner(val, held, objects, budget, out, depth + 1);
+                passed_over |= harvest_inner(val, held, objects, budget, out, depth + 1);
             }
         }
         Primitive::Array(items) => {
             for it in items {
-                harvest_inner(it, held, objects, budget, out, depth + 1);
+                passed_over |= harvest_inner(it, held, objects, budget, out, depth + 1);
             }
         }
         _ => {}
     }
+    passed_over
 }
 
 /// Adds the string that the value of a key of active content is, or names, to
@@ -536,16 +595,19 @@ fn harvest_object_stream(
     let mut table = pdf_objstm::table(decoded, count, first, left.saturating_add(1));
     table.sort_by_key(|&(_, offset)| offset);
     let mut parsed_to = 0;
-    for (_, offset) in table {
+    for (number, offset) in table {
         if out.full {
             break;
         }
         budget.count_entry()?;
-        let (object, end) = pdf_objstm::object_at(decoded, offset);
+        let (object, end, passed_over) = pdf_objstm::object_at(decoded, offset);
+        if passed_over {
+            out.unparsed.get_or_insert(number);
+        }
         budget.charge_reparsed(parsed_to.min(end).saturating_sub(offset) as u64)?;
         parsed_to = parsed_to.max(end);
         if let Some(object) = object {
-            harvest_actions(&object, Source::Compressed, objects, budget, out);
+            harvest_actions(&object, number, Source::Compressed, objects, budget, out);
         }
     }
     Ok(())
@@ -750,7 +812,7 @@ impl<'a> Objects<'a> {
             && top.is_none_or(|(_, start)| start < m.at)
         {
             let decoded = &self.index.as_ref()?.streams[m.stream].decoded;
-            let (object, end) = pdf_objstm::object_at(decoded, m.offset);
+            let (object, end, _) = pdf_objstm::object_at(decoded, m.offset);
             self.parsed = self
                 .parsed
                 .saturating_add(end.saturating_sub(m.offset) as u64);
@@ -763,12 +825,33 @@ impl<'a> Objects<'a> {
             return None;
         }
         lex.set_pos(start);
-        let parsed = parse_indirect_object_body(&mut lex);
+        let parsed = parse_indirect_object_with(&mut lex, &mut |id| self.length_of(id));
         // An object that does not parse can have run to the end of the file.
         self.parsed = self
             .parsed
             .saturating_add(lex.pos().saturating_sub(start) as u64);
         Some((parsed?.0, Source::Object(id, r#gen)))
+    }
+
+    /// The integer that the object `id` of the file is, for the `/Length` of a
+    /// stream that names it: the last definition, read as a number only, so
+    /// that no stream is parsed to find it.
+    fn length_of(&mut self, id: u32) -> Option<u64> {
+        let data = self.data;
+        let index = self.index.get_or_insert_with(|| Index::build(data));
+        let (_, start) = *index.objects.get(&id)?;
+        let mut lex = Lexer::new(data);
+        lex.set_pos(start);
+        let Token::Integer(n) = lex.next_token() else {
+            return None;
+        };
+        // `n g R` is a reference to another object, not a number.
+        if let Token::Integer(_) = lex.next_token()
+            && lex.next_token() == Token::R
+        {
+            return None;
+        }
+        u64::try_from(n).ok()
     }
 
     /// Where the object `id` is inside an object stream, if it is in one. The
@@ -822,7 +905,7 @@ impl<'a> Objects<'a> {
         let (number, generation, start) = (stream.number, stream.generation, stream.start);
         let mut lex = Lexer::new(self.data);
         lex.set_pos(start);
-        let parsed = parse_indirect_object_body(&mut lex);
+        let parsed = parse_indirect_object_with(&mut lex, &mut |id| self.length_of(id));
         self.parsed = self
             .parsed
             .saturating_add(lex.pos().saturating_sub(start) as u64);
@@ -965,6 +1048,7 @@ pub(crate) fn apply_filters(
         });
     }
     let parms = decode_parms_list(info, names.len());
+    let image = matches!(info.get("Subtype"), Some(Primitive::Name(n)) if n == "Image");
     let mut buf = stream_data.to_vec();
     let mut part_way = false;
     let mut unknown_filter = false;
@@ -1055,6 +1139,15 @@ pub(crate) fn apply_filters(
             });
         }
         buf = out;
+        // The samples of an image are left predicted for its decoder, which
+        // undoes the predictor; any other stream is read as it is written.
+        if !image
+            && matches!(name.as_str(), "FlateDecode" | "Fl" | "LZWDecode" | "LZW")
+            && predictor::undo(&mut buf, parm) == Undone::Unreadable
+        {
+            unknown_filter = true;
+            break;
+        }
     }
     let truncated = buf.len() as u64 > cap;
     Ok(FilterOutcome {
@@ -1487,6 +1580,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 
     /// Deeply nested `/JS` arrays must not blow the harvest recursion (bounded at
     /// depth 32) and a huge harvested value must stay budget-bounded, no panic.
+    /// What is past the bound is reported.
     #[test]
     fn deeply_nested_and_large_harvest_no_panic() {
         let mut body = String::from("%PDF-1.5\n1 0 obj\n<< /JS ");
@@ -1499,7 +1593,11 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         }
         body.push_str(" >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF");
         let mut budget = Budget::new(Limits::default());
-        let _ = extract(Format::Pdf, &body.as_bytes(), &mut budget).unwrap();
+        let hit = extract(Format::Pdf, &body.as_bytes(), &mut budget).unwrap_err();
+        assert!(
+            hit.is_corrupt() && hit.reason.contains("PDF object 1"),
+            "{hit}"
+        );
     }
 
     /// An object stream is decrypted as a whole, so the strings of the objects

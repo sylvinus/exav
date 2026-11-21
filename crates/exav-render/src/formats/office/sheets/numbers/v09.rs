@@ -968,7 +968,7 @@ fn read_table(
         let (cs, rs) = (span("sf:col-span"), span("sf:row-span"));
         if cs.is_some() || rs.is_some() {
             let last = |at: u32, n: Option<u32>| at.saturating_add(n.unwrap_or(1) - 1);
-            push_merge(sheet, d, r, c, last(r, rs), last(c, cs));
+            push_merge(sheet, d, budget, (r, c), (last(r, rs), last(c, cs)));
         }
         let border = borders.get(&(r, c)).cloned().unwrap_or_default();
         let sid = style_of(wb, style, fmt, border, band(r, c));

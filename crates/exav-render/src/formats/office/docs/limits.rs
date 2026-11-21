@@ -1,5 +1,7 @@
 use crate::formats::office::docs::error::{Error, Result};
-use crate::formats::office::docs::model::{AbstractNum, Block, Cell, Inline, Level, inline_bytes};
+use crate::formats::office::docs::model::{
+    AbstractNum, Block, Cell, Inline, Level, Num, inline_bytes,
+};
 
 /// Bounds on the work one conversion may do. A document past one of them is
 /// refused with [`Error::TooLarge`] rather than partly converted.
@@ -69,6 +71,11 @@ pub(crate) const CELL_BYTES: u64 = (size_of::<Cell>() + 3 * size_of::<Block>()) 
 /// What one list definition costs in the model: its nine levels, which a
 /// definition of a few bytes is given.
 pub(crate) const LIST_BYTES: u64 = (size_of::<AbstractNum>() + 9 * size_of::<Level>()) as u64;
+
+/// What one list instance costs in the model, with its level overrides.
+pub(crate) fn num_bytes(overrides: &[(u32, Option<i64>, Option<Level>)]) -> u64 {
+    (size_of::<Num>() + std::mem::size_of_val(overrides)) as u64
+}
 
 impl Budget {
     pub fn new(limits: Limits) -> Self {

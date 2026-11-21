@@ -6,6 +6,7 @@
  * checks it again with the browser's own URL reader, which is the one that
  * will follow it.
  */
+import { isHidden } from "../core/hidden.generated.js";
 
 export type Inline =
   | { t: "text"; s: string }
@@ -42,9 +43,9 @@ export function plain(nodes: Inline[]): string {
   return s;
 }
 
-/** White space, controls, line and paragraph separators and bidirectional controls: none may be in a target. */
+/** White space, and what a name may not show (controls, separators, the bidirectional characters): none may be in a target. */
 function unsafeChar(c: number): boolean {
-  return c <= 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0x2028 || c === 0x2029 || (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069);
+  return c <= 0x20 || isHidden(c);
 }
 
 /**

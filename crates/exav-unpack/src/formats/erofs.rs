@@ -262,7 +262,7 @@ impl Erofs {
         }
         *left = left.saturating_sub(dir.size);
         let bytes = match self.data(v, dir, MAX_DIR) {
-            Got::Whole(b) => b,
+            Got::Whole(b) | Got::Sparse(b, _, None) => b,
             _ => return (out, false),
         };
         let bs = crate::bytes::to_usize(self.bs);

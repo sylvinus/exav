@@ -72,6 +72,50 @@ fn a_split_zip_in_a_directory_is_rejoined_and_found() {
     assert!(found(&objs, "e.z01").is_none(), "{objs:#?}");
 }
 
+/// `--all-matches` lists every signature the rejoined archive matches. Two
+/// signatures beside the built-in EICAR one, each across the place the first
+/// part ends.
+#[test]
+fn all_matches_lists_every_signature_of_a_split_zip() {
+    let dir = TempDir::new().unwrap();
+    zip_set(dir.path());
+    let db = TempDir::new().unwrap();
+    std::fs::write(
+        db.path().join("two.ndb"),
+        "Test.First:0:*:4341522d5354414e44415244\n\
+         Test.Second:0:*:522d5354414e444152442d414e54495649525553\n",
+    )
+    .unwrap();
+    let scan = |all: bool| {
+        let mut c = exav();
+        c.arg("-d").arg(db.path()).arg("--json");
+        if all {
+            c.arg("--all-matches");
+        }
+        let out = c.arg(dir.path()).output().expect("run exav");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut objs: Vec<serde_json::Value> = stdout
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        objs.pop();
+        objs
+    };
+    let first = scan(false);
+    let hit = found(&first, "e.zip").unwrap_or_else(|| panic!("{first:#?}"));
+    assert!(hit["signature"].is_string() && hit.get("signatures").is_none());
+    let all = scan(true);
+    let hit = found(&all, "e.zip").unwrap_or_else(|| panic!("{all:#?}"));
+    let mut sigs: Vec<&str> = hit["signatures"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{hit}"))
+        .iter()
+        .map(|s| s["signature"].as_str().unwrap())
+        .collect();
+    sigs.sort();
+    assert_eq!(sigs, ["Eicar-Test-Signature", "Test.First", "Test.Second"]);
+}
+
 #[test]
 fn a_part_named_alone_is_scanned_with_its_siblings() {
     let dir = TempDir::new().unwrap();

@@ -308,6 +308,20 @@ pub(crate) struct Found {
     /// searched through the whole object (at its offset, if it is anchored
     /// there), and its regexp searches did not reach the limit of their work.
     pub complete: bool,
+    /// The pattern has more than [`MAX_MATCHES`] matches. Implies `!complete`.
+    pub capped: bool,
+    /// Why a regexp or hex pattern's search stopped short, when it did.
+    pub regex_cut: Option<RegexCut>,
+}
+
+/// Why the search of a regexp or hex pattern did not finish.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum RegexCut {
+    /// Its searches made the steps they may (`--max-regex-steps`).
+    Steps,
+    /// It needed the object whole, past the size read whole
+    /// (`--max-object-bytes`).
+    Whole,
 }
 
 /// Matches as they are found, up to [`MAX_MATCHES`], and the work left to the
@@ -455,7 +469,7 @@ pub(crate) fn find_all_windowed(pats: &[&PatternMatcher], src: &dyn ByteSource) 
         base = end;
     }
     outs.into_iter()
-        .map(|out| sorted(out.out, complete && !out.full))
+        .map(|out| sorted(out.out, complete && !out.full, out.full))
         .collect()
 }
 
@@ -490,15 +504,20 @@ impl WindowedTap {
     /// The matches, unless the pattern has more than it keeps: then it is
     /// searched again, as [`PatternMatcher::find_all`] does.
     pub(crate) fn found(self) -> Option<Found> {
-        (!self.out.full).then(|| sorted(self.out.out, true))
+        (!self.out.full).then(|| sorted(self.out.out, true, false))
     }
 }
 
 /// `matches` sorted by offset then length, without duplicates.
-fn sorted(mut matches: Vec<Match>, complete: bool) -> Found {
+fn sorted(mut matches: Vec<Match>, complete: bool, capped: bool) -> Found {
     matches.sort_unstable_by(|a, b| a.offset.cmp(&b.offset).then(a.len.cmp(&b.len)));
     matches.dedup();
-    Found { matches, complete }
+    Found {
+        matches,
+        complete,
+        capped,
+        regex_cut: None,
+    }
 }
 
 /// The matches of a regexp pattern, found as a read of the object goes by:
@@ -588,7 +607,7 @@ impl<'r> RegexTap<'r> {
 
     /// The matches, unless the tap is spoiled.
     pub(crate) fn found(self) -> Option<Found> {
-        (!self.spoiled()).then(|| sorted(self.out.out, true))
+        (!self.spoiled()).then(|| sorted(self.out.out, true, false))
     }
 }
 
@@ -674,8 +693,21 @@ impl PatternMatcher {
             Some(data) => self.search(data, 0..data.len(), 0, stream, &mut out),
             None => complete = self.search_source(src, stream, materialize, &mut out),
         }
+        let regexp = self.regex_fullword().is_some();
+        let regex_cut = if !regexp || out.full {
+            None
+        } else if out.spent {
+            Some(RegexCut::Steps)
+        } else if !complete && src.len() > materialize {
+            Some(RegexCut::Whole)
+        } else {
+            None
+        };
         let complete = complete && !out.full && !out.spent;
-        sorted(out.out, complete)
+        Found {
+            regex_cut,
+            ..sorted(out.out, complete, out.full)
+        }
     }
 
     /// The matches starting at a position in `keep` of `data`, reported at

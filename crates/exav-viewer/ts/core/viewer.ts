@@ -30,6 +30,7 @@ const ERROR_CODES: Record<string, ViewerError["code"]> = {
   rtf: "office",
   doc: "office",
   odt: "office",
+  pages: "office",
   ppt: "office",
   odp: "office",
   keynote: "office",

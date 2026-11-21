@@ -27,6 +27,7 @@ import {
   odp,
   ods,
   odt,
+  pages,
   pagemaker,
   ppt,
   pptx,
@@ -51,6 +52,7 @@ import {
   checkCommand,
   checkHighlights,
   checkOpen,
+  checkPing,
   checkRaster,
   checkReplace,
   checkSniff,
@@ -58,10 +60,13 @@ import {
   checkUnraster,
   checkWatch,
   CONTROLLER_KEYS,
+  fitSnapshot,
   HELLO,
+  isRefusedOpen,
   NAV_KEYS,
   PROTOCOL,
   refusedRasterId,
+  refusedReplaceCall,
   WATCHED_KEYS,
   type ArchiveSnapshot,
   type CommandMessage,
@@ -146,6 +151,7 @@ function plugins(formats: readonly BuiltinFormat[], o: FrameOptions, source: Ope
     rtf: () => rtf(o.conversion),
     doc: () => doc(o.conversion),
     odt: () => odt(o.conversion),
+    pages: () => pages(o.conversion),
     ppt: () => ppt(o.conversion),
     odp: () => odp(o.conversion),
     keynote: () => keynote(o.conversion),
@@ -221,7 +227,7 @@ function snapshot<K extends ControllerKey>(key: K, value: unknown, from: number)
     const out: Snapshots["highlights"] = { items: h.items.map(({ id, state, page, rects }) => ({ id, state, page, rects })), current: h.current };
     return out as Snapshots[K];
   }
-  if (key !== "archive") return value as Snapshots[K];
+  if (key !== "archive") return fitSnapshot(key, value as Snapshots[K]);
   const a = value as ReturnType<NonNullable<Controllers["archive"]>["get"]>;
   let relay = members.get(from);
   if (relay && relay.session !== a.opened?.session) {
@@ -524,6 +530,7 @@ const ranges = new Set<PortRanges>();
 let around: PortTree | null = null;
 
 function receive(data: unknown) {
+  if (checkPing(data)) return post({ type: "pong" });
   // What a file is, asked before the first is opened and before each next one.
   const sniffing = checkSniff(data, BUILTIN_ORDER);
   if (sniffing) {
@@ -532,7 +539,8 @@ function receive(data: unknown) {
   }
   if (!opened) {
     const open = checkOpen(data, BUILTIN_ORDER);
-    if (!open) return;
+    // An open this frame cannot take is still answered: the host shows the file as loading until then.
+    if (!open) return void (isRefusedOpen(data, BUILTIN_ORDER) && post({ type: "status", session: 0, status: { phase: "error", code: "file" } }));
     opened = true;
     applyTheme(open.theme);
     const formats = shipped ? open.formats.filter((f) => shipped.has(f)) : open.formats;
@@ -592,6 +600,9 @@ function receive(data: unknown) {
     void replace(replacing).then((ok) => post({ type: "replaced", call: replacing.call, ok }));
     return;
   }
+  // Likewise a replacement: the host takes no other until this one is answered.
+  const unreplaced = refusedReplaceCall(data, BUILTIN_ORDER);
+  if (unreplaced !== null) return post({ type: "replaced", call: unreplaced, ok: false });
   const command = checkCommand(data);
   if (!command) return;
   void run(command)

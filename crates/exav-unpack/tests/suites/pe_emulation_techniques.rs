@@ -414,12 +414,21 @@ fn a_loader_that_unfolds_into_memory_it_allocated() {
 fn a_stub_that_wipes_its_own_headers_before_transferring() {
     // An anti-dump move: overwrite `MZ`/`PE` in memory once the loader is done
     // with them, so a memory dump is not a valid image. The bytes are still in
-    // the file, and the dump has to fall back to them.
+    // the file, and the dump has to fall back to them. The headers are
+    // read-only until the stub says otherwise.
     //
+    //   push &old ; push 0x40 ; push 0x1000 ; push base ; call [VirtualProtect]
     //   mov edi, base ; xor eax, eax ; mov ecx, 0x40 ; rep stosb
     //   <decrypt tail>
     let (_, cipher) = payload(0xc000);
-    let mut stub: Vec<u8> = vec![0xbf];
+    let mut stub: Vec<u8> = Vec::new();
+    for imm in [stub_va() + 0x7f0, 0x40, 0x1000, BASE] {
+        stub.push(0x68);
+        stub.extend_from_slice(&imm.to_le_bytes());
+    }
+    stub.extend_from_slice(&[0xff, 0x15]);
+    stub.extend_from_slice(&iat_va(0).to_le_bytes());
+    stub.push(0xbf);
     stub.extend_from_slice(&BASE.to_le_bytes());
     stub.extend_from_slice(&[0x31, 0xc0]); // xor eax, eax
     stub.push(0xb9);
@@ -436,6 +445,7 @@ fn a_stub_that_wipes_its_own_headers_before_transferring() {
     let file = Packed {
         stub,
         section_payload: cipher,
+        imports: vec!["VirtualProtect"],
         ..Default::default()
     }
     .build();
@@ -551,4 +561,116 @@ fn a_stub_that_resolves_kernel32_by_walking_the_loader_list() {
     }
     .build();
     assert!(recovered(&unpack(&file)));
+}
+
+#[test]
+fn a_stub_resolving_an_import_by_ordinal_from_the_export_table() {
+    // Petite imports by ordinal without calling GetProcAddress: it indexes the
+    // export table of the DLL it loaded, and takes a fallback that does not
+    // exist on Windows when the ordinal is past NumberOfFunctions.
+    //
+    //   push "OLEAUT32.dll" ; call [LoadLibraryA] ; mov ebx, eax
+    //   mov ecx,[ebx+0x3c] ; mov ecx,[ebx+ecx+0x78] ; add ecx, ebx   ; export directory
+    //   cmp dword [ecx+0x14], 10 ; jb fail                          ; ordinal 10 in range
+    //   mov edx,[ecx+0x1c] ; add edx, ebx ; mov eax,[edx+36]        ; its function
+    //   test eax, eax ; jz fail
+    //   <decrypt tail>
+    // fail: ret
+    let (_, cipher) = payload(0xc000);
+    let mut p = Packed {
+        imports: vec!["LoadLibraryA"],
+        strings: vec!["OLEAUT32.dll"],
+        section_payload: cipher.clone(),
+        ..Default::default()
+    };
+    let name = p.string_va(0);
+    let tail = decrypt_tail(0, 0, 0, 0).len();
+    let mut stub: Vec<u8> = vec![0x68];
+    stub.extend_from_slice(&name.to_le_bytes());
+    stub.extend_from_slice(&[0xff, 0x15]);
+    stub.extend_from_slice(&iat_va(0).to_le_bytes());
+    stub.extend_from_slice(&[
+        0x89, 0xc3, 0x8b, 0x4b, 0x3c, 0x8b, 0x4c, 0x0b, 0x78, 0x01, 0xd9,
+    ]);
+    stub.extend_from_slice(&[0x83, 0x79, 0x14, 0x0a]);
+    stub.extend_from_slice(&[0x72, (3 + 2 + 3 + 2 + 2 + tail) as u8]); // jb fail
+    stub.extend_from_slice(&[0x8b, 0x51, 0x1c, 0x01, 0xda, 0x8b, 0x42, 0x24]);
+    stub.extend_from_slice(&[0x85, 0xc0, 0x74, tail as u8]); // test eax,eax ; jz fail
+    let tail_at = stub_va() + stub.len() as u32;
+    stub.extend_from_slice(&decrypt_tail(
+        tail_at,
+        stub_va() + PAYLOAD_OFF,
+        dest_va(),
+        cipher.len() as u32,
+    ));
+    stub.push(0xc3); // fail
+    p.stub = stub;
+    assert!(
+        recovered(&unpack(&p.build())),
+        "ordinal 10 of a DLL the stub loaded is past its export table"
+    );
+}
+
+#[test]
+fn a_stub_running_the_c_runtime_start_up_calls() {
+    // The C runtime encodes the pointers it keeps, then compares and swaps
+    // under a lock-free primitive. An export the emulator did not implement
+    // returns zero, which fails every check below.
+    //
+    //   push 0x12345678 ; call [EncodePointer] ; cmp eax, 0x12345678 ; je fail
+    //   push eax ; call [DecodePointer] ; cmp eax, 0x12345678 ; jne fail
+    //   push 0 ; push 5 ; push var ; call [InterlockedCompareExchange]
+    //   test eax, eax ; jnz fail ; cmp dword [var], 5 ; jne fail
+    //   <decrypt tail>
+    // fail: ret
+    let (_, cipher) = payload(0xc000);
+    let var = stub_va() + 0x7f0;
+    let tail = decrypt_tail(0, 0, 0, 0).len();
+    let mut stub: Vec<u8> = vec![0x68];
+    stub.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+    stub.extend_from_slice(&[0xff, 0x15]);
+    stub.extend_from_slice(&iat_va(0).to_le_bytes());
+    // Each branch skips what follows it up to `fail`: the byte counts below
+    // are the instructions after it, then the decrypt tail.
+    stub.push(0x3d);
+    stub.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+    stub.extend_from_slice(&[0x74, (42 + tail) as u8]); // je fail
+    stub.push(0x50); // push eax
+    stub.extend_from_slice(&[0xff, 0x15]);
+    stub.extend_from_slice(&iat_va(1).to_le_bytes());
+    stub.push(0x3d);
+    stub.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+    stub.extend_from_slice(&[0x75, (28 + tail) as u8]); // jne fail
+    stub.extend_from_slice(&[0x6a, 0x00, 0x6a, 0x05, 0x68]);
+    stub.extend_from_slice(&var.to_le_bytes());
+    stub.extend_from_slice(&[0xff, 0x15]);
+    stub.extend_from_slice(&iat_va(2).to_le_bytes());
+    stub.extend_from_slice(&[0x85, 0xc0]);
+    stub.extend_from_slice(&[0x75, (7 + 2 + tail) as u8]); // jnz fail
+    stub.extend_from_slice(&[0x83, 0x3d]);
+    stub.extend_from_slice(&var.to_le_bytes());
+    stub.extend_from_slice(&[0x05, 0x75, tail as u8]); // cmp dword [var],5 ; jne fail
+    let tail_at = stub_va() + stub.len() as u32;
+    stub.extend_from_slice(&decrypt_tail(
+        tail_at,
+        stub_va() + PAYLOAD_OFF,
+        dest_va(),
+        cipher.len() as u32,
+    ));
+    stub.push(0xc3); // fail
+    let file = Packed {
+        stub,
+        section_payload: cipher,
+        imports: vec![
+            "EncodePointer",
+            "DecodePointer",
+            "InterlockedCompareExchange",
+        ],
+        ..Default::default()
+    }
+    .build();
+    assert!(
+        recovered(&unpack(&file)),
+        "the pointer encoding or the compare-exchange did not behave"
+    );
 }

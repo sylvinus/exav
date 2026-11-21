@@ -4,6 +4,7 @@
 
 use base64::Engine;
 use exav_core::{ScanOptions, Scanner, Verdict, analyze};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 
 // The standard EICAR test string: the built-in DB carries a signature for it.
 // Assembled at runtime; see `exav_core::unpack::eicar` for why it is never a
@@ -201,9 +202,8 @@ fn the_base64_limits_are_limits() {
     // Too short for a base64 run of a text: only the page's assets reach it.
     let small_zip = {
         use std::io::Write;
-        let deflated = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let deflated = FileOptions::default().method(Method::Deflated);
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
         z.start_file("e.com", deflated).unwrap();
         z.write_all(&[eicar(), b"\n"].concat().repeat(40)).unwrap();
         z.finish().unwrap().into_inner()
@@ -243,11 +243,9 @@ fn a_script_behind_a_long_run_of_high_bytes_is_still_read_as_text() {
 /// compress, which is also how it comes to be long enough for the scan to read.
 fn zip_with_payload() -> Vec<u8> {
     use std::io::Write;
-    let deflated = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
-    let stored =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = FileOptions::default().method(Method::Deflated);
+    let stored = FileOptions::default().method(Method::Stored);
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     z.start_file("e.com", deflated).unwrap();
     z.write_all(&[eicar(), b"\n"].concat().repeat(40)).unwrap();
     z.start_file("pad.bin", stored).unwrap();

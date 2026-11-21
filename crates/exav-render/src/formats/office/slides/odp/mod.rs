@@ -14,7 +14,8 @@ use crate::formats::office::slides::limits::{Budget, text_bytes};
 use crate::formats::office::slides::model::*;
 use crate::formats::office::slides::package::{Zip, image_ext};
 use std::collections::HashMap;
-use styles::{Props, Styles, color, len, percent};
+use std::rc::Rc;
+use styles::{CELL, GRAPHIC, PAGE, Props, PropsExt, Styles, color, len, percent};
 
 /// What a document holds: slides, or the pages of a drawing, each of which
 /// becomes a slide of its own size.
@@ -246,7 +247,7 @@ impl<'d> Reader<'d> {
             for d in &sources {
                 for k in ["office:font-face-decls", "office:styles"] {
                     if let Some(n) = d.child(k) {
-                        s.add(n);
+                        s.add(n, false);
                     }
                 }
             }
@@ -254,13 +255,13 @@ impl<'d> Reader<'d> {
         // A flat document has one set of automatic styles for both.
         if let Some(sd) = styles_doc {
             if let Some(a) = sd.child("office:automatic-styles") {
-                master.add(a);
+                master.add(a, true);
             }
         } else if let Some(a) = content.child("office:automatic-styles") {
-            master.add(a);
+            master.add(a, true);
         }
         if let Some(a) = content.child("office:automatic-styles") {
-            body.add(a);
+            body.add(a, true);
         }
         Reader {
             kind,
@@ -373,7 +374,13 @@ impl<'d> Reader<'d> {
             return Err(e);
         }
         budget.alloc(self.media_bytes)?;
+        self.charge_styles(budget)?;
         Ok(self.p)
+    }
+
+    /// Charges the memory the resolved styles took to the budget.
+    fn charge_styles(&self, budget: &mut Budget) -> Result<()> {
+        budget.alloc(self.master.take_charge() + self.body.take_charge())
     }
 
     /// The size of the page a master page's layout gives, a side it leaves
@@ -413,9 +420,9 @@ impl<'d> Reader<'d> {
     }
 
     fn page_fill(&mut self, props: &Props, scope: Scope) -> Option<Fill> {
-        match props.get("draw:fill") {
+        match props.get_in(PAGE, "draw:fill") {
             None | Some("none") => None,
-            _ => Some(self.fill(props, scope)),
+            _ => Some(self.fill(props, PAGE, scope)),
         }
     }
 
@@ -473,7 +480,7 @@ impl<'d> Reader<'d> {
         let dp = self
             .body
             .resolve("drawing-page", page.attr("draw:style-name"));
-        let background = if dp.is("presentation:background-visible", "false") {
+        let background = if dp.is_in(PAGE, "presentation:background-visible", "false") {
             Some(Fill::Solid(Color::rgb(0xFFFFFF)))
         } else {
             self.page_fill(&dp, Scope::Content)
@@ -508,7 +515,8 @@ impl<'d> Reader<'d> {
         }
         // The master's footer, slide number and date, as the page shows them.
         if let Some(m) = master {
-            let show = |k: &str, default: bool| dp.get(k).map(|v| v == "true").unwrap_or(default);
+            let show =
+                |k: &str, default: bool| dp.get_in(PAGE, k).map(|v| v == "true").unwrap_or(default);
             for n in m.nodes() {
                 let wanted = match n.attr("presentation:class") {
                     Some("footer") => {
@@ -535,9 +543,9 @@ impl<'d> Reader<'d> {
             layout: 0,
             background,
             shapes,
-            hidden: dp.is("presentation:visibility", "hidden")
+            hidden: dp.is_in(PAGE, "presentation:visibility", "hidden")
                 || page.attr("presentation:visibility") == Some("hidden"),
-            show_master_shapes: !dp.is("presentation:background-objects-visible", "false"),
+            show_master_shapes: !dp.is_in(PAGE, "presentation:background-objects-visible", "false"),
         })
     }
 
@@ -593,47 +601,59 @@ impl<'d> Reader<'d> {
         Some(self.p.add_media(ext, d))
     }
 
-    fn fill(&mut self, p: &Props, scope: Scope) -> Fill {
+    /// The fill of the properties of the given kinds of property element.
+    fn fill(&mut self, p: &Props, kinds: &[&str], scope: Scope) -> Fill {
         let alpha = p
-            .get("draw:opacity")
+            .get_in(kinds, "draw:opacity")
             .and_then(percent)
             .map(|f| (f * 100_000.0).round().clamp(0.0, 100_000.0) as u32)
             .filter(|&a| a < 100_000);
         let c = |rgb: Rgb| Color { rgb, alpha };
         // Unstyled shapes are filled, as their usual writer's default
         // style is (pages say otherwise in `page_fill`).
-        match p.get("draw:fill").unwrap_or("solid") {
-            "solid" => Fill::Solid(c(p.color("draw:fill-color").unwrap_or(0x729FCF))),
+        match p.get_in(kinds, "draw:fill").unwrap_or("solid") {
+            "solid" => Fill::Solid(c(p.color_in(kinds, "draw:fill-color").unwrap_or(0x729FCF))),
             "gradient" => {
                 let st = self.styles(scope);
                 let g = p
-                    .get("draw:fill-gradient-name")
+                    .get_in(kinds, "draw:fill-gradient-name")
                     .and_then(|n| st.object("draw:gradient", n))
                     .cloned();
                 match g {
                     Some(g) => gradient(&g, alpha),
-                    None => Fill::Solid(c(p.color("draw:fill-color").unwrap_or(0x729FCF))),
+                    None => {
+                        Fill::Solid(c(p.color_in(kinds, "draw:fill-color").unwrap_or(0x729FCF)))
+                    }
                 }
             }
             "bitmap" => {
                 let href = p
-                    .get("draw:fill-image-name")
+                    .get_in(kinds, "draw:fill-image-name")
                     .and_then(|n| self.styles(scope).object("draw:fill-image", n))
                     .and_then(|o| o.get("xlink:href"))
                     .map(str::to_string);
                 // ODF's default is to repeat.
                 // A tile as large as the shape is the shape stretched.
-                let whole = |k: &str| p.get(k).and_then(percent).is_some_and(|f| f >= 0.99);
-                let tile = !matches!(p.get("style:repeat"), Some("stretch" | "no-repeat"))
-                    && !(whole("draw:fill-image-width") && whole("draw:fill-image-height"));
+                let whole = |k: &str| {
+                    p.get_in(kinds, k)
+                        .and_then(percent)
+                        .is_some_and(|f| f >= 0.99)
+                };
+                let tile = !matches!(
+                    p.get_in(kinds, "style:repeat"),
+                    Some("stretch" | "no-repeat")
+                ) && !(whole("draw:fill-image-width")
+                    && whole("draw:fill-image-height"));
                 match href.and_then(|h| self.image(&h)) {
                     Some(media) => Fill::Picture { media, tile },
-                    None => Fill::Solid(c(p.color("draw:fill-color").unwrap_or(0xCCCCCC))),
+                    None => {
+                        Fill::Solid(c(p.color_in(kinds, "draw:fill-color").unwrap_or(0xCCCCCC)))
+                    }
                 }
             }
             "hatch" => {
                 let h = p
-                    .get("draw:fill-hatch-name")
+                    .get_in(kinds, "draw:fill-hatch-name")
                     .and_then(|n| self.styles(scope).object("draw:hatch", n));
                 let fg = h.and_then(|h| h.color("draw:color")).unwrap_or(0);
                 let rot = h
@@ -650,8 +670,8 @@ impl<'d> Reader<'d> {
                     (false, r) if (r - 135.0).abs() < 22.5 => "dnDiag",
                     _ => "horz",
                 };
-                let bg = if p.is("draw:fill-hatch-solid", "true") {
-                    c(p.color("draw:fill-color").unwrap_or(0xFFFFFF))
+                let bg = if p.is_in(kinds, "draw:fill-hatch-solid", "true") {
+                    c(p.color_in(kinds, "draw:fill-color").unwrap_or(0xFFFFFF))
                 } else {
                     Color {
                         rgb: 0xFFFFFF,
@@ -669,35 +689,35 @@ impl<'d> Reader<'d> {
     }
 
     fn line(&self, p: &Props, scope: Scope) -> Line {
-        let stroke = p.get("draw:stroke").unwrap_or("solid");
+        let stroke = p.get_in(GRAPHIC, "draw:stroke").unwrap_or("solid");
         if stroke == "none" {
             return Line::default();
         }
         let alpha = p
-            .get("svg:stroke-opacity")
+            .get_in(GRAPHIC, "svg:stroke-opacity")
             .and_then(|v| percent(v).or_else(|| v.parse::<f64>().ok()))
             .map(|f| (f * 100_000.0).round().clamp(0.0, 100_000.0) as u32)
             .filter(|&a| a < 100_000);
         // A width with no unit is in hundredths of a millimetre, as a drawing
         // counts them.
         let width = p
-            .get("svg:stroke-width")
+            .get_in(GRAPHIC, "svg:stroke-width")
             .and_then(|v| v.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
             .map(|v| (v * 360.0).clamp(-1e13, 1e13).round() as Emu)
-            .or_else(|| p.len("svg:stroke-width"))
+            .or_else(|| p.len_in(GRAPHIC, "svg:stroke-width"))
             .unwrap_or(0)
             .max(0);
         let dash = if stroke == "dash" {
             let d = p
-                .get("draw:stroke-dash")
+                .get_in(GRAPHIC, "draw:stroke-dash")
                 .and_then(|n| self.styles(scope).object("draw:stroke-dash", n));
             Some(dash_preset(d))
         } else {
             None
         };
         let marker = |which: &str| -> Option<Arrow> {
-            let name = p.get(&format!("draw:marker-{which}"))?;
+            let name = p.get_in(GRAPHIC, &format!("draw:marker-{which}"))?;
             if name.is_empty() {
                 return None;
             }
@@ -712,7 +732,7 @@ impl<'d> Reader<'d> {
                 "triangle"
             };
             let mw = p
-                .len(&format!("draw:marker-{which}-width"))
+                .len_in(GRAPHIC, &format!("draw:marker-{which}-width"))
                 .unwrap_or(width * 3);
             let ratio = if width > 0 {
                 mw as f64 / width as f64
@@ -734,17 +754,17 @@ impl<'d> Reader<'d> {
         };
         Line {
             fill: Fill::Solid(Color {
-                rgb: p.color("svg:stroke-color").unwrap_or(0x3465A4),
+                rgb: p.color_in(GRAPHIC, "svg:stroke-color").unwrap_or(0x3465A4),
                 alpha,
             }),
             width: if width == 0 { 9525 } else { width },
             dash,
-            cap: match p.get("svg:stroke-linecap") {
+            cap: match p.get_in(GRAPHIC, "svg:stroke-linecap") {
                 Some("round") => Some("rnd"),
                 Some("square") => Some("sq"),
                 _ => None,
             },
-            join: match p.get("draw:stroke-linejoin") {
+            join: match p.get_in(GRAPHIC, "draw:stroke-linejoin") {
                 Some("round") => Some("round"),
                 Some("bevel") => Some("bevel"),
                 Some("miter") => Some("miter"),
@@ -757,32 +777,32 @@ impl<'d> Reader<'d> {
     }
 
     fn shadow(&self, p: &Props) -> Option<Shadow> {
-        if !p.is("draw:shadow", "visible") {
+        if !p.is_in(GRAPHIC, "draw:shadow", "visible") {
             return None;
         }
-        let dx = p.len("draw:shadow-offset-x").unwrap_or(0) as f64;
-        let dy = p.len("draw:shadow-offset-y").unwrap_or(0) as f64;
+        let dx = p.len_in(GRAPHIC, "draw:shadow-offset-x").unwrap_or(0) as f64;
+        let dy = p.len_in(GRAPHIC, "draw:shadow-offset-y").unwrap_or(0) as f64;
         let alpha = p
-            .get("draw:shadow-opacity")
+            .get_in(GRAPHIC, "draw:shadow-opacity")
             .and_then(percent)
             .map(|f| (f * 100_000.0).round().clamp(0.0, 100_000.0) as u32);
         Some(Shadow {
             color: Color {
-                rgb: p.color("draw:shadow-color").unwrap_or(0x808080),
+                rgb: p.color_in(GRAPHIC, "draw:shadow-color").unwrap_or(0x808080),
                 alpha,
             },
-            blur: p.len("loext:shadow-blur").unwrap_or(0).max(0),
+            blur: p.len_in(GRAPHIC, "loext:shadow-blur").unwrap_or(0).max(0),
             dist: dx.hypot(dy).round() as Emu,
             dir: dy.atan2(dx).to_degrees(),
         })
     }
 
-    fn style_of(&self, n: &Node, scope: Scope) -> (Props, Option<String>) {
+    fn style_of(&self, n: &Node, scope: Scope) -> (Rc<Props>, Option<String>) {
         let st = self.styles(scope);
         if let Some(ps) = n.attr("presentation:style-name") {
             let mut p = st.resolve("presentation", Some(ps));
             if let Some(gs) = n.attr("draw:style-name") {
-                p.overlay(&st.chain("graphic", Some(gs)).0);
+                Rc::make_mut(&mut p).overlay_props(&st.chain("graphic", Some(gs)));
             }
             return (p, Some(ps.to_string()));
         }
@@ -790,10 +810,15 @@ impl<'d> Reader<'d> {
     }
 
     fn body_props(&self, p: &Props, frame: bool) -> BodyProps {
-        let pad = |k: &str, d: Emu| p.len(k).or_else(|| p.len("fo:padding")).unwrap_or(d).max(0);
+        let pad = |k: &str, d: Emu| {
+            p.len_in(GRAPHIC, k)
+                .or_else(|| p.len_in(GRAPHIC, "fo:padding"))
+                .unwrap_or(d)
+                .max(0)
+        };
         // Unsaid, a drawing shape's text sits in its middle, a frame's at
         // its top.
-        let anchor = match p.get("draw:textarea-vertical-align") {
+        let anchor = match p.get_in(GRAPHIC, "draw:textarea-vertical-align") {
             Some("middle") => "ctr",
             Some("bottom") => "b",
             Some(_) => "t",
@@ -801,16 +826,16 @@ impl<'d> Reader<'d> {
             None => "ctr",
         };
         let wrap = if frame {
-            !p.is("draw:auto-grow-width", "true")
+            !p.is_in(GRAPHIC, "draw:auto-grow-width", "true")
         } else {
-            !p.is("fo:wrap-option", "no-wrap")
+            !p.is_in(GRAPHIC, "fo:wrap-option", "no-wrap")
         };
-        let autofit = if p.is("draw:fit-to-size", "true")
-            || p.is("draw:fit-to-size", "shrink-to-fit")
-            || p.is("style:shrink-to-fit", "true")
+        let autofit = if p.is_in(GRAPHIC, "draw:fit-to-size", "true")
+            || p.is_in(GRAPHIC, "draw:fit-to-size", "shrink-to-fit")
+            || p.is_in(GRAPHIC, "style:shrink-to-fit", "true")
         {
             Autofit::Normal(100_000, 0)
-        } else if p.is("draw:auto-grow-height", "true") && frame {
+        } else if p.is_in(GRAPHIC, "draw:auto-grow-height", "true") && frame {
             Autofit::Shape
         } else {
             Autofit::None
@@ -823,9 +848,9 @@ impl<'d> Reader<'d> {
                 pad("fo:padding-bottom", 0),
             ],
             anchor,
-            anchor_ctr: !wrap && p.is("draw:textarea-horizontal-align", "center"),
+            anchor_ctr: !wrap && p.is_in(GRAPHIC, "draw:textarea-horizontal-align", "center"),
             wrap,
-            vert: match p.get("style:writing-mode") {
+            vert: match p.get_in(GRAPHIC, "style:writing-mode") {
                 Some("tb-rl") | Some("tb") => Some("eaVert"),
                 Some("tb-rl90") => Some("vert"),
                 Some("bt-lr") => Some("vert270"),
@@ -834,7 +859,7 @@ impl<'d> Reader<'d> {
             autofit,
             rot: 0.0,
             columns: p
-                .get("fo:column-count")
+                .get_in(GRAPHIC, "fo:column-count")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1)
                 .clamp(1, 16),
@@ -842,12 +867,13 @@ impl<'d> Reader<'d> {
     }
 
     /// Text of `n` (a text box or a shape) with `props` as the shape's
-    /// style.
+    /// style, its fill in the property elements `fill_kinds`.
     #[allow(clippy::too_many_arguments)]
     fn text(
         &mut self,
         n: &Node,
         props: &Props,
+        fill_kinds: &[&str],
         pres_style: Option<&str>,
         scope: Scope,
         ctx: &PageCtx,
@@ -881,7 +907,7 @@ impl<'d> Reader<'d> {
             .and_then(|s| st.list_of("presentation", Some(s)))
             .or_else(|| st.list_of("graphic", n.attr("draw:style-name")))
             .cloned();
-        let levels = |lv: usize| -> Option<Props> {
+        let levels = |lv: usize| -> Option<Rc<Props>> {
             let b = outline_base.as_ref()?;
             (lv > 1).then(|| st.chain("presentation", Some(&format!("{b}-outline{lv}"))))
         };
@@ -895,7 +921,10 @@ impl<'d> Reader<'d> {
             date: &ctx.date,
             header: &ctx.header,
             // Over the shape's own solid fill, else over the page.
-            auto_color: match (props.get("draw:fill"), props.color("draw:fill-color")) {
+            auto_color: match (
+                props.get_in(fill_kinds, "draw:fill"),
+                props.color_in(fill_kinds, "draw:fill-color"),
+            ) {
                 (Some("solid"), Some(c)) => auto_color(Some(&Fill::Solid(Color::rgb(c)))),
                 _ => ctx.auto_color,
             },
@@ -924,7 +953,7 @@ impl<'d> Reader<'d> {
         // A drawing shape's text block is centred unless said otherwise.
         if !frame
             && props
-                .get("draw:textarea-horizontal-align")
+                .get_in(GRAPHIC, "draw:textarea-horizontal-align")
                 .is_none_or(|a| a == "center")
         {
             for p in &mut paras {
@@ -979,8 +1008,9 @@ impl<'d> Reader<'d> {
             return Ok(None);
         }
         let (props, pres_style) = self.style_of(n, scope);
+        self.charge_styles(budget)?;
         let mut xf = transform(n);
-        let fill = self.fill(&props, scope);
+        let fill = self.fill(&props, GRAPHIC, scope);
         let line = self.line(&props, scope);
         // An empty placeholder shows only while editing, but for the fill
         // and line it has.
@@ -1054,7 +1084,7 @@ impl<'d> Reader<'d> {
                             line: line.clone(),
                             shadow: shadow.clone(),
                             alpha: props
-                                .get("draw:image-opacity")
+                                .get_in(GRAPHIC, "draw:image-opacity")
                                 .and_then(percent)
                                 .map(|f| (f * 100_000.0).round() as u32),
                         })));
@@ -1074,9 +1104,16 @@ impl<'d> Reader<'d> {
                 if shape_kind.is_none() {
                     let tb = n.child("draw:text-box");
                     let text = match tb {
-                        Some(tb) => {
-                            self.text(tb, &props, pres_style.as_deref(), scope, ctx, true, budget)?
-                        }
+                        Some(tb) => self.text(
+                            tb,
+                            &props,
+                            GRAPHIC,
+                            pres_style.as_deref(),
+                            scope,
+                            ctx,
+                            true,
+                            budget,
+                        )?,
                         None => None,
                     };
                     if text.is_none() && tb.is_none() {
@@ -1122,8 +1159,16 @@ impl<'d> Reader<'d> {
                 });
                 if fontwork {
                     // Fontwork: its text in its fill, filling the shape.
-                    let mut text =
-                        self.text(n, &props, pres_style.as_deref(), scope, ctx, false, budget)?;
+                    let mut text = self.text(
+                        n,
+                        &props,
+                        GRAPHIC,
+                        pres_style.as_deref(),
+                        scope,
+                        ctx,
+                        false,
+                        budget,
+                    )?;
                     if let Some(t) = &mut text {
                         let lines = t.paras.len().max(1) as f64;
                         let size = ((xf.h as f64 / 12_700.0 / lines * 0.75).clamp(1.0, 400.0)
@@ -1164,8 +1209,16 @@ impl<'d> Reader<'d> {
                 let Some(geom) = geom else {
                     return Ok(None);
                 };
-                let text =
-                    self.text(n, &props, pres_style.as_deref(), scope, ctx, false, budget)?;
+                let text = self.text(
+                    n,
+                    &props,
+                    GRAPHIC,
+                    pres_style.as_deref(),
+                    scope,
+                    ctx,
+                    false,
+                    budget,
+                )?;
                 let open = matches!(
                     kind,
                     "draw:line" | "draw:polyline" | "draw:connector" | "draw:measure"
@@ -1393,7 +1446,7 @@ impl<'d> Reader<'d> {
         for c in t.all("table:table-column").take(1000) {
             let w = st
                 .resolve("table-column", c.attr("table:style-name"))
-                .len("style:column-width")
+                .len("table-column/style:column-width")
                 .unwrap_or(0);
             let rep = c
                 .attr("table:number-columns-repeated")
@@ -1464,6 +1517,7 @@ impl<'d> Reader<'d> {
         };
         let mut rows = vec![];
         for (ri, r) in rows_nodes.into_iter().enumerate() {
+            self.charge_styles(budget)?;
             let ncols = r
                 .nodes()
                 .filter(|c| c.name == "table:table-cell" || c.name == "table:covered-table-cell")
@@ -1471,7 +1525,7 @@ impl<'d> Reader<'d> {
             let h = self
                 .styles(scope)
                 .resolve("table-row", r.attr("table:style-name"))
-                .len("style:row-height")
+                .len("table-row/style:row-height")
                 .unwrap_or(0);
             let mut cells = vec![];
             let cell_nodes = r
@@ -1482,31 +1536,35 @@ impl<'d> Reader<'d> {
                 let mut cp = self
                     .styles(scope)
                     .resolve("table-cell", template(ri, ci, ncols).as_deref());
-                cp.overlay(
+                Rc::make_mut(&mut cp).overlay_props(
                     &self
                         .styles(scope)
-                        .chain("table-cell", c.attr("table:style-name"))
-                        .0,
+                        .chain("table-cell", c.attr("table:style-name")),
                 );
-                let fill = match cp.get("fo:background-color") {
+                let fill = match cp.get_in(CELL, "fo:background-color") {
                     Some(v) if v != "transparent" => color(v)
                         .map(|rgb| Fill::Solid(Color::rgb(rgb)))
                         .unwrap_or_default(),
-                    _ => match cp.get("draw:fill") {
-                        Some("solid") | Some("gradient") | Some("bitmap") => self.fill(&cp, scope),
+                    _ => match cp.get_in(CELL, "draw:fill") {
+                        Some("solid") | Some("gradient") | Some("bitmap") => {
+                            self.fill(&cp, CELL, scope)
+                        }
                         _ => Fill::None,
                     },
                 };
                 let border = |k: &str| -> Line {
-                    let v = cp.get(k).or_else(|| cp.get("fo:border")).unwrap_or("none");
+                    let v = cp
+                        .get_in(CELL, k)
+                        .or_else(|| cp.get_in(CELL, "fo:border"))
+                        .unwrap_or("none");
                     border_line(v)
                 };
                 let mut text = self
-                    .text(c, &cp, None, scope, ctx, true, budget)?
+                    .text(c, &cp, CELL, None, scope, ctx, true, budget)?
                     .unwrap_or_default();
                 let pad = |k: &str| {
-                    cp.len(k)
-                        .or_else(|| cp.len("fo:padding"))
+                    cp.len_in(CELL, k)
+                        .or_else(|| cp.len_in(CELL, "fo:padding"))
                         .unwrap_or(91440 / 2)
                         .max(0)
                 };
@@ -1516,7 +1574,7 @@ impl<'d> Reader<'d> {
                     pad("fo:padding-right"),
                     pad("fo:padding-bottom"),
                 ];
-                text.body.anchor = match cp.get("style:vertical-align") {
+                text.body.anchor = match cp.get_in(CELL, "style:vertical-align") {
                     Some("middle") => "ctr",
                     Some("bottom") => "b",
                     _ => "t",

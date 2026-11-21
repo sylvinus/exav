@@ -17,7 +17,9 @@
 #   4. playwright: the demo built for production, as a host's bundler builds
 #      the package, driven in headless Chromium under the demo's
 #      Content-Security-Policy, each file in the sandboxed frame and again in
-#      the page, against samples whose content is known; and the frame's
+#      the page, against samples whose content is known, and every file the
+#      demo lists opened from its sidebar (e2e/examples.spec.ts, in the frame
+#      only with EXAV_EXAMPLES_MODES=sandbox, as CI runs it); and the frame's
 #      guarantees (e2e/frame.spec.ts) and text selection and copy in PDF,
 #      Word, PowerPoint and Excel files (e2e/selection.spec.ts) in
 #      Chromium, Firefox and WebKit. Then the demo again with its frame

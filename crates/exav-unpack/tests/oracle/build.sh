@@ -25,9 +25,9 @@ mkdir -p "$OUT"
 cd "$OUT"
 
 if [ ! -d lzfse-src ]; then
-  git init -q lzfse-src
-  git -C lzfse-src fetch -q --depth 1 https://github.com/lzfse/lzfse "$LZFSE_REV"
-  git -C lzfse-src checkout -q FETCH_HEAD
+  mkdir lzfse-src
+  curl -fsSL "https://github.com/lzfse/lzfse/archive/$LZFSE_REV.tar.gz" |
+    tar xz -C lzfse-src --strip-components 1
 fi
 for f in blast.c blast.h; do
   [ -f "$f" ] || curl -fsSL "https://raw.githubusercontent.com/madler/zlib/$ZLIB_TAG/contrib/blast/$f" -o "$f"

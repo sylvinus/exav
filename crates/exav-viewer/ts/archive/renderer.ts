@@ -1,3 +1,4 @@
+import { DEFAULT_PACKAGE_LIMITS } from "../core/detect.js";
 import { writable } from "../core/store.js";
 import type { ArchiveController, ArchiveMember, ByteRanges, RenderContext, Renderer, Session, ViewerFile } from "../core/types.js";
 import type { ArchiveOptions } from "./index.js";
@@ -8,9 +9,10 @@ import { volumesAround, type Volumes } from "./volumes.js";
 /**
  * What one archive may cost. The library enforces them: an archive is
  * untrusted, and a few kilobytes can decompress to a terabyte. These are far
- * above any real delivery and far below a bomb.
+ * above any real delivery and far below a bomb. The viewer's limits on a
+ * ZIP's directory, so that one the detection lets through is listed.
  */
-const DEFAULTS = { maxExtractedBytes: 512 * 1024 * 1024, maxMembers: 5_000 };
+const DEFAULTS = { maxExtractedBytes: DEFAULT_PACKAGE_LIMITS.maxExtractedBytes, maxMembers: DEFAULT_PACKAGE_LIMITS.maxMembers };
 
 type State = ArchiveController extends { get(): infer S } ? S : never;
 

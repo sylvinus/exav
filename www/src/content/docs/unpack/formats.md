@@ -265,7 +265,7 @@ encoder cannot produce, so a corrupt stream does not turn into plausible output.
 
 | State | Packers |
 |---|---|
-| **Unpacked, per format** | UPX, all methods: NRV2B/2D/2E (UCL), LZMA and DEFLATE, including the bare-`PackHeader` layout, decoded to the size the header records (a run matching its Adler-32 first), then rebuilt as a PE (a stripped or patched `PackHeader` falls back to running the stub); the aPLib family (Petite 2.x, FSG 2.0, NsPack), round-trip byte-exact |
+| **Unpacked, per format** | UPX, all methods: NRV2B/2D/2E (UCL), LZMA and DEFLATE, including the bare-`PackHeader` layout, decoded to the size the header records (a run matching its Adler-32 first), then rebuilt as a PE (a stripped or patched `PackHeader` falls back to running the stub) |
 | **Unpacked by running the stub** | ASPack, MEW, Upack, WWPack, PESpin, Yoda's Cryptor, and anything else that looks packed, under a bounded x86 interpreter that captures the image the stub rebuilds (the `pe-emu` feature). Measured coverage is on the [PE stub emulation](/scanner/concepts/pe-emulation/#measured-coverage) page |
 | **Reported unsupported** | A file whose packer exav identified but could not unpack. A file sent to the emulator only because of its shape yields nothing if nothing comes out |
 | **Reported, never unpacked** | VMProtect, Themida/WinLicense, Enigma: virtualizers, where no original code exists in memory to recover |

@@ -68,6 +68,42 @@ pub(crate) enum Addr {
     },
 }
 
+impl Addr {
+    /// What two spellings of one socket have in common, `None` for an address
+    /// that names no particular socket (port 0 asks for a free one each time).
+    ///
+    /// A socket address is compared as the address it parses to, a path by the
+    /// directory it is in once that is resolved. A host name is compared as
+    /// written: two names for one machine are left to the bind, which fails on
+    /// a port that is taken.
+    fn identity(&self) -> Option<String> {
+        match self {
+            Addr::Tcp(a) => {
+                if a.rsplit_once(':')
+                    .is_some_and(|(_, port)| port.parse::<u16>() == Ok(0))
+                {
+                    return None;
+                }
+                Some(match a.parse::<std::net::SocketAddr>() {
+                    Ok(s) => format!("tcp:{s}"),
+                    Err(_) => format!("tcp:{}", a.to_ascii_lowercase()),
+                })
+            }
+            Addr::Unix { path, .. } => {
+                // Drops `.`, repeated and trailing separators.
+                let clean: PathBuf = path.components().collect();
+                let resolved = match (clean.parent(), clean.file_name()) {
+                    (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+                        .map(|d| d.join(name))
+                        .unwrap_or_else(|_| clean.clone()),
+                    _ => clean,
+                };
+                Some(format!("unix:{}", resolved.display()))
+            }
+        }
+    }
+}
+
 /// A protocol and a place, parsed from one `--listen` / `--connect` value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Endpoint {
@@ -712,6 +748,10 @@ impl std::fmt::Display for Endpoint {
 
 /// Parse every `--listen` value, refusing a set that cannot all be bound.
 ///
+/// Every address is served, each with the options on its own address, so a
+/// protocol can be given any number of times. The same socket given twice is
+/// refused (see [`Addr::identity`]).
+///
 /// An empty value names no listener rather than being an error, because
 /// `EXAV_LISTEN=` is the only way to switch off a listener an image's `ENV` set:
 /// a container runtime can override a variable and cannot unset one. Refusing it
@@ -726,18 +766,37 @@ pub(crate) fn listeners_of(flag: &str, values: &[String]) -> Result<Vec<Endpoint
     let mut out: Vec<Endpoint> = Vec::new();
     for v in values.iter().filter(|v| !v.trim().is_empty()) {
         let e = Endpoint::parse(v)?;
-        // Two listeners on one protocol is a configuration with a silent loser:
-        // whichever the code happens to pick first serves, and the other address
-        // is simply never bound while appearing in the command line.
-        if let Some(prev) = out.iter().find(|p| p.proto == e.proto) {
+        // One socket given twice is a configuration with a silent loser: for a
+        // Unix path the second bind replaces the first socket, so the options
+        // of one address serve while both appear in the command line.
+        if let Some(id) = e.addr.identity()
+            && let Some(prev) = out.iter().find(|p| p.addr.identity().as_ref() == Some(&id))
+        {
             return Err(format!(
-                "{flag} {e} and {flag} {prev} both serve {}; give one",
-                e.proto.as_str()
+                "{flag} {prev} and {flag} {e} are the same socket; give it once"
             ));
         }
         out.push(e);
     }
     Ok(out)
+}
+
+/// Refuses a socket named both in `--listen` and in `--listen-health`: for a
+/// Unix path the second bind replaces the first one's socket, so one protocol
+/// would serve under the other's address.
+pub(crate) fn apart(listen: &[Endpoint], health: &[Endpoint]) -> Result<(), String> {
+    for h in health {
+        if let Some(id) = h.addr.identity()
+            && let Some(l) = listen
+                .iter()
+                .find(|l| l.addr.identity().as_ref() == Some(&id))
+        {
+            return Err(format!(
+                "--listen {l} and --listen-health {h} are the same socket; give each its own"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// [`listeners_of`] for `--listen-health`, which reads `?mode=`,
@@ -1228,12 +1287,73 @@ mod tests {
     }
 
     #[test]
-    fn one_listener_per_protocol() {
-        assert!(listeners(&["clamd://0.0.0.0:3310".into(), "icap://0.0.0.0:1344".into()]).is_ok());
-        // Both spellings of the same protocol, so the second would silently
-        // never be bound.
-        let e = listeners(&["0.0.0.0:3310".into(), "clamd://0.0.0.0:3311".into()]).unwrap_err();
-        assert!(e.contains("both serve clamd"), "{e}");
+    fn every_address_of_a_protocol_is_kept_with_its_own_options() {
+        let all = listeners(&[
+            "/run/a.sock?mode=660".into(),
+            "0.0.0.0:3310?max-connections=7".into(),
+            "icap://0.0.0.0:1344?service=one".into(),
+            "icap://0.0.0.0:1345?service=two".into(),
+        ])
+        .unwrap();
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[1].max_connections, Some(7));
+        assert_eq!(all[0].max_connections, None);
+        assert_eq!(all[2].services, ["one"]);
+        assert_eq!(all[3].services, ["two"]);
+        // A health address is read the same way.
+        let health = health_listeners_of(&["0.0.0.0:3311".into(), "/run/h.sock".into()]).unwrap();
+        assert_eq!(health.len(), 2);
+    }
+
+    #[test]
+    fn one_socket_given_twice_is_refused() {
+        let twice = |a: &str, b: &str| listeners(&[a.into(), b.into()]).unwrap_err();
+        // Options on either copy do not make them two sockets.
+        let e = twice("0.0.0.0:3310", "clamd://0.0.0.0:3310?idle-secs=5");
+        assert!(e.contains("same socket"), "{e}");
+        // Nor does the protocol: the second bind would fail on the port.
+        assert!(twice("0.0.0.0:3310", "icap://0.0.0.0:3310").contains("same socket"));
+        // Spellings of one socket: an IPv6 address written long, a port with
+        // leading zeros.
+        assert!(twice("[::1]:3310", "[0:0:0:0:0:0:0:1]:3310").contains("same socket"));
+        assert!(twice("127.0.0.1:3310", "127.0.0.1:03310").contains("same socket"));
+        // Spellings of one path: repeated and trailing separators, a `.`, in a
+        // directory that does not exist and in one that does.
+        for dir in ["/exav-no-such-dir", "/"] {
+            let first = format!("{dir}/a.sock");
+            for second in [
+                format!("{dir}//a.sock"),
+                format!("{dir}/./a.sock"),
+                format!("{dir}/a.sock//"),
+                format!("clamd://{dir}/a.sock?mode=660"),
+            ] {
+                assert!(twice(&first, &second).contains("same socket"), "{second}");
+            }
+        }
+        // The health flag reads the same rule.
+        let e = health_listeners_of(&["/run/h.sock".into(), "/run//h.sock".into()]).unwrap_err();
+        assert!(
+            e.contains("--listen-health") && e.contains("same socket"),
+            "{e}"
+        );
+        // And one socket in both flags is refused.
+        let both = |l: &str, h: &str| {
+            apart(
+                &listeners(&[l.into()]).unwrap(),
+                &health_listeners_of(&[h.into()]).unwrap(),
+            )
+        };
+        let e = both("/run/a.sock", "/run//a.sock").unwrap_err();
+        assert!(
+            e.contains("--listen-health") && e.contains("same socket"),
+            "{e}"
+        );
+        assert!(both("0.0.0.0:3310", "0.0.0.0:3310").is_err());
+        assert!(both("0.0.0.0:3310", "0.0.0.0:3311").is_ok());
+        // Other ports and paths, and port 0, which is a free port each time.
+        assert!(listeners(&["0.0.0.0:3310".into(), "0.0.0.0:3311".into()]).is_ok());
+        assert!(listeners(&["/run/a.sock".into(), "/run/b.sock".into()]).is_ok());
+        assert!(listeners(&["127.0.0.1:0".into(), "127.0.0.1:0".into()]).is_ok());
     }
 
     #[test]

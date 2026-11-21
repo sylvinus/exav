@@ -191,14 +191,16 @@ describe("a presentation opened", () => {
       ["unreachable", "crashed"],
     ]) {
       convertSlides.mockRejectedValue(new Error(reason));
-      // With an external converter set, as without: it never gets the file.
+      // With an external converter set, as without: an external converter set
+      // gets the file next, and failing too, leaves the first error the file's.
       for (const external of [true, false]) {
+        convertExternal.mockClear();
         const { ctx, nested } = context(PPT, {}, external);
         const error = await failure("ppt", ctx);
         expect(error, reason).toBeInstanceOf(SlideConversionError);
         expect((error as SlideConversionError).kind).toBe(kind);
         expect(nested).not.toHaveBeenCalled();
-        expect(convertExternal).not.toHaveBeenCalled();
+        expect(convertExternal).toHaveBeenCalledTimes(external ? 1 : 0);
       }
     }
   });
@@ -225,20 +227,25 @@ describe("a presentation opened", () => {
     expect(error).toBeInstanceOf(SlideConversionError);
     expect((error as SlideConversionError).kind).toBe("malformed");
     expect((error as SlideConversionError).format).toBe("odg");
-    expect(convertExternal).not.toHaveBeenCalled();
+    // Tried by the external converter after it, which failed too.
+    expect(convertExternal).toHaveBeenCalledTimes(1);
   });
 
-  it("fails the same way for a version of PowerPoint or of Keynote the converter does not read", async () => {
+  it("goes on to the external converter for a version of PowerPoint or of Keynote the converter does not read", async () => {
+    const { rendererFor } = await import("./convert.js");
     convertSlides.mockRejectedValue(new Error("unsupported"));
+    convertExternal.mockResolvedValue({ format: "pdf", bytes: new Uint8Array([5]) });
     for (const [kind, data, format] of [
       ["ppt", bytes([0xed, 0xde, 0xad, 0x0b, 2, 0, 0, 0]), "ppt"],
       ["keynote", zip("index.apxl.gz"), "key"],
     ] as const) {
-      const { ctx } = context(data, {}, true);
-      const error = await failure(kind, ctx);
-      expect(error).toBeInstanceOf(SlideConversionError);
+      const { ctx, nested } = context(data, {}, true);
+      await rendererFor(kind).mount(document.createElement("div"), ctx);
       expect(convertSlides).toHaveBeenLastCalledWith(data, format, expect.anything());
-      expect(convertExternal).not.toHaveBeenCalled();
+      expect((nested.mock.calls[0] as unknown as [unknown, { format: string }])[1].format).toBe("pdf");
+      // Without an external converter it fails with the converter's reason.
+      const alone = context(data, {}, false);
+      expect(await failure(kind, alone.ctx)).toBeInstanceOf(SlideConversionError);
     }
   });
 

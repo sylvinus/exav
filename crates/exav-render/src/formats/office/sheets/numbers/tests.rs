@@ -6,6 +6,7 @@ use crate::formats::office::common::iwa::snappy::literal_block;
 use crate::formats::office::sheets::error::Error;
 use crate::formats::office::sheets::limits::{Budget, Limits};
 use crate::formats::office::sheets::model::*;
+use exav_unpack::zip_write::{FileOptions, ZipWriter};
 use std::io::Write;
 
 /// One IWA stream holding `objects` (identifier, message type, payload).
@@ -34,10 +35,9 @@ fn iwa(objects: &[(u64, u32, W)]) -> Vec<u8> {
 }
 
 fn zip(files: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(vec![]));
+    let mut z = ZipWriter::new(std::io::Cursor::new(vec![]));
     for (name, data) in files {
-        z.start_file(*name, zip::write::SimpleFileOptions::default())
-            .unwrap();
+        z.start_file(name, FileOptions::default()).unwrap();
         z.write_all(data).unwrap();
     }
     z.finish().unwrap().into_inner()
@@ -225,6 +225,15 @@ fn document() -> Vec<u8> {
     zip(&[("Index/Document.iwa", &iwa(&objects()))])
 }
 
+/// The IWA stream of a document built by [`document`].
+fn document_iwa(doc: &[u8]) -> Vec<u8> {
+    crate::formats::office::common::package::Zip::open(doc)
+        .unwrap()
+        .read("Index/Document.iwa", u64::MAX)
+        .unwrap()
+        .unwrap()
+}
+
 fn read(bytes: &[u8]) -> Result<Workbook, Error> {
     super::read(bytes, &mut Budget::new(Limits::default()))
 }
@@ -287,9 +296,7 @@ fn refusals() {
 #[test]
 fn nested_index_zip() {
     let doc = document();
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(&doc[..])).unwrap();
-    let mut iwa = vec![];
-    std::io::Read::read_to_end(&mut z.by_name("Index/Document.iwa").unwrap(), &mut iwa).unwrap();
+    let iwa = document_iwa(&doc);
     let inner = zip(&[("Index/Document.iwa", &iwa)]);
     let outer = zip(&[("Doc.numbers/Index.zip", &inner)]);
     assert_eq!(read(&outer).unwrap().sheets.len(), 2);
@@ -298,9 +305,7 @@ fn nested_index_zip() {
 #[test]
 fn damaged_documents_do_not_panic() {
     let doc = document();
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(&doc[..])).unwrap();
-    let mut iwa = vec![];
-    std::io::Read::read_to_end(&mut z.by_name("Index/Document.iwa").unwrap(), &mut iwa).unwrap();
+    let iwa = document_iwa(&doc);
     // Every truncation, and bytes flipped one at a time.
     for n in (0..iwa.len()).step_by(7) {
         let _ = read(&zip(&[("Index/Document.iwa", &iwa[..n])]));
@@ -336,4 +341,66 @@ fn cells_are_counted() {
         &mut Budget::new(Limits::default().with_max_cells(3)),
     );
     assert_eq!(r.unwrap_err(), Error::TooLarge("cells"));
+}
+
+/// A merge that overlaps one kept is dropped while the comparisons last,
+/// and kept unchecked past them.
+#[test]
+fn merges_are_compared_within_the_budget() {
+    use super::table::push_merge;
+    let d = super::formula::TableDims {
+        rows: 10,
+        cols: 10,
+        ..Default::default()
+    };
+    let merges = |budget: &mut Budget| {
+        let mut sheet = Sheet::new("T".into());
+        for _ in 0..3 {
+            push_merge(&mut sheet, &d, budget, (0, 0), (1, 1));
+        }
+        push_merge(&mut sheet, &d, budget, (5, 5), (5, 5));
+        sheet.merges.len()
+    };
+    assert_eq!(merges(&mut Budget::new(Limits::default())), 1);
+    let mut tight = Budget::new(Limits::default()).with_max_compared(1);
+    assert_eq!(merges(&mut tight), 2);
+}
+
+/// The calculation engine's merges of a table are as many as the other
+/// sources read, and charged to the memory limit.
+#[test]
+fn the_calculation_engines_merges_are_bounded() {
+    use super::iwa::Store;
+    let uuid = W::default().uint(2, 1).uint(3, 2).uint(4, 3).uint(5, 4);
+    let engine = W::default().msg(
+        2,
+        W::default().msg(3, W::default().msg(1, W::default().uint(1, 7).msg(2, uuid))),
+    );
+    let deps = |n: u64| {
+        let mut list = W::default();
+        for i in 0..n {
+            let range = W::default()
+                .uint(1, 0)
+                .uint(2, 2 * i)
+                .uint(3, 1)
+                .uint(4, 2 * i);
+            list = list.msg(
+                2,
+                W::default().msg(4, W::default().uint(1, 7).msg(2, range)),
+            );
+        }
+        W::default().uint(3, 5).msg(5, list)
+    };
+    let store = Store::of(&[
+        (1, 4000, engine),
+        (2, 4008, deps(40_000)),
+        (3, 4008, deps(40_000)),
+    ]);
+    let by_uuid = [(4 << 96 | 3 << 64 | 2 << 32 | 1, 0)].into_iter().collect();
+    let mut budget = Budget::new(Limits::default());
+    let merges = super::merge_owners(&store, &by_uuid, &mut budget).unwrap();
+    assert_eq!(merges[&0].len(), 1 << 16);
+    assert_eq!(budget.used(), 16 << 16);
+    let mut small = Budget::new(Limits::default().with_max_memory(1000));
+    assert!(super::merge_owners(&store, &by_uuid, &mut small).is_err());
 }

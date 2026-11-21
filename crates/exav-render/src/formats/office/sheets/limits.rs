@@ -52,6 +52,8 @@ pub(crate) struct Budget {
     memory: u64,
     swept: u64,
     max_swept: u64,
+    compared: u64,
+    max_compared: u64,
 }
 
 /// What one cell costs in the model, beyond its strings: the cell, its key and
@@ -64,6 +66,10 @@ pub(crate) const CELL_BYTES: u64 = 160;
 /// couple of seconds.
 const MAX_SWEPT: u64 = 1 << 26;
 
+/// Merges a new merge may be compared with for an overlap, in all: under a
+/// second.
+const MAX_COMPARED: u64 = 1 << 27;
+
 impl Budget {
     pub fn new(limits: Limits) -> Self {
         Budget {
@@ -72,6 +78,8 @@ impl Budget {
             memory: 0,
             swept: 0,
             max_swept: MAX_SWEPT,
+            compared: 0,
+            max_compared: MAX_COMPARED,
         }
     }
 
@@ -79,6 +87,22 @@ impl Budget {
     pub fn with_max_swept(mut self, columns: u64) -> Self {
         self.max_swept = columns;
         self
+    }
+
+    #[cfg(test)]
+    pub fn with_max_compared(mut self, merges: u64) -> Self {
+        self.max_compared = merges;
+        self
+    }
+
+    /// Whether a merge may be compared with `merges` more, counting them if so.
+    pub fn compare(&mut self, merges: u64) -> bool {
+        let total = self.compared.saturating_add(merges);
+        if total > self.max_compared {
+            return false;
+        }
+        self.compared = total;
+        true
     }
 
     /// Whether `columns` more may be checked, counting them if so.

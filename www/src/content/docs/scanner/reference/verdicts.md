@@ -40,7 +40,8 @@ The grammar is `path: [reason ][CATEGORY ]STATUS`, with the status last, where
   `--max-object-bytes` (an object too large for the checks that parse it whole,
   or a member too large to hold with spilling off), the extraction and matcher
   budgets, the ratio,
-  recursion and member caps, `--max-pe-emulation-steps`, a stream past the spill
+  recursion and member caps, `--max-pe-emulation-steps` and
+  `--max-pe-stub-steps`, a stream past the spill
   budgets, a daemon job past `--max-scan-secs`, the YARA step and match budgets,
   a bytecode signature that ran out of steps, and the engine's internal step
   budgets.

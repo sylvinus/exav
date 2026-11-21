@@ -72,6 +72,7 @@ panic instead of wrapping). Targets in `fuzz/fuzz_targets/`:
 | `ifc`           | `exav_render::ifc::read()` + `exav_render::stl::read()` | IFC (IFC2X3, IFC4, IFC4X3) and STL into triangle meshes, as `@exav/viewer`'s model module reads them: the STEP index and parameter parser, units, placements (local, grid and linear), profiles, curves (alignment curve segments among them), swept and tessellated solids, B-reps with their curved faces, booleans (BSP trees) and openings, within a 200,000-triangle budget; and binary and ASCII STL. No other target reaches them. |
 | `mesh`          | `exav_render::obj::read()`, `ply::read()`, `gltf::read()` | Wavefront OBJ, Stanford PLY (ASCII and binary, both byte orders) and glTF 2.0 (`.gltf` with `data:` buffers, `.glb`) into triangle meshes, within a 200,000-triangle budget: polygon triangulation, PLY headers and list types, glTF's own JSON reader, accessors, sparse accessors, node transforms and trees, base64. The target also checks that every scene it gets back has whole triangles, indices in range and finite positions. |
 | `markdown`      | `exav_render::markdown::parse()` + `to_json()`, `visible_text()` | Markdown (CommonMark, tables, strikethrough) into the tree `@exav/viewer`'s text module draws, through pulldown-cmark: the nesting, column and node bounds, the link targets the tree may carry (http, https and mailto, no space, control, separator, bidirectional control or credentials, checked on their own terms), padded table rows, and that the JSON is balanced and ends as the page expects. |
+| `pdf_readers`   | `exav_unpack::extract()` of a PDF against hayro-syntax's `Pdf` | the two readings the scanner takes a PDF's members and its text from, one against the other (`crates/exav-unpack/tests/pdf_readers/mod.rs`, shared with the `pdf_readers_diff` test): the streams each finds by object and generation number, the strings under `/JS`, `/JavaScript` and the link and launch keys, and whether the file opens. Panics when hayro lists a stream, a script or a link target that exav-unpack's members lack, or opens a file exav-unpack found no stream in. The other differences are repairs, recorded per file by the test. exav-unpack reads first, under tight limits, and hayro is given only a file it took whole. Run with `-max_len=65536`. |
 | `sheets_xls`    | `exav_render::sheets::convert(.., Format::Xls, ..)` | XLS into the XLSX `@exav/viewer`'s sheets module shows: the lenient compound file reader, BIFF2 to BIFF8 records and their CONTINUE joins, decryption with the default password (XOR, RC4, RC4 CryptoAPI), code pages, formulas, conditional formats, validations, the drawing layer (pictures, shapes, charts) and the XLSX writer, within 200,000 cells and 64 MiB. Checks that what converts is a ZIP whose first parts are XML without a C0 control character. No other target reaches it. |
 | `sheets_ods`    | `exav_render::sheets::convert(.., Format::Ods / Fods, ..)` | ODS (a ZIP) and FODS (anything else): the XML tree's bounds, styles and data styles, OpenFormula conversion, conditional formats and validations, frames and charts, the repeated rows and columns, then the XLSX writer, under the same limits and checks. |
 | `sheets_numbers` | `exav_render::sheets::convert(.., Format::Numbers, ..)` | Apple Numbers: the input is an IWA stream the target stores as `Index/Document.iwa`, or a Numbers '08/'09 `index.xml` when it starts with `<` (`index.xml.gz` when gzipped), or a whole document when it is a ZIP, so the mutations reach the Snappy blocks, the protobuf archives, the tiles and cell records, the '09 XML's styles, data source and formulas, not the ZIP around them. Same limits and checks. |
@@ -206,6 +207,9 @@ pass as an extra, read-only corpus directory:
    their names: a DOC, an XLS, a PPT, an RTF, a Word 2003 XML and a
    SpreadsheetML 2003 file, a SYLK file, the flat OpenDocument files, a
    Numbers, a Pages and a Keynote document).
+   **PDFs**, for `pdf_readers`: every PDF of the repository of at most 64 KiB
+   (exav-unpack's and exav-core's fixtures, the viewer's demo files and PDF
+   image streams).
    **Markdown**, for `markdown`: three files written by the script (every
    construct the reader folds, the link targets it must refuse, deep quotes and
    lists), and a dictionary of Markdown's punctuation (`fuzz/dicts/markdown.dict`).
@@ -331,10 +335,15 @@ fields set to extremes, cuts, insertions, repeats) and compare the bytes
 written and the verdict (whole, output past the limit, cut, damaged):
 
 ```sh
+make test-oracles      # builds them in target/oracles, then runs the tests
+# or by hand:
 crates/exav-unpack/tests/oracle/build.sh DIR
 EXAV_LZFSE_ORACLE=DIR/lzfse_oracle EXAV_DCL_ORACLE=DIR/dcl_oracle \
   cargo test -p exav-unpack --lib -- --ignored oracle
 ```
+
+The nightly workflow (`fuzz-nightly.yml`) runs `make test-oracles` in a job of
+its own.
 
 They are ignored, not skipped: a run that did not ask for them lists them as
 ignored, and a run that did fails when the oracle is not built.

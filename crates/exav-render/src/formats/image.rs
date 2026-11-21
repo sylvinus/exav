@@ -328,13 +328,23 @@ impl Pixels {
 
 /// Decode `data` as `format`, within `max_alloc` bytes of pixels (at most
 /// [`DECODE_MAX`]). A decoder panic is caught and reported
-/// [`Error::Undecodable`].
+/// [`Error::Undecodable`]. A truncated or damaged JPEG 2000 or JBIG2 file is
+/// refused (hayro's strict mode): this is what the scanner reads. The viewer
+/// shows what such a file holds ([`decode_any`]).
 pub fn decode(data: &[u8], format: Format, max_alloc: u64) -> Result<Pixels, Error> {
+    decode_with(data, format, max_alloc, true)
+}
+
+/// [`decode`], and with `strict` false a damaged JPEG 2000 or JBIG2 file is
+/// decoded as far as it goes.
+fn decode_with(data: &[u8], format: Format, max_alloc: u64, strict: bool) -> Result<Pixels, Error> {
+    #[cfg(not(any(feature = "jp2", feature = "jbig2")))]
+    let _ = strict;
     std::panic::catch_unwind(|| match format {
         #[cfg(feature = "jp2")]
-        Format::Jpeg2000 => jp2::decode(data, max_alloc),
+        Format::Jpeg2000 => jp2::decode(data, max_alloc, strict),
         #[cfg(feature = "jbig2")]
-        Format::Jbig2 => jbig2::decode(data, max_alloc),
+        Format::Jbig2 => jbig2::decode(data, max_alloc, strict),
         #[cfg(feature = "jxl")]
         Format::Jxl => jxl::decode(data, max_alloc),
         _ => decode_dynamic(data, format, max_alloc).map(Pixels::from_dynamic),
@@ -397,8 +407,19 @@ fn ycc_to_rgb(mut samples: Vec<u8>) -> Vec<u8> {
 /// [`decode`], the format read from the first bytes. With the `raw` feature,
 /// a camera RAW file is shown by its largest embedded preview (`raw`),
 /// where [`Format::detect`] and [`decode`] read a TIFF-structured one as the
-/// TIFF it also is.
+/// TIFF it also is. A truncated or damaged JPEG 2000 or JBIG2 file shows what
+/// it holds.
 pub fn decode_any(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
+    decode_any_with(data, max_alloc, false)
+}
+
+/// [`decode_any`] for the scanner (the QR reading): a truncated or damaged
+/// JPEG 2000 or JBIG2 file is refused, as by [`decode`].
+pub fn decode_any_strict(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
+    decode_any_with(data, max_alloc, true)
+}
+
+fn decode_any_with(data: &[u8], max_alloc: u64, strict: bool) -> Result<Pixels, Error> {
     #[cfg(feature = "raw")]
     match raw::decode(data, max_alloc) {
         Err(Error::Unsupported) => {}
@@ -409,7 +430,7 @@ pub fn decode_any(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
     if data.starts_with(&[0, 0, 2, 0])
         && let Some(icon) = ico_view::cursor_as_icon(data)
     {
-        return decode_any(&icon, max_alloc);
+        return decode_any_with(&icon, max_alloc, strict);
     }
     // BigTIFF has a magic of its own, which only the viewer reads.
     let bigtiff = data.starts_with(b"II+\0") || data.starts_with(b"MM\0+");
@@ -418,7 +439,7 @@ pub fn decode_any(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
         return std::panic::catch_unwind(|| tga_view::decode(data, max_alloc))
             .unwrap_or(Err(Error::Undecodable));
     };
-    let pixels = viewed_pixels(data, format, max_alloc)?;
+    let pixels = viewed_pixels(data, format, max_alloc, strict)?;
     Ok(if format == Format::Tiff {
         tiff_view::oriented(data, pixels)
     } else {
@@ -428,7 +449,12 @@ pub fn decode_any(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
 
 /// What `decode_any` shows of a file of this format, before a TIFF's
 /// orientation is applied.
-fn viewed_pixels(data: &[u8], format: Format, max_alloc: u64) -> Result<Pixels, Error> {
+fn viewed_pixels(
+    data: &[u8],
+    format: Format,
+    max_alloc: u64,
+    strict: bool,
+) -> Result<Pixels, Error> {
     // What the hashing decoder reads wrongly, or not as the eye would pick
     // (the image of an icon file with most colour), for the eye only.
     let viewed = std::panic::catch_unwind(|| match format {
@@ -442,7 +468,7 @@ fn viewed_pixels(data: &[u8], format: Format, max_alloc: u64) -> Result<Pixels, 
     if let Ok(Ok(pixels)) = viewed {
         return Ok(pixels);
     }
-    let decoded = decode(data, format, max_alloc);
+    let decoded = decode_with(data, format, max_alloc, strict);
     // What the hashing decoder refuses, for the eye only.
     if decoded == Err(Error::Undecodable) {
         let viewed = std::panic::catch_unwind(|| match format {

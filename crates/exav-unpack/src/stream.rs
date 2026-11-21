@@ -199,6 +199,9 @@ pub struct MemberMeta {
     /// For a symbolic link whose container records the target apart from the
     /// content (tar), that target. A ZIP link's target is its content.
     pub link: Option<String>,
+    /// For a hard link (tar), the name of the earlier member whose content it
+    /// shares, as the archive spells it: it has no content of its own.
+    pub hard_link: Option<String>,
     /// For a ZIP member, its compression method number (0 stored, 8
     /// deflate, ...).
     pub zip_method: Option<u16>,
@@ -594,21 +597,49 @@ pub(crate) fn emit_entry(
     };
     // An unsupported member may still carry what was decoded of it.
     let content = (e.unsupported.is_none() || !e.data.is_empty()).then_some(e.data);
-    emit_bytes(&meta, content, budget, visit)
+    emit_held(&meta, content, e.holes, budget, visit)
 }
 
 /// Hand the visitor a member decoded whole. Its bytes are charged to the scan
 /// budget, as a streamed member's are while it is read.
+#[cfg_attr(not(any(feature = "zip", feature = "rar")), allow(dead_code))]
 pub(crate) fn emit_bytes(
     meta: &MemberMeta,
     content: Option<Vec<u8>>,
     budget: &mut Budget,
     visit: Visit<()>,
 ) -> Result<Option<()>, LimitHit> {
+    emit_held(meta, content, 0, budget, visit)
+}
+
+/// [`emit_bytes`], `holes` of the bytes being holes of a sparse file: those
+/// are charged to [`crate::Limits::max_hole_bytes`] instead of the scan budget.
+fn emit_held(
+    meta: &MemberMeta,
+    content: Option<Vec<u8>>,
+    holes: u64,
+    budget: &mut Budget,
+    visit: Visit<()>,
+) -> Result<Option<()>, LimitHit> {
     if let Some(data) = &content {
-        budget.charge_scan(data.len() as u64)?;
+        let len = data.len() as u64;
+        let holes = holes.min(len);
+        if holes > budget.remaining_holes() {
+            return Err(more_holes(meta, budget));
+        }
+        budget.charge_holes(holes)?;
+        budget.charge_scan(len - holes)?;
     }
     Ok(visit(meta, content.map(Member::Bytes), budget))
+}
+
+/// A member's holes past what is left of [`crate::Limits::max_hole_bytes`].
+fn more_holes(meta: &MemberMeta, budget: &Budget) -> LimitHit {
+    LimitHit::new(format!(
+        "member '{}' has more holes than the {} bytes of them a scan may hand over",
+        crate::tree::quoted(&meta.name),
+        budget.limits.max_hole_bytes
+    ))
 }
 
 /// Shared driver for a single-member sequential compressor: seek to the start,
@@ -706,11 +737,7 @@ pub(crate) fn emit_stream_with_holes(
         return Ok(out);
     }
     if br.overflowed && hole_bytes > br.hole_cap {
-        return Err(LimitHit::new(format!(
-            "member '{}' has more holes than the {} bytes of them a scan may hand over",
-            crate::tree::quoted(&meta.name),
-            budget.limits.max_hole_bytes
-        )));
+        return Err(more_holes(meta, budget));
     }
     if br.overflowed {
         if ratio_cap.is_some_and(|r| r < scan_cap) {
@@ -975,9 +1002,9 @@ mod tests {
         use std::io::Write;
         let mut buf = Cursor::new(Vec::new());
         {
-            let mut zip = ::zip::ZipWriter::new(&mut buf);
-            let opts = ::zip::write::SimpleFileOptions::default()
-                .compression_method(::zip::CompressionMethod::Stored);
+            let mut zip = crate::zip_write::ZipWriter::new(&mut buf);
+            let opts =
+                crate::zip_write::FileOptions::default().method(crate::zip_write::Method::Stored);
             for name in ["a.txt", "b.txt"] {
                 zip.start_file(name, opts).unwrap();
                 zip.write_all(b"member").unwrap();
@@ -1014,9 +1041,9 @@ mod tests {
         let zip_of = |name: &str, data: &[u8]| {
             let mut buf = Cursor::new(Vec::new());
             {
-                let mut zip = ::zip::ZipWriter::new(&mut buf);
-                let opts = ::zip::write::SimpleFileOptions::default()
-                    .compression_method(::zip::CompressionMethod::Stored);
+                let mut zip = crate::zip_write::ZipWriter::new(&mut buf);
+                let opts = crate::zip_write::FileOptions::default()
+                    .method(crate::zip_write::Method::Stored);
                 zip.start_file(name, opts).unwrap();
                 zip.write_all(data).unwrap();
                 zip.finish().unwrap();
@@ -1119,19 +1146,19 @@ mod tests {
     #[cfg(feature = "zip")]
     #[test]
     fn a_member_left_out_is_reported_by_its_own_container() {
+        use crate::zip_write::Method;
         use std::io::Write;
-        let zip_of = |members: &[(&str, &[u8], ::zip::CompressionMethod)]| {
-            let mut w = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let zip_of = |members: &[(&str, &[u8], Method)]| {
+            let mut w = crate::zip_write::ZipWriter::new(Cursor::new(Vec::new()));
             for (name, body, method) in members {
-                let options =
-                    ::zip::write::SimpleFileOptions::default().compression_method(*method);
-                w.start_file(*name, options).unwrap();
+                let options = crate::zip_write::FileOptions::default().method(*method);
+                w.start_file(name, options).unwrap();
                 w.write_all(body).unwrap();
             }
             w.finish().unwrap().into_inner()
         };
-        let stored = ::zip::CompressionMethod::Stored;
-        let deflated = ::zip::CompressionMethod::Deflated;
+        let stored = Method::Stored;
+        let deflated = Method::Deflated;
         let inner = zip_of(&[("a.txt", b"nothing", stored)]);
         let outer = zip_of(&[
             ("zeros.bin", &vec![0u8; 1 << 20], deflated),
@@ -1211,15 +1238,14 @@ mod tests {
     fn a_member_range_is_the_member() {
         use std::io::Write;
         let zip = |prefix: &[u8]| {
-            let mut w = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
-            let stored = ::zip::write::SimpleFileOptions::default()
-                .compression_method(::zip::CompressionMethod::Stored);
+            let mut w = crate::zip_write::ZipWriter::new(Cursor::new(Vec::new()));
+            let stored =
+                crate::zip_write::FileOptions::default().method(crate::zip_write::Method::Stored);
             for (name, body) in [("a", &b"first member"[..]), ("b", &[7u8; 5000][..])] {
                 w.start_file(name, stored).unwrap();
                 w.write_all(body).unwrap();
             }
-            let deflated = ::zip::write::SimpleFileOptions::default()
-                .compression_method(::zip::CompressionMethod::Deflated);
+            let deflated = crate::zip_write::FileOptions::default();
             w.start_file("c", deflated).unwrap();
             w.write_all(&[1u8; 4000]).unwrap();
             [prefix, &w.finish().unwrap().into_inner()].concat()

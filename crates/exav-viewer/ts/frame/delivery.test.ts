@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import "../test/blob.js";
 import { kindOf, prepare, readRefusal, urlRefusal, type Prepared } from "./delivery.js";
-import { READS } from "./protocol.js";
+import { MAX_URL, READS } from "./protocol.js";
 
 describe("an address the frame may be given", () => {
   const allowed = ["https://media.test"];
@@ -26,6 +26,10 @@ describe("an address the frame may be given", () => {
       expect(urlRefusal(url, init, allowed, "https://host.test/"), url).not.toBeNull();
     }
     expect(urlRefusal("https://media.test/a.mp4", undefined, [])).toMatch(/none/);
+    // As long as the frame takes, and not longer.
+    const signed = (n: number) => `https://media.test/a.mp4?sig=${"x".repeat(n - "https://media.test/a.mp4?sig=".length)}`;
+    expect(urlRefusal(signed(MAX_URL), undefined, allowed)).toBeNull();
+    expect(urlRefusal(signed(MAX_URL + 1), undefined, allowed)).toMatch(/characters/);
   });
 
   it("is given only for video, audio and the images browsers decode", () => {

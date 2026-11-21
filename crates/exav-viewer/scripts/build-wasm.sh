@@ -15,6 +15,9 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+# The modules are published: no path of this machine in them (panic locations).
+RUSTFLAGS="$(../../scripts/build-flags.sh)"
+export RUSTFLAGS
 TARGET=wasm32-unknown-unknown
 OUT=wasm
 PDF=target/pdf-decoders
@@ -99,4 +102,5 @@ for feature in image dwg model text sheets slides docs table sniff pdf-jpx pdf-j
 done
 node scripts/build-pdf-decoders.mjs "$PDF" "$OUT"
 node scripts/check-wasm-imports.mjs "$OUT"
+python3 -I ../../scripts/check-build-paths.py "$OUT" "$PDF"
 ls -la "$OUT"

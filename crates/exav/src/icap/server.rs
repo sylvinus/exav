@@ -19,7 +19,7 @@ use super::chunked::{Body, BodyEnd, BodyError, BodyOutcome, read_chunked_body};
 use super::config::IcapConfig;
 use super::response::{self, Decision};
 use super::wire::{Entity, IcapMethod, RequestHead, read_head};
-use crate::daemon::{Clocked, Held, ReadClock, Replies, is_session_over};
+use crate::daemon::{Clocked, Held, ReadClock, Replies, Rest, is_session_over, size_counted};
 
 /// A connection's reads: buffered, under the clock of the request in progress.
 type ConnReader<'a> = BufReader<Clocked<'a, TcpStream>>;
@@ -519,6 +519,7 @@ fn modify<R: BufRead, W: Write>(
         opts,
         body.as_ref(),
         total,
+        if abandoned { Rest::Unread } else { Rest::Read },
         &headers,
         enc.span(Entity::ReqHdr),
     );
@@ -629,17 +630,16 @@ fn named_opts(
 /// Turn a scan result into a decision.
 ///
 /// A malicious object that panics a decoder must fail this one request, not the
-/// connection and not the process: the same containment the CLI and the daemon
-/// put around every file.
-fn decide(
-    scanned: std::thread::Result<std::io::Result<(exav_core::ScanReport, Option<String>)>>,
-) -> Decision {
+/// connection and not the process: the scan runs in [`crate::daemon::contained`],
+/// as it does for the clamd listener and the command line, and a panic is worded
+/// as they word it.
+fn decide(scanned: std::io::Result<(exav_core::ScanReport, Option<String>)>) -> Decision {
     let decision = match scanned {
-        Ok(Ok((report, _loc))) => Decision::from_report(&report),
+        Ok((report, _loc)) => Decision::from_report(&report),
+        Err(e) if crate::daemon::scan_panicked(&e) => Decision::Error(e.to_string()),
         // Not a partial: nothing was examined, and `--partial-as ok` must not
         // deliver it.
-        Ok(Err(e)) => Decision::Error(format!("scan failed: {e}")),
-        Err(_) => Decision::Error("scan failed (internal error)".to_string()),
+        Err(e) => Decision::Error(format!("scan failed: {e}")),
     };
     apply_found_policy(decision)
 }
@@ -673,11 +673,15 @@ fn apply_found_policy(decision: Decision) -> Decision {
 /// container-aware treatment (a ZIP's directory lives at its end), from RAM or
 /// from the spill file, under the same [`ScanOptions`] every other exav
 /// front-end uses.
+///
+/// `size` is the body's size as far as it was counted, which is a floor when
+/// `rest` says the read of it stopped.
 fn scan(
     scanner: &Scanner,
     opts: &ScanOptions,
     body: Option<&Held>,
     size: u64,
+    rest: Rest,
     headers: &[u8],
     req_hdr: Option<(usize, usize)>,
 ) -> Decision {
@@ -695,9 +699,10 @@ fn scan(
     // slow-scan line nobody can trace back to an object says only that
     // something was slow.
     let timer = crate::metrics::ScanTimer::start();
-    let decision = decide(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        || crate::daemon::scan_held(scanner, named, held, size),
-    )));
+    let decision = decide(crate::daemon::contained(|| {
+        crate::daemon::scan_held(scanner, named, held, size)
+            .map(|(report, loc)| (size_counted(report, size, rest), loc))
+    }));
     timer.finish(
         named.filename.as_deref().unwrap_or("<icap object>"),
         held.payload.len(),
@@ -720,9 +725,9 @@ fn scan_bytes(
     }
     let owned = named_opts(opts, headers, req_hdr);
     let opts = owned.as_ref().unwrap_or(opts);
-    decide(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        || scan_seekable_located(scanner, std::io::Cursor::new(body), body.len() as u64, opts),
-    )))
+    decide(crate::daemon::contained(|| {
+        scan_seekable_located(scanner, std::io::Cursor::new(body), body.len() as u64, opts)
+    }))
 }
 
 /// The request target from an encapsulated HTTP request line, for naming the
@@ -816,11 +821,24 @@ mod tests {
     /// a partial, and must never pass an object nothing examined.
     #[test]
     fn a_failed_scan_is_an_error_that_blocks() {
-        let failed = decide(Ok(Err(std::io::Error::other("read failed"))));
+        let failed = decide(Err(std::io::Error::other("read failed")));
         assert!(matches!(failed, Decision::Error(_)), "{}", failed.summary());
         assert!(failed.blocks());
-        let panicked = decide(Err(Box::new("boom")));
-        assert!(matches!(panicked, Decision::Error(_)));
+    }
+
+    /// A scan that panics fails its request with the reason the clamd listener
+    /// and the command line give for it.
+    #[test]
+    fn a_panic_in_a_scan_is_an_error_worded_as_on_the_other_surfaces() {
+        crate::daemon::before_scan::set(|| panic!("a scan that panics"));
+        let scanner = Scanner::builtin();
+        let panicked = scan_bytes(&scanner, &ScanOptions::default(), b"abc", b"", None);
+        assert!(
+            matches!(&panicked, Decision::Error(why) if why == crate::daemon::SCAN_PANICKED),
+            "{}",
+            panicked.summary()
+        );
+        assert!(panicked.blocks());
     }
 
     #[test]
@@ -875,6 +893,11 @@ mod tests {
 
     /// [`connect`], under `cfg`.
     fn connect_with(cfg: IcapConfig) -> TcpStream {
+        connect_under(cfg, ScanOptions::default())
+    }
+
+    /// [`connect_with`], scanning under `opts`.
+    fn connect_under(cfg: IcapConfig, opts: ScanOptions) -> TcpStream {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
@@ -885,7 +908,7 @@ mod tests {
         server.set_write_timeout(Some(cfg.idle_timeout)).unwrap();
         std::thread::spawn(move || {
             let db = crate::daemon::SharedDb::new(Arc::new(Scanner::builtin()));
-            serve_connection(server, &cfg, &db, &ScanOptions::default(), &Idle::default());
+            serve_connection(server, &cfg, &db, &opts, &Idle::default());
         });
         client
     }
@@ -1038,6 +1061,34 @@ mod tests {
         while crate::spill::in_use() > before && start.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// A body the discard gave up on was counted as far as it went, so the
+    /// reason gives its size as a floor.
+    #[test]
+    fn a_body_the_drain_gave_up_on_has_its_size_given_as_a_floor() {
+        let cfg = IcapConfig {
+            max_drain_bytes: 1024,
+            ..IcapConfig::default()
+        };
+        let mut opts = ScanOptions::default();
+        opts.max_scan_size = Some(1024);
+        let mut client = connect_under(cfg, opts);
+        let http = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n";
+        // A chunk of 64 KiB, of which the 1 KiB that is kept is sent: the rest
+        // is past the drain and is never read.
+        let head = format!(
+            "RESPMOD icap://h/avscan ICAP/1.0\r\nHost: h\r\nAllow: 204\r\n\
+             Encapsulated: res-hdr=0, res-body={}\r\n\r\n{http}10000\r\n",
+            http.len()
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        client.write_all(&[b'a'; 1024]).unwrap();
+        let said = answer(&mut client);
+        assert!(
+            said.contains("X-Exav-Reason: file size at least 65536 exceeds max-input-bytes 1024"),
+            "{said}"
+        );
     }
 
     /// With no limit a slow head is read to its end.

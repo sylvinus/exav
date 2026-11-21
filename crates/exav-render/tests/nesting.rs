@@ -22,6 +22,7 @@
     feature = "office-sheets"
 ))]
 
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -121,13 +122,11 @@ fn nest(open: &str, close: &str, inner: &str, depth: usize) -> String {
 
 /// A zipped ODF package of one `content.xml`.
 fn odf_zip(mime: &str, content: &str) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let stored =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let stored = FileOptions::default().method(Method::Stored);
     z.start_file("mimetype", stored).unwrap();
     z.write_all(mime.as_bytes()).unwrap();
-    z.start_file("content.xml", zip::write::SimpleFileOptions::default())
-        .unwrap();
+    z.start_file("content.xml", FileOptions::default()).unwrap();
     z.write_all(content.as_bytes()).unwrap();
     z.finish().unwrap().into_inner()
 }
@@ -823,8 +822,8 @@ fn visio_pages() {
                 "<?xml version=\"1.0\"?><PageContents {ns}>{}</PageContents>",
                 body(depth)
             );
-            let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-            let o = zip::write::SimpleFileOptions::default();
+            let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let o = FileOptions::default();
             z.start_file("[Content_Types].xml", o).unwrap();
             z.write_all(b"<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Override PartName=\"/visio/document.xml\" ContentType=\"application/vnd.ms-visio.drawing.main+xml\"/></Types>").unwrap();
             z.start_file("_rels/.rels", o).unwrap();

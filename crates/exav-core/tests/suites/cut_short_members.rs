@@ -15,6 +15,7 @@
 use std::io::{Read, Write};
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze};
+use exav_unpack::zip_write::{FileOptions, ZipWriter};
 
 #[derive(Clone, Copy, Debug)]
 enum Want {
@@ -160,6 +161,69 @@ fn a_upx_block_cut_short_or_damaged_is_scanned_as_far_as_it_goes() {
         ("dmg30%".into(), dmg(&d, block, 30), NotClean),
         ("dmg60%".into(), dmg(&d, block, 60), Found),
     ]);
+}
+
+/// A self-extractor: the UPX-packed ELF above as the stub (the string is in
+/// the stub only unpacked) and a clean ZIP appended as the archive. Typed
+/// `Sfx`, which the walk reads as its archive.
+fn upx_stub_with_zip(stub: &[u8]) -> Vec<u8> {
+    let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file("readme.txt", FileOptions::default())
+        .unwrap();
+    zip.write_all(b"nothing to see here\n").unwrap();
+    let zip = zip.finish().unwrap().into_inner();
+    let blob = [stub, &zip].concat();
+    assert_eq!(
+        exav_core::unpack::detect(&&blob[..]),
+        Some(exav_core::unpack::Format::Sfx)
+    );
+    blob
+}
+
+/// The stub of a self-extractor is read as UPX as well as the archive: a
+/// detection in what the stub unpacks to is found, and located in the stub.
+#[test]
+fn a_upx_packed_stub_of_a_self_extractor_is_scanned_unpacked() {
+    let db = Scanner::builtin();
+    let elf = fixture("upx_lzma.elf");
+    let eicar = exav_core::unpack::eicar();
+    assert!(!elf.windows(eicar.len()).any(|w| w == eicar), "packed");
+    let blob = upx_stub_with_zip(&elf);
+    let (report, location) = exav_core::scan_seekable_located(
+        &db,
+        std::io::Cursor::new(blob.clone()),
+        blob.len() as u64,
+        &ScanOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(&report.verdict, Verdict::Infected { signature, .. }
+            if signature.to_ascii_uppercase().contains("EICAR")),
+        "{:?}",
+        report.verdict
+    );
+    assert_eq!(location.as_deref(), Some("upx-decompressed"));
+}
+
+/// A stub that does not unpack (here its packed data damaged) is not a reason
+/// of the scan: the archive is clean and the scan is OK, as without the second
+/// reading. Read alone, the same stub is not OK.
+#[test]
+fn a_upx_stub_that_does_not_unpack_leaves_the_verdict_of_the_archive() {
+    let elf = fixture("upx_lzma.elf");
+    let first = elf.windows(4).position(|w| w == b"UPX!").unwrap() - 4 + 24;
+    let second = first + 12 + u32_le(&elf, first + 4);
+    let block = (second + 12, second + 12 + u32_le(&elf, second + 4));
+    let damaged = dmg(&elf, block, 30);
+    let db = Scanner::builtin();
+    let opts = ScanOptions::default();
+    assert_ne!(
+        analyze(&db, &damaged, &opts).verdict,
+        Verdict::Clean,
+        "the stub read alone must meet the damage"
+    );
+    let blob = upx_stub_with_zip(&damaged);
+    assert_eq!(analyze(&db, &blob, &opts).verdict, Verdict::Clean);
 }
 
 /// A qcow2 image of compressed 4 KiB clusters, EICAR near the end of the

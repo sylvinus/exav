@@ -9,53 +9,40 @@ mod numfmt;
 mod styles;
 mod table;
 
+use crate::formats::office::common::package::MAX_NAMES;
 use crate::formats::office::common::xml::{self, Child, Node};
 use crate::formats::office::sheets::error::{Error, Result};
 use crate::formats::office::sheets::limits::Budget;
 use crate::formats::office::sheets::model::*;
+use exav_unpack::package::{Package, PartError};
 use std::collections::HashMap;
-use std::io::Read;
-use styles::{Props, Styles};
+use styles::Styles;
 
 /// A ZIP package's members, read within the limits.
-pub(crate) struct Zip<'a> {
-    z: zip::ZipArchive<std::io::Cursor<&'a [u8]>>,
-}
+pub(crate) struct Zip<'a>(Package<'a>);
 
 impl<'a> Zip<'a> {
     pub fn open(bytes: &'a [u8]) -> Result<Zip<'a>> {
-        let z = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-            .map_err(|e| Error::NotFormat(format!("not a ZIP package: {e}")))?;
-        Ok(Zip { z })
+        Package::from_bytes(bytes)
+            .map(Zip)
+            .map_err(|e| Error::NotFormat(format!("not a ZIP package: {e}")))
     }
 
     pub fn names(&self) -> Vec<String> {
-        self.z
-            .file_names()
-            .take(1 << 16)
-            .filter_map(|s| s.ok().map(|s| s.to_string()))
-            .collect()
+        self.0.names(MAX_NAMES)
     }
 
     /// A member, `None` when absent or unreadable; past `max` bytes, an
     /// error.
     pub fn get(&mut self, name: &str, max: u64, budget: &mut Budget) -> Result<Option<Vec<u8>>> {
-        let Ok(f) = self.z.by_name(name) else {
-            return Ok(None);
-        };
-        if f.encrypted() {
-            return Err(Error::Encrypted);
+        let part = self.0.read(name, max).map_err(|e| match e {
+            PartError::Encrypted => Error::Encrypted,
+            PartError::TooLarge => Error::TooLarge("a package part"),
+        })?;
+        if let Some(v) = &part {
+            budget.alloc(v.len() as u64)?;
         }
-        let mut v = Vec::new();
-        let n = f.take(max + 1).read_to_end(&mut v);
-        if n.is_err() {
-            return Ok(None);
-        }
-        if v.len() as u64 > max {
-            return Err(Error::TooLarge("a package part"));
-        }
-        budget.alloc(v.len() as u64)?;
-        Ok(Some(v))
+        Ok(part)
     }
 }
 
@@ -342,7 +329,6 @@ pub(crate) struct Doc<'a> {
     pub st: Styles,
     pub fc: formula::Converter,
     pub null: (i64, i64, i64),
-    pub text_styles: HashMap<String, Props>,
     pub parts: &'a HashMap<String, Vec<u8>>,
     pub validations: HashMap<String, Validation>,
     pub style_ids: HashMap<String, u32>,
@@ -355,7 +341,7 @@ impl Doc<'_> {
     /// Notes the cell at `r`, `c` when its style `name` has conditions.
     pub fn note_maps(&mut self, name: Option<&str>, r: u32, c: u32) {
         let name = name.unwrap_or("Default");
-        if self.st.defs.get(name).is_some_and(|d| !d.maps.is_empty()) {
+        if self.st.has_maps(name) {
             self.map_cells
                 .entry(name.to_string())
                 .or_default()
@@ -369,8 +355,7 @@ impl Doc<'_> {
         if let Some(&i) = self.style_ids.get(name) {
             return i;
         }
-        let p = self.st.resolve(name);
-        let i = wb.styles.add(self.st.to_style(&p));
+        let i = wb.styles.add(self.st.style(name));
         if self.style_ids.len() < 1 << 16 {
             self.style_ids.insert(name.to_string(), i);
         }
@@ -390,7 +375,7 @@ fn read_doc(
         roots.push(s);
     }
     roots.push(content);
-    let mut st = Styles::collect(&roots);
+    let st = Styles::collect(&roots);
     let body = content
         .child("office:body")
         .ok_or_else(|| Error::NotFormat("no office:body".into()))?;
@@ -398,15 +383,7 @@ fn read_doc(
         .child("office:spreadsheet")
         .ok_or_else(|| Error::NotFormat("not a spreadsheet".into()))?;
     let settings = read_settings(settings);
-    let default_style = {
-        let p = if st.defs.contains_key("Default") {
-            st.resolve("Default")
-        } else {
-            st.default.clone()
-        };
-        st.to_style(&p)
-    };
-    let mut wb = Workbook::new(default_style);
+    let mut wb = Workbook::new(st.style("Default"));
 
     let mut null = (1899, 12, 30);
     if let Some(v) = ss
@@ -426,21 +403,10 @@ fn read_doc(
     if null == (1904, 1, 1) {
         wb.date1904 = true;
     }
-    let mut text_styles: HashMap<String, Props> = HashMap::new();
-    for ((fam, name), node) in &st.other {
-        if fam == "text" {
-            let mut p = Props::default();
-            if let Some(tp) = node.child("style:text-properties") {
-                styles::text_props(tp, &st.fonts, &mut p);
-            }
-            text_styles.insert(name.clone(), p);
-        }
-    }
     let mut doc = Doc {
         st,
         fc: formula::Converter::default(),
         null,
-        text_styles,
         parts,
         validations: HashMap::new(),
         style_ids: HashMap::new(),
@@ -478,18 +444,18 @@ fn read_doc(
     for (ti, t) in tables.iter().enumerate() {
         let mut sheet = Sheet::new(sheet_names[ti].clone());
         sheet.default_row_height = 12.8;
-        if let Some(tp) = t
-            .attr("table:style-name")
-            .and_then(|sn| doc.st.other("table", sn))
-            .and_then(|ts| ts.child("style:table-properties"))
-        {
-            if tp.attr("table:display") == Some("false") {
+        if let Some(sn) = t.attr("table:style-name") {
+            let tp = doc.st.chain("table", Some(sn));
+            if tp.get("table/table:display") == Some("false") {
                 sheet.state = SheetState::Hidden;
             }
-            if let Some(c) = tp.attr("tableooo:tab-color").or(tp.attr("table:tab-color")) {
+            if let Some(c) = tp
+                .get("table/tableooo:tab-color")
+                .or(tp.get("table/table:tab-color"))
+            {
                 sheet.tab_color = styles::parse_color(c).flatten();
             }
-            if tp.attr("style:writing-mode") == Some("rl-tb") {
+            if tp.get("table/style:writing-mode") == Some("rl-tb") {
                 sheet.rtl = true;
             }
         }
@@ -539,9 +505,8 @@ fn read_doc(
         }
         wb.sheets.push(sheet);
     }
-    if wb.sheets.is_empty() {
-        return Err(Error::Malformed("no sheets".into()));
-    }
+    // A spreadsheet of no table (an empty template) is one ODF allows: an
+    // empty workbook.
     // Charts, once every sheet's values are known.
     for (i, list) in pending_charts.into_iter().enumerate() {
         for (anchor, href, fallback) in list {
@@ -701,6 +666,155 @@ mod tests {
         let warnings = read(3);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("formatting"), "{warnings:?}");
+    }
+
+    const NS: &str = r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0""#;
+
+    /// A flat spreadsheet of one table, with the styles and rows given.
+    fn fods_of(styles: &str, auto: &str, table: &str) -> String {
+        format!(
+            r##"<?xml version="1.0"?>
+<office:document {NS} office:mimetype="application/vnd.oasis.opendocument.spreadsheet">
+<office:font-face-decls><style:font-face style:name="F1" svg:font-family="Arial"/></office:font-face-decls>
+<office:styles>{styles}</office:styles>
+<office:automatic-styles>{auto}</office:automatic-styles>
+<office:body><office:spreadsheet><table:table table:name="S">{table}</table:table></office:spreadsheet></office:body></office:document>"##
+        )
+    }
+
+    fn read(
+        fods: &str,
+        limits: crate::formats::office::sheets::limits::Limits,
+    ) -> Result<Workbook> {
+        read_fods(fods.as_bytes(), &mut Budget::new(limits))
+    }
+
+    #[test]
+    fn a_style_used_many_times_is_resolved_once() {
+        let fods = fods_of(
+            r#"<style:style style:name="a" style:family="table-cell"><style:text-properties fo:font-weight="bold"/></style:style>
+<style:style style:name="b" style:family="table-cell" style:parent-style-name="a"><style:text-properties fo:font-size="9pt"/></style:style>
+<style:style style:name="T1" style:family="text"><style:text-properties fo:font-style="italic"/></style:style>"#,
+            "",
+            "",
+        );
+        let doc = xml::parse(fods.as_bytes(), &mut xml::within(1 << 20)).unwrap();
+        let st = Styles::collect(&[&doc]);
+        let base = st.font("b");
+        for i in 0..1000 {
+            assert!(st.style("b").font.bold);
+            // Names that are no style resolve as one.
+            st.style(&format!("missing{i}"));
+            st.dxf("b", false);
+            assert!(st.span_font("T1", &base).unwrap().italic);
+        }
+        // "b", no style, and the text style.
+        assert_eq!(st.walks(), 3);
+    }
+
+    #[test]
+    fn resolved_styles_count_in_the_memory_limit() {
+        // 30 styles deep with 40 properties each: a style resolved from the
+        // bottom holds all 1200.
+        let mut styles = String::new();
+        for k in 0..30 {
+            let parent = match k {
+                0 => String::new(),
+                _ => format!(r#" style:parent-style-name="c{}""#, k - 1),
+            };
+            let props: String = (0..40).map(|j| format!(r#" svg:k{k}a{j}="v""#)).collect();
+            styles += &format!(
+                r#"<style:style style:name="c{k}" style:family="table-cell"{parent}><style:table-cell-properties{props}/></style:style>"#
+            );
+        }
+        let leaves: String = (0..150)
+            .map(|i| format!(r#"<style:style style:name="l{i}" style:family="table-cell" style:parent-style-name="c29"/>"#))
+            .collect();
+        let row = |name: &dyn Fn(usize) -> String| -> String {
+            let cells: String = (0..150)
+                .map(|i| format!(r#"<table:table-cell table:style-name="{}" office:value-type="float" office:value="1"/>"#, name(i)))
+                .collect();
+            format!("<table:table-row>{cells}</table:table-row>")
+        };
+        let limits =
+            || crate::formats::office::sheets::limits::Limits::default().with_max_memory(4 << 20);
+        // One style used 150 times is resolved once.
+        let same = fods_of(&styles, &leaves, &row(&|_| "l0".into()));
+        assert!(read(&same, limits()).is_ok());
+        // 150 styles are 150 resolutions, 16 MB or so.
+        let each = fods_of(&styles, &leaves, &row(&|i| format!("l{i}")));
+        let err = read(&each, limits()).err();
+        assert!(matches!(err, Some(Error::TooLarge("memory"))), "{err:?}");
+    }
+
+    #[test]
+    fn styles_other_than_cell_styles_follow_their_parents() {
+        let fods = fods_of(
+            r#"<style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="3cm"/></style:style>
+<style:style style:name="T1" style:family="text"><style:text-properties fo:font-weight="bold"/></style:style>"#,
+            r#"<style:style style:name="co2" style:family="table-column" style:parent-style-name="co1"/>
+<style:style style:name="T2" style:family="text" style:parent-style-name="T1"/>"#,
+            r#"<table:table-column table:style-name="co2"/>
+<table:table-row><table:table-cell office:value-type="string"><text:p>a<text:span text:style-name="T2">b</text:span></text:p></table:table-cell></table:table-row>"#,
+        );
+        let wb = read(&fods, Default::default()).unwrap();
+        let s = &wb.sheets[0];
+        assert!(s.cols[0].width.is_some());
+        let Value::Rich(runs) = &s.cells[&(0, 0)].value else {
+            panic!("{:?}", s.cells[&(0, 0)].value);
+        };
+        let bold: Vec<bool> = runs.iter().map(|r| r.font.as_ref().unwrap().bold).collect();
+        assert_eq!(bold, [false, true]);
+    }
+
+    /// A style that sets a value replaces the one its parent set it through
+    /// another attribute.
+    #[test]
+    fn a_style_replaces_what_its_parent_set_however_it_did() {
+        let fods = fods_of(
+            r##"<style:style style:name="P" style:family="table-cell"><style:table-cell-properties fo:border-bottom="2pt solid #000000"/><style:text-properties style:use-window-font-color="true" style:font-name="F1" style:text-underline-style="solid" style:text-underline-type="double"/></style:style>
+<style:style style:name="C" style:family="table-cell" style:parent-style-name="P"><style:table-cell-properties fo:border="none"/><style:text-properties fo:color="#ff0000" fo:font-family="Courier" style:text-underline-style="solid"/></style:style>
+<style:style style:name="D" style:family="table-cell" style:parent-style-name="P"/>"##,
+            "",
+            r#"<table:table-row><table:table-cell table:style-name="C" office:value-type="float" office:value="1"/><table:table-cell table:style-name="D" office:value-type="float" office:value="1"/></table:table-row>"#,
+        );
+        let wb = read(&fods, Default::default()).unwrap();
+        let cells = &wb.sheets[0].cells;
+        let c = wb.styles.get(cells[&(0, 0)].style);
+        assert_eq!(c.border.bottom, Edge::default());
+        assert_eq!(c.font.color, Some(0xFF0000));
+        assert_eq!(c.font.name, "Courier");
+        assert_eq!(c.font.underline, Some("single"));
+        // The parent's own values, through the declared face.
+        let d = wb.styles.get(cells[&(0, 1)].style);
+        assert_eq!(d.border.bottom.style, Some("medium"));
+        assert_eq!(d.font.color, None);
+        assert_eq!(d.font.name, "Arial");
+        assert_eq!(d.font.underline, Some("double"));
+    }
+
+    /// A percentage size is taken of the size of the parent style, or of the
+    /// cell's font for a text style.
+    #[test]
+    fn a_percentage_size_is_taken_of_the_size_of_the_parent_style() {
+        let fods = fods_of(
+            r#"<style:style style:name="P" style:family="table-cell"><style:text-properties fo:font-size="20pt"/></style:style>
+<style:style style:name="C" style:family="table-cell" style:parent-style-name="P"><style:text-properties fo:font-size="50%"/></style:style>
+<style:style style:name="T" style:family="text"><style:text-properties fo:font-size="150%"/></style:style>"#,
+            "",
+            r#"<table:table-row><table:table-cell table:style-name="C" office:value-type="string"><text:p>a<text:span text:style-name="T">b</text:span></text:p></table:table-cell></table:table-row>"#,
+        );
+        let wb = read(&fods, Default::default()).unwrap();
+        let cell = &wb.sheets[0].cells[&(0, 0)];
+        assert_eq!(wb.styles.get(cell.style).font.size_centipt, 1000);
+        let Value::Rich(runs) = &cell.value else {
+            panic!("{:?}", cell.value);
+        };
+        let sizes: Vec<u32> = runs
+            .iter()
+            .map(|r| r.font.as_ref().map_or(1000, |f| f.size_centipt))
+            .collect();
+        assert_eq!(sizes, [1000, 1500]);
     }
 
     #[test]

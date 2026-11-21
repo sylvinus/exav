@@ -6,6 +6,7 @@
 //! and the members after it are still scanned.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::io::Write;
 
 fn eicar() -> &'static [u8] {
@@ -14,11 +15,10 @@ fn eicar() -> &'static [u8] {
 
 /// A ZIP of deflated members, in order.
 fn zip_of(members: &[(&str, &[u8])]) -> Vec<u8> {
-    let deflated = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = FileOptions::default().method(Method::Deflated);
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for (name, body) in members {
-        z.start_file(*name, deflated).unwrap();
+        z.start_file(name, deflated).unwrap();
         z.write_all(body).unwrap();
     }
     z.finish().unwrap().into_inner()

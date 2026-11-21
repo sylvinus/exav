@@ -10,13 +10,19 @@ import {
   checkHighlights,
   checkOpen,
   checkOptions,
+  checkPing,
   checkRaster,
   checkReplace,
   checkSniff,
   checkThemeMessage,
   checkUnraster,
   checkWatch,
+  type ControllerKey,
+  fitSnapshot,
+  fitWarnings,
+  followTarget,
   isColor,
+  isRefusedOpen,
   linkTarget,
   MAX_ITEMS,
   MAX_TEXT,
@@ -25,6 +31,9 @@ import {
   READS,
   TREE,
   refusedRasterId,
+  refusedReplaceCall,
+  type Snapshots,
+  WARNINGS,
 } from "./protocol.js";
 
 describe("a status from the frame", () => {
@@ -148,6 +157,15 @@ describe("links", () => {
 
   it("is refused with credentials in it, as a Markdown link's is", () => {
     for (const u of ["https://bank.example@evil.example/", "https://user:pass@example.com/", "http://:x@example.com/"]) expect(linkTarget(u), u).toBeNull();
+  });
+
+  it("may also be followed to the mail program, which no source may be", () => {
+    expect(followTarget("mailto:a@b.c")).toBe("mailto:a@b.c");
+    expect(followTarget("https://example.com/")).toBe("https://example.com/");
+    for (const u of ["mailto:", "javascript:alert(1)", "tel:+123", "https://bank.example@evil.example/"]) expect(followTarget(u), u).toBeNull();
+    // An address of a file to show or read is never one.
+    const file = { name: "a.pdf", type: "", path: "a.pdf", format: "pdf" };
+    expect(checkReplace({ type: "replace", call: 1, generation: 1, file, source: { kind: "url", url: "mailto:a@b.c" } }, BUILTIN_ORDER)).toBeNull();
   });
 });
 
@@ -328,6 +346,8 @@ describe("what the frame takes from the host", () => {
     expect(checkOptions({ conversion: { timeoutMs: "1" } })).toEqual({ conversion: {} });
     expect(checkOptions({ conversion: { converter: "external" } })).toEqual({ conversion: { converter: "external" } });
     expect(checkOptions({ conversion: { converter: "excel" } })).toEqual({ conversion: {} });
+    // One per converted format: the others, and any other word, are dropped.
+    expect(checkOptions({ conversion: { converter: { doc: "exav", odt: "nope", pdf: "exav", __proto__: "exav", xls: "external" } } })).toEqual({ conversion: { converter: { doc: "exav", xls: "external" } } });
     // The external converter: a package name the manifest lists, a path or an http(s) URL; nothing else.
     for (const ok of ["@acme/to-pdf", "to-pdf", "/conv/index.js", "./conv/index.js", "https://converter.example.com/index.js"]) {
       expect(checkOptions({ conversion: { externalConverter: ok } }), ok).toEqual({ conversion: { externalConverter: ok } });
@@ -465,6 +485,59 @@ describe("what the frame takes from the host", () => {
     expect(checkReplace({ type: "replace", call: 3, generation: 1, file: { ...file, name: "x".repeat(5000) }, source }, BUILTIN_ORDER)).toBeNull();
   });
 
+  it("owes an answer to an open or a replacement it refuses, and to no other message", () => {
+    const file = { name: "a.pdf", type: "", path: "a.pdf", format: "pdf" };
+    const source = { kind: "blob", blob: new Blob(["x"]) };
+    // A signed address past the longest the frame takes.
+    const long = { kind: "url", url: `https://files.test/a.pdf?sig=${"x".repeat(3000)}` };
+    expect(refusedReplaceCall({ type: "replace", call: 3, generation: 1, file, source: long }, BUILTIN_ORDER)).toBe(3);
+    expect(refusedReplaceCall({ type: "replace", call: 3, generation: 1, file, source }, BUILTIN_ORDER)).toBeNull();
+    expect(refusedReplaceCall({ type: "replace", generation: 1, file, source: long }, BUILTIN_ORDER)).toBeNull();
+    expect(refusedReplaceCall({ type: "command", call: 3 }, BUILTIN_ORDER)).toBeNull();
+    const open = { type: "open", formats: ["pdf"], file, source, options: {}, theme: { tokens: {}, scheme: null } };
+    expect(checkOpen(open, BUILTIN_ORDER)).not.toBeNull();
+    expect(isRefusedOpen(open, BUILTIN_ORDER)).toBe(false);
+    expect(isRefusedOpen({ ...open, source: long }, BUILTIN_ORDER)).toBe(true);
+    expect(isRefusedOpen({ type: "sniff" }, BUILTIN_ORDER)).toBe(false);
+  });
+
+  it("takes the warnings the frame fits to its limits, where the same warnings unfitted drop the message", () => {
+    const names = Array.from({ length: 40 }, (_, i) => `${"x".repeat(300)}${i}`);
+    const warnings = [{ key: "external_references", count: 40, names }, ...Array.from({ length: 70 }, () => ({ key: "unknown_entities", count: 1 }))];
+    const message = (w: unknown) => checkFrameMessage({ type: "controllers", session: 0, values: { warnings: w, zoom: { scale: 1, min: 0, max: 4 } }, statics: {} });
+    expect(message(warnings)).toBeNull();
+    const fitted = fitWarnings(warnings);
+    expect(fitted).toHaveLength(WARNINGS.maxEntries);
+    expect(fitted[0]!.names).toHaveLength(WARNINGS.maxNames);
+    expect(fitted[0]!.names![0]).toHaveLength(WARNINGS.maxName);
+    expect(message(fitted)).toMatchObject({ values: { zoom: { scale: 1 } } });
+    // A name cut in a surrogate pair loses the half.
+    const emoji = fitWarnings([{ key: "k", count: 1, names: [`${"x".repeat(WARNINGS.maxName - 2)}😀😀`] }])[0]!.names![0]!;
+    expect(emoji.length).toBeLessThanOrEqual(WARNINGS.maxName);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(emoji)).toBe(false);
+  });
+
+  it("takes a document's names the frame fits to its limits, where the same names unfitted drop the message", () => {
+    const long = "n".repeat(MAX_TEXT + 500);
+    const values = {
+      outline: [{ title: long, page: 1, depth: 0, offset: null }],
+      layers: { kind: "layers", items: [{ id: "0", name: long, color: "rgb(1 2 3)", visible: true }, { id: long, name: "lost", color: "rgb(1 2 3)", visible: true }] },
+      storeys: { items: [{ id: "s", name: long, elevation: null, visible: true }] },
+      layouts: { items: [{ id: "M", name: long, isModel: true }], current: long },
+      sheets: { items: [{ index: 0, name: long }], current: 0 },
+      selection: { name: long, category: long, storey: long },
+    } as const;
+    const message = (v: Record<string, unknown>) => checkFrameMessage({ type: "controllers", session: 0, values: { ...v, zoom: { scale: 1, min: 0, max: 4 } }, statics: {} });
+    for (const [key, value] of Object.entries(values)) {
+      expect(message({ [key]: value }), key).toBeNull();
+      const fitted = fitSnapshot(key as ControllerKey, value as never);
+      expect(message({ [key]: fitted }), key).toMatchObject({ values: { zoom: { scale: 1 } } });
+    }
+    const layers = fitSnapshot("layers", values.layers as never) as Snapshots["layers"];
+    // The layer whose id could not be named back is left out; the other's name is cut.
+    expect(layers.items.map((i) => [i.id, i.name.length])).toEqual([["0", MAX_TEXT]]);
+  });
+
   it("names the document a read is for, and answers a replacement", () => {
     expect(checkFrameMessage({ type: "read", id: 5, generation: 2, offset: 10, length: 20 })).toEqual({ type: "read", id: 5, generation: 2, offset: 10, length: 20 });
     expect(checkFrameMessage({ type: "read", id: 5, offset: 10, length: 20 })).toBeNull();
@@ -488,6 +561,13 @@ describe("what the frame takes from the host", () => {
     expect(checkFrameMessage({ type: "sniffed", call: 2, format: null })).toEqual({ type: "sniffed", call: 2, format: null });
     expect(checkFrameMessage({ type: "sniffed", call: 2, format: "nope" })).toBeNull();
     expect(checkFrameMessage({ type: "sniffed", format: "pdf" })).toBeNull();
+  });
+
+  it("takes a ping and its answer, with nothing else in them", () => {
+    expect(checkPing({ type: "ping", extra: 1 })).toEqual({ type: "ping" });
+    expect(checkPing({ type: "pong" })).toBeNull();
+    expect(checkFrameMessage({ type: "pong", extra: 1 })).toEqual({ type: "pong" });
+    expect(checkFrameMessage({ type: "ping" })).toBeNull();
   });
 });
 

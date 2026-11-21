@@ -18,7 +18,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 # exav-render's image decoders, for the formats browsers do not draw.
-image = ["exav-render/image", "exav-render/webp", "exav-render/ico", "exav-render/pnm", "exav-render/qoi", "exav-render/dds", "exav-render/ff", "exav-render/hdr", "exav-render/jp2", "exav-render/jbig2", "exav-render/jxl", "exav-render/raw"]
+image = ["exav-render/image", "exav-render/webp", "exav-render/ico", "exav-render/pnm", "exav-render/qoi", "exav-render/dds", "exav-render/ff", "exav-render/hdr", "exav-render/jp2", "exav-render/jbig2", "exav-render/ccitt", "exav-render/jxl", "exav-render/raw"]
 # DWG and DXF, parsed and tessellated.
 dwg = ["exav-render/dwg"]
 # IFC, STL, OBJ, PLY and glTF models, meshed.

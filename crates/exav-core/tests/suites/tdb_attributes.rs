@@ -16,6 +16,7 @@
 //!   assets a page carries inline get extracted from it.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::io::Write;
 
 const MARK: &[u8] = b"exav-tdb-probe-marker-0123456789";
@@ -40,9 +41,8 @@ fn found(db: &Scanner, blob: &[u8]) -> Option<String> {
 }
 
 fn zip_of(name: &str, body: &[u8]) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    z.start_file(name, zip::write::SimpleFileOptions::default())
-        .unwrap();
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    z.start_file(name, FileOptions::default()).unwrap();
     z.write_all(body).unwrap();
     z.finish().unwrap().into_inner()
 }
@@ -164,8 +164,8 @@ fn a_copy_found_clean_is_scanned_again_under_another_chain() {
         "one ZIP: a link short"
     );
     // The copy one level up is scanned first and is clean.
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let options = zip::write::SimpleFileOptions::default();
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = FileOptions::default();
     z.start_file("a.bin", options).unwrap();
     z.write_all(&payload).unwrap();
     z.start_file("inner.zip", options).unwrap();
@@ -221,9 +221,8 @@ fn intermediates_hold_for_objects_read_through_the_cache() {
     );
     let db = db(&[sig]);
     let stored = |name: &str, body: &[u8]| {
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = FileOptions::default().method(Method::Stored);
         z.start_file(name, options).unwrap();
         z.write_all(body).unwrap();
         z.finish().unwrap().into_inner()

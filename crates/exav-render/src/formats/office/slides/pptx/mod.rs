@@ -12,6 +12,7 @@ use crate::formats::office::common::package::{Lift, Out};
 use crate::formats::office::slides::error::{Error, Result};
 use crate::formats::office::slides::model::*;
 use draw::{Ctx, Rels};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::fmt::Write as _;
 use std::io::Write;
 use xml::{XML_HEAD, esc, hex, ns_decl};
@@ -26,22 +27,20 @@ fn zip_err(e: impl std::fmt::Display) -> Error {
 }
 
 struct Package {
-    // Dropped first: see `Lift`.
-    _lift: Lift,
-    z: zip::ZipWriter<Out>,
+    lift: Lift,
+    z: ZipWriter<Out>,
 }
 
 impl Package {
     fn put(&mut self, name: &str, data: &[u8], compress: bool) -> Result<()> {
         let method = if compress {
-            zip::CompressionMethod::Deflated
+            Method::Deflated
         } else {
-            zip::CompressionMethod::Stored
+            Method::Stored
         };
-        let opt = zip::write::SimpleFileOptions::default()
-            .compression_method(method)
-            .compression_level(compress.then_some(6))
-            .last_modified_time(zip::DateTime::default());
+        let opt = FileOptions::default()
+            .method(method)
+            .level(compress.then_some(6));
         self.z.start_file(name, opt).map_err(zip_err)?;
         self.z.write_all(data).map_err(zip_err)
     }
@@ -80,8 +79,8 @@ pub(crate) fn write(p: &mut Presentation, limit: u64) -> Result<Vec<u8>> {
     let guess = media + (64 << 10) + p.slides.len() as u64 * (8 << 10);
     let (out, lift) = Out::new(guess.min(limit) as usize, limit);
     let mut pkg = Package {
-        _lift: lift,
-        z: zip::ZipWriter::new(out),
+        lift,
+        z: ZipWriter::new(out),
     };
     let width = p.width.clamp(914_400, 51_206_400);
     let height = p.height.clamp(914_400, 51_206_400);
@@ -393,7 +392,7 @@ pub(crate) fn write(p: &mut Presentation, limit: u64) -> Result<Vec<u8>> {
         charts_done = put_charts(&mut pkg, &ctx)?;
     }
 
-    pkg._lift.lift();
+    pkg.lift.lift();
     let out = pkg.z.finish().map_err(zip_err)?;
     Ok(out.into_inner())
 }

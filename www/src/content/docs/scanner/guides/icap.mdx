@@ -55,9 +55,11 @@ Each address is a listener, so the protocols combine:
 | `exav --listen clamd://0.0.0.0:3310` | clamd only |
 | `exav --listen icap://0.0.0.0:1344` | ICAP only |
 | `exav --listen clamd://0.0.0.0:3310 --listen icap://0.0.0.0:1344` | both, in one process, over one loaded database |
+| `exav --listen 'icap://0.0.0.0:1344/avscan' --listen 'icap://0.0.0.0:1345/srv_clamav?max-connections=20'` | two ICAP ports, each with its own services and options |
 
 One process for both replaces a `c-icap` + `clamav` pair, and loads the signature
-set once instead of twice.
+set once instead of twice. Several ICAP addresses are served side by side; under
+the worker pool each gets a child process of its own.
 
 Under the worker pool the ICAP listener runs in a dedicated child of the
 supervisor, sharing the loaded database copy-on-write. It gets its own process
@@ -74,7 +76,7 @@ ICAP served alone runs without the pool: one process, scans in threads,
 `--max-scan-secs` refused. Signatures reload on `SIGUSR2` or when the source
 changes on disk, and the new database is swapped in for the next request. With
 no clamd listener there is no `STATS` command; the scan totals are written to
-stderr every `--metrics-secs` (300 by default).
+stderr every `--metrics-secs` (300 by default), as `exav: daemon: SCANSTATS: ...`.
 
 For the container, see [Docker](/scanner/guides/docker/#replacing-a-c-icap-container).
 
@@ -291,7 +293,8 @@ verdict. Draining keeps the verdict and leaves the connection at the next reques
 
 A client that never stops sending would hold a thread forever, so draining stops
 at 64 MiB; past that exav answers and closes, and that client may lose the
-response. The clamd listener drains `INSTREAM` the same way (see
+response. The size in a `LIMITS-EXCEEDED` reason is then a floor (`file size
+at least N`). The clamd listener drains `INSTREAM` the same way (see
 [size over the wire](/scanner/guides/daemon/#size-over-the-wire)).
 
 ## Caching and the `ISTag`

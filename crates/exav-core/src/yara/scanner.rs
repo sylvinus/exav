@@ -12,7 +12,9 @@ use crate::yara::compiler::ExternalValue;
 use crate::yara::error::{Error, Result};
 use crate::yara::feed::{FeedPlan, YaraFeed, YaraPass};
 use crate::yara::ir::{Cond, EvalCtx, Value, anchors};
-use crate::yara::matcher::{Match, PatternDef, PatternMatcher, StreamRegexes, find_all_windowed};
+use crate::yara::matcher::{
+    Match, PatternDef, PatternMatcher, RegexCut, StreamRegexes, find_all_windowed,
+};
 use crate::yara::modules::{ModuleCtx, ModuleKind};
 
 /// A compiled rule (internal representation).
@@ -211,6 +213,7 @@ impl<'r> Scanner<'r> {
             matching: e.matching,
             steps_exhausted: e.steps_exhausted,
             complete: e.complete,
+            capped: e.capped.map(|id| self.owner(id)),
         }
     }
 
@@ -233,7 +236,11 @@ impl<'r> Scanner<'r> {
                 .map(|&i| self.rules.rules[i].name.as_str())
                 .collect(),
             steps_exhausted: e.steps_exhausted,
+            spent_by: e.spent_by.map(|i| self.rules.rules[i].name.as_str()),
             complete: e.complete,
+            module_cut: e.module_cut,
+            capped: e.capped.map(|id| self.owner(id)),
+            regex_cut: e.regex_cut.map(|(id, why)| (self.owner(id), why)),
         }
     }
 
@@ -258,6 +265,10 @@ impl<'r> Scanner<'r> {
         };
         fed.resize_with(rules.patterns.len(), || None);
         let mut complete = true;
+        // The first pattern with more matches than a search keeps.
+        let mut capped: Option<usize> = None;
+        // The first regexp or hex pattern whose search stopped short, and why.
+        let mut regex_cut: Option<(usize, RegexCut)> = None;
         // Over an object not held in memory, the literal and base64 patterns
         // the read did not search are searched in one read of it together,
         // but for those anchored at an offset, looked for there alone.
@@ -276,6 +287,9 @@ impl<'r> Scanner<'r> {
         let pats: Vec<&PatternMatcher> = together.iter().map(|&i| &rules.patterns[i]).collect();
         for (&i, found) in together.iter().zip(find_all_windowed(&pats, data)) {
             complete &= found.complete;
+            if found.capped {
+                capped = Some(capped.map_or(i, |c| c.min(i)));
+            }
             windowed[i] = found.matches;
         }
         let matches: Vec<Vec<Match>> = rules
@@ -301,22 +315,32 @@ impl<'r> Scanner<'r> {
                 let only = rules.anchored[i];
                 let found = p.find_all(data, &stream, materialize, whole.regex_steps, only);
                 complete &= found.complete;
+                if found.capped {
+                    capped = Some(capped.map_or(i, |c| c.min(i)));
+                }
+                if let Some(why) = found.regex_cut
+                    && regex_cut.is_none_or(|(c, _)| i < c)
+                {
+                    regex_cut = Some((i, why));
+                }
                 found.matches
             })
             .collect();
 
         // 2. Build the per-scan module state (parse PE, etc.) once.
+        let mut module_cut = None;
         let modules = if rules.imported.is_empty() && !rules.uses_entrypoint {
             ModuleCtx::empty()
         } else {
-            let (modules, built) = ModuleCtx::build(
+            let (modules, cut) = ModuleCtx::build(
                 data,
                 &rules.imported,
                 rules.uses_entrypoint,
                 materialize,
                 self.carved,
             );
-            complete &= built;
+            complete &= cut.is_none();
+            module_cut = cut.and_then(|c| c.reason());
             modules
         };
 
@@ -325,9 +349,11 @@ impl<'r> Scanner<'r> {
         //    The step budget is shared by every rule in the scan, so the total
         //    condition work one buffer can cost is bounded no matter how the
         //    ruleset is shaped.
-        let steps = std::cell::Cell::new(crate::yara::ir::EVAL_STEP_BUDGET);
+        let steps = std::cell::Cell::new(whole.yara_steps.unwrap_or(u64::MAX));
         let mut results: Vec<bool> = Vec::with_capacity(rules.rules.len());
-        for rule in &rules.rules {
+        // The rule whose evaluation took the budget to zero.
+        let mut spent_by: Option<usize> = None;
+        for (i, rule) in rules.rules.iter().enumerate() {
             let ctx = EvalCtx {
                 data,
                 matches: &matches,
@@ -339,6 +365,9 @@ impl<'r> Scanner<'r> {
             };
             let r = rule.cond.eval_bool(&ctx);
             results.push(r);
+            if spent_by.is_none() && steps.get() == 0 {
+                spent_by = Some(i);
+            }
         }
         let steps_exhausted = steps.get() == 0;
 
@@ -368,8 +397,22 @@ impl<'r> Scanner<'r> {
             matches,
             matching,
             steps_exhausted,
+            spent_by,
             complete,
+            module_cut,
+            capped,
+            regex_cut,
         }
+    }
+
+    /// The rule and the pattern of the pattern with the given id.
+    fn owner(&self, id: usize) -> (&'r str, &'r str) {
+        let rules = self.rules;
+        let rule = rules.rules.iter().find(|r| r.pattern_ids.contains(&id));
+        (
+            rule.map_or("", |r| r.name.as_str()),
+            rules.pattern_names[id].as_str(),
+        )
     }
 }
 
@@ -378,7 +421,16 @@ struct Evaluated {
     matches: Vec<Vec<Match>>,
     matching: Vec<usize>,
     steps_exhausted: bool,
+    /// The first rule (by index) after which no steps were left.
+    spent_by: Option<usize>,
     complete: bool,
+    /// Why the modules' values are not all of the object's, when they are
+    /// not and the scan has no other reason for it.
+    module_cut: Option<String>,
+    /// The first pattern (by id) with more matches than a search keeps.
+    capped: Option<usize>,
+    /// The first regexp or hex pattern (by id) whose search stopped short.
+    regex_cut: Option<(usize, RegexCut)>,
 }
 
 /// The outcome of [`Scanner::scan_source`].
@@ -387,8 +439,18 @@ pub(crate) struct SourceResults<'r> {
     pub matching: Vec<&'r str>,
     /// As [`ScanResults::budget_exhausted`].
     pub steps_exhausted: bool,
+    /// The first rule after whose evaluation no steps were left.
+    pub spent_by: Option<&'r str>,
     /// As [`ScanResults::complete`], and the modules could parse the object.
     pub complete: bool,
+    /// Why the modules' values are not all of the object's, when they are
+    /// not and the scan has no other reason for it.
+    pub module_cut: Option<String>,
+    /// As [`ScanResults::capped_pattern`].
+    pub capped: Option<(&'r str, &'r str)>,
+    /// The rule and pattern of the first regexp or hex pattern whose search
+    /// stopped short, and why.
+    pub regex_cut: Option<((&'r str, &'r str), RegexCut)>,
 }
 
 /// The outcome of a scan.
@@ -399,6 +461,7 @@ pub struct ScanResults<'r, 'd> {
     matching: Vec<usize>,
     steps_exhausted: bool,
     complete: bool,
+    capped: Option<(&'r str, &'r str)>,
 }
 
 impl<'r, 'd> ScanResults<'r, 'd> {
@@ -428,6 +491,13 @@ impl<'r, 'd> ScanResults<'r, 'd> {
     /// partial list and the results are not to be trusted either way.
     pub fn complete(&self) -> bool {
         self.complete
+    }
+
+    /// The rule and the pattern (with its `$`) of the first pattern, in rule
+    /// order, that has more matches than a search keeps. `None` when no
+    /// pattern does.
+    pub fn capped_pattern(&self) -> Option<(&'r str, &'r str)> {
+        self.capped
     }
 }
 
@@ -1374,6 +1444,11 @@ mod source_tests {
             assert_eq!(got.matches, without.matches);
             assert_eq!(got.complete, without.complete);
             assert_eq!(got.complete, materialize == usize::MAX);
+            // Not read whole, the regexp's search says it needed to be.
+            assert_eq!(
+                got.regex_cut,
+                (materialize == 0).then_some((0, super::RegexCut::Whole))
+            );
             if materialize == usize::MAX {
                 assert_eq!(got.matches, want.matches);
             }
@@ -1424,6 +1499,54 @@ mod source_tests {
         let e = evaluate(&rules, &h, usize::MAX);
         assert_eq!(e.matches[0].len(), super::super::matcher::MAX_MATCHES);
         assert!(!e.complete);
+    }
+
+    /// The scan names the first rule, in rule order, with a pattern past the
+    /// cap, and that pattern: held in memory and read from a source. A pattern
+    /// with exactly the cap's matches is not named.
+    #[test]
+    fn the_rule_and_pattern_past_the_match_cap_are_named() {
+        use crate::yara::matcher::MAX_MATCHES;
+        let rules = rules(
+            r#"rule a { strings: $x = "ab" condition: $x }
+               rule b { strings: $s = "q" $v1 = "\x00\x00" $v2 = { 00 00 00 } condition: #v1 > 5 }
+               rule c { strings: $w = { 00 00 } condition: #w > 5 }"#,
+        );
+        let h = vec![0u8; MAX_MATCHES + 10];
+        let held = rules.scan(&h);
+        assert_eq!(held.capped_pattern(), Some(("b", "$v1")));
+        let cache = BlockCache::with_sizes(Cursor::new(h), 1 << 16, 1 << 20).unwrap();
+        let whole = WholeLimits {
+            materialize: 0,
+            ..WholeLimits::NONE
+        };
+        let read = Scanner::new(&rules).scan_source(&cache, &whole, None);
+        assert_eq!(read.capped, Some(("b", "$v1")));
+        // Exactly the cap: all of them kept, nothing to name.
+        let h = vec![0u8; MAX_MATCHES + 1];
+        let held = rules.scan(&h);
+        assert!(held.complete());
+        assert_eq!(held.capped_pattern(), None);
+    }
+
+    /// The scan names the rule whose evaluation took the shared step budget to
+    /// zero, not an earlier rule nor one that came after.
+    #[test]
+    fn the_rule_that_spends_the_step_budget_is_named() {
+        let data: &[u8] = b"anything";
+        let spent = rules(
+            r#"rule a { condition: true }
+               rule runaway { condition: for any i in (0..200000000) : ( i == 199999999 ) }
+               rule c { condition: true }"#,
+        );
+        let r = Scanner::new(&spent).scan_source(&data, &WholeLimits::NONE, None);
+        assert!(r.steps_exhausted);
+        assert_eq!(r.spent_by, Some("runaway"));
+        assert_eq!(r.matching, ["a"]);
+        let cheap = rules(r#"rule a { condition: for any i in (0..10) : ( i == 9 ) }"#);
+        let r = Scanner::new(&cheap).scan_source(&data, &WholeLimits::NONE, None);
+        assert!(!r.steps_exhausted);
+        assert_eq!(r.spent_by, None);
     }
 
     /// A pattern anchored at an offset, every use of it naming that one, is

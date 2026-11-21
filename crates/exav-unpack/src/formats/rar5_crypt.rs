@@ -8,11 +8,10 @@
 
 use std::sync::atomic::AtomicU64;
 
+use crate::hmac::{Hmac, ct_eq, pbkdf2_block};
 use aes::cipher::{BlockModeDecrypt, KeyIvInit};
-use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
-type HmacSha256 = Hmac<Sha256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
 /// The largest KDF count RAR writes: 2^24 iterations. A larger one costs more
@@ -83,7 +82,7 @@ impl CryptRecord {
         if Sha256::digest(&c[..8])[..4] != c[8..] {
             return true;
         }
-        c[..8] == keys.check
+        ct_eq(&c[..8], &keys.check)
     }
 }
 
@@ -92,31 +91,18 @@ pub(crate) fn derive(password: &[u8], salt: &[u8; 16], kdf_count: u8) -> Option<
     if kdf_count > MAX_KDF_COUNT {
         return None;
     }
-    let mac = HmacSha256::new_from_slice(password).ok()?;
+    let mac = Hmac::<Sha256>::new(password);
     let rounds = 1u32 << kdf_count;
-    let mut m = mac.clone();
-    m.update(salt);
-    m.update(&1u32.to_be_bytes());
-    let mut u: [u8; 32] = m.finalize().into_bytes().into();
-    let mut f = u;
     let mut got = [[0u8; 32]; 3];
-    for i in 1..=rounds + 32 {
-        if i > 1 {
-            let mut m = mac.clone();
-            m.update(&u);
-            u = m.finalize().into_bytes().into();
-            for (a, b) in f.iter_mut().zip(u) {
-                *a ^= b;
-            }
-        }
+    pbkdf2_block(&mac, salt, 1, rounds + 32, |i, t| {
         if i == rounds {
-            got[0] = f;
+            got[0].copy_from_slice(t);
         } else if i == rounds + 16 {
-            got[1] = f;
+            got[1].copy_from_slice(t);
         } else if i == rounds + 32 {
-            got[2] = f;
+            got[2].copy_from_slice(t);
         }
-    }
+    });
     let mut check = [0u8; 8];
     for (i, b) in got[2].iter().enumerate() {
         check[i % 8] ^= b;
@@ -208,12 +194,9 @@ pub(crate) fn decrypt(key: &[u8; 32], iv: &[u8; 16], data: &mut Vec<u8>) {
 /// A CRC-32 as a member under a tweaked checksum stores it: HMAC-SHA256 of its
 /// bytes under the hash key, folded to 32 bits.
 pub(crate) fn tweak_crc(hash_key: &[u8; 32], crc: u32) -> u32 {
-    let Ok(mut m) = HmacSha256::new_from_slice(hash_key) else {
-        return crc;
-    };
+    let mut m = Hmac::<Sha256>::new(hash_key);
     m.update(&crc.to_le_bytes());
     m.finalize()
-        .into_bytes()
         .iter()
         .enumerate()
         .fold(0u32, |r, (i, &b)| r ^ (u32::from(b) << ((i & 3) * 8)))

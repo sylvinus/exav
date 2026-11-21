@@ -20,11 +20,13 @@ use crate::yara::ir::{Cond, EvalCtx, Value};
 
 pub(crate) mod dotnet;
 pub(crate) mod elf;
+pub(crate) mod elf_hashes;
 pub(crate) mod hash;
 pub(crate) mod math;
 pub(crate) mod pe;
 pub(crate) mod stringmod;
 pub(crate) mod timemod;
+mod tlsh;
 
 /// The modules the engine understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -65,7 +67,8 @@ impl ModuleKind {
     }
 }
 
-/// The bytes that the module values copy out of the object. A name that many
+/// The bytes that the module values copy out of the object: names, and the
+/// entries of tables that many records can cover. A name that many
 /// entries refer to (an import name that thousands of thunks point at, a
 /// string of a table that thousands of rows index) is copied for each of
 /// them, so a crafted object makes the copies many times its own size. They
@@ -112,6 +115,52 @@ impl Copies {
     }
 }
 
+/// Why the values of a module are not all of the object's.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Incomplete {
+    /// The module, or `entrypoint` when only that keyword asked for the parse.
+    module: &'static str,
+    cause: Cause,
+}
+
+#[derive(Debug, PartialEq)]
+enum Cause {
+    /// The object is not held in memory and is past `--max-object-bytes`, so
+    /// the parser got the part of it that holds the structure, or nothing.
+    ObjectSize,
+    /// The names and table entries the values copy out of the object came to
+    /// more than `--max-object-bytes` ([`Copies`]).
+    Copies,
+    /// A table (`import` or `export`) that would take more than
+    /// `--max-object-bytes` to parse.
+    Table(&'static str),
+    /// A table of the whole object does not parse. The scan is marked
+    /// unreadable, with its own reason.
+    Malformed,
+}
+
+impl Incomplete {
+    /// The reason the search is incomplete. `None` when the scan has
+    /// recorded another reason already (an unreadable object).
+    pub(crate) fn reason(&self) -> Option<String> {
+        let module = self.module;
+        Some(match &self.cause {
+            Cause::ObjectSize => {
+                format!("YARA module {module}: the object is past --max-object-bytes")
+            }
+            Cause::Copies => format!(
+                "YARA module {module}: the values copied out of the object (names, table \
+                 entries) come to more than --max-object-bytes"
+            ),
+            Cause::Table(table) => format!(
+                "YARA module {module}: the {table} table would take more than \
+                 --max-object-bytes to parse"
+            ),
+            Cause::Malformed => return None,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-scan module state
 // ---------------------------------------------------------------------------
@@ -123,6 +172,8 @@ pub(crate) struct ModuleCtx {
     roots: HashMap<ModuleKind, Value>,
     pub entry_point: Option<i64>,
     pe: Option<pe::PeExtra>,
+    /// `elf.import_md5()` and `elf.telfhash()`, computed on the first call.
+    elf_hashes: std::cell::OnceCell<elf_hashes::ElfHashes>,
 }
 
 impl ModuleCtx {
@@ -131,14 +182,15 @@ impl ModuleCtx {
     /// `entrypoint` keyword (which needs a PE parse even without `import "pe"`).
     ///
     /// The format parsers read the object in memory. One not held there is
-    /// read whole when it is at most `materialize` bytes. A larger one gives
+    /// read whole when it is at most `materialize` bytes and starts with the
+    /// magic of a format a module imported reads. A larger one gives
     /// each parser the part of it that holds its format's structure (a PE's
     /// image, [`crate::pe::image_in`]; an ELF's, [`crate::pe::elf_image_in`]),
     /// when that is at most `materialize` bytes. For a format whose part is
     /// longer, or cannot be found, it gets the value the parser gives when the
     /// object is not of its format, which is exact when the object does not
     /// start with that format's magic, and the build is otherwise incomplete
-    /// (the `bool`).
+    /// ([`Incomplete`]).
     ///
     /// The values copy names out of the object, at most `materialize` bytes
     /// of them in all; the build is incomplete when it had to stop copying.
@@ -152,58 +204,92 @@ impl ModuleCtx {
         need_entrypoint: bool,
         materialize: usize,
         carved: bool,
-    ) -> (Self, bool) {
+    ) -> (Self, Option<Incomplete>) {
         let wants_pe = need_entrypoint
             || imported.contains(&ModuleKind::Pe)
             || imported.contains(&ModuleKind::DotNet);
         let wants_elf = imported.contains(&ModuleKind::Elf);
-        let whole = if wants_pe || wants_elf {
+        let head = src.window(0, 4);
+        let pe_head = wants_pe && head.starts_with(b"MZ");
+        let elf_head = wants_elf && head.starts_with(b"\x7fELF");
+        // An object without the magic is read for neither: the parsers give
+        // empty bytes the value they give it.
+        let whole = if pe_head || elf_head {
             src.materialize(materialize)
         } else {
             None
         };
-        let mut complete = true;
+        // The first cause found: the object, then a table, then the names.
+        let mut cut: Option<Incomplete> = None;
+        // The module that asked for a parse of the format (`entrypoint` when
+        // none did).
+        let reader = |kinds: &[ModuleKind]| {
+            imported
+                .iter()
+                .find(|k| kinds.contains(k))
+                .map_or("entrypoint", |k| k.label())
+        };
         let (pe_data, elf_data) = match &whole {
             Some(data) => (Cow::Borrowed(&data[..]), Cow::Borrowed(&data[..])),
             None => {
-                let head = src.window(0, 4);
                 let none = || Some(Cow::Borrowed(&[][..]));
-                let pe = if wants_pe && head.starts_with(b"MZ") {
+                let pe = if pe_head {
                     crate::pe::image_in(src, materialize)
                 } else {
                     none()
                 };
-                let elf = if wants_elf && head.starts_with(b"\x7fELF") {
+                let elf = if elf_head {
                     crate::pe::elf_image_in(src, materialize)
                 } else {
                     none()
                 };
-                complete = pe.is_some() && elf.is_some();
+                if pe.is_none() {
+                    cut = Some(Incomplete {
+                        module: reader(&[ModuleKind::Pe, ModuleKind::DotNet]),
+                        cause: Cause::ObjectSize,
+                    });
+                } else if elf.is_none() {
+                    cut = Some(Incomplete {
+                        module: ModuleKind::Elf.label(),
+                        cause: Cause::ObjectSize,
+                    });
+                }
                 (pe.unwrap_or_default(), elf.unwrap_or_default())
             }
         };
         let copies = Copies::new(materialize);
-        let ctx = Self::build_from(&pe_data, &elf_data, imported, need_entrypoint, &copies);
+        let (ctx, copies_cut_in) =
+            Self::build_from(&pe_data, &elf_data, imported, need_entrypoint, &copies);
         // A table that does not parse from an image may be fine in the object
         // it is cut from, and one too large to parse is a limit. Only a table
         // of the whole object that is malformed is unreadable.
         // An import table that starts past the end of a PE carved out of a
         // host is not in the PE's bytes: nothing was left unread.
         let absent = carved && ctx.pe.as_ref().is_some_and(pe::PeExtra::absent);
-        match ctx.pe.as_ref().and_then(pe::PeExtra::unread) {
-            _ if absent => {}
+        let pe_cut = |cause| Incomplete {
+            module: ModuleKind::Pe.label(),
+            cause,
+        };
+        let table_cut = match ctx.pe.as_ref().and_then(pe::PeExtra::unread) {
+            _ if absent => None,
             Some((table, crate::pe::Unread::Malformed)) if whole.is_some() => {
                 crate::engine::mark_unreadable(|| {
                     format!(
                         "the YARA pe module could not read the {table} table of the PE: it does not parse"
                     )
                 });
-                complete = false;
+                Some(pe_cut(Cause::Malformed))
             }
-            Some(_) => complete = false,
-            None => {}
-        }
-        (ctx, complete && !copies.cut())
+            // Cut from a larger object: the table may be fine in it.
+            Some((_, crate::pe::Unread::Malformed)) => Some(pe_cut(Cause::ObjectSize)),
+            Some((table, crate::pe::Unread::TooLarge)) => Some(pe_cut(Cause::Table(table))),
+            None => None,
+        };
+        let copies_cut = copies_cut_in.map(|kind| Incomplete {
+            module: kind.label(),
+            cause: Cause::Copies,
+        });
+        (ctx, cut.or(table_cut).or(copies_cut))
     }
 
     fn build_from(
@@ -212,9 +298,11 @@ impl ModuleCtx {
         imported: &[ModuleKind],
         need_entrypoint: bool,
         copies: &Copies,
-    ) -> Self {
+    ) -> (Self, Option<ModuleKind>) {
         let mut roots = HashMap::new();
         let mut pe_extra = None;
+        // The first module whose values the copy limit cut.
+        let mut cut_in = None;
 
         for &kind in imported {
             match kind {
@@ -242,6 +330,9 @@ impl ModuleCtx {
                     roots.insert(kind, dotnet::build(pe_data, copies));
                 }
             }
+            if cut_in.is_none() && copies.cut() {
+                cut_in = Some(kind);
+            }
         }
 
         let entry_point = if need_entrypoint {
@@ -250,11 +341,13 @@ impl ModuleCtx {
             None
         };
 
-        ModuleCtx {
+        let ctx = ModuleCtx {
             roots,
             entry_point,
             pe: pe_extra,
-        }
+            elf_hashes: std::cell::OnceCell::new(),
+        };
+        (ctx, cut_in)
     }
 
     /// An empty state (no modules), used when a rule set imports nothing.
@@ -263,7 +356,13 @@ impl ModuleCtx {
             roots: HashMap::new(),
             entry_point: None,
             pe: None,
+            elf_hashes: std::cell::OnceCell::new(),
         }
+    }
+
+    pub(crate) fn elf_hashes(&self) -> &elf_hashes::ElfHashes {
+        self.elf_hashes
+            .get_or_init(|| elf_hashes::compute(self.roots.get(&ModuleKind::Elf)))
     }
 
     pub(crate) fn root(&self, kind: ModuleKind) -> Option<&Value> {
@@ -456,6 +555,9 @@ pub(crate) enum FuncId {
     PeExportsFunc,
     PeExportsOrdinal,
     PeSectionIndexName,
+    // elf
+    ElfImportMd5,
+    ElfTelfhash,
 }
 
 /// Resolves a module function call to a concrete [`FuncId`], choosing the
@@ -559,9 +661,12 @@ pub(crate) fn resolve_func(module: ModuleKind, name: &str, args: &[Cond]) -> Res
             "section_index" if kinds.as_slice() == [ArgKind::Str] => FuncId::PeSectionIndexName,
             _ => return Err(Error::new(format!("unsupported pe function: {name}()"))),
         },
-        // YARA's `elf` module exposes data fields and constants only — it has no
-        // functions — so any call is a genuine error, not a coverage gap.
-        ModuleKind::Elf => return Err(unknown()),
+        ModuleKind::Elf => match (name, n) {
+            ("import_md5", 0) => FuncId::ElfImportMd5,
+            ("telfhash", 0) => FuncId::ElfTelfhash,
+            ("import_md5" | "telfhash", _) => return Err(unsupported()),
+            _ => return Err(unknown()),
+        },
         ModuleKind::DotNet => return Err(unknown()),
     };
     Ok(id)
@@ -607,6 +712,16 @@ pub(crate) fn call(func: FuncId, ctx: &EvalCtx, args: &[Value]) -> Option<Value>
 
         PeImphash | PeImportsDll | PeImportsFunc | PeImportsOrdinal | PeExportsFunc
         | PeExportsOrdinal | PeSectionIndexName => pe::call(func, ctx.modules.pe_extra(), args),
+
+        ElfImportMd5 => Some(Value::Str(
+            ctx.modules.elf_hashes().import_md5.clone().into_bytes(),
+        )),
+        ElfTelfhash => ctx
+            .modules
+            .elf_hashes()
+            .telfhash
+            .clone()
+            .map(|h| Value::Str(h.into_bytes())),
     }
 }
 
@@ -661,16 +776,22 @@ mod tests {
             (&pe, PE, pe_image, ModuleKind::Pe),
             (&elf, ELF, ELF.len(), ModuleKind::Elf),
         ] {
-            let (whole, complete) = ModuleCtx::build(&held, &all, true, 1 << 20, false);
-            assert!(complete);
-            let (ctx, complete) = ModuleCtx::build(&cached(file), &all, true, image, false);
-            assert!(complete, "{wants:?}");
+            let (whole, cut) = ModuleCtx::build(&held, &all, true, 1 << 20, false);
+            assert_eq!(cut, None);
+            let (ctx, cut) = ModuleCtx::build(&cached(file), &all, true, image, false);
+            assert_eq!(cut, None, "{wants:?}");
             assert_eq!(pe_sections(&ctx), pe_sections(&whole), "{wants:?}");
             assert_eq!(elf_sections(&ctx), elf_sections(&whole), "{wants:?}");
             assert_eq!(ctx.entry_point, whole.entry_point, "{wants:?}");
             // One byte under the image's length.
-            let (ctx, complete) = ModuleCtx::build(&cached(file), &all, true, image - 1, false);
-            assert!(!complete, "{wants:?}");
+            let (ctx, cut) = ModuleCtx::build(&cached(file), &all, true, image - 1, false);
+            let module = wants.label();
+            assert_eq!(
+                cut.and_then(|c| c.reason()).as_deref(),
+                Some(
+                    format!("YARA module {module}: the object is past --max-object-bytes").as_str()
+                )
+            );
             assert_eq!(
                 (pe_sections(&ctx), elf_sections(&ctx)),
                 (None, None),
@@ -687,8 +808,95 @@ mod tests {
         );
         // Another format's object is complete either way, and has no value
         // for a module that is not of its format.
-        let (ctx, complete) = ModuleCtx::build(&cached(&overlay), &all, true, 10, false);
-        assert!(complete);
+        let (ctx, cut) = ModuleCtx::build(&cached(&overlay), &all, true, 10, false);
+        assert_eq!(cut, None);
         assert_eq!((pe_sections(&ctx), elf_sections(&ctx)), (None, None));
+    }
+
+    /// A source that keeps the longest read made of it.
+    struct Longest<'a>(&'a [u8], std::cell::Cell<usize>);
+
+    impl ByteSource for Longest<'_> {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn window(&self, off: usize, len: usize) -> Cow<'_, [u8]> {
+            self.1.set(self.1.get().max(len));
+            let end = off.saturating_add(len).min(self.0.len());
+            Cow::Borrowed(&self.0[off.min(end)..end])
+        }
+        fn identity(&self) -> (usize, usize) {
+            (self as *const Self as usize, self.0.len())
+        }
+    }
+
+    /// An object not held in memory is read whole only when it starts as a
+    /// format a module imported reads.
+    #[test]
+    fn an_object_of_another_format_is_not_read_for_the_modules() {
+        let all = [ModuleKind::Pe, ModuleKind::Elf, ModuleKind::DotNet];
+        let text = vec![b'z'; 100_000];
+        let src = Longest(&text, Default::default());
+        let (ctx, cut) = ModuleCtx::build(&src, &all, true, 1 << 20, false);
+        assert_eq!(cut, None);
+        assert_eq!((pe_sections(&ctx), elf_sections(&ctx)), (None, None));
+        assert!(src.1.get() <= 4, "{} bytes read", src.1.get());
+        let src = Longest(PE, Default::default());
+        let (ctx, _) = ModuleCtx::build(&src, &all, true, 1 << 20, false);
+        assert_eq!(pe_sections(&ctx), Some(1));
+        assert_eq!(src.1.get(), PE.len());
+    }
+
+    const COPIES_REASON: &str = "YARA module elf: the values copied out of the object (names, \
+                                 table entries) come to more than --max-object-bytes";
+
+    /// An object held in memory has no values cut by its size, but the names
+    /// copied out of it are charged to the same limit; the reason says so.
+    #[test]
+    fn the_names_copied_past_the_limit_are_named_in_the_reason() {
+        let reason = |cut: Option<Incomplete>| cut.and_then(|c| c.reason());
+        let (_, cut) = ModuleCtx::build(&ELF, &[ModuleKind::Elf], false, usize::MAX, false);
+        assert_eq!(cut, None);
+        let (_, cut) = ModuleCtx::build(&ELF, &[ModuleKind::Elf], false, 1, false);
+        assert_eq!(reason(cut).as_deref(), Some(COPIES_REASON));
+    }
+
+    /// An ELF with a dynamic section and no section headers copies no name,
+    /// only entries: those are charged too, and the reason is the same.
+    #[test]
+    fn the_dynamic_entries_copied_past_the_limit_are_named_in_the_reason() {
+        let mut elf = vec![0u8; 64 + 56 + 4 * 16];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4..7].copy_from_slice(&[2, 1, 1]);
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[52..58].copy_from_slice(&[64, 0, 56, 0, 1, 0]);
+        elf[64..68].copy_from_slice(&2u32.to_le_bytes());
+        elf[72..80].copy_from_slice(&120u64.to_le_bytes());
+        elf[96..104].copy_from_slice(&64u64.to_le_bytes());
+        (0..4).for_each(|i| elf[120 + i * 16] = 1);
+        let reason = |limit| {
+            let (_, cut) =
+                ModuleCtx::build(&elf.as_slice(), &[ModuleKind::Elf], false, limit, false);
+            cut.and_then(|c| c.reason())
+        };
+        assert_eq!(reason(usize::MAX), None);
+        assert_eq!(reason(16 * 4), None);
+        assert_eq!(reason(16 * 3).as_deref(), Some(COPIES_REASON));
+    }
+
+    /// A table that would take more than the limit to parse is named, with its
+    /// module, in the reason.
+    #[test]
+    fn a_table_too_large_to_parse_is_named_in_the_reason() {
+        let (_, cut) = ModuleCtx::build(&PE, &[ModuleKind::Pe], false, usize::MAX, false);
+        assert_eq!(cut, None);
+        let (_, cut) = ModuleCtx::build(&PE, &[ModuleKind::Pe], false, 0, false);
+        assert_eq!(
+            cut.and_then(|c| c.reason()).as_deref(),
+            Some(
+                "YARA module pe: the import table would take more than --max-object-bytes to parse"
+            )
+        );
     }
 }

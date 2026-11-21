@@ -15,7 +15,7 @@ use crate::formats::office::common::iwa::Store;
 use crate::formats::office::common::iwa::proto::{Msg, Val};
 use crate::formats::office::common::package::Zip;
 use crate::formats::office::docs::error::{Error, Result};
-use crate::formats::office::docs::limits::Budget;
+use crate::formats::office::docs::limits::{Budget, LIST_BYTES, num_bytes};
 use crate::formats::office::docs::model::*;
 use std::collections::HashMap;
 
@@ -443,6 +443,9 @@ impl<'a> Pages<'a> {
             }
             levels.push(level);
         }
+        // Past the memory limit the list is not numbered, and the conversion
+        // ends at the next charge.
+        self.b.alloc(LIST_BYTES + num_bytes(&[])).ok()?;
         let abs = self.doc.numbering.abstracts.len() as u32;
         self.doc.numbering.abstracts.push(AbstractNum {
             id: abs,

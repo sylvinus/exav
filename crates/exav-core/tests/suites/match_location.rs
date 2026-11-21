@@ -13,6 +13,7 @@
 //! location is reported for a hit that is nested.
 
 use exav_core::{ScanOptions, Scanner, Verdict, scan_seekable_located};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::io::Cursor;
 
 fn eicar() -> &'static [u8] {
@@ -143,13 +144,9 @@ fn a_location_replaces_control_and_bidirectional_characters() {
 /// A ZIP of one deflated member, so that what it holds is in no byte of it.
 fn zip_deflated(name: &str, data: &[u8]) -> Vec<u8> {
     use std::io::Write;
-    let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    z.start_file(
-        name,
-        zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated),
-    )
-    .unwrap();
+    let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+    z.start_file(name, FileOptions::default().method(Method::Deflated))
+        .unwrap();
     z.write_all(data).unwrap();
     z.finish().unwrap().into_inner()
 }

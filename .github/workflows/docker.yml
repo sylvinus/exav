@@ -89,6 +89,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cross
         run: cargo install cross --locked
+      # Paths mapped to fixed names, and passed on to cross's container.
+      - name: Map build paths to fixed names
+        run: echo "RUSTFLAGS=$(scripts/build-flags.sh)" >> "$GITHUB_ENV"
       # Same flags the Dockerfile compiles with, so the two image paths stay
       # one build apart: updater (`http`) on, everything else default.
       - name: Cross-compile static musl binary
@@ -103,6 +106,8 @@ jobs:
           else
             strip "bins/exav-${{ matrix.arch }}"
           fi
+      - name: Refuse a build path in the binary
+        run: python3 -I scripts/check-build-paths.py "bins/exav-${{ matrix.arch }}"
       - name: Upload per-arch binary
         uses: actions/upload-artifact@v4
         with:
@@ -128,6 +133,10 @@ jobs:
           pattern: exav-docker-*
           path: bins
           merge-multiple: true
+      # The image's layers hold these binaries and empty directories only:
+      # checked again here, in the job that pushes.
+      - name: Refuse a build path in the binaries
+        run: python3 -I scripts/check-build-paths.py bins
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:

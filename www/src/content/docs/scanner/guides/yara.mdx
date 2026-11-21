@@ -80,7 +80,7 @@ Rules that use the `pe`, `elf` or `dotnet` modules read the image of the file
 whose image is past `--max-object-bytes` cannot run them: it is reported
 `LIMITS-EXCEEDED` unless something is found. The same verdict comes
 from a pattern with more than a million matches and from a rule set that runs
-out of evaluation steps. A pattern a rule uses at one offset only (`$a at 0`)
+out of evaluation steps (`--max-yara-steps`). A pattern a rule uses at one offset only (`$a at 0`)
 is looked for there alone, as yara-x does, so its matches elsewhere do not
 count. See [Limits and tuning](/scanner/reference/limits/).
 
@@ -90,8 +90,10 @@ The set of matching rules is compared with the real `yara-x` over varied inputs
 (see [Differential testing](/scanner/concepts/differential-testing/)). The
 harness runs yara-x as a program (`yr`) instead of linking it, which would bring
 its WebAssembly runtime into exav's build. Install it with
-`cargo install yara-x-cli` and run `make test-yara-diff`. Without `yr` the
-harness skips, so read its output rather than only its exit code.
+`cargo install yara-x-cli` and run `make test-yara-diff`, with a directory of
+rules in `EXAV_DEBUG_YARA_CORPUS`; it fails when either is missing
+(`make test-yara-diff-rules` needs only `yr`). A plain `cargo test` skips these
+suites without `yr`.
 
 ## Using the engine directly
 

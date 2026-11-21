@@ -5,13 +5,13 @@ import { clip, MAX_LINE, sanitize, splitLines } from "./decode.js";
 const ch = (code: number) => String.fromCharCode(code);
 
 describe("sanitize", () => {
-  it("makes every bidirectional override, embedding and isolate visible", () => {
-    const hidden = [0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069];
+  it("makes every bidirectional mark, override, embedding and isolate visible", () => {
+    const hidden = [0x61c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069];
     const text = `if (admin ${hidden.map(ch).join("")}) { // end`;
     const out = sanitize(text);
     for (const c of hidden) {
       expect(out.includes(ch(c)), c.toString(16)).toBe(false);
-      expect(out).toContain(`<U+${c.toString(16).toUpperCase()}>`);
+      expect(out).toContain(`<U+${c.toString(16).toUpperCase().padStart(4, "0")}>`);
     }
     // The text around them is as it was.
     expect(out.startsWith("if (admin ")).toBe(true);

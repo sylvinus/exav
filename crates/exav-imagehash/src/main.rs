@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::ffi::{OsStr, OsString};
 use std::process::ExitCode;
 
 use exav_imagehash::{
@@ -37,7 +38,7 @@ Prints `FILE: HASH` for each file, the hash in hex. The ClamAV preset gives
   -V, --version";
 
 fn main() -> ExitCode {
-    match run(std::env::args().skip(1).collect()) {
+    match run(std::env::args_os().skip(1).collect()) {
         Ok(code) => code,
         Err(msg) => {
             eprintln!("exav-imagehash: {msg}\n\n{USAGE}");
@@ -46,12 +47,14 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: Vec<String>) -> Result<ExitCode, String> {
+/// Options are read as text; a file name keeps its bytes.
+fn run(args: Vec<OsString>) -> Result<ExitCode, String> {
     // The preset first, wherever it is, so the other options apply on top.
     let mut params = Params::CLAMAV;
     let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if let Some(v) = value(a, "--preset", &mut it)? {
+    while let Some(arg) = it.next() {
+        let a = arg.to_string_lossy();
+        if let Some(v) = value(&a, "--preset", &mut it)? {
             params = match v.as_str() {
                 "clamav" => Preset::ClamAv,
                 "imagehash" => Preset::ImagehashPhash,
@@ -62,8 +65,10 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
     }
     let (mut files, mut distance, mut print_params) = (Vec::new(), false, false);
     let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
+    while let Some(arg) = it.next() {
+        let a = arg.to_string_lossy();
+        let a = a.as_ref();
+        match a {
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(ExitCode::SUCCESS);
@@ -109,7 +114,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
                 } else if a.starts_with('-') && a.len() > 1 {
                     return Err(format!("unknown option `{a}`"));
                 } else {
-                    files.push(a.clone());
+                    files.push(arg.clone());
                 }
             }
         }
@@ -155,7 +160,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
     let mut ok = true;
     for f in &files {
         match hash(&hasher, f) {
-            Ok(h) => println!("{f}: {h}"),
+            Ok(h) => println!("{}: {h}", f.display()),
             Err(e) => {
                 eprintln!("exav-imagehash: {e}");
                 ok = false;
@@ -169,11 +174,12 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
     })
 }
 
-fn hash(hasher: &Hasher, path: &str) -> Result<exav_imagehash::ImageHash, String> {
-    let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+fn hash(hasher: &Hasher, path: &OsStr) -> Result<exav_imagehash::ImageHash, String> {
+    let path_text = path.display();
+    let data = std::fs::read(path).map_err(|e| format!("{path_text}: {e}"))?;
     hasher.hash(&data).map_err(|e| match e {
-        Error::Unsupported => format!("{path}: not an image of the formats asked for"),
-        e => format!("{path}: {e}"),
+        Error::Unsupported => format!("{path_text}: not an image of the formats asked for"),
+        e => format!("{path_text}: {e}"),
     })
 }
 
@@ -181,13 +187,12 @@ fn hash(hasher: &Hasher, path: &str) -> Result<exav_imagehash::ImageHash, String
 fn value(
     arg: &str,
     name: &str,
-    rest: &mut std::slice::Iter<'_, String>,
+    rest: &mut std::slice::Iter<'_, OsString>,
 ) -> Result<Option<String>, String> {
     if arg == name {
         return rest
             .next()
-            .cloned()
-            .map(Some)
+            .map(|v| Some(v.to_string_lossy().into_owned()))
             .ok_or(format!("{name} takes a value"));
     }
     Ok(arg

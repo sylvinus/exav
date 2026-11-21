@@ -2,21 +2,19 @@
 //! PKWARE "ZipCrypto" stream cipher and WinZip AES (AE-1/AE-2).
 //!
 //! DECRYPTION with a *known* password needs only a cipher (AES) + a KDF
-//! (PBKDF2-HMAC-SHA1) and a stream XOR, no RNG. So this links `aes`/`hmac`/
-//! `sha1`/`pbkdf2`/`ctr`, none of which pull `getrandom`, preserving the
-//! project's no-getrandom default build. We deliberately do NOT enable the
-//! `zip` crate's `aes-crypto`/encryption features (those pull `getrandom` for
-//! the salt/IV generation that only *encryption* needs).
+//! (PBKDF2-HMAC-SHA1, in `crate::hmac`) and a stream XOR, no RNG. So this
+//! links `aes` and `sha1`, neither of which pulls `getrandom`, preserving the
+//! project's no-getrandom default build. Salt and IV generation, which needs
+//! it, is only for *encryption*.
 //!
-//! These routines take the already-read *raw encrypted member bytes* (what
-//! `ZipFile::read` would yield without a decryptor, i.e. the stored/compressed
-//! payload after the format's own crypto framing) and return the decrypted
-//! ciphertext-stripped bytes ready to be decompressed by the member's method.
+//! These routines take the already-read *raw encrypted member bytes* (the
+//! stored or compressed payload, with the format's own crypto framing) and
+//! return the decrypted, ciphertext-stripped bytes ready to be decompressed by
+//! the member's method.
 
-use hmac::{Hmac, KeyInit, Mac};
+use crate::hmac::{Hmac, ct_eq, pbkdf2};
+use crate::zip_keys::{ZipCryptoKeys, crc32};
 use sha1::Sha1;
-
-type HmacSha1 = Hmac<Sha1>;
 
 /// WinZip AES strength byte → (key bytes, salt bytes, mac-key bytes).
 fn aes_params(strength: u8) -> Option<(usize, usize)> {
@@ -49,22 +47,20 @@ pub(crate) fn decrypt_aes(body: &[u8], strength: u8, password: &[u8]) -> Option<
 
     // PBKDF2-HMAC-SHA1, 1000 iters → enc_key || mac_key || 2-byte verifier.
     let mut derived = vec![0u8; key_len * 2 + 2];
-    pbkdf2::pbkdf2::<HmacSha1>(password, salt, 1000, &mut derived).ok()?;
+    pbkdf2::<Sha1>(password, salt, 1000, &mut derived);
     let enc_key = &derived[..key_len];
     let mac_key = &derived[key_len..key_len * 2];
     let verifier = &derived[key_len * 2..];
 
-    // Plain comparisons: the password is the caller's own and the file is the
-    // attacker's, so there is no secret for timing to leak.
-    if verifier != pw_verify {
+    if !ct_eq(verifier, pw_verify) {
         return None;
     }
 
     // Authenticate the ciphertext (AE-2 / HMAC-SHA1-80 over the ciphertext).
-    let mut mac = HmacSha1::new_from_slice(mac_key).ok()?;
+    let mut mac = Hmac::<Sha1>::new(mac_key);
     mac.update(ct);
-    let full = mac.finalize().into_bytes();
-    if full[..10] != *stored_mac {
+    let full = mac.finalize();
+    if !ct_eq(&full[..10], stored_mac) {
         return None;
     }
 
@@ -153,56 +149,6 @@ pub(crate) fn decrypt_zipcrypto(
         out.push(c);
     }
     Some(out)
-}
-
-/// PKWARE ZipCrypto key state (the three 32-bit keys + CRC table).
-struct ZipCryptoKeys {
-    key0: u32,
-    key1: u32,
-    key2: u32,
-}
-
-impl ZipCryptoKeys {
-    fn new(password: &[u8]) -> Self {
-        let mut k = ZipCryptoKeys {
-            key0: 0x1234_5678,
-            key1: 0x2345_6789,
-            key2: 0x3456_7890,
-        };
-        for &b in password {
-            k.update(b);
-        }
-        k
-    }
-
-    fn update(&mut self, byte: u8) {
-        self.key0 = crc32(self.key0, byte);
-        self.key1 = self
-            .key1
-            .wrapping_add(self.key0 & 0xff)
-            .wrapping_mul(0x0808_8405)
-            .wrapping_add(1);
-        let t = (self.key1 >> 24) as u8;
-        self.key2 = crc32(self.key2, t);
-    }
-
-    fn stream_byte(&self) -> u8 {
-        let temp = (self.key2 | 2) as u16;
-        ((temp.wrapping_mul(temp ^ 1)) >> 8) as u8
-    }
-}
-
-/// One step of the CRC-32 used by ZipCrypto (reflected, poly 0xEDB88320).
-fn crc32(crc: u32, byte: u8) -> u32 {
-    let mut c = (crc ^ byte as u32) & 0xff;
-    for _ in 0..8 {
-        c = if c & 1 != 0 {
-            (c >> 1) ^ 0xEDB8_8320
-        } else {
-            c >> 1
-        };
-    }
-    (crc >> 8) ^ c
 }
 
 /// Standard ZIP CRC-32 (IEEE 802.3, reflected poly 0xEDB88320) over a whole

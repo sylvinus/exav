@@ -110,20 +110,20 @@ Not in `make test`:
 | target | what it does | needs |
 | --- | --- | --- |
 | `scripts/difftest.sh` | exav against clamd over a corpus, a compliance diff (see [differential testing](/scanner/concepts/differential-testing/)) | Docker, a corpus and a signature database (`make db`) |
-| `make test-yara-diff` | exav's YARA engine against `yara-x` on identical rules and inputs; without `yr` the tests skip and pass | `yara-x-cli` |
+| `make test-yara-diff` | exav's YARA engine against `yara-x` on identical rules and inputs; fails without `yr` and without a rule corpus in `EXAV_DEBUG_YARA_CORPUS` (`make test-yara-diff-rules` needs only `yr`) | `yara-x-cli` |
 | `make miri` | selected library tests under Miri, which checks the `unsafe` in dependencies along real code paths; slow | a nightly toolchain with the `miri` component |
 
 `scripts/difftest.sh` is not a merge gate: it measures exav against clamd, so it
 can go red because clamd or the database changed. Run it when you touch
-detection. `make test-yara-diff` runs in CI on every pull request, and a failure
-fails the run.
+detection. `make test-yara-diff-rules` runs in CI on every pull request, and a
+failure fails the run; CI has no rule corpus, so the coverage half runs locally.
 
 `cargo test` is fine for the inner loop, but it is a subset: a test file that
 opens with `#![cfg(feature = "x")]` compiles to zero tests without `x`, and the run
 reports green having checked nothing. Run `make test` before you push.
 
 CI runs, on every pull request and push to `main`: the `make lint` checks,
-`make test-native`, the MSRV check (`make msrv`), `make test-yara-diff`, the WASM
+`make test-native`, the MSRV check (`make msrv`), `make test-yara-diff-rules`, the WASM
 builds with `make test-wasm` and `make test-js`, `make test-viewer`, `make test-www`, `cargo audit`,
 `cargo deny check`, and a `cargo-fuzz` smoke run of every target.
 

@@ -73,7 +73,23 @@ const T_TYPEREF: usize = 0x01;
 /// `ELEMENT_TYPE_STRING`, the Constant table's type byte for a string literal.
 const ELEMENT_TYPE_STRING: u8 = 0x0E;
 
+/// Whether `b` is an `ELEMENT_TYPE_*` value of ECMA-335, as the type byte of a
+/// Constant row has to be.
+fn is_element_type(b: u8) -> bool {
+    matches!(b, 0x00..=0x16 | 0x18 | 0x19 | 0x1B..=0x21 | 0x40 | 0x41 | 0x45)
+}
+
 const MAX_TABLES: usize = 64;
+
+/// The size of the CLI header, its first field.
+const CLI_HEADER_SIZE: u32 = 0x48;
+
+/// The longest version string of the metadata root that yara-x accepts.
+const MAX_VERSION_LEN: usize = 255;
+
+/// yara-x reads no more rows than this from a table, and lays the tables
+/// out, and sizes the indexes, as if the table had no more.
+const MAX_ROWS: u32 = 15_000;
 
 fn le_u16(d: &[u8], off: usize) -> u16 {
     off.checked_add(2)
@@ -111,9 +127,69 @@ pub(crate) fn build(data: &[u8], copies: &Copies) -> Value {
     }
 }
 
+/// The most section headers yara-x reads.
+const MAX_SECTIONS: usize = 96;
+
+/// What the module reads of the PE headers.
+struct PeHeaders {
+    sections: Vec<goblin::pe::section_table::SectionTable>,
+    file_alignment: u32,
+    section_alignment: u32,
+    /// The RVA of the CLI header, the data directory 14.
+    cli_rva: u32,
+}
+
+/// The PE headers as yara-x reads them: the optional header is PE32+ only
+/// for the magic 0x20B and has as many data directories as the file has
+/// room for, whatever it says; at most [`MAX_SECTIONS`] section headers,
+/// those that are whole in the file.
+fn read_headers(data: &[u8]) -> Option<PeHeaders> {
+    use goblin::pe::section_table::SectionTable;
+    let pe = goblin::pe::header::DosHeader::parse(data).ok()?.pe_pointer as usize;
+    if data.get(pe..pe.checked_add(4)?)? != b"PE\0\0" {
+        return None;
+    }
+    let coff = pe + 4;
+    let sections_count = usize::from(le_u16(data, coff + 2));
+    let optional = coff + 20;
+    let size_of_optional = usize::from(le_u16(data, coff + 16));
+    let directories = optional
+        + if le_u16(data, optional) == 0x20B {
+            112
+        } else {
+            96
+        };
+    let cli = directories + COM_DESCRIPTOR_DIR * 8;
+    let mut headers = PeHeaders {
+        sections: Vec::new(),
+        file_alignment: le_u32(data, optional + 36),
+        section_alignment: le_u32(data, optional + 32),
+        cli_rva: u32::from_le_bytes(*data.get(cli..)?.first_chunk::<4>()?),
+    };
+    let first = optional.checked_add(size_of_optional)?;
+    for i in 0..sections_count.min(MAX_SECTIONS) {
+        let Some(h) = first
+            .checked_add(i * 40)
+            .and_then(|at| data.get(at..)?.first_chunk::<40>())
+        else {
+            break;
+        };
+        let word = |i: usize| u32::from_le_bytes([h[i], h[i + 1], h[i + 2], h[i + 3]]);
+        headers.sections.push(SectionTable {
+            virtual_size: word(8),
+            virtual_address: word(12),
+            size_of_raw_data: word(16),
+            pointer_to_raw_data: word(20),
+            ..Default::default()
+        });
+    }
+    Some(headers)
+}
+
 /// One named stream in the metadata root.
 struct Stream {
-    name: String,
+    /// `None` for a name that is not UTF-8.
+    name: Option<String>,
     offset: u32,
     size: u32,
 }
@@ -136,62 +212,89 @@ struct Meta<'a> {
     /// Byte offset of each table's first row within `tables`.
     table_at: [usize; MAX_TABLES],
     tables: &'a [u8],
+    /// yara-x reads the tables in order and gives up at the first that does
+    /// not parse: the tables from this number on read as absent.
+    stop: usize,
     wide_str: bool,
     wide_guid: bool,
     wide_blob: bool,
+    /// What converts an RVA to a file offset, as yara-x does.
+    sections: Vec<goblin::pe::section_table::SectionTable>,
+    file_alignment: u32,
+    section_alignment: u32,
+    /// The RVA and the size of the managed resources, from the CLI header.
+    resources_rva: u32,
+    resources_size: u32,
 }
 
 impl<'a> Meta<'a> {
     fn parse(data: &'a [u8], copies: &'a Copies) -> Option<Meta<'a>> {
-        let pe = crate::pe::headers(data)?;
-        let opt = pe.header.optional_header?;
-        let (_, dd) = opt.data_directories.data_directories[COM_DESCRIPTOR_DIR]?;
+        let PeHeaders {
+            sections,
+            file_alignment,
+            section_alignment,
+            cli_rva,
+        } = read_headers(data)?;
         // yara-x converts RVAs here as in its `pe` module.
         let rva_to_offset = |rva: u32| {
-            crate::pe::yarax_offset(
-                rva,
-                &pe.sections,
-                opt.windows_fields.file_alignment,
-                opt.windows_fields.section_alignment,
-            )
-            .map(|offset| offset as usize)
+            crate::pe::yarax_offset(rva, &sections, file_alignment, section_alignment)
+                .map(|offset| offset as usize)
         };
-        let cli = rva_to_offset(dd.virtual_address)?;
-        // The CLI header's `MetaData` directory sits at offset 8.
+        let cli = rva_to_offset(cli_rva)?;
+        // The CLI header starts with its size, which is 0x48.
+        if le_u32(data, cli) != CLI_HEADER_SIZE {
+            return None;
+        }
+        // Its `MetaData` directory: the RVA at offset 8, the size at 12.
+        // yara-x reads the root and the list of streams only inside it.
         let md_rva = le_u32(data, cli + 8);
+        let md_size = le_u32(data, cli + 12) as usize;
         let root = rva_to_offset(md_rva)?;
-        if le_u32(data, root) != METADATA_MAGIC {
+        let window = data.get(root..)?;
+        let window = &window[..window.len().min(md_size)];
+        if le_u32(window, 0) != METADATA_MAGIC {
             return None;
         }
 
         // Root: signature, major, minor, reserved, then a length-prefixed
-        // version string padded to a four-byte boundary.
-        let vlen = le_u32(data, root.saturating_add(12)) as usize;
-        let vbytes = data.get(root.checked_add(16)?..)?.get(..vlen)?;
-        let version = String::from_utf8_lossy(
+        // version string. The streams start right after its stated length,
+        // which is not rounded up.
+        let vlen = le_u32(window, 12) as usize;
+        if vlen > MAX_VERSION_LEN {
+            return None;
+        }
+        let vbytes = window.get(16..)?.get(..vlen)?;
+        let version = std::str::from_utf8(
             &vbytes[..vbytes.iter().position(|&b| b == 0).unwrap_or(vbytes.len())],
         )
-        .into_owned();
-        let after_version = root + 16 + vlen.next_multiple_of(4);
-        let n_streams = le_u16(data, after_version + 2) as usize;
+        .ok()?
+        .to_owned();
+        // Flags and the number of streams, then one entry per stream.
+        let list = window.get(16 + vlen..)?;
+        let n_streams = usize::from(le_u16(list.get(..4)?, 2));
 
         let mut streams = Vec::with_capacity(n_streams.min(64));
-        let mut p = after_version + 4;
-        for _ in 0..n_streams.min(64) {
-            let offset = le_u32(data, p);
-            let size = le_u32(data, p + 4);
-            let name_start = p + 8;
-            let end = data.get(name_start..)?.iter().position(|&b| b == 0)? + name_start;
-            let name = String::from_utf8_lossy(data.get(name_start..end)?).into_owned();
-            streams.push(Stream { name, offset, size });
+        let mut p = 4;
+        for _ in 0..n_streams {
+            let entry = list.get(p..)?;
+            let offset = le_u32(entry.get(..8)?, 0);
+            let size = le_u32(entry, 4);
+            let name = entry.get(8..)?;
+            let len = name.iter().position(|&b| b == 0)?;
             // Names are NUL-terminated and padded to four bytes.
-            p = name_start + (end - name_start + 1).next_multiple_of(4);
+            let padded = (len + 1).next_multiple_of(4);
+            name.get(..padded)?;
+            let name = std::str::from_utf8(&name[..len]).ok().map(String::from);
+            streams.push(Stream { name, offset, size });
+            p += 8 + padded;
         }
 
         let heap = |n: &str| -> &'a [u8] {
+            // With two streams of one name, the last is the one yara-x reads.
             streams
                 .iter()
-                .find(|s| s.name == n)
+                .rev()
+                .find(|s| s.name.as_deref() == Some(n))
                 .and_then(|s| {
                     let a = root.checked_add(s.offset as usize)?;
                     data.get(a..a.checked_add(s.size as usize)?)
@@ -203,28 +306,30 @@ impl<'a> Meta<'a> {
         let guids = heap("#GUID");
         let us = heap("#US");
         // The table stream is `#~` normally and `#-` in unoptimised metadata.
-        let tilde = if streams.iter().any(|s| s.name == "#~") {
+        let tilde = if streams.iter().any(|s| s.name.as_deref() == Some("#~")) {
             heap("#~")
         } else {
             heap("#-")
         };
-        if tilde.len() < 24 {
-            return None;
-        }
 
         // `#~` header: reserved, major, minor, heap-size flags, reserved, then
-        // the valid/sorted bitmaps and one row count per valid table.
-        let heap_sizes = tilde[6];
-        let valid = u64::from_le_bytes(tilde.get(8..16)?.try_into().ok()?);
+        // the valid/sorted bitmaps and one row count per valid table. Without
+        // the whole header the assembly is still one, with no tables.
+        let mut heap_sizes = 0;
         let mut rows = [0u32; MAX_TABLES];
-        let mut p = 24;
-        for (i, r) in rows.iter_mut().enumerate() {
-            if valid & (1u64 << i) != 0 {
-                *r = le_u32(tilde, p);
-                p += 4;
+        let mut tables: &[u8] = &[];
+        if tilde.len() >= 24 {
+            heap_sizes = tilde[6];
+            let valid = u64::from_le_bytes(tilde.get(8..16)?.try_into().ok()?);
+            let mut p = 24;
+            for (i, r) in rows.iter_mut().enumerate() {
+                if valid & (1u64 << i) != 0 {
+                    *r = le_u32(tilde, p).min(MAX_ROWS);
+                    p += 4;
+                }
             }
+            tables = tilde.get(p..).unwrap_or(&[]);
         }
-        let tables = tilde.get(p..)?;
 
         let mut m = Meta {
             data,
@@ -239,12 +344,30 @@ impl<'a> Meta<'a> {
             rows,
             table_at: [0; MAX_TABLES],
             tables,
+            stop: MAX_TABLES,
             wide_str: heap_sizes & 0x01 != 0,
             wide_guid: heap_sizes & 0x02 != 0,
             wide_blob: heap_sizes & 0x04 != 0,
+            sections,
+            file_alignment,
+            section_alignment,
+            // The `Resources` directory of the CLI header is at offset 24.
+            resources_rva: le_u32(data, cli + 24),
+            resources_size: le_u32(data, cli + 28),
         };
         m.locate_tables();
         Some(m)
+    }
+
+    /// The file offset of `rva`, as yara-x converts it.
+    fn file_offset(&self, rva: u32) -> Option<i64> {
+        crate::pe::yarax_offset(
+            rva,
+            &self.sections,
+            self.file_alignment,
+            self.section_alignment,
+        )
+        .map(i64::from)
     }
 
     /// Row sizes depend on how many rows every *other* table has, so the layout
@@ -255,6 +378,56 @@ impl<'a> Meta<'a> {
             self.table_at[t] = at;
             at = at.saturating_add((self.rows[t] as usize).saturating_mul(self.row_size(t)));
         }
+        // Past ManifestResource no table gives a value.
+        self.stop = (0..=T_MANIFESTRESOURCE)
+            .find(|&t| !self.table_parses(t))
+            .unwrap_or(MAX_TABLES);
+    }
+
+    /// Whether yara-x reads table `t`: all its rows are in the stream, and
+    /// each coded index has a tag that names one of the tables it can point at.
+    fn table_parses(&self, t: usize) -> bool {
+        let rows = self.rows[t] as usize;
+        let size = self.row_size(t);
+        if rows == 0 || size == 0 {
+            return true;
+        }
+        let at = self.table_at[t];
+        let Some(body) = rows
+            .checked_mul(size)
+            .and_then(|n| self.tables.get(at..at.checked_add(n)?))
+        else {
+            return false;
+        };
+        let s = self.str_w();
+        // (offset, width, tag bits, number of tags that name a table)
+        let (def_or_ref, implementation) = (self.type_def_or_ref(), self.implementation());
+        let columns: &[(usize, usize, u32, u32)] = match t {
+            T_TYPEDEF => &[(4 + 2 * s, def_or_ref, 2, 3)],
+            T_INTERFACEIMPL => &[(self.idx_w(T_TYPEDEF), def_or_ref, 2, 3)],
+            T_MEMBERREF => &[(0, self.member_ref_parent(), 3, 5)],
+            T_CONSTANT => &[(2, self.has_constant(), 2, 3)],
+            T_CUSTOMATTRIBUTE => &[
+                (0, self.has_custom_attribute(), 5, 22),
+                (
+                    self.has_custom_attribute(),
+                    self.custom_attribute_type(),
+                    3,
+                    5,
+                ),
+            ],
+            T_DECLSECURITY => &[(2, self.has_decl_security(), 2, 3)],
+            T_EVENT => &[(2 + s, def_or_ref, 2, 3)],
+            T_EXPORTEDTYPE => &[(8 + 2 * s, implementation, 2, 3)],
+            T_MANIFESTRESOURCE => &[(8 + s, implementation, 2, 3)],
+            _ => &[],
+        };
+        body.chunks_exact(size).all(|row| {
+            (t != T_CONSTANT || is_element_type(row[0]))
+                && columns
+                    .iter()
+                    .all(|&(off, w, bits, n)| self.idx(row, off, w) & ((1 << bits) - 1) < n)
+        })
     }
 
     fn str_w(&self) -> usize {
@@ -273,10 +446,11 @@ impl<'a> Meta<'a> {
     }
 
     /// A coded index packs a table tag into the low bits, so it widens once any
-    /// of the tables it can point at is large enough.
+    /// of the tables it can point at is large enough. yara-x widens it above
+    /// `2^(16 - tag_bits)` rows, one more than the format says.
     fn coded_w(&self, tables: &[usize], tag_bits: u32) -> usize {
         let max = tables.iter().map(|&t| self.rows[t]).max().unwrap_or(0);
-        if (max as u64) >= (1u64 << (16 - tag_bits)) {
+        if (max as u64) > (1u64 << (16 - tag_bits)) {
             4
         } else {
             2
@@ -389,10 +563,11 @@ impl<'a> Meta<'a> {
             T_TYPESPEC => b,
             T_IMPLMAP => 2 + self.member_forwarded() + s + self.idx_w(T_MODULEREF),
             T_FIELDRVA => 4 + self.idx_w(T_FIELD),
-            0x1E | 0x1F => 4, // ENCLog / ENCMap
+            0x1E => 8, // ENCLog
+            0x1F => 4, // ENCMap
             T_ASSEMBLY => 16 + b + s * 2,
-            0x21 => 4 + b + s * 2, // AssemblyProcessor / OS variants
-            0x22 => 4,
+            0x21 => 4,  // AssemblyProcessor
+            0x22 => 12, // AssemblyOS
             T_ASSEMBLYREF => 12 + b * 2 + s * 2,
             0x24 => 4 + self.idx_w(T_ASSEMBLYREF),
             0x25 => 12 + self.idx_w(T_ASSEMBLYREF),
@@ -409,7 +584,7 @@ impl<'a> Meta<'a> {
 
     /// The bytes of row `i` (zero-based) of table `t`.
     fn row(&self, t: usize, i: u32) -> Option<&'a [u8]> {
-        if i >= self.rows[t] {
+        if t >= self.stop || i >= self.rows[t] {
             return None;
         }
         let sz = self.row_size(t);
@@ -426,39 +601,31 @@ impl<'a> Meta<'a> {
         }
     }
 
-    /// A NUL-terminated string from `#Strings`; empty once the copies have
-    /// used up their room.
-    fn string(&self, i: u32) -> Vec<u8> {
-        let i = i as usize;
-        match self.strings.get(i..) {
-            Some(s) => {
-                let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
-                if self.copies.take(end) {
-                    s[..end].to_vec()
-                } else {
-                    Vec::new()
-                }
-            }
-            None => Vec::new(),
+    /// A NUL-terminated string from `#Strings`, `None` if the index is not in
+    /// the heap, no NUL ends the string before the heap does, or it is not
+    /// UTF-8. Empty once the copies have used up their room.
+    fn string(&self, i: u32) -> Option<Vec<u8>> {
+        let s = self.strings.get(i as usize..)?;
+        let end = s.iter().position(|&b| b == 0)?;
+        if !self.copies.take(end) {
+            return Some(Vec::new());
         }
+        std::str::from_utf8(&s[..end]).ok()?;
+        Some(s[..end].to_vec())
     }
 
-    /// A length-prefixed blob from `#Blob`, minus its prefix; empty once the
+    /// A length-prefixed blob from `#Blob`, minus its prefix; `None` if the
+    /// index, the length or the blob is not in the heap. Empty once the
     /// copies have used up their room.
-    fn blob(&self, i: u32) -> Vec<u8> {
-        let i = i as usize;
-        let Some(s) = self.blobs.get(i..) else {
-            return Vec::new();
-        };
-        let (len, hdr) = match compressed_uint(s) {
-            Some(v) => v,
-            None => return Vec::new(),
-        };
-        hdr.checked_add(len as usize)
-            .and_then(|end| s.get(hdr..end))
-            .filter(|blob| self.copies.take(blob.len()))
-            .map(<[u8]>::to_vec)
-            .unwrap_or_default()
+    fn blob(&self, i: u32) -> Option<Vec<u8>> {
+        let s = self.blobs.get(i as usize..)?;
+        let (len, hdr) = compressed_uint(s)?;
+        let blob = s.get(hdr..hdr.checked_add(len as usize)?)?;
+        Some(if self.copies.take(blob.len()) {
+            blob.to_vec()
+        } else {
+            Vec::new()
+        })
     }
 
     fn build(&self) -> Value {
@@ -472,13 +639,17 @@ impl<'a> Meta<'a> {
         // Module: generation, name, mvid, encid, encbaseid.
         if let Some(r) = self.row(T_MODULE, 0) {
             let name = self.idx(r, 2, self.str_w());
-            f.insert("module_name".into(), Value::Str(self.string(name)));
+            if let Some(name) = self.string(name) {
+                f.insert("module_name".into(), Value::Str(name));
+            }
         }
 
         let mut streams = Vec::with_capacity(self.streams.len());
         for s in &self.streams {
             let mut v = Fields::new();
-            v.insert("name".into(), Value::Str(s.name.as_bytes().to_vec()));
+            if let Some(name) = &s.name {
+                v.insert("name".into(), Value::Str(name.as_bytes().to_vec()));
+            }
             // Stream offsets are relative to the metadata root; yara-x reports
             // them as file offsets.
             v.insert(
@@ -502,26 +673,29 @@ impl<'a> Meta<'a> {
         f.insert("guids".into(), Value::Array(Rc::new(guids)));
 
         // User strings: the `#US` heap is a run of length-prefixed UTF-16
-        // values starting after a single leading zero byte.
+        // values, normally after a leading empty one.
         let mut user_strings = Vec::new();
-        let mut p = 1usize;
+        let mut p = 0usize;
         while p < self.us.len() {
+            // A length that is not valid ends the list, keeping what was read.
             let Some((len, hdr)) = compressed_uint(&self.us[p..]) else {
                 break;
             };
-            let len = len as usize;
-            // The last byte of an entry is a flag rather than character data, so
-            // a one-byte entry carries no characters at all. YARA counts neither
-            // those nor zero-length ones.
-            let start = p.saturating_add(hdr);
-            let next = start.saturating_add(len);
-            if len <= 1 {
-                p = next;
-                continue;
+            let start = p + hdr;
+            // An entry that does not fit in the stream voids the whole list.
+            let Some(next) = start
+                .checked_add(len as usize)
+                .filter(|&next| next <= self.us.len())
+            else {
+                user_strings.clear();
+                break;
+            };
+            // The last byte of an entry is a flag rather than character data.
+            // YARA keeps the entries with at least two bytes of characters
+            // and none of the shorter ones.
+            if len >= 3 {
+                user_strings.push(Value::Str(self.us[start..next - 1].to_vec()));
             }
-            let end = next.min(self.us.len());
-            let body = &self.us[start..end.saturating_sub(1).max(start)];
-            user_strings.push(Value::Str(body.to_vec()));
             p = next;
         }
         f.insert(
@@ -542,7 +716,10 @@ impl<'a> Meta<'a> {
                 continue;
             }
             let b = self.idx(r, 2 + self.has_constant(), self.blob_w());
-            constants.push(Value::Str(self.blob(b)));
+            // A row whose value is not in the heap has no entry.
+            if let Some(value) = self.blob(b) {
+                constants.push(Value::Str(value));
+            }
         }
         f.insert(
             "number_of_constants".into(),
@@ -556,7 +733,9 @@ impl<'a> Meta<'a> {
             let Some(r) = self.row(T_MODULEREF, i) else {
                 break;
             };
-            modulerefs.push(Value::Str(self.string(self.idx(r, 0, self.str_w()))));
+            if let Some(name) = self.string(self.idx(r, 0, self.str_w())) {
+                modulerefs.push(Value::Str(name));
+            }
         }
         f.insert(
             "number_of_modulerefs".into(),
@@ -567,10 +746,9 @@ impl<'a> Meta<'a> {
         // Assembly: version, flags, public key, name, culture.
         if let Some(r) = self.row(T_ASSEMBLY, 0) {
             let mut a = Fields::new();
-            a.insert(
-                "name".into(),
-                Value::Str(self.string(self.idx(r, 16 + self.blob_w(), self.str_w()))),
-            );
+            if let Some(name) = self.string(self.idx(r, 16 + self.blob_w(), self.str_w())) {
+                a.insert("name".into(), Value::Str(name));
+            }
             a.insert("version".into(), version_struct(r, 4));
             f.insert("assembly".into(), Value::Struct(Rc::new(a)));
         }
@@ -582,11 +760,13 @@ impl<'a> Meta<'a> {
             };
             let mut a = Fields::new();
             let key = self.idx(r, 12, self.blob_w());
-            a.insert(
-                "name".into(),
-                Value::Str(self.string(self.idx(r, 12 + self.blob_w(), self.str_w()))),
-            );
-            a.insert("public_key_or_token".into(), Value::Str(self.blob(key)));
+            if let Some(name) = self.string(self.idx(r, 12 + self.blob_w(), self.str_w())) {
+                a.insert("name".into(), Value::Str(name));
+            }
+            // An empty key is no key.
+            if let Some(key) = self.blob(key).filter(|key| !key.is_empty()) {
+                a.insert("public_key_or_token".into(), Value::Str(key));
+            }
             a.insert("version".into(), version_struct(r, 0));
             refs.push(Value::Struct(Rc::new(a)));
         }
@@ -596,16 +776,19 @@ impl<'a> Meta<'a> {
         );
         f.insert("assembly_refs".into(), Value::Array(Rc::new(refs)));
 
-        // `field_offsets` is the FieldRVA table's RVA column — where a field
-        // with an initial value is stored — not the FieldLayout table, which
-        // gives a field's offset *within its class* and is usually absent. This
-        // assembly has zero FieldLayout rows and twenty-two FieldRVA ones.
+        // `field_offsets` is the FieldRVA table's RVA column converted to a
+        // file offset: where a field with an initial value is stored. It is
+        // not the FieldLayout table, which gives a field's offset *within its
+        // class* and is usually absent. A row whose RVA is in no section has no
+        // entry.
         let mut offsets = Vec::new();
         for i in 0..self.rows[T_FIELDRVA] {
             let Some(r) = self.row(T_FIELDRVA, i) else {
                 break;
             };
-            offsets.push(Value::Int(le_u32(r, 0) as i64));
+            if let Some(offset) = self.file_offset(le_u32(r, 0)) {
+                offsets.push(Value::Int(offset));
+            }
         }
         f.insert(
             "number_of_field_offsets".into(),
@@ -613,19 +796,27 @@ impl<'a> Meta<'a> {
         );
         f.insert("field_offsets".into(), Value::Array(Rc::new(offsets)));
 
-        // Only resources held in this file count; the ones with a non-zero
-        // `Implementation` live in another file entirely.
+        // Every row is a resource. The `offset` is the file offset of its data,
+        // after the four bytes of its length, and only a resource held in this
+        // file (`Implementation` 0) and inside the resources directory of the CLI
+        // header has one.
+        let resources_at = self.file_offset(self.resources_rva);
         let mut resources = Vec::new();
         for i in 0..self.rows[T_MANIFESTRESOURCE] {
             let Some(r) = self.row(T_MANIFESTRESOURCE, i) else {
                 break;
             };
             let mut m = Fields::new();
-            m.insert("offset".into(), Value::Int(le_u32(r, 0) as i64));
-            m.insert(
-                "name".into(),
-                Value::Str(self.string(self.idx(r, 8, self.str_w()))),
-            );
+            let in_this_file = self.idx(r, 8 + self.str_w(), self.implementation()) == 0;
+            let start = u64::from(le_u32(r, 0)) + 4;
+            if let (Some(base), true) = (resources_at, in_this_file)
+                && start <= u64::from(self.resources_size)
+            {
+                m.insert("offset".into(), Value::Int(base + start as i64));
+            }
+            if let Some(name) = self.string(self.idx(r, 8, self.str_w())) {
+                m.insert("name".into(), Value::Str(name));
+            }
             resources.push(Value::Struct(Rc::new(m)));
         }
         f.insert(
@@ -634,13 +825,22 @@ impl<'a> Meta<'a> {
         );
         f.insert("resources".into(), Value::Array(Rc::new(resources)));
 
-        // Every assembly's TypeDef row 0 is the `<Module>` pseudo-type, which
-        // holds global functions and fields rather than being a class. YARA does
-        // not count it.
-        f.insert(
-            "number_of_classes".into(),
-            Value::Int(self.rows[T_TYPEDEF].saturating_sub(1) as i64),
-        );
+        // A TypeDef row is a class when its name can be read and is neither
+        // empty nor `<Module>`, the pseudo-type of the global functions and
+        // fields that is row 0 of every assembly.
+        let mut classes = 0;
+        for i in 0..self.rows[T_TYPEDEF] {
+            let Some(r) = self.row(T_TYPEDEF, i) else {
+                break;
+            };
+            if let Some(name) = self.string(self.idx(r, 4, self.str_w()))
+                && !name.is_empty()
+                && name != b"<Module>"
+            {
+                classes += 1;
+            }
+        }
+        f.insert("number_of_classes".into(), Value::Int(classes));
 
         let _ = self.data;
         Value::Struct(Rc::new(f))
@@ -664,10 +864,13 @@ fn version_struct(row: &[u8], off: usize) -> Value {
 }
 
 /// The compressed unsigned integer the metadata format uses for blob and string
-/// lengths: one, two or four bytes, selected by the top bits of the first.
+/// lengths: one, two or four bytes, selected by the top bits of the first. A
+/// first byte of 0xE0 or more starts none of them.
 fn compressed_uint(s: &[u8]) -> Option<(u32, usize)> {
     let b0 = *s.first()? as u32;
-    if b0 & 0x80 == 0 {
+    if b0 & 0xE0 == 0xE0 {
+        None
+    } else if b0 & 0x80 == 0 {
         Some((b0, 1))
     } else if b0 & 0x40 == 0 {
         Some((((b0 & 0x3F) << 8) | *s.get(1)? as u32, 2))
@@ -1015,6 +1218,46 @@ mod tests {
         assert!(parses(&pe));
     }
 
+    /// yara-x reads 15,000 rows of a table and no more.
+    #[test]
+    fn a_table_is_read_up_to_15000_rows() {
+        for (rows, read) in [(14_999, 14_999), (15_000, 15_000), (15_001, 15_000)] {
+            let pe = assembly_with_module_refs(rows, 4);
+            let refs = module_refs(&build(&pe, &Copies::new(usize::MAX)));
+            assert_eq!(refs.len(), read, "{rows} rows");
+        }
+    }
+
+    /// A coded index is 4 bytes above `2^(16 - tag bits)` rows of a table it
+    /// can name, one more than ECMA-335 says: yara-x reads 2,048 rows of a
+    /// table that a 5-bit index names as 2 bytes, and 8,192 of a 3-bit one.
+    #[test]
+    fn a_coded_index_widens_one_row_later_than_the_format_says() {
+        let pe = assembly_with_module_refs(1, 4);
+        let copies = Copies::new(usize::MAX);
+        let mut meta = Meta::parse(&pe, &copies).unwrap();
+        for (rows, custom_attribute, member_ref_parent) in
+            [(2_048, 2, 2), (2_049, 4, 2), (8_192, 4, 2), (8_193, 4, 4)]
+        {
+            meta.rows[T_METHODDEF] = rows;
+            assert_eq!(meta.has_custom_attribute(), custom_attribute, "{rows}");
+            assert_eq!(meta.member_ref_parent(), member_ref_parent, "{rows}");
+        }
+    }
+
+    /// The tables that compilers do not write have the size the format gives
+    /// them, and the ones after them are where yara-x finds them.
+    #[test]
+    fn the_rarely_used_tables_have_their_size() {
+        let pe = assembly_with_module_refs(1, 4);
+        let copies = Copies::new(usize::MAX);
+        let meta = Meta::parse(&pe, &copies).unwrap();
+        // ENCLog, ENCMap, AssemblyProcessor, AssemblyOS.
+        for (table, size) in [(0x1E, 8), (0x1F, 4), (0x21, 4), (0x22, 12)] {
+            assert_eq!(meta.row_size(table), size, "table {table:#x}");
+        }
+    }
+
     fn module_refs(root: &Value) -> Vec<Vec<u8>> {
         let Value::Struct(f) = root else {
             panic!("not a struct")
@@ -1056,14 +1299,14 @@ mod tests {
         let pe = assembly_with_module_refs(1, 1000);
         let copies = Copies::new(2500);
         let meta = Meta::parse(&pe, &copies).unwrap();
-        assert_eq!(meta.blob(1), vec![b'B'; 1000]);
-        assert_eq!(meta.blob(1), vec![b'B'; 1000]);
+        assert_eq!(meta.blob(1), Some(vec![b'B'; 1000]));
+        assert_eq!(meta.blob(1), Some(vec![b'B'; 1000]));
         assert!(!copies.cut());
-        assert!(meta.blob(1).is_empty());
+        assert_eq!(meta.blob(1), Some(Vec::new()));
         assert!(copies.cut());
         // From then on nothing is copied, whatever its size.
-        assert!(meta.blob(0).is_empty());
-        assert!(meta.string(1).is_empty());
+        assert_eq!(meta.blob(0), Some(Vec::new()));
+        assert_eq!(meta.string(1), Some(Vec::new()));
     }
 
     #[test]

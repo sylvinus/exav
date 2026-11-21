@@ -578,12 +578,7 @@ fn read_style_maps(sheet: &mut Sheet, doc: &mut Doc, by_style: HashMap<String, V
     let mut names: Vec<String> = by_style.keys().cloned().collect();
     names.sort();
     for name in names {
-        let maps = doc
-            .st
-            .defs
-            .get(&name)
-            .map(|d| d.maps.clone())
-            .unwrap_or_default();
+        let maps = doc.st.maps(&name);
         let cells = &by_style[&name];
         let ranges = column_runs(cells);
         let tl = ranges.iter().map(|r| (r.r1, r.c1)).min().unwrap_or((0, 0));

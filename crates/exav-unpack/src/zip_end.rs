@@ -9,6 +9,12 @@
 pub(crate) struct EndRecord {
     /// Where the record starts, from the start of the file.
     pub(crate) at: u64,
+    /// Number of this disk, and of the one the directory starts on.
+    pub(crate) disk: u16,
+    pub(crate) directory_disk: u16,
+    /// Entries of the directory held on this disk.
+    pub(crate) entries_here: u16,
+    /// Entries of the whole directory.
     pub(crate) entries: u16,
     /// Length of the central directory, which ends where the record starts.
     pub(crate) size: u32,
@@ -32,6 +38,9 @@ impl EndRecord {
         }
         let record = EndRecord {
             at,
+            disk: u16::from_le_bytes([b[4], b[5]]),
+            directory_disk: u16::from_le_bytes([b[6], b[7]]),
+            entries_here: u16::from_le_bytes([b[8], b[9]]),
             entries: u16::from_le_bytes([b[10], b[11]]),
             size: u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
             offset: u32::from_le_bytes([b[16], b[17], b[18], b[19]]),

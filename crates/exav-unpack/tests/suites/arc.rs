@@ -126,6 +126,33 @@ fn detection_needs_more_than_the_two_byte_marker() {
     fake[15..19].copy_from_slice(&3000u32.to_le_bytes());
     fake[3000 + 29] = 0x77;
     assert_ne!(detect(&fake), Some(Format::Arc));
+
+    // A compiled terminfo entry: `1A 01`, the size of its names (48: "0" and
+    // a NUL), then its counts and names. Read as ARC it is a member of method
+    // 1, named "0", whose size runs past the end.
+    let mut terminfo = vec![0x1A, 0x01, 48, 0, 38, 0, 15, 0, 157, 1, 166, 2];
+    terminfo.extend_from_slice(b"xterm|xterm terminal emulator (X Window System)\0");
+    terminfo.resize(3000, 0x01);
+    assert_ne!(detect(&terminfo), Some(Format::Arc));
+}
+
+/// A stored member whose declared size runs past the end of the file is the
+/// bytes there are: they are scanned, whatever the header says, and are not
+/// past the member budget for a size that is not there.
+#[test]
+fn a_stored_member_cut_short_is_the_bytes_there_are() {
+    let mut a = vec![0x1A, 2];
+    let mut name = [0u8; 13];
+    name[..8].copy_from_slice(b"text.txt");
+    a.extend_from_slice(&name);
+    a.extend_from_slice(&(1u32 << 30).to_le_bytes()); // 1 GiB declared
+    a.extend_from_slice(&[0; 6]); // date, time, crc
+    a.extend_from_slice(&(1u32 << 30).to_le_bytes());
+    a.extend_from_slice(b"what is there");
+    let e = members(&a);
+    assert_eq!(e.len(), 1);
+    assert!(e[0].unsupported.is_none(), "{:?}", e[0].unsupported);
+    assert_eq!(e[0].data, b"what is there");
 }
 
 /// One method-9 (squashed) member around `codes`, 9-bit LSB-first.

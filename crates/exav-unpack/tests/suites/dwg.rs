@@ -204,7 +204,8 @@ fn the_converters_files_are_dwg_and_every_object_reads() {
 /// The drawings of `fixtures/dwg/ole/` (make.py there: one OLE2FRAME,
 /// handle 2F, embedding a compound file whose stream is a ZIP of the EICAR
 /// test file), every version: the compound file is a member, from its
-/// signature on, as the `cfb` and `zip` crates read it back.
+/// signature on, as the `cfb` crate and the package reader read it back.
+#[cfg(feature = "zip")]
 #[test]
 fn an_ole2frame_yields_its_compound_file() {
     use std::io::Cursor;
@@ -224,13 +225,9 @@ fn an_ole2frame_yields_its_compound_file() {
             .expect("its stream")
             .read_to_end(&mut zipped)
             .expect("read");
-        let mut zip = zip::ZipArchive::new(Cursor::new(zipped)).expect("a ZIP");
-        let mut file = Vec::new();
-        zip.by_name("eicar.com")
-            .expect("the file")
-            .read_to_end(&mut file)
-            .expect("read");
-        assert_eq!(file, exav_unpack::eicar(), "{v}");
+        let mut zip = exav_unpack::package::Package::from_bytes(&zipped).expect("a ZIP");
+        let file = zip.read("eicar.com", 1 << 20).expect("the file");
+        assert_eq!(file.as_deref(), Some(exav_unpack::eicar()), "{v}");
     }
 }
 

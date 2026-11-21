@@ -231,12 +231,7 @@ pub fn wrap_spans(line: &Line, max_cap: f64, f: &Metrics) -> Vec<Line> {
         return as_lines(
             wrap_line(&spans[0].text, max_cap, f)
                 .into_iter()
-                .map(|text| {
-                    vec![Span {
-                        text,
-                        ..spans[0].clone()
-                    }]
-                })
+                .map(|text| vec![spans[0].restyled(text)])
                 .collect(),
         );
     }
@@ -268,10 +263,7 @@ pub fn wrap_spans(line: &Line, max_cap: f64, f: &Metrics) -> Vec<Line> {
             let i = owner.get(at + k).copied().unwrap_or(spans.len() - 1);
             match runs.last_mut() {
                 Some(last) if last.same_style(&spans[i]) => last.text.push(c),
-                _ => runs.push(Span {
-                    text: c.to_string(),
-                    ..spans[i].clone()
-                }),
+                _ => runs.push(spans[i].restyled(c.to_string())),
             }
         }
         at += count;
@@ -485,6 +477,24 @@ impl Span {
             && self.tracking == other.tracking
             && self.stack.is_none()
             && other.stack.is_none()
+    }
+
+    /// This run's style around `text`. Not `..self.clone()`, which copies this
+    /// run's whole text for each line cut from it.
+    pub fn restyled(&self, text: String) -> Span {
+        Span {
+            text,
+            color: self.color,
+            face: self.face,
+            height: self.height,
+            underline: self.underline,
+            overline: self.overline,
+            strike: self.strike,
+            width: self.width,
+            oblique: self.oblique,
+            tracking: self.tracking,
+            stack: self.stack.clone(),
+        }
     }
 }
 
@@ -1020,11 +1030,26 @@ mod wrapping {
     #[cfg_attr(target_family = "wasm", ignore = "timing")]
     fn a_long_paragraph_of_several_runs_is_wrapped_in_linear_time() {
         let f = fixed();
-        let raw = format!("{{\\C7;{}}}{}", "ab ".repeat(40_000), "cd ".repeat(40_000));
-        let lines = mtext_spans(&raw);
-        let t = std::time::Instant::now();
-        let wrapped = wrap_spans(&lines[0], box_for(5), &f);
-        assert!(t.elapsed().as_millis() < 500, "took {:?}", t.elapsed());
+        let paragraph =
+            |words: usize| format!("{{\\C7;{}}}{}", "ab ".repeat(words), "cd ".repeat(words));
+        // The best of three runs at each size, the larger against the smaller
+        // rather than against a clock, which a loaded machine slows: linear is
+        // a ratio of 2, the quadratic step this guards against 4.
+        let best = |raw: &str| {
+            let lines = mtext_spans(raw);
+            (0..3)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    let wrapped = wrap_spans(&lines[0], box_for(5), &f);
+                    (t.elapsed(), wrapped)
+                })
+                .min_by_key(|(d, _)| *d)
+                .unwrap()
+        };
+        let (half, _) = best(&paragraph(40_000));
+        let (whole, wrapped) = best(&paragraph(80_000));
+        let ratio = whole.as_secs_f64() / half.as_secs_f64().max(1e-6);
+        assert!(ratio < 3.0, "{whole:?} against {half:?}");
         // Five characters to a line holds "ab ab" and "cd cd": one word is
         // always left over to the next line's start.
         assert!(wrapped.len() > 30_000, "{} lines", wrapped.len());

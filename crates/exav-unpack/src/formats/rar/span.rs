@@ -107,12 +107,24 @@ struct Pending {
     data: Pieces,
 }
 
+/// How the parts of a member end in the volumes given.
+enum Ending {
+    /// Its last part is there: the CRC its header records, and the bytes of
+    /// the data that header declares and the last volume ends before.
+    Done { crc: Option<u32>, missing: u64 },
+    /// It goes on in a volume that is not there.
+    GoesOn,
+}
+
 /// The state of a join: the archive so far, the member whose parts are being
 /// gathered, and the service blocks met meanwhile, which go after it.
 struct Join {
     out: Pieces,
     pending: Option<Pending>,
     deferred: Pieces,
+    /// The last volume ends inside a block: nothing may follow the pieces, or
+    /// it would be read as the data that block says it has.
+    cut: bool,
     max: usize,
 }
 
@@ -122,6 +134,7 @@ impl Join {
             out: Pieces::default(),
             pending: None,
             deferred: Pieces::default(),
+            cut: false,
             max,
         }
     }
@@ -156,8 +169,13 @@ pub struct RarSpan<'a> {
 impl<'a> RarSpan<'a> {
     /// The volumes, in order (`x.part1.rar` first, or `x.rar`, `x.r00`, ...).
     /// `Err` names what does not fit together: a volume that is not the one its
-    /// place says, a member whose start or end is missing, a volume that ends
-    /// inside a block or has a block header that does not parse.
+    /// place says, a member whose start is missing, a volume but the last that
+    /// ends inside a block, or one with a block header that does not parse.
+    ///
+    /// The last volume may end inside a block, as a single archive may. A
+    /// member whose last part it cuts is read as far as the volume goes, as a
+    /// cut archive's is. A member that goes on in a volume not given stays
+    /// flagged as continuing, as in a volume read alone.
     ///
     /// The span keeps a table of pieces, each a stretch of one volume or a few
     /// bytes of its own (a rewritten header); `max_table_bytes` is the most it
@@ -253,6 +271,8 @@ fn join4(parts: &[Box<dyn ByteSource + '_>], max: usize) -> Result<Pieces, Strin
         if !v.window(0, RAR4_MAGIC.len()).starts_with(RAR4_MAGIC) {
             return Err(format!("part {} is not a RAR4 volume", k + 1));
         }
+        // The last volume may end inside a block: what is missing is absent.
+        let last = k + 1 == parts.len();
         let size = v.len();
         let mut pos = RAR4_MAGIC.len();
         while pos < size {
@@ -260,6 +280,10 @@ fn join4(parts: &[Box<dyn ByteSource + '_>], max: usize) -> Result<Pieces, Strin
             // them, as the walk reads them.
             let w = v.window(pos, 40);
             let (Some(flags), Some(head_size)) = (u16le(&w, 3), u16le(&w, 5)) else {
+                if last {
+                    j.cut = true;
+                    break;
+                }
                 return Err(format!("part {} ends inside a block", k + 1));
             };
             let (htype, head_size) = (w[2], usize::from(head_size));
@@ -277,11 +301,26 @@ fn join4(parts: &[Box<dyn ByteSource + '_>], max: usize) -> Result<Pieces, Strin
             if htype == 0x74 && flags & 0x100 != 0 {
                 add |= u64::from(u32le(&w, 32).unwrap_or(0)) << 32;
             }
-            let end = pos
+            let declared = pos
                 .checked_add(head_size)
-                .and_then(|e| e.checked_add(usize::try_from(add).ok()?))
-                .filter(|&e| e <= size)
-                .ok_or_else(|| format!("part {} ends inside a block", k + 1))?;
+                .and_then(|e| e.checked_add(usize::try_from(add).ok()?));
+            let (end, missing) = match declared {
+                Some(e) if e <= size => (e, 0),
+                Some(e) if last && pos + head_size <= size => (size, (e - size) as u64),
+                Some(_) if last => {
+                    j.cut = true;
+                    break;
+                }
+                _ => return Err(format!("part {} ends inside a block", k + 1)),
+            };
+            if missing > 0 {
+                // With a member waiting for its parts, the block the volume
+                // ends inside can only be its next part.
+                if j.pending.is_some() && !(htype == 0x74 && flags & 0x01 != 0) {
+                    return Err(format!("part {} ends inside a block", k + 1));
+                }
+                j.cut = true;
+            }
             let len = (end - pos) as u64;
             // A volume's end block may record its number (EARC_VOLNUMBER,
             // after the data CRC when EARC_DATACRC is set): it must be where
@@ -329,7 +368,8 @@ fn join4(parts: &[Box<dyn ByteSource + '_>], max: usize) -> Result<Pieces, Strin
                     }
                     if before && !after {
                         let p = j.pending.take().expect("a split member was pending");
-                        let (header, data) = rar4_whole(p, u32le(&w, 16).unwrap_or(0))?;
+                        let crc = Some(u32le(&w, 16).unwrap_or(0));
+                        let (header, data) = rar4_member(p, Ending::Done { crc, missing })?;
                         j.out.lit(&header);
                         j.out.append(data);
                     }
@@ -344,43 +384,58 @@ fn join4(parts: &[Box<dyn ByteSource + '_>], max: usize) -> Result<Pieces, Strin
             pos = end;
         }
     }
-    if j.pending.is_some() {
-        return Err("the last part ends inside a member".to_string());
+    if let Some(p) = j.pending.take() {
+        // The set ends inside a member, which goes on in a volume not given:
+        // its header says so, and it is read as a member that continues.
+        let (header, data) = rar4_member(p, Ending::GoesOn)?;
+        j.out.lit(&header);
+        j.out.append(data);
     }
-    // ENDARC: CRC, type 0x7B, flags, size 7.
-    j.out.lit(&[0x3d, 0x7b, 0x7b, 0x00, 0x40, 0x07, 0x00]);
+    if !j.cut {
+        // ENDARC: CRC, type 0x7B, flags, size 7.
+        j.out.lit(&[0x3d, 0x7b, 0x7b, 0x00, 0x40, 0x07, 0x00]);
+    }
     Ok(j.out)
 }
 
-/// A RAR4 member's whole header, and its data, from its parts.
-fn rar4_whole(p: Pending, crc: u32) -> Result<(Vec<u8>, Pieces), String> {
+/// A RAR4 member's header, and its data, from its parts: as a whole member
+/// when its last part is there, else still flagged as going on.
+fn rar4_member(p: Pending, ending: Ending) -> Result<(Vec<u8>, Pieces), String> {
     let Pending { mut header, data } = p;
     let h = &mut header;
     // The smallest block head is 7 bytes, and a split member's has fields up to byte 20.
     if h.len() < 20 {
         return Err("a short file header".to_string());
     }
-    // A stored member's data is its content, so a part missing from between
-    // the ones given shows as a size the header does not record. (A volume
-    // missing from a set that records volume numbers is refused by the join;
-    // without them, a compressed member fails its CRC once decoded, which is
-    // reported only when checksums are verified.)
-    let large = u16::from_le_bytes([h[3], h[4]]) & 0x100 != 0;
+    let mut flags = u16::from_le_bytes([h[3], h[4]]);
+    let large = flags & 0x100 != 0;
     let unp = u64::from(u32le(h, 11).unwrap_or(0))
         | if large {
             u64::from(u32le(h, 36).unwrap_or(0)) << 32
         } else {
             0
         };
-    if h.get(25) == Some(&0x30) && unp != data.len {
-        return Err(format!(
-            "a stored member of {unp} bytes has {} in the parts given",
-            data.len
-        ));
-    }
-    let flags = u16::from_le_bytes([h[3], h[4]]) & !0x03;
+    let total = match ending {
+        Ending::Done { crc, missing } => {
+            let total = data.len.saturating_add(missing);
+            // A stored member's data is its content, so a part missing from
+            // between the ones given shows as a size the header does not
+            // record. (A volume missing from a set that records volume
+            // numbers is refused by the join; without them, a compressed
+            // member fails its CRC once decoded, which is reported only when
+            // checksums are verified.)
+            if h.get(25) == Some(&0x30) && unp != total {
+                return Err(format!(
+                    "a stored member of {unp} bytes has {total} in the parts given"
+                ));
+            }
+            flags &= !0x03;
+            h[16..20].copy_from_slice(&crc.unwrap_or(0).to_le_bytes());
+            total
+        }
+        Ending::GoesOn => data.len,
+    };
     h[3..5].copy_from_slice(&flags.to_le_bytes());
-    let total = data.len;
     h[7..11].copy_from_slice(&(total as u32).to_le_bytes());
     match (flags & 0x100 != 0, h.len() >= 40) {
         (true, true) => h[32..36].copy_from_slice(&((total >> 32) as u32).to_le_bytes()),
@@ -389,7 +444,6 @@ fn rar4_whole(p: Pending, crc: u32) -> Result<(Vec<u8>, Pieces), String> {
         }
         _ => {}
     }
-    h[16..20].copy_from_slice(&crc.to_le_bytes());
     Ok((header, data))
 }
 
@@ -417,14 +471,33 @@ pub(super) struct Rar5Block<'a> {
     pub(super) htype: u64,
     pub(super) hflags: u64,
     pub(super) end: usize,
+    /// Bytes of the data the volume ends before: 0 unless the block was read
+    /// with `cut_ok`.
+    pub(super) missing: u64,
 }
 
+const PARSE: &str = "has a block header that does not parse";
+const CUT: &str = "ends inside a block";
+
 /// The block at `pos`, or why it does not parse.
+#[cfg(test)]
 pub(super) fn rar5_block(v: &dyn ByteSource, pos: usize) -> Result<Rar5Block<'_>, &'static str> {
-    const PARSE: &str = "has a block header that does not parse";
-    const CUT: &str = "ends inside a block";
+    rar5_block_in(v, pos, false)
+}
+
+/// [`rar5_block`]. With `cut_ok` (the last volume of a set), a block whose
+/// header is whole and whose data goes past the end of the volume is read as
+/// far as the volume goes, with the rest in `missing`; `CUT` is then only for a
+/// header the volume ends inside.
+fn rar5_block_in(
+    v: &dyn ByteSource,
+    pos: usize,
+    cut_ok: bool,
+) -> Result<Rar5Block<'_>, &'static str> {
     let w = v.window(pos, 14);
-    let (hsize, n) = vint(&w, 4).ok_or(PARSE)?;
+    let Some((hsize, n)) = vint(&w, 4) else {
+        return Err(if cut_ok && w.len() < 14 { CUT } else { PARSE });
+    };
     if hsize == 0 || hsize > RAR5_MAX_HEADER {
         return Err(PARSE);
     }
@@ -448,17 +521,23 @@ pub(super) fn rar5_block(v: &dyn ByteSource, pos: usize) -> Result<Rar5Block<'_>
     } else {
         0
     };
-    let end = usize::try_from(data_size)
+    let room = (v.len() - data_off) as u64;
+    let (end, missing) = match usize::try_from(data_size)
         .ok()
         .and_then(|d| data_off.checked_add(d))
         .filter(|&e| e <= v.len())
-        .ok_or(CUT)?;
+    {
+        Some(e) => (e, 0),
+        None if cut_ok => (v.len(), data_size - room),
+        None => return Err(CUT),
+    };
     Ok(Rar5Block {
         content,
         data_off,
         htype,
         hflags,
         end,
+        missing,
     })
 }
 
@@ -469,9 +548,26 @@ fn join5(parts: &[Box<dyn ByteSource + '_>], max: usize) -> Result<Pieces, Strin
         if !v.window(0, RAR5_MAGIC.len()).starts_with(RAR5_MAGIC) {
             return Err(format!("part {} is not a RAR5 volume", k + 1));
         }
+        // The last volume may end inside a block: what is missing is absent.
+        let last = k + 1 == parts.len();
         let mut pos = RAR5_MAGIC.len();
         while pos < v.len() {
-            let b = rar5_block(&**v, pos).map_err(|e| format!("part {} {e}", k + 1))?;
+            let b = match rar5_block_in(&**v, pos, last) {
+                Ok(b) => b,
+                Err(CUT) if last => {
+                    j.cut = true;
+                    break;
+                }
+                Err(e) => return Err(format!("part {} {e}", k + 1)),
+            };
+            if b.missing > 0 {
+                // With a member waiting for its parts, the block the volume
+                // ends inside can only be its next part.
+                if j.pending.is_some() && !(matches!(b.htype, 2 | 3) && b.hflags & 0x08 != 0) {
+                    return Err(format!("part {} {CUT}", k + 1));
+                }
+                j.cut = true;
+            }
             let len = (b.end - pos) as u64;
             // A volume past the first records its number: it must be where
             // it is given.
@@ -522,11 +618,23 @@ fn join5(parts: &[Box<dyn ByteSource + '_>], max: usize) -> Result<Pieces, Strin
                     }
                     if before && !after {
                         let p = j.pending.take().expect("a split member was pending");
-                        let (header, data) = rar5_whole(p, rar5_crc(&b.content))?;
-                        j.out.lit(&header);
-                        j.out.append(data);
+                        let crc = rar5_crc(&b.content);
+                        let ending = Ending::Done {
+                            crc,
+                            missing: b.missing,
+                        };
+                        let (header, data) = rar5_member(p, ending)?;
                         let deferred = std::mem::take(&mut j.deferred);
-                        j.out.append(deferred);
+                        // A member cut short takes what follows it as data.
+                        if b.missing > 0 {
+                            j.out.append(deferred);
+                            j.out.lit(&header);
+                            j.out.append(data);
+                        } else {
+                            j.out.lit(&header);
+                            j.out.append(data);
+                            j.out.append(deferred);
+                        }
                     }
                 }
                 _ => j.out.range(k, pos as u64, len),
@@ -539,14 +647,22 @@ fn join5(parts: &[Box<dyn ByteSource + '_>], max: usize) -> Result<Pieces, Strin
             pos = b.end;
         }
     }
-    if j.pending.is_some() {
-        return Err("the last part ends inside a member".to_string());
+    if let Some(p) = j.pending.take() {
+        // The set ends inside a member, which goes on in a volume not given:
+        // its header says so, and it is read as a member that continues.
+        let (header, data) = rar5_member(p, Ending::GoesOn)?;
+        j.out.lit(&header);
+        j.out.append(data);
+        let deferred = std::mem::take(&mut j.deferred);
+        j.out.append(deferred);
     }
-    // End of archive: type 5, no flags, no end-of-archive flags.
-    let content = [vint_bytes(5), vint_bytes(0), vint_bytes(0)].concat();
-    j.out.lit(&crc32_ieee(&content).to_le_bytes());
-    j.out.lit(&vint_bytes(content.len() as u64));
-    j.out.lit(&content);
+    if !j.cut {
+        // End of archive: type 5, no flags, no end-of-archive flags.
+        let content = [vint_bytes(5), vint_bytes(0), vint_bytes(0)].concat();
+        j.out.lit(&crc32_ieee(&content).to_le_bytes());
+        j.out.lit(&vint_bytes(content.len() as u64));
+        j.out.lit(&content);
+    }
     Ok(j.out)
 }
 
@@ -621,35 +737,42 @@ pub(super) fn rar5_fields_at(c: &[u8]) -> Option<Rar5Layout> {
     })
 }
 
-/// A RAR5 member's whole block header, and its data, from its parts: the
-/// first header with the split flags off, the total data size, and the last
-/// part's CRC.
-fn rar5_whole(p: Pending, crc: Option<u32>) -> Result<(Vec<u8>, Pieces), String> {
+/// A RAR5 member's block header, and its data, from its parts. A member whose
+/// last part is there has the first header with the split flags off, the
+/// total data size, and the last part's CRC; one that goes on has the flag
+/// for it and the size of the data held.
+fn rar5_member(p: Pending, ending: Ending) -> Result<(Vec<u8>, Pieces), String> {
     let c = &p.header;
     let bad = || "a short file header".to_string();
     let layout = rar5_fields_at(c).ok_or_else(bad)?;
-    // As for RAR4: a stored member's size shows a missing part.
     let (file_flags, n) = vint(c, layout.after_sizes).ok_or_else(bad)?;
     let (unp, n2) = vint(c, layout.after_sizes + n).ok_or_else(bad)?;
     let mut q = layout.after_sizes + n + n2;
     q += vint(c, q).ok_or_else(bad)?.1;
     q += if file_flags & 0x02 != 0 { 4 } else { 0 } + if file_flags & 0x04 != 0 { 4 } else { 0 };
     let (comp_info, _) = vint(c, q).ok_or_else(bad)?;
-    if (comp_info >> 7) & 0x7 == 0 && file_flags & 0x08 == 0 && unp != p.data.len {
-        return Err(format!(
-            "a stored member of {unp} bytes has {} in the parts given",
-            p.data.len
-        ));
-    }
+    let (total, crc, split) = match ending {
+        Ending::Done { crc, missing } => {
+            let total = p.data.len.saturating_add(missing);
+            // As for RAR4: a stored member's size shows a missing part.
+            if (comp_info >> 7) & 0x7 == 0 && file_flags & 0x08 == 0 && unp != total {
+                return Err(format!(
+                    "a stored member of {unp} bytes has {total} in the parts given"
+                ));
+            }
+            (total, crc, 0x00)
+        }
+        Ending::GoesOn => (p.data.len, None, 0x10),
+    };
     let (htype, t1) = vint(c, 0).ok_or_else(bad)?;
     let (hflags, t2) = vint(c, t1).ok_or_else(bad)?;
     let mut content = vint_bytes(htype);
-    content.extend(vint_bytes((hflags & !0x18) | 0x02));
+    content.extend(vint_bytes((hflags & !0x18) | split | 0x02));
     if hflags & 0x01 != 0 {
         let (extra, _) = vint(c, t1 + t2).ok_or_else(bad)?;
         content.extend(vint_bytes(extra));
     }
-    content.extend(vint_bytes(p.data.len));
+    content.extend(vint_bytes(total));
     let shift = content.len() as isize - layout.after_sizes as isize;
     content.extend_from_slice(&c[layout.after_sizes..]);
     if let (Some(at), Some(crc)) = (layout.crc_at, crc) {

@@ -142,6 +142,7 @@ that states each licence, the words read there, the SHA-256 of the file, and how
 | `scene-pages.tif` | tiff | 83 KB | exav project | made for the demo | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | `fax-g4.tif` | tiff-fax | 22 KB | exav project | made for the demo | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | `fax-g4-3pages.tif` | tiff-fax | 66 KB | exav project | made for the demo | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+| `fax-g3-1d.tif` | tiff-fax | 60 KB | exav project | made for the demo | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | `scene-24.bmp` | bmp | 56 KB | exav project | made for the demo | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | `scene-8.bmp` | bmp | 20 KB | exav project | made for the demo | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | `scene-32.bmp` | bmp | 75 KB | exav project | made for the demo | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
@@ -298,7 +299,6 @@ that states each licence, the words read there, the SHA-256 of the file, and how
 
 | File | Format | Size | Author | Source | Licence |
 | --- | --- | ---: | --- | --- | --- |
-| `fax-g3-1d.tif` | tiff-fax | 60 KB | exav project | made for the demo | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | `minolta-dimage-5.mrw` | raw-mrw | 6.1 MB | Uploader to raw.pixls.us (the site gives no name) | [raw.pixls.us](https://raw.pixls.us/#repo) | [CC0-1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
 | `chickpea-pointcloud-ascii.ply` | ply | 3.3 MB | William T. Salter, Arjina Shrestha, Margaret M. Barbour | [zenodo.org](https://zenodo.org/records/4018242) | [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) |
 | `tika-pages09-layout.pages` | pages | 65 KB | Michael McCandless (Apache Tika) | [github.com](https://github.com/apache/tika/blob/f58e44c022a9952252f3e094dcc40abd931f7ecd/tika-parsers/tika-parsers-standard/tika-parsers-standard-modules/tika-parser-apple-module/src/test/resources/test-documents/testPagesLayout.pages) | [Apache-2.0](https://spdx.org/licenses/Apache-2.0.html) |

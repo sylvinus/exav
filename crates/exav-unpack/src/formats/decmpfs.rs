@@ -483,8 +483,8 @@ mod tests {
             max: usize::MAX,
         };
         match file(&mut v, attr, fork, cap) {
-            Got::Whole(b) => Out::Whole(b),
-            Got::Partial(b, why) => Out::Short(b, why),
+            Got::Whole(b) | Got::Sparse(b, _, None) => Out::Whole(b),
+            Got::Partial(b, why) | Got::Sparse(b, _, Some(why)) => Out::Short(b, why),
             Got::Big(n) => Out::Big(n),
             Got::Why(why) => Out::Why(why),
             Got::Stream(mut r, _, _) => {

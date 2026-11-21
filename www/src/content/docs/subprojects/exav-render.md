@@ -198,11 +198,16 @@ What each keeps:
   are not read: `@exav/viewer` sends them to an external converter.
 - **Text documents**: styles stay styles; sections with their headers and
   footers, lists, tables, notes, comments, fields, pictures and OfficeArt
-  shapes. Tracked changes in a DOC are drawn as strike-through and underline.
+  shapes. Tracked changes in a DOC and in Word 2003 XML are drawn as
+  strike-through and underline.
 
 Every conversion is bounded by `Limits`, one per module, and fails with
 `Error::TooLarge` rather than convert part of a document. The error's `kind()`
 is `not-format`, `encrypted`, `unsupported`, `too-large` or `malformed`.
+The table gives the defaults. The scanner, for the text of a document,
+derives each module's limits from `--max-object-bytes` (the sizes equal to
+it, the counts in proportion to it from the numbers below, which the default
+256 MiB gives); the viewer's entry points take their own.
 
 | Limit | `sheets` | `slides` | `docs` |
 |---|---|---|---|
@@ -361,8 +366,9 @@ not decode, or a PDF image whose dictionary, color space or predictor is not
 read). It is `None` for a file with the signature of BMP, ICO, PNM, DDS, QOI or
 a bare JPEG XL codestream and no header of it. Feature `raster` (not a
 default; `qr` implies it, and `ccitt` and `jbig2`): `image::from_raster(&Raster,
-&[u8], max_alloc)` gives the grey pixels of a PDF image's samples (PNG
-predictors, 1 to 16 bits, Gray, RGB, CMYK, Indexed, `/Decode`, image masks).
+&[u8], max_alloc)` gives the grey pixels of a PDF image's samples (PNG and
+TIFF predictors, undone by exav-unpack's `Predictor::undo`, 1 to 16 bits,
+Gray, RGB, CMYK, Indexed, `/Decode`, image masks).
 
 ```rust
 use exav_render::qr::{Limits, find};

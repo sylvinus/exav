@@ -207,6 +207,121 @@ fn legacy_methods_are_decoded() {
     }
 }
 
+/// What the `legacy_*_*.zip` fixtures below hold: 7602 bytes of numbered lines
+/// with stretches of 0x90 (Reduce's marker byte) and runs of `a` past what a
+/// Reduce length byte holds.
+fn legacy_sample() -> Vec<u8> {
+    let mut out = Vec::new();
+    for i in 0..220u32 {
+        out.extend_from_slice(
+            format!("{i:04} the quick brown fox {}\n", i * 7919 % 1009).as_bytes(),
+        );
+        if i % 25 == 0 {
+            out.extend_from_slice(b"\x90\x00\x90\x90\x01");
+        }
+        if i % 60 == 0 {
+            out.extend_from_slice(&[b'a'; 300]);
+        }
+    }
+    out
+}
+
+fn assert_decodes_to_sample(name: &str) {
+    let entries = extract(
+        Format::Zip,
+        &fixture(name),
+        &mut Budget::new(Limits::default()),
+    )
+    .unwrap();
+    assert_eq!(entries.len(), 1, "{name}");
+    assert_eq!(entries[0].unsupported, None, "{name}");
+    assert!(entries[0].data == legacy_sample(), "{name}");
+}
+
+/// Shrink with partial clears (256,2) and the code size going from 9 to 10
+/// bits (256,1). The fixture was checked against Info-ZIP's unzip.
+#[test]
+fn shrink_with_partial_clears_and_growing_codes() {
+    assert_decodes_to_sample("legacy_shrink_clear.zip");
+}
+
+/// Reduce at compression factor 1: 7-bit lengths, so the runs of `a` take the
+/// extension byte, and the 0x90 bytes are escaped. The fixture's follower
+/// sets and codes were checked against the PKZIP 1.x decoder this replaced.
+#[test]
+fn reduce_at_factor_one() {
+    assert_decodes_to_sample("legacy_reduce_f1.zip");
+}
+
+/// Implode with a 4 KiB window and two trees (no literal tree, matches of 2
+/// bytes). The fixture was checked against Info-ZIP's unzip.
+#[test]
+fn implode_with_a_small_window_and_no_literal_tree() {
+    assert_decodes_to_sample("legacy_implode_4k.zip");
+}
+
+/// A member declared longer than its stream holds ends cut short: the bytes
+/// decoded before the end are kept.
+#[test]
+fn legacy_members_longer_than_their_stream_keep_what_was_decoded() {
+    for name in LEGACY {
+        let mut blob = fixture(name);
+        // The uncompressed size, in the local header and in the directory.
+        for at in [
+            22,
+            blob.windows(4).position(|w| w == b"PK\x01\x02").unwrap() + 24,
+        ] {
+            blob[at..at + 4].copy_from_slice(&1200u32.to_le_bytes());
+        }
+        let entries = extract(Format::Zip, &blob, &mut Budget::new(Limits::default())).unwrap();
+        assert_eq!(entries.len(), 1, "{name}");
+        assert_eq!(entries[0].data.len(), 1092, "{name}");
+    }
+}
+
+/// These streams end at the declared size and hold nothing else to tell damage
+/// by: the directory's CRC-32 is checked once the member is read.
+#[test]
+fn legacy_members_are_checked_against_their_crc() {
+    use exav_unpack::{Member, MemberMeta, walk};
+    for name in LEGACY {
+        let mut blob = fixture(name);
+        let dir = blob.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        blob[dir + 16] ^= 1;
+        let mut read = None;
+        let mut visit = |_: &MemberMeta, content: Option<Member<'_>>, _: &mut Budget| {
+            if let Some(Member::Stream(r)) = content {
+                read = Some(r.read_to_end(&mut Vec::new()));
+            }
+            None::<()>
+        };
+        walk(
+            Format::Zip,
+            &blob,
+            &mut Budget::new(Limits::default()),
+            &mut visit,
+        )
+        .unwrap();
+        let err = read.expect(name).unwrap_err();
+        assert!(err.to_string().contains("CRC-32"), "{name}: {err}");
+    }
+}
+
+/// With no central directory, a member is found by its local header, which
+/// holds Implode's flags.
+#[test]
+fn legacy_members_without_a_directory_are_decoded() {
+    for name in LEGACY {
+        let mut blob = fixture(name);
+        let dir = blob.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        blob.truncate(dir);
+        let entries = extract(Format::Zip, &blob, &mut Budget::new(Limits::default())).unwrap();
+        assert_eq!(entries.len(), 1, "{name}");
+        assert_eq!(entries[0].data.len(), 1092, "{name}");
+        assert!(entries[0].data.starts_with(b"The play of Hamlet"), "{name}");
+    }
+}
+
 /// A one-member ZIP holding `data` as method 6 (Implode) with the given flags.
 fn implode_zip(flags: u16, data: &[u8]) -> Vec<u8> {
     let name = b"a";
@@ -259,27 +374,29 @@ fn implode_tree_size_255_is_not_a_panic() {
     assert!(!outcome.contains("panicked"), "{outcome}");
 }
 
-/// The `zip` crate decodes these methods whole, into a buffer it reserves from
-/// the member's declared size. Over the buffer limit, the member is not
-/// decoded and the limit is reported.
+/// These methods are decoded as they are read, in memory the size of their
+/// tables: a member past the buffer limit is no limit.
 #[test]
-fn legacy_methods_over_the_buffer_limit_are_a_limit() {
+fn legacy_methods_over_the_buffer_limit_are_streamed() {
     use exav_unpack::{Member, MemberMeta, walk};
     for name in LEGACY {
         let blob = fixture(name);
         let mut limits = Limits::default();
         limits.max_buffer_bytes = 1000;
-        let mut visited = 0;
-        let mut visit = |_: &MemberMeta, _: Option<Member<'_>>, _: &mut Budget| {
-            visited += 1;
+        let mut got = Vec::new();
+        let mut visit = |m: &MemberMeta, content: Option<Member<'_>>, _: &mut Budget| {
+            let mut d = Vec::new();
+            if let Some(Member::Stream(r)) = content {
+                r.read_to_end(&mut d).unwrap();
+            }
+            got.push((m.unsupported, d));
             None::<()>
         };
-        let hit = walk(Format::Zip, &blob, &mut Budget::new(limits), &mut visit).unwrap_err();
-        assert_eq!(visited, 0, "{name}");
-        assert!(
-            !hit.is_corrupt() && hit.reason.contains("--max-object-bytes"),
-            "{name}: {hit:?}"
-        );
+        walk(Format::Zip, &blob, &mut Budget::new(limits), &mut visit).unwrap();
+        assert_eq!(got.len(), 1, "{name}");
+        assert_eq!(got[0].0, None, "{name}");
+        assert_eq!(got[0].1.len(), 1092, "{name}");
+        assert!(got[0].1.starts_with(b"The play of Hamlet"), "{name}");
     }
 }
 
@@ -907,9 +1024,12 @@ fn unsigned_descriptor(member: &[u8]) -> Vec<u8> {
 /// not list it.
 fn hidden_before_a_zip(member: &[u8]) -> Vec<u8> {
     use std::io::Write;
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    z.start_file("carrier.txt", zip::write::SimpleFileOptions::default())
-        .unwrap();
+    let mut z = exav_unpack::zip_write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    z.start_file(
+        "carrier.txt",
+        exav_unpack::zip_write::FileOptions::default(),
+    )
+    .unwrap();
     z.write_all(SMALL_MEMBER).unwrap();
     [member, &z.finish().unwrap().into_inner()].concat()
 }

@@ -11,6 +11,7 @@
 use std::io::Write;
 
 use exav_render::slides::Format;
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use libfuzzer_sys::fuzz_target;
 
 #[path = "slides_check.rs"]
@@ -23,9 +24,8 @@ fuzz_target!(|data: &[u8]| {
     {
         data.to_vec()
     } else {
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = FileOptions::default().method(Method::Stored);
         if z.start_file("Index/Document.iwa", opts).is_err() || z.write_all(data).is_err() {
             return;
         }

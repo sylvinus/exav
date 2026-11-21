@@ -1,97 +1,27 @@
-//! ODF styles: cell styles with their parent chain resolved, to the model's
-//! styles and differential formats.
+//! ODF styles of the spreadsheet converter: the shared ones
+//! (`common::odf`, whose property keys carry the kind of property element:
+//! `table-cell/fo:border-left`), read as the model's styles and differential
+//! formats.
 
 use super::numfmt;
-use crate::formats::office::common::xml::{Child, Node};
+use crate::formats::office::common::odf::{self, Props, StyleDef};
+use crate::formats::office::common::xml::Node;
 use crate::formats::office::sheets::model::*;
 use std::collections::HashMap;
+use std::rc::Rc;
 
-#[derive(Clone, Default, Debug, PartialEq)]
-pub(crate) struct Props {
-    pub font: Option<String>,
-    pub size: Option<f64>,
-    pub bold: Option<bool>,
-    pub italic: Option<bool>,
-    pub underline: Option<Option<&'static str>>,
-    pub strike: Option<bool>,
-    pub color: Option<Option<Rgb>>,
-    pub vert: Option<Option<&'static str>>,
-    pub outline: Option<bool>,
-    pub shadow: Option<bool>,
-    pub bg: Option<Option<Rgb>>,
-    pub left: Option<Edge>,
-    pub right: Option<Edge>,
-    pub top: Option<Edge>,
-    pub bottom: Option<Edge>,
-    pub diag_up: Option<Edge>,
-    pub diag_down: Option<Edge>,
-    pub halign: Option<Option<&'static str>>,
-    pub valign: Option<Option<&'static str>>,
-    pub wrap: Option<bool>,
-    pub rotation: Option<u8>,
-    pub shrink: Option<bool>,
-    pub indent: Option<u8>,
-    pub data_style: Option<String>,
-    pub locked: Option<bool>,
-    pub hidden: Option<bool>,
-    /// The style has text properties at all.
-    pub text: bool,
-}
+const CELL: &str = "table-cell";
 
-macro_rules! over {
-    ($a:ident, $b:ident, $($f:ident),*) => { $( if $b.$f.is_some() { $a.$f = $b.$f.clone(); } )* };
-}
-
-impl Props {
-    pub fn overlay(&mut self, o: &Props) {
-        self.text |= o.text;
-        over!(
-            self, o, font, size, bold, italic, underline, strike, color, vert, outline, shadow, bg,
-            left, right, top, bottom, diag_up, diag_down, halign, valign, wrap, rotation, shrink,
-            indent, data_style, locked, hidden
-        );
-    }
-}
-
-pub(crate) struct StyleDef {
-    pub parent: Option<String>,
-    pub props: Props,
-    /// style:map: (condition, applied style, base cell).
-    pub maps: Vec<(String, String, Option<String>)>,
-}
-
-/// A length to points.
-pub(crate) fn parse_len_pt(s: &str) -> Option<f64> {
-    let s = s.trim();
-    let (num, unit) = s.split_at(
-        s.find(|c: char| c.is_ascii_alphabetic() || c == '%')
-            .unwrap_or(s.len()),
-    );
-    let v: f64 = num.trim().parse().ok()?;
-    if !v.is_finite() {
-        return None;
-    }
-    Some(match unit {
-        "pt" | "" => v,
-        "in" => v * 72.0,
-        "cm" => v * 72.0 / 2.54,
-        "mm" => v * 72.0 / 25.4,
-        "pc" => v * 12.0,
-        "px" => v * 0.75,
-        _ => return None,
-    })
-}
+/// A style:map: (condition, applied style, base cell).
+pub(crate) type StyleMap = (String, String, Option<String>);
 
 /// "#RRGGBB" or "transparent" (Some(None)).
 pub(crate) fn parse_color(s: &str) -> Option<Option<Rgb>> {
     if s == "transparent" {
         return Some(None);
     }
-    let h = s.strip_prefix('#')?;
-    if h.len() != 6 {
-        return None;
-    }
-    u32::from_str_radix(h, 16).ok().map(Some)
+    // The shared reader also takes "#RGB" and spaces around.
+    (s.len() == 7).then(|| odf::color(s)).flatten().map(Some)
 }
 
 /// "0.74pt solid #000000" to an XLSX border edge.
@@ -104,7 +34,7 @@ pub(crate) fn parse_border(s: &str) -> Edge {
     let mut style = "solid";
     let mut color = Some(0);
     for t in s.split_whitespace() {
-        if let Some(w) = parse_len_pt(t) {
+        if let Some(w) = odf::pt(t) {
             width = w;
         } else if t.starts_with('#') {
             color = parse_color(t).flatten();
@@ -175,51 +105,86 @@ fn pct(v: &str) -> Option<f64> {
     v.trim_end_matches('%').parse::<f64>().ok()
 }
 
-pub(crate) fn text_props(tp: &Node, fonts: &HashMap<String, String>, p: &mut Props) {
-    // A declared font face, else the family named directly; a face that is
-    // not declared is ignored.
-    match tp.attr("style:font-name").and_then(|f| fonts.get(f)) {
-        Some(fam) => p.font = Some(fam.clone()),
-        None => {
-            if let Some(f) = tp.attr("fo:font-family") {
-                p.font = Some(f.trim().trim_matches('\'').trim_matches('"').to_string());
-            }
+/// What a resolved style sets of a font, `None` for what it leaves alone.
+#[derive(Default)]
+struct TextLook {
+    font: Option<String>,
+    size: Option<f64>,
+    /// A percentage of the size the style has no size to take of.
+    size_of: Option<f64>,
+    bold: Option<bool>,
+    italic: Option<bool>,
+    underline: Option<Option<&'static str>>,
+    strike: Option<bool>,
+    color: Option<Option<Rgb>>,
+    vert: Option<Option<&'static str>>,
+    outline: Option<bool>,
+    shadow: Option<bool>,
+}
+
+/// What a resolved cell style sets, `None` for what it leaves alone.
+#[derive(Default)]
+struct Look {
+    text: TextLook,
+    bg: Option<Option<Rgb>>,
+    left: Option<Edge>,
+    right: Option<Edge>,
+    top: Option<Edge>,
+    bottom: Option<Edge>,
+    diag_up: Option<Edge>,
+    diag_down: Option<Edge>,
+    halign: Option<Option<&'static str>>,
+    valign: Option<Option<&'static str>>,
+    wrap: Option<bool>,
+    rotation: Option<u8>,
+    shrink: Option<bool>,
+    indent: Option<u8>,
+    locked: Option<bool>,
+    hidden: Option<bool>,
+}
+
+fn text_look(p: &Props, st: &odf::Styles) -> TextLook {
+    let t = |k: &str| p.get(&format!("text/{k}"));
+    let mut l = TextLook {
+        font: t("style:font-name").map(|n| st.font(n)).or_else(|| {
+            t("fo:font-family").map(|f| f.trim().trim_matches(['\'', '"']).to_string())
+        }),
+        ..TextLook::default()
+    };
+    if let Some(v) = t("fo:font-size") {
+        // A percentage is left when no style gives a size to take it of.
+        if let Some(f) = odf::percent(v) {
+            l.size_of = Some(f);
+        } else if let Some(pt) = odf::pt(v) {
+            l.size = Some(pt.clamp(1.0, 409.0));
         }
     }
-    p.text = true;
-    if let Some(v) = tp.attr("fo:font-size")
-        && !v.ends_with('%')
-        && let Some(pt) = parse_len_pt(v)
-    {
-        p.size = Some(pt.clamp(1.0, 409.0));
+    if let Some(v) = t("fo:font-weight") {
+        l.bold = Some(v == "bold" || v.parse::<u32>().is_ok_and(|w| w >= 600));
     }
-    if let Some(v) = tp.attr("fo:font-weight") {
-        p.bold = Some(v == "bold" || v.parse::<u32>().is_ok_and(|w| w >= 600));
+    if let Some(v) = t("fo:font-style") {
+        l.italic = Some(v == "italic" || v == "oblique");
     }
-    if let Some(v) = tp.attr("fo:font-style") {
-        p.italic = Some(v == "italic" || v == "oblique");
-    }
-    if let Some(v) = tp.attr("style:text-underline-style") {
-        p.underline = Some(if v == "none" {
-            None
-        } else if tp.attr("style:text-underline-type") == Some("double") {
-            Some("double")
-        } else {
-            Some("single")
+    if let Some(v) = t("style:text-underline-style") {
+        let double = t("style:text-underline-type") == Some("double");
+        l.underline = Some(match (v, double) {
+            ("none", _) => None,
+            (_, true) => Some("double"),
+            _ => Some("single"),
         });
     }
-    if let Some(v) = tp.attr("style:text-line-through-style") {
-        p.strike = Some(v != "none");
+    if let Some(v) = t("style:text-line-through-style") {
+        l.strike = Some(v != "none");
     }
-    if let Some(c) = tp.attr("fo:color").and_then(parse_color) {
-        p.color = Some(c);
+    // The automatic colour is the cell's own, as a transparent one.
+    if t("style:use-window-font-color") == Some("true") {
+        l.color = Some(None);
+    } else if let Some(c) = t("fo:color").and_then(parse_color) {
+        l.color = Some(c);
     }
-    if tp.attr("style:use-window-font-color") == Some("true") {
-        p.color = Some(None);
-    }
-    if let Some(v) = tp.attr("style:text-position") {
+    if let Some(v) = t("style:text-position") {
         let first = v.split_whitespace().next().unwrap_or("");
-        p.vert = Some(if first == "super" || pct(first).is_some_and(|x| x > 0.0) {
+        l.vert = Some(if first == "super" || pct(first).is_some_and(|x| x > 0.0) {
             Some("superscript")
         } else if first == "sub" || pct(first).is_some_and(|x| x < 0.0) {
             Some("subscript")
@@ -227,169 +192,185 @@ pub(crate) fn text_props(tp: &Node, fonts: &HashMap<String, String>, p: &mut Pro
             None
         });
     }
-    if let Some(v) = tp.attr("style:text-outline") {
-        p.outline = Some(v == "true");
+    if let Some(v) = t("style:text-outline") {
+        l.outline = Some(v == "true");
     }
-    if let Some(v) = tp.attr("fo:text-shadow") {
-        p.shadow = Some(v != "none");
+    if let Some(v) = t("fo:text-shadow") {
+        l.shadow = Some(v != "none");
+    }
+    l
+}
+
+fn look(p: &Props, st: &odf::Styles) -> Look {
+    let c = |k: &str| p.get(&format!("table-cell/{k}"));
+    let mut l = Look {
+        text: text_look(p, st),
+        ..Look::default()
+    };
+    if let Some(v) = c("fo:background-color").and_then(parse_color) {
+        l.bg = Some(v);
+    }
+    let edge = |side: &str| {
+        c(&format!("fo:border-{side}"))
+            .or_else(|| c("fo:border"))
+            .map(parse_border)
+    };
+    l.left = edge("left");
+    l.right = edge("right");
+    l.top = edge("top");
+    l.bottom = edge("bottom");
+    l.diag_up = c("style:diagonal-bl-tr").map(parse_border);
+    l.diag_down = c("style:diagonal-tl-br").map(parse_border);
+    if let Some(v) = c("style:vertical-align") {
+        l.valign = Some(match v {
+            "top" => Some("top"),
+            "middle" => Some("center"),
+            _ => None,
+        });
+    }
+    if let Some(v) = c("fo:wrap-option") {
+        l.wrap = Some(v == "wrap");
+    }
+    if let Some(v) = c("style:rotation-angle") {
+        let a = v
+            .trim_end_matches("deg")
+            .trim()
+            .parse::<f64>()
+            .unwrap_or(0.0);
+        let a = if a.is_finite() {
+            (a.round() as i64).rem_euclid(360)
+        } else {
+            0
+        };
+        l.rotation = Some(if a == 0 {
+            0
+        } else if a <= 90 {
+            a as u8
+        } else if a >= 270 {
+            (90 + 360 - a) as u8
+        } else if a <= 180 {
+            // Upside-down angles have no XLSX equivalent: the nearest.
+            90
+        } else {
+            180
+        });
+    }
+    if c("style:direction") == Some("ttb") {
+        l.rotation = Some(255);
+    }
+    if let Some(v) = c("style:shrink-to-fit") {
+        l.shrink = Some(v == "true");
+    }
+    if let Some(v) = c("style:cell-protect") {
+        l.locked = Some(v.contains("protected") && !v.contains("none"));
+        l.hidden = Some(v.contains("formula-hidden") || v.contains("hidden-and-protected"));
+    }
+    // `drop_value_aligned` has dropped it when the alignment follows the
+    // value's type.
+    if let Some(v) = p.get("paragraph/fo:text-align") {
+        l.halign = Some(match v {
+            "start" | "left" => Some("left"),
+            "center" => Some("center"),
+            "end" | "right" => Some("right"),
+            "justify" => Some("justify"),
+            _ => None,
+        });
+    }
+    if let Some(pt) = p.margin("paragraph", "left").and_then(odf::pt) {
+        l.indent = Some((pt / 10.0).round().clamp(0.0, 15.0) as u8);
+    }
+    l
+}
+
+/// The font a style gives, over the application's default one.
+fn font_of(t: &TextLook) -> Font {
+    let mut f = Font {
+        name: "Liberation Sans".into(),
+        size_centipt: 1000,
+        bold: false,
+        italic: false,
+        underline: None,
+        strike: false,
+        color: None,
+        vert_align: None,
+        family: 0,
+        charset: None,
+        outline: false,
+        shadow: false,
+    };
+    apply(&mut f, t);
+    f
+}
+
+/// What a style sets of a font, over a font.
+fn apply(f: &mut Font, t: &TextLook) {
+    if let Some(n) = &t.font {
+        f.name = n.clone();
+    }
+    if let Some(s) = t.size {
+        f.size_centipt = (s * 100.0).round() as u32;
+    } else if let Some(x) = t.size_of {
+        f.size_centipt = (f64::from(f.size_centipt) * x)
+            .round()
+            .clamp(100.0, 40_900.0) as u32;
+    }
+    if let Some(b) = t.bold {
+        f.bold = b;
+    }
+    if let Some(i) = t.italic {
+        f.italic = i;
+    }
+    if let Some(u) = t.underline {
+        f.underline = u;
+    }
+    if let Some(s) = t.strike {
+        f.strike = s;
+    }
+    if let Some(c) = t.color {
+        f.color = c;
+    }
+    if let Some(v) = t.vert {
+        f.vert_align = v;
+    }
+    if let Some(o) = t.outline {
+        f.outline = o;
+    }
+    if let Some(s) = t.shadow {
+        f.shadow = s;
     }
 }
 
-pub(crate) fn style_props(st: &Node, fonts: &HashMap<String, String>) -> Props {
-    let mut p = Props::default();
-    if let Some(d) = st.attr("style:data-style-name") {
-        p.data_style = Some(d.to_string());
+/// A cell style whose horizontal alignment follows the value's type has none
+/// of its own.
+fn drop_value_aligned(props: &mut Vec<(String, String)>) {
+    let by_type = props
+        .iter()
+        .any(|(k, v)| k == "table-cell/style:text-align-source" && v == "value-type");
+    if by_type {
+        props.retain(|(k, _)| k != "paragraph/fo:text-align");
     }
-    if let Some(tc) = st.child("style:table-cell-properties") {
-        if let Some(c) = tc.attr("fo:background-color").and_then(parse_color) {
-            p.bg = Some(c);
-        }
-        if let Some(v) = tc.attr("fo:border") {
-            let e = parse_border(v);
-            p.left = Some(e.clone());
-            p.right = Some(e.clone());
-            p.top = Some(e.clone());
-            p.bottom = Some(e);
-        }
-        for (k, f) in [
-            ("fo:border-left", 0),
-            ("fo:border-right", 1),
-            ("fo:border-top", 2),
-            ("fo:border-bottom", 3),
-        ] {
-            if let Some(v) = tc.attr(k) {
-                let e = parse_border(v);
-                match f {
-                    0 => p.left = Some(e),
-                    1 => p.right = Some(e),
-                    2 => p.top = Some(e),
-                    _ => p.bottom = Some(e),
-                }
-            }
-        }
-        if let Some(v) = tc.attr("style:diagonal-bl-tr") {
-            p.diag_up = Some(parse_border(v));
-        }
-        if let Some(v) = tc.attr("style:diagonal-tl-br") {
-            p.diag_down = Some(parse_border(v));
-        }
-        if let Some(v) = tc.attr("style:vertical-align") {
-            p.valign = Some(match v {
-                "top" => Some("top"),
-                "middle" => Some("center"),
-                _ => None,
-            });
-        }
-        if let Some(v) = tc.attr("fo:wrap-option") {
-            p.wrap = Some(v == "wrap");
-        }
-        if let Some(v) = tc.attr("style:rotation-angle") {
-            let a = v
-                .trim_end_matches("deg")
-                .trim()
-                .parse::<f64>()
-                .unwrap_or(0.0);
-            let a = if a.is_finite() {
-                (a.round() as i64).rem_euclid(360)
-            } else {
-                0
-            };
-            p.rotation = Some(if a == 0 {
-                0
-            } else if a <= 90 {
-                a as u8
-            } else if a >= 270 {
-                (90 + 360 - a) as u8
-            } else if a <= 180 {
-                // Upside-down angles have no XLSX equivalent: the nearest.
-                90
-            } else {
-                180
-            });
-        }
-        if tc.attr("style:direction") == Some("ttb") {
-            p.rotation = Some(255);
-        }
-        if let Some(v) = tc.attr("style:shrink-to-fit") {
-            p.shrink = Some(v == "true");
-        }
-        if let Some(v) = tc.attr("style:cell-protect") {
-            p.locked = Some(v.contains("protected") && !v.contains("none"));
-            p.hidden = Some(v.contains("formula-hidden") || v.contains("hidden-and-protected"));
-        }
-    }
-    if let Some(pp) = st.child("style:paragraph-properties") {
-        let fixed = st
-            .child("style:table-cell-properties")
-            .and_then(|t| t.attr("style:text-align-source"))
-            != Some("value-type");
-        if let Some(v) = pp.attr("fo:text-align")
-            && fixed
-        {
-            p.halign = Some(match v {
-                "start" | "left" => Some("left"),
-                "center" => Some("center"),
-                "end" | "right" => Some("right"),
-                "justify" => Some("justify"),
-                _ => None,
-            });
-        }
-        if let Some(pt) = pp.attr("fo:margin-left").and_then(parse_len_pt) {
-            p.indent = Some((pt / 10.0).round().clamp(0.0, 15.0) as u8);
-        }
-    }
-    if let Some(tp) = st.child("style:text-properties") {
-        text_props(tp, fonts, &mut p);
-    }
-    p
+}
+
+fn has_text(p: &Props) -> bool {
+    p.iter().any(|(k, _)| k.starts_with("text/"))
 }
 
 pub(crate) struct Styles {
-    pub defs: HashMap<String, StyleDef>,
-    pub display: HashMap<String, String>,
-    pub default: Props,
-    pub data: HashMap<String, String>,
-    pub fonts: HashMap<String, String>,
-    /// Other families' styles: (family, name).
-    pub other: HashMap<(String, String), Node>,
-    cache: HashMap<String, Props>,
-}
-
-fn clone_node(n: &Node) -> Node {
-    Node {
-        name: n.name.clone(),
-        attrs: n.attrs.clone(),
-        children: n
-            .children
-            .iter()
-            .map(|c| match c {
-                Child::Node(x) => Child::Node(clone_node(x)),
-                Child::Text(t) => Child::Text(t.clone()),
-            })
-            .collect(),
-    }
+    sty: odf::Styles,
+    display: HashMap<String, String>,
+    maps: HashMap<String, Vec<StyleMap>>,
+    data: HashMap<String, String>,
 }
 
 impl Styles {
     pub fn collect(roots: &[&Node]) -> Styles {
-        let mut fonts = HashMap::new();
+        let mut sty = odf::Styles::default();
         for r in roots {
             if let Some(ff) = r.child("office:font-face-decls") {
-                for f in ff.all("style:font-face") {
-                    if let Some(n) = f.attr("style:name") {
-                        let fam = f
-                            .attr("svg:font-family")
-                            .unwrap_or(n)
-                            .trim()
-                            .trim_matches('\'')
-                            .trim_matches('"')
-                            .to_string();
-                        fonts.insert(n.to_string(), fam);
-                    }
-                }
+                sty.add(ff, false);
             }
         }
-        let mut style_roots: Vec<&Node> = vec![];
+        let mut style_roots: Vec<(&Node, bool)> = vec![];
         for r in roots {
             for k in [
                 "office:styles",
@@ -397,118 +378,121 @@ impl Styles {
                 "office:master-styles",
             ] {
                 if let Some(s) = r.child(k) {
-                    style_roots.push(s);
+                    style_roots.push((s, k == "office:automatic-styles"));
                 }
             }
         }
-        let data = numfmt::collect(&style_roots);
-        let mut defs = HashMap::new();
         let mut display = HashMap::new();
-        let mut default = Props::default();
-        let mut other = HashMap::new();
-        for sr in &style_roots {
-            for st in sr.nodes() {
-                match st.name.as_str() {
-                    "style:default-style" if st.attr("style:family") == Some("table-cell") => {
-                        default = style_props(st, &fonts)
-                    }
-                    "style:style" => {
-                        let fam = st.attr("style:family").unwrap_or("");
-                        let Some(name) = st.attr("style:name") else {
-                            continue;
-                        };
-                        if fam == "table-cell" {
-                            if let Some(d) = st.attr("style:display-name") {
-                                display.insert(d.to_string(), name.to_string());
-                            }
-                            let maps = st
-                                .all("style:map")
-                                .take(64)
-                                .filter_map(|m| {
-                                    Some((
-                                        m.attr("style:condition")?.to_string(),
-                                        m.attr("style:apply-style-name")?.to_string(),
-                                        m.attr("style:base-cell-address").map(str::to_string),
-                                    ))
-                                })
-                                .collect();
-                            defs.insert(
-                                name.to_string(),
-                                StyleDef {
-                                    parent: st.attr("style:parent-style-name").map(str::to_string),
-                                    props: style_props(st, &fonts),
-                                    maps,
-                                },
-                            );
-                        } else {
-                            other.insert((fam.to_string(), name.to_string()), clone_node(st));
-                        }
-                    }
-                    _ => {}
+        let mut maps: HashMap<String, Vec<StyleMap>> = HashMap::new();
+        for (sr, automatic) in &style_roots {
+            sty.add(sr, *automatic);
+            for st in sr.all("style:style") {
+                let Some(name) = st
+                    .attr("style:name")
+                    .filter(|_| st.attr("style:family") == Some(CELL))
+                else {
+                    continue;
+                };
+                if let Some(d) = st.attr("style:display-name") {
+                    display.insert(d.to_string(), name.to_string());
+                }
+                let m: Vec<StyleMap> = st
+                    .all("style:map")
+                    .take(64)
+                    .filter_map(|m| {
+                        Some((
+                            m.attr("style:condition")?.to_string(),
+                            m.attr("style:apply-style-name")?.to_string(),
+                            m.attr("style:base-cell-address").map(str::to_string),
+                        ))
+                    })
+                    .collect();
+                // A style defined again replaces the conditions too.
+                if m.is_empty() {
+                    maps.remove(name);
+                } else {
+                    maps.insert(name.to_string(), m);
                 }
             }
+        }
+        let nodes: Vec<&Node> = style_roots.iter().map(|(n, _)| *n).collect();
+        let data = numfmt::collect(&nodes);
+        for ((family, _), def) in &mut sty.styles {
+            if family == CELL {
+                drop_value_aligned(&mut def.props);
+            }
+        }
+        if let Some(d) = sty.defaults.get_mut(CELL) {
+            drop_value_aligned(d);
         }
         Styles {
-            defs,
+            sty,
             display,
-            default,
+            maps,
             data,
-            fonts,
-            other,
-            cache: HashMap::new(),
         }
     }
 
-    fn chain(&self, name: &str) -> Vec<String> {
-        let mut chain = vec![];
-        let mut cur = Some(name.to_string());
-        while let Some(n) = cur {
-            if chain.contains(&n) || chain.len() > 32 {
-                break;
-            }
-            let parent = self.defs.get(&n).and_then(|d| d.parent.clone());
-            chain.push(n);
-            cur = parent;
-        }
-        chain
+    /// The properties of a style of another family (table, column, row,
+    /// drawing, text) over its parents'.
+    pub fn chain(&self, family: &str, name: Option<&str>) -> Rc<Props> {
+        self.sty.chain(family, name)
     }
 
-    /// A style's properties with its parents' under them.
-    pub fn resolve(&mut self, name: &str) -> Props {
-        if let Some(p) = self.cache.get(name) {
-            return p.clone();
-        }
-        let mut p = self.default.clone();
-        for n in self.chain(name).iter().rev() {
-            if let Some(d) = self.defs.get(n) {
-                p.overlay(&d.props);
-            }
-        }
-        if self.cache.len() < 1 << 16 {
-            self.cache.insert(name.to_string(), p.clone());
-        }
-        p
+    /// Whether a text style of this name is defined.
+    pub fn has_text_style(&self, name: &str) -> bool {
+        self.sty.get("text", name).is_some()
     }
 
-    pub fn other(&self, family: &str, name: &str) -> Option<&Node> {
-        self.other.get(&(family.to_string(), name.to_string()))
+    /// The memory the resolved styles took since the last call, in bytes.
+    pub fn take_charge(&self) -> u64 {
+        self.sty.take_charge()
     }
 
-    pub fn to_style(&self, p: &Props) -> Style {
-        let font = Font {
-            name: p.font.clone().unwrap_or_else(|| "Liberation Sans".into()),
-            size_centipt: (p.size.unwrap_or(10.0) * 100.0).round() as u32,
-            bold: p.bold.unwrap_or(false),
-            italic: p.italic.unwrap_or(false),
-            underline: p.underline.flatten(),
-            strike: p.strike.unwrap_or(false),
-            color: p.color.flatten(),
-            vert_align: p.vert.flatten(),
-            family: 0,
-            charset: None,
-            outline: p.outline.unwrap_or(false),
-            shadow: p.shadow.unwrap_or(false),
-        };
+    /// Whether the cell style has conditions (style:map).
+    pub fn has_maps(&self, name: &str) -> bool {
+        self.maps.contains_key(name)
+    }
+
+    pub fn maps(&self, name: &str) -> Vec<StyleMap> {
+        self.maps.get(name).cloned().unwrap_or_default()
+    }
+
+    /// The number format code of the data style the cell style or its
+    /// parents name.
+    fn number_format(&self, data_style: Option<&str>) -> Option<String> {
+        data_style.and_then(|d| self.data.get(d).cloned())
+    }
+
+    /// The model style of a cell style, with its parents and the defaults.
+    pub fn style(&self, name: &str) -> Style {
+        let p = self.sty.resolve(CELL, Some(name));
+        let data = self
+            .sty
+            .lineage(CELL, Some(name))
+            .into_iter()
+            .find_map(|s| s.attr("style:data-style-name"));
+        self.to_style(&look(&p, &self.sty), data)
+    }
+
+    /// The font of a cell style.
+    pub fn font(&self, name: &str) -> Font {
+        font_of(&text_look(&self.sty.resolve(CELL, Some(name)), &self.sty))
+    }
+
+    /// The font of a text style over a font, or `None` for a name that is
+    /// no text style.
+    pub fn span_font(&self, name: &str, over: &Font) -> Option<Font> {
+        self.has_text_style(name).then(|| {
+            let mut f = over.clone();
+            let look = text_look(&self.sty.chain("text", Some(name)), &self.sty);
+            apply(&mut f, &look);
+            f
+        })
+    }
+
+    fn to_style(&self, p: &Look, data_style: Option<&str>) -> Style {
+        let font = font_of(&p.text);
         let fill = match p.bg.flatten() {
             Some(c) => Fill::solid(c),
             None => Fill::NONE,
@@ -520,11 +504,6 @@ impl Styles {
         } else {
             dd.clone()
         };
-        let numfmt = p
-            .data_style
-            .as_ref()
-            .and_then(|d| self.data.get(d).cloned())
-            .unwrap_or_else(|| "General".into());
         Style {
             font,
             fill,
@@ -546,7 +525,9 @@ impl Styles {
                 shrink: p.shrink.unwrap_or(false),
                 reading_order: 0,
             },
-            numfmt,
+            numfmt: self
+                .number_format(data_style)
+                .unwrap_or_else(|| "General".into()),
             locked: p.locked.unwrap_or(true),
             hidden: p.hidden.unwrap_or(false),
         }
@@ -557,8 +538,8 @@ impl Styles {
     /// the conditional style replaces the cell's, so its font is written
     /// whole when it or its parents set any font property (`always_font`
     /// for style:map conditions).
-    pub fn dxf(&mut self, name: &str, always_font: bool) -> Dxf {
-        let name = if self.defs.contains_key(name) {
+    pub fn dxf(&self, name: &str, always_font: bool) -> Dxf {
+        let name = if self.sty.get(CELL, name).is_some() {
             name.to_string()
         } else {
             self.display
@@ -566,49 +547,54 @@ impl Styles {
                 .cloned()
                 .unwrap_or_else(|| name.to_string())
         };
+        // What the style adds to the style every cell has, "Default".
+        let line = self.sty.lineage(CELL, Some(&name));
+        let own: Vec<&StyleDef> = line
+            .iter()
+            .copied()
+            .filter(|s| s.attr("style:name") != Some("Default"))
+            .collect();
         let mut p = Props::default();
-        for n in self.chain(&name).iter().rev() {
-            if n == "Default" {
-                continue;
-            }
-            if let Some(d) = self.defs.get(n) {
-                p.overlay(&d.props);
-            }
+        for s in own.iter().rev() {
+            p.overlay(&s.props);
         }
-        let full = self.resolve(&name);
-        let mut with_default = self
-            .defs
-            .get("Default")
-            .map(|d| d.props.clone())
-            .unwrap_or_default();
-        with_default.overlay(&p);
-        if always_font || with_default.text {
-            p.color = Some(Some(full.color.flatten().unwrap_or(0)));
-            p.bold = Some(full.bold.unwrap_or(false));
-            p.italic = Some(full.italic.unwrap_or(false));
-            p.strike = Some(full.strike.unwrap_or(false));
-            p.underline = Some(full.underline.flatten());
+        let mut with_default = Props::default();
+        if let Some(d) = self.sty.get(CELL, "Default") {
+            with_default.overlay(&d.props);
+        }
+        with_default.overlay_props(&p);
+        let full = text_look(&self.sty.resolve(CELL, Some(&name)), &self.sty);
+        let data = own.iter().find_map(|s| s.attr("style:data-style-name"));
+        let mut l = look(&p, &self.sty);
+        if always_font || has_text(&with_default) {
+            l.text.color = Some(Some(full.color.flatten().unwrap_or(0)));
+            l.text.bold = Some(full.bold.unwrap_or(false));
+            l.text.italic = Some(full.italic.unwrap_or(false));
+            l.text.strike = Some(full.strike.unwrap_or(false));
+            l.text.underline = Some(full.underline.flatten());
         }
         let any_border =
-            p.left.is_some() || p.right.is_some() || p.top.is_some() || p.bottom.is_some();
+            l.left.is_some() || l.right.is_some() || l.top.is_some() || l.bottom.is_some();
         Dxf {
-            font_color: p.color.flatten(),
-            bold: p.bold,
-            italic: p.italic,
-            underline: p.underline.map(|u| u.unwrap_or("none")),
-            strike: p.strike,
-            fill: p.bg.flatten().map(Fill::solid),
+            font_color: l.text.color.flatten(),
+            bold: l.text.bold,
+            italic: l.text.italic,
+            underline: l.text.underline.map(|u| u.unwrap_or("none")),
+            strike: l.text.strike,
+            fill: l.bg.flatten().map(Fill::solid),
             border: any_border.then(|| Border {
-                left: p.left.clone().unwrap_or_default(),
-                right: p.right.clone().unwrap_or_default(),
-                top: p.top.clone().unwrap_or_default(),
-                bottom: p.bottom.clone().unwrap_or_default(),
+                left: l.left.clone().unwrap_or_default(),
+                right: l.right.clone().unwrap_or_default(),
+                top: l.top.clone().unwrap_or_default(),
+                bottom: l.bottom.clone().unwrap_or_default(),
                 ..Default::default()
             }),
-            numfmt: p
-                .data_style
-                .as_ref()
-                .and_then(|d| self.data.get(d).cloned()),
+            numfmt: self.number_format(data),
         }
+    }
+
+    #[cfg(test)]
+    pub fn walks(&self) -> usize {
+        self.sty.walks()
     }
 }

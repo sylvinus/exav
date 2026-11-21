@@ -74,11 +74,48 @@ fn a_sparse_file_past_the_scan_budget_does_not_end_the_walk() {
     assert!(last.2.starts_with(b"the last file of the volume\n"));
 }
 
+/// The holes a scan hands over are bounded by the default at 10 GiB, which
+/// is not above what the matcher is given in all.
+#[test]
+fn the_default_hole_budget_is_the_matcher_budget_or_below() {
+    let l = Limits::default();
+    assert_eq!(l.max_hole_bytes, 10 * 1024 * 1024 * 1024);
+    assert!(l.max_hole_bytes <= l.max_scanned_bytes);
+}
+
 /// Holes are bounded by their own setting: past it the walk stops, and says
 /// why.
 #[test]
 fn holes_past_their_own_limit_are_a_limit() {
     let mut l = limits();
+    l.max_hole_bytes = 1024 * 1024;
+    let (_, end) = walked(l);
+    let e = end.unwrap_err();
+    assert!(e.contains("holes"), "{e}");
+}
+
+/// The limits, with the sparse file small enough to be held whole.
+fn held() -> Limits {
+    let mut l = limits();
+    l.max_buffer_bytes = 64 * 1024 * 1024;
+    l
+}
+
+/// Held whole, the sparse file's holes are charged as they are when it is
+/// read as it goes: not to the scan budget, so the walk reaches the next file.
+#[test]
+fn a_sparse_file_held_whole_does_not_end_the_walk() {
+    let (got, end) = walked(held());
+    end.unwrap();
+    let sparse = got.iter().find(|g| g.0.ends_with("a-sparse.bin"));
+    assert_eq!(sparse.map(|g| g.1), Some(50_331_671), "{got:?}");
+    assert!(got.iter().any(|g| g.0.ends_with("z-last.txt")), "{got:?}");
+}
+
+/// And to the hole budget.
+#[test]
+fn the_holes_of_a_file_held_whole_are_a_limit_past_their_own() {
+    let mut l = held();
     l.max_hole_bytes = 1024 * 1024;
     let (_, end) = walked(l);
     let e = end.unwrap_err();

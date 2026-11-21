@@ -48,9 +48,9 @@ fn members(fmt: Format, src: &dyn exav_unpack::ByteSource) -> Vec<(String, Vec<u
 
 fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
     use std::io::Write;
-    let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let mut w = exav_unpack::zip_write::ZipWriter::new(Cursor::new(Vec::new()));
     for (name, data) in files {
-        w.start_file(*name, zip::write::SimpleFileOptions::default())
+        w.start_file(name, exav_unpack::zip_write::FileOptions::default())
             .unwrap();
         w.write_all(data).unwrap();
     }

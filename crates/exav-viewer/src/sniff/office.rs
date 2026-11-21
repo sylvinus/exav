@@ -101,9 +101,12 @@ fn zip_kinds(head: &[u8], names: &[String]) -> Vec<&'static str> {
     }
     // iWork: IWA archives or an Index.zip, which the member names tell
     // apart by Slide and Tables (an Index.zip not at all), and the XML
-    // packages of Numbers '08 and '09 and Keynote 1 to 5.
+    // packages of Numbers '08 and '09, Pages '09 and Keynote 1 to 5. An
+    // `index.xml` is Numbers' or Pages' alike, so both kinds are given.
     let iwa = has(".iwa") || has("Index.zip");
-    if (has("Index/Document.iwa") || has("Index.zip")) && !(has("Index/Tables/") || has("Slide")) {
+    if (has("Index/Document.iwa") || has("Index.zip") || has("index.xml"))
+        && !(has("Index/Tables/") || has("Slide"))
+    {
         kinds.push("pages");
     }
     if iwa || has("index.xml") {
@@ -273,7 +276,7 @@ mod tests {
             ["numbers", "key"]
         );
         assert_eq!(of_zip("Doc.key/Index.zip"), ["pages", "numbers", "key"]);
-        assert_eq!(of_zip("index.xml"), ["numbers"]);
+        assert_eq!(of_zip("index.xml"), ["pages", "numbers"]);
         assert_eq!(of_zip("Contents/PkgInfo index.apxl"), ["key"]);
         assert!(of_zip("backup.zip").is_empty());
     }

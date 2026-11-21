@@ -1026,11 +1026,11 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
             "PUA.Test.Db=6d79706f74656e7469616c\n",
         )
         .unwrap();
-        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let mut zip = exav_unpack::zip_write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         zip.start_file(
             "m.txt",
-            zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored),
+            exav_unpack::zip_write::FileOptions::default()
+                .method(exav_unpack::zip_write::Method::Stored),
         )
         .unwrap();
         zip.write_all(b"xx puapuapuap and mypotential xx").unwrap();

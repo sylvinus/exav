@@ -430,9 +430,11 @@ impl<'c> Cx<'c> {
                 if let Some(reason) = part.incomplete {
                     note(v, &mut reasons, &path, reason);
                 }
-                // The parts were charged as they were read; this is a buffer
-                // the sets made.
-                if let Err(hit) = self.budget.charge_scan(part.data.len() as u64) {
+                // The parts were charged as they were read; a set's buffer is
+                // new bytes, a part that did not join is not.
+                if part.joined
+                    && let Err(hit) = self.budget.charge_scan(part.data.len() as u64)
+                {
                     if matches!(ended, Ended::Complete) {
                         ended = Ended::Limit(hit);
                     }
@@ -494,7 +496,8 @@ impl<'c> Cx<'c> {
     ) -> Descent<T> {
         let found = derive(src, kind, self.budget.limits());
         let mut reasons = Reasons::default();
-        if found.children.is_empty() {
+        // A kind cut short before it found anything goes on, to say so.
+        if found.children.is_empty() && !found.capped {
             return Descent {
                 ended: Ended::Complete,
                 reasons,
@@ -1383,6 +1386,9 @@ mod tests {
             (why.kind, why.text.as_str(), why.at.as_str()),
             (ReasonKind::SetIncomplete, LOST, "x.7z.001")
         );
+        // A part that did not join is its bytes as its reader handed them
+        // over, and charged them (`emit_bytes`): not charged again.
+        assert_eq!(b.scanned, 0);
     }
 
     #[test]
@@ -2279,6 +2285,31 @@ mod tests {
         );
         assert!(matches!(got.ended, Ended::Complete));
         assert!(got.reasons.is_empty());
+    }
+
+    /// A kind cut short before it found anything still says so.
+    #[cfg(feature = "base64scan")]
+    #[test]
+    fn a_kind_cut_short_with_nothing_found_is_a_reason() {
+        use super::super::derive::pe_carrier;
+        let w = walk(100, None, true);
+        let top = Path::root(Name::stored("top"));
+        let mut script = Script::default();
+        let mut b = Budget::new(Limits {
+            max_base64_runs: 0,
+            ..Limits::default()
+        });
+        let got = Cx::new(&w, &mut b).derived(
+            &top,
+            0,
+            &pe_carrier(&[1]).as_slice(),
+            DeriveKind::Base64Runs,
+            &mut script,
+        );
+        assert!(script.seen.is_empty());
+        assert!(matches!(got.ended, Ended::Complete));
+        let why = got.reasons.limits.expect("the cut is a reason");
+        assert_eq!(why.kind, ReasonKind::Limit(LimitKind::MaxFiles));
     }
 
     #[cfg(feature = "base64scan")]

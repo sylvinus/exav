@@ -8,8 +8,8 @@ with a compressed or encrypted blob plus a small **stub** that rebuilds it in
 memory at start-up. On disk there is nothing for a signature to match: the
 original code is there, but not in a form anything can read.
 
-The usual answer is a decoder per packer. exav has those for the common cases
-(UPX, and the aPLib family: Petite, FSG, NsPack), and they are the fast path. But
+The usual answer is a decoder per packer. exav has one for the commonest case,
+UPX, and it is the fast path. But
 a decoder per packer cannot keep up: the packer's author picks the format, and
 the packers that matter vary it per build to break tools that assume a layout.
 
@@ -95,12 +95,16 @@ which.
   flagging every unusual executable would be noise. `--detect packed` turns an
   identified packer exav could not unpack into a `Heuristics.Packed.*`
   detection.
-* **Running out of budget is a limit.** The emulator has an instruction budget
-  of 120 million per stub and a 32 MiB dump cap, and
+* **Running out of budget is a limit.** Each stub may run 500 million
+  instructions (`--max-pe-stub-steps`) into a 32 MiB dump cap, and
   `--max-pe-emulation-steps` (1,000,000,000 by default) bounds the total across
-  every packed executable in one file. A scan that reaches the total is
-  `LIMITS-EXCEEDED`. A stub stopped by its own budget alone is treated like any
-  other stub that would not finish: `UNSCANNABLE` if its packer was identified.
+  every packed executable in one file. A scan that reaches either is
+  `LIMITS-EXCEEDED` unless something is found; what the stub had rebuilt is
+  still scanned, as a partial image. A stub that runs 64 million instructions
+  (`--max-pe-idle-steps`) without writing a page it has not written before is
+  looping on nothing: the run stops there, which is not a limit reached. What
+  it had rebuilt is scanned, and if nothing came back the file is
+  `UNSCANNABLE` when its packer was identified.
 
 A run that stopped part-way with a substantial part of the image rebuilt is
 reported as a partial reconstruction: worth scanning, but not named as the
@@ -122,22 +126,25 @@ packed; fetched by `scripts/fetch-packed-pe.py` and checked by the corpus test i
 
 | | Packers |
 |---|---|
-| **Unpacked**: every sample yields an image at least as large as the packed file | ASPack, BeRoEXEPacker, EXpressor, FSG, MEW, MPRESS, Molebox, NSPack, Neolite, PECompact, Packman, RLPack, UPX, WinUpack, Yoda-Crypter |
-| **Unpacked, but not on every sample** | Exe32pack (11/12), PEtite (11/12), JDPack (10/12), Eronana Packer (6/12) |
+| **Unpacked**: every sample yields an image at least as large as the packed file | ASPack, Alienyze, BeRoEXEPacker, EXpressor, Exe32pack, FSG, MEW, MPRESS, Molebox, NSPack, Neolite, PECompact, PEtite, Packman, RLPack, UPX, WinUpack, Yoda-Crypter |
+| **Of those, the program's start reached on every sample** | ASPack, Alienyze, BeRoEXEPacker, EXpressor, Exe32pack, FSG, MPRESS, Molebox, NSPack, PECompact, PEtite, Packman, UPX, Yoda-Crypter |
+| **Unpacked, but not on every sample** | JDPack (11/12), Eronana Packer (6/12), TELock (1/12) |
 | **Payload recovered, image incomplete** | Amber (a .NET packer: the native stub hands the assembly to the runtime, and that assembly comes back, on 11 of 12 samples) |
-| **Nothing recovered**: the stub defended itself | Alienyze, TELock, Yoda-Protector |
+| **Nothing recovered**: the stub defended itself | Yoda-Protector |
 
-Apart from Amber, recovery is all-or-nothing per sample: every sample that
-recovered anything recovered an image at least as large as the input. Seven of
-the fully unpacked packers have a hand-written unpacker in ClamAV (ASPack, FSG,
-MEW, NSPack, UPX, WinUpack, Yoda-Crypter), plus PEtite among the partial ones;
-most of the rest have no decoder anywhere.
+200 of the 276 samples reach the program's start, 234 come back as a whole
+image. Eight of the fully unpacked packers have a hand-written unpacker in
+ClamAV (ASPack, FSG, MEW, NSPack, PEtite, UPX, WinUpack, Yoda-Crypter); on
+these samples ClamAV 1.4.3 unpacks five of them (ASPack, MEW, UPX, WinUpack,
+Yoda-Crypter). Most of the rest have no decoder anywhere.
 
 The measure is the size of what came back, not whether the run reached the
 original entry point. Several packers hand control to the unpacked program in a
 way the heuristic cannot tell from an ordinary jump, and the run then ends a
 little later at `ExitProcess` with the whole image rebuilt; stopping late and
-dumping everything beats stopping at the first plausible jump.
+dumping everything beats stopping at the first plausible jump. The corpus test
+also holds the packers of the second row to the stricter measure: every sample
+must reach the program's start.
 
 ## Cost
 

@@ -1,0 +1,22 @@
+# The installers `make test-inno` fetches into target/inno: Inno Setup's own
+# installer of each release, built by that release. Columns: Inno Setup
+# version, URL, SHA-256. The hash is checked before a file is used.
+6.4.0 https://github.com/jrsoftware/issrc/releases/download/is-6_4_0/innosetup-6.4.0.exe a360db165cfb1d42d195b020700181e7eaf5db45c1249a24edb51c3c33e9d659
+6.4.2 https://github.com/jrsoftware/issrc/releases/download/is-6_4_2/innosetup-6.4.2.exe 238e2cf82c212a3879a050e02d787283c54bcb72d5cb6070830942de56627d5b
+6.4.3 https://github.com/jrsoftware/issrc/releases/download/is-6_4_3/innosetup-6.4.3.exe f3c42116542c4cc57263c5ba6c4feabfc49fe771f2f98a79d2f7628b8762723b
+6.5.0 https://github.com/jrsoftware/issrc/releases/download/is-6_5_0/innosetup-6.5.0.exe 79b7a1063b3888bb8eceb44a8c28e90ccdaa22ac71f9272de1dac79b42941dbd
+6.5.1 https://github.com/jrsoftware/issrc/releases/download/is-6_5_1/innosetup-6.5.1.exe 3622ffdad7b2534239370099149c33adb85b90054799d901cb8ec844df7a0e41
+6.5.2 https://github.com/jrsoftware/issrc/releases/download/is-6_5_2/innosetup-6.5.2.exe 8582879760b6e0e42e00f2e28ce904afac0d739941a130d3da3573c3cbf2d75b
+6.5.3 https://github.com/jrsoftware/issrc/releases/download/is-6_5_3/innosetup-6.5.3.exe 9345ee029faa0b7aed0818c3d5b227699ef9a496cce79e20c19eb9d6ef2e2c2d
+6.5.4 https://github.com/jrsoftware/issrc/releases/download/is-6_5_4/innosetup-6.5.4.exe fa73bf47a4da250d185d07561c2bfda387e5e20db77e4570004cf6a133cc10b1
+6.6.0 https://github.com/jrsoftware/issrc/releases/download/is-6_6_0/innosetup-6.6.0.exe fa39687070ba17cf1c6a179f8671af73375254b63e97948e6b9532fc46302cec
+6.6.1 https://github.com/jrsoftware/issrc/releases/download/is-6_6_1/innosetup-6.6.1.exe d243ce440c02705530699554fb9612b9b2bd7a2a90629cdb7f41e66f5faeb91f
+6.7.0 https://github.com/jrsoftware/issrc/releases/download/is-6_7_0/innosetup-6.7.0.exe f45c7d68d1e660cf13877ec36738a5179ce72a33414f9959d35e99b68c52a697
+6.7.1 https://github.com/jrsoftware/issrc/releases/download/is-6_7_1/innosetup-6.7.1.exe 4d11e8050b6185e0d49bd9e8cc661a7a59f44959a621d31d11033124c4e8a7b0
+6.7.2 https://github.com/jrsoftware/issrc/releases/download/is-6_7_2/innosetup-6.7.2.exe 9f27f8386e554eb093336a1ca5c2dcacb7dbf04ab020889491d7ac53c38a12ff
+6.7.3 https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe 9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732
+6.7.4 https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c
+7.0.2-x64 https://github.com/jrsoftware/issrc/releases/download/is-7_0_2/innosetup-7.0.2-x64.exe 5ad54ca3def786f8f4212552e54cc6d8d61329e2d24a1cfee0571d42c2684ff1
+7.0.2-x86 https://github.com/jrsoftware/issrc/releases/download/is-7_0_2/innosetup-7.0.2-x86.exe 2b8734490a83f1ed074022b85d46c5ce9c3e2fbe9b63a45c28a74b478ac3a94f
+7.1.0-x64 https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe 0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f
+7.1.0-x86 https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x86.exe f9671174e0d15ba9b4f6b56564c6aed32ea8db9c3cb9bf6f2af0850fe7894f60

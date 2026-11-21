@@ -139,12 +139,15 @@ change. `--workers` takes a count or `threads`, and refuses `0`.
 | `--http-redirect-private` | off | unchanged | Over HTTP, follow a redirect to a host with a loopback, private, link-local, shared-address or unspecified address (an IPv6 address that carries one included). The URL given may be one; where a redirect leads is the server's choice, so it is refused unless this is set. The addresses are filtered where each connection is made. |
 | `--http-spill` | off | unchanged | Over HTTP, download an object past `--max-object-bytes` once into a spill file and scan it from there: one transfer in place of one for each pass, paid in disk up to `--max-spill-bytes`. An object that does not fit, or is past `--max-input-bytes`, is read by range requests. |
 | `--max-matcher-bytes <SIZE\|off>` | `10G` | unchanged | Bytes fed to the matcher across one top-level file: a CPU bound, not a memory one. `clamscan`'s `--max-scansize`. |
-| `--max-hole-bytes <SIZE\|off>` | `64G` | unchanged | Bytes of holes of sparse files in a filesystem image fed to the matcher as zeros across one top-level file, counted here instead of toward `--max-matcher-bytes`, so a large sparse file does not end the walk of the rest of the volume. A CPU bound. |
+| `--max-hole-bytes <SIZE\|off>` | `10G` | unchanged | Bytes of holes of sparse files in a filesystem image fed to the matcher as zeros across one top-level file, counted here instead of toward `--max-matcher-bytes`, so a large sparse file does not end the walk of the rest of the volume. A CPU bound. |
 | `--max-pcre-bytes <SIZE\|off>` | unlimited | `100M` | The largest object PCRE subsignatures run on; on a larger one they do not match, and the scan is reported incomplete (under `--clamav-compat` it is not, as with `clamscan`). Per object, so a small member of a large archive is still matched. A CPU bound: an object is matched without being copied. `clamscan`'s `--pcre-max-filesize`. |
 | `--max-regex-steps <N\|off>` | `100000000` | unchanged | The most steps one search may make in a regex engine that a crafted pattern or object can make take long: a PCRE subsignature that uses lookaround or a back reference, and a YARA regexp. A search is the work of one subsignature or pattern on one object. A backtrack of a PCRE is a step, and so is each 32 bytes that a part of it handed to the linear engine, or a back reference, reads; a YARA regexp makes a step for each 32 bytes its searches read. A search that reaches the limit stops, the matches found before it still count, and the scan is `LIMITS-EXCEEDED` unless something is found. A CPU bound. |
+| `--max-yara-steps <N\|off>` | `20000000` | unchanged | The most steps the conditions of the YARA rules may take in one scan, all the rules together. A rule's range loop takes its bounds from the rule, not from the object. A condition that runs out does not match, nor do those after it, and the scan is `LIMITS-EXCEEDED` unless something is found. A CPU bound. `off` or `0` means no limit. |
 | `--max-matcher-steps <N\|off>` | `2000000` | unchanged | Steps the verifier of body signatures with wildcards and gaps may take, per MiB of the object it searches; an object under 256 MiB counts as 256 MiB (512 million steps by default). One group of signatures sharing an anchor (a common x86 function start, say) may take a 32nd of that, so it cannot spend what the others need. Past either the search stops, the matches found before still count, and the scan is `LIMITS-EXCEEDED` unless something is found. A CPU bound that grows with the object, as its anchor hits do. |
 | `--min-scan-bytes <SIZE>` | `6` | unchanged | The smallest object scanned. A smaller file or member, at any depth, is neither matched nor unpacked and counts as clean, as ClamAV scans no object under 6 bytes. `0` scans every object. |
 | `--max-pe-emulation-steps <N\|off>` | `1000000000` | unchanged | Instructions the PE unpacking emulator may run across one top-level file, summed over every packed executable in it. Reaching it is `LIMITS-EXCEEDED`. |
+| `--max-pe-stub-steps <N\|off>` | `500000000` | unchanged | Instructions the PE unpacking emulator may run for one packed executable. Reaching it is `LIMITS-EXCEEDED`; the image the stub rebuilt so far is still scanned. |
+| `--max-pe-idle-steps <N\|off>` | `64000000` | unchanged | Instructions a packed executable's stub may run without writing a page it has not written before. A stub that goes that long is looping on nothing, and the run stops there; this is not a limit reached. |
 | `--max-unpack-depth <N>` | `16` | `17` | Maximum nesting depth for recursive unpacking. `0` opens no container: each file is scanned as it stands, and an archive is reported with its members not scanned. No `off`, since each level costs stack. |
 | `--max-members <N\|off>` | `100000` | `10000` | Maximum members visited across the whole recursive walk. Higher than ClamAV's because exav descends into nested archives ClamAV does not, so it counts more objects for the same file. |
 | `--max-compression-ratio <N\|off>` | `1000` | unchanged | A member that decodes to more than N times its size in its container, once it is past `--max-object-bytes`, is left out. The other members of the container are still scanned, and the file is `LIMITS-EXCEEDED` unless something is found. Below `--max-object-bytes` a member is held in memory and the memory limits bound it, so with `--max-object-bytes off` the ratio never acts. |
@@ -168,7 +171,9 @@ Container-aware scanning needs to seek (a ZIP's directory is at its end), so
 every stream (`INSTREAM`/`EXINSTREAM`, stdin, an ICAP body) is held before it is
 scanned: small ones in RAM, larger ones in a temp file. A local scan spills too:
 an archive member that decodes past `--max-object-bytes` goes to a temp file
-under the same budgets. These bound that, on every surface.
+under the same budgets. These bound that, on every surface. When stdin goes
+on past what exav reads of it beyond `--max-input-bytes`, the size in its
+`LIMITS-EXCEEDED` reason is a floor (`file size at least N`).
 
 | Flag | Default | Description |
 |---|---|---|
@@ -286,7 +291,7 @@ A listener keeps no per-file output, so it keeps its own counters:
 |---|---|---|
 | `--profile` | off | Measure where scan time goes, per matcher. Scanning files, it replaces the output with a CSV row per file, so it is refused with `--json` and `--all-matches`; on a listener the numbers accumulate and come back as `MATCHERSTATS`. Off by default because it times every matcher call. |
 | `--slow-scan-secs <SECS\|off>` | `10` | Log any scan taking longer, naming the object and (with `--profile`) where the time went. |
-| `--metrics-secs <SECS\|off>` | `300` | Seconds between the scan-totals lines a listener writes to its log. Silent while nothing is scanned. |
+| `--metrics-secs <SECS\|off>` | `300` | Seconds between the scan-totals lines the daemon writes to its log, labelled `daemon`: one set per interval for every listener (under the worker pool, the pool's totals). Silent while nothing is scanned. |
 
 Scan counts, bytes and wall time are always collected (one clock read per scan);
 only the per-matcher breakdown is opt-in. Three ways to read them:
@@ -302,8 +307,9 @@ MATCHERSTATS: engine=2278.692ms/7calls/60405341b normalize=566.013ms/4calls/4027
 END
 ```
 
-**In the log**, every `--metrics-secs`. An ICAP-only deployment has no clamd port
-to ask `STATS` on, so for a container `docker logs` is the answer.
+**In the log**, every `--metrics-secs`, as `exav: daemon: SCANSTATS: ...` and
+the matchers' line. An ICAP-only deployment has no clamd port to ask `STATS` on,
+so for a container `docker logs` is the answer.
 
 **Per slow object:**
 
@@ -311,9 +317,9 @@ to ask `STATS` on, so for a container `docker logs` is the answer.
 exav: slow scan: 5.295s for 20000000 bytes of /data/big.bin [engine 2253.1ms, normalize 596.4ms]
 ```
 
-Under the worker pool the counters are per process, so a `STATS` reply describes
-the worker that answered it; the log lines cover every process. For one set of
-totals across both listeners, run `--workers threads`.
+Under the worker pool every process shares the counters, so a `STATS` reply from
+any worker, and the lines the supervisor writes to the log, are the pool's
+totals.
 
 ## Serving and connecting
 
@@ -365,9 +371,10 @@ exav --listen 'clamd:///run/exav.sock?mode=660' \
 
 Each option is refused where it cannot apply (a path or an option marked ICAP
 on a `clamd://` address, a mode on a `host:port`, any of them on `--connect`),
-and an unknown option is an error. `max-connections` bounds the
-clamd listener only under `--workers threads`; the pool bounds concurrency by
-its worker count. ICAP always reads it and advertises it as `Max-Connections`.
+and an unknown option is an error. `max-connections` bounds a clamd address
+only under `--workers threads`, each address counting its own connections; the
+pool bounds concurrency by its worker count, over all its addresses. ICAP
+always reads it and advertises it as `Max-Connections`.
 A `--listen-health` address reads `?max-connections=`, `?idle-secs=` and
 `?mode=`, and refuses the other options.
 
@@ -378,7 +385,7 @@ stderr, so an image that sets it for its daemon can still run a one-shot scan
 
 | Flag | Default | Description |
 |---|---|---|
-| `--listen <ADDR>` | none | Serve on this address. Repeatable (comma-separated in the environment). |
+| `--listen <ADDR>` | none | Serve on this address. Repeatable (comma-separated in the environment); a protocol can be given several addresses. |
 | `--listen-health <ADDR>` | none | Also answer "are you there?" on this address, and nothing else. Repeatable (comma-separated in the environment). Needs `--listen`. See [Health listener](#health-listener). |
 | `--connect <ADDR>` | none | Scan by handing each file to a daemon already running there, instead of loading a database. Listener options (`?mode=`, `?idle-secs=` and the others above) are refused here. |
 | `--send-as <WHAT>` | `path` | What a `--connect` client hands the daemon: `path`, `contents` or `fd`. |
@@ -399,8 +406,12 @@ Naming both protocols serves both from one process over one loaded database:
 exav --listen clamd://0.0.0.0:3310 --listen icap://0.0.0.0:1344
 ```
 
-Two `--listen` addresses on the same protocol are refused. Under the worker pool
-the ICAP listener runs in a child process of its own (see the
+A protocol can be named more than once: a Unix socket and a TCP port for
+clamd, as `clamd.conf`'s `LocalSocket` with `TCPSocket`, or two ICAP ports with
+their own services. Each address is served with the options on it, and the
+same socket given twice (the same `host:port`, or one path spelled two ways) is
+refused. Under the worker pool every worker waits on all the clamd addresses,
+and each ICAP address runs in a child process of its own (see the
 [ICAP guide](/scanner/guides/icap/#with-the-clamd-listener)).
 
 ### Health listener
@@ -408,7 +419,9 @@ the ICAP listener runs in a child process of its own (see the
 Under the worker pool, a `PING` to the clamd listener waits for a free worker,
 so while every worker is in a long scan a health check times out and restarts a
 daemon that is only busy. `--listen-health` opens an address that does no
-scanning and waits for no worker, and answers in the protocol of its scheme:
+scanning and waits for no worker, and answers in the protocol of its scheme
+(it can be repeated, one address each; the same socket twice, or one also
+given to `--listen`, is refused):
 
 ```sh
 exav --listen clamd://0.0.0.0:3310 --listen-health clamd://127.0.0.1:3311
@@ -523,7 +536,7 @@ stderr at startup. Do not run it in production. It changes:
 | `.imp` match of a PE32+ | matches (hashed as a PE32) | none (clamscan makes no import hash for a PE32+) | none |
 
 A flag given explicitly wins over the preset. Everything else stays on exav's
-defaults: `--max-matcher-bytes`, `--max-pe-emulation-steps`, the spill settings,
+defaults: `--max-matcher-bytes`, the three PE emulation budgets, the spill settings,
 `--detect`/`--no-detect`, passwords, and the update, network and worker
 settings.
 

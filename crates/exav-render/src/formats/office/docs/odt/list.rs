@@ -1,7 +1,8 @@
 //! List styles as numbering definitions.
 
 use super::{Odt, props};
-use crate::formats::office::common::odf::{self, ListDef, Props};
+use crate::formats::office::common::odf::{self, ListDef};
+use crate::formats::office::docs::limits::{LIST_BYTES, num_bytes};
 use crate::formats::office::docs::model::*;
 
 fn num_fmt(f: &str) -> &'static str {
@@ -54,6 +55,9 @@ impl Odt<'_> {
                 },
             });
         }
+        // Past the memory limit the list is not numbered, and the conversion
+        // ends at the next charge.
+        self.b.alloc(LIST_BYTES).ok()?;
         let id = self.doc.numbering.abstracts.len() as u32;
         self.doc.numbering.abstracts.push(AbstractNum {
             id,
@@ -151,7 +155,7 @@ impl Odt<'_> {
             });
         }
         // The label's own character formatting.
-        let mut rpr = props::run_props(&Props(p.0.clone()), &self.cs, 24);
+        let mut rpr = props::run_props(p, &self.cs, 24);
         if rpr
             .fonts
             .ascii
@@ -191,6 +195,7 @@ impl Odt<'_> {
                 overrides.push((lvl as u32, Some(s), None));
             }
         }
+        self.b.alloc(num_bytes(&overrides)).ok()?;
         self.doc.numbering.nums.push(Num {
             id,
             abstract_id: abs,
@@ -228,5 +233,28 @@ mod tests {
         assert_eq!(num_fmt(""), "none");
         assert_eq!(bullet_char('\u{E00A}'), "\u{2022}");
         assert_eq!(bullet_char('-'), "-");
+    }
+
+    /// Each list style a list uses is nine levels in the model, and each list
+    /// that starts again its overrides: both are counted in the memory.
+    #[test]
+    fn list_definitions_are_counted_in_the_memory() {
+        use crate::formats::office::docs::limits::{Budget, Limits};
+        let n = 2000;
+        let mut styles = String::new();
+        let mut body = String::new();
+        for i in 0..n {
+            styles += &format!(r#"<text:list-style style:name="L{i}"/>"#);
+            body += &format!(
+                r#"<text:list text:style-name="L{i}"><text:list-item><text:p>x</text:p></text:list-item></text:list>"#
+            );
+        }
+        let fodt = format!(
+            r#"<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:mimetype="application/vnd.oasis.opendocument.text"><office:automatic-styles>{styles}</office:automatic-styles><office:body><office:text>{body}</office:text></office:body></office:document>"#
+        );
+        let mut b = Budget::new(Limits::default());
+        let doc = super::super::read_fodt(fodt.as_bytes(), &mut b).unwrap();
+        assert_eq!(doc.numbering.abstracts.len(), n);
+        assert!(b.used() >= n as u64 * LIST_BYTES, "{}", b.used());
     }
 }

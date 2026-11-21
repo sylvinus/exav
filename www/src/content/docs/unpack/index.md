@@ -73,6 +73,7 @@ The defaults differ by where the code runs:
 | Limit | Rust crate | Command | `@exav/unpack-wasm` |
 |---|---|---|---|
 | Total bytes decoded | 1 GiB | 64 GiB (`--max-extracted-bytes`) | 128 MiB |
+| Holes of sparse files | 10 GiB | 64 GiB (`--max-hole-bytes`) | 10 GiB (`maxHoleBytes`) |
 | Largest object held in memory | 256 MiB | 1 GiB (`--max-object-bytes`) | 32 MiB |
 | Members | 100,000 | 1,000,000 (`--max-members`) | 100,000 |
 

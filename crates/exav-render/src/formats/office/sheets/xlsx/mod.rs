@@ -12,6 +12,7 @@ use crate::formats::office::common::package::{Lift, Out};
 use crate::formats::office::sheets::error::{Error, Result};
 use crate::formats::office::sheets::model::*;
 use crate::formats::office::sheets::numtext;
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write;
@@ -25,9 +26,8 @@ const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relatio
 const XML_HEAD: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
 
 struct Package {
-    // Dropped first: see `Lift`.
-    _lift: Lift,
-    z: zip::ZipWriter<Out>,
+    lift: Lift,
+    z: ZipWriter<Out>,
     content_types: Vec<(String, &'static str)>,
     defaults: Vec<(&'static str, &'static str)>,
 }
@@ -43,10 +43,9 @@ fn zip_err(e: impl std::fmt::Display) -> Error {
 
 impl Package {
     fn start(&mut self, name: &str) -> Result<()> {
-        let opt = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated)
-            .compression_level(Some(6))
-            .last_modified_time(zip::DateTime::default());
+        let opt = FileOptions::default()
+            .method(Method::Deflated)
+            .level(Some(6));
         self.z.start_file(name, opt).map_err(zip_err)
     }
 
@@ -895,8 +894,8 @@ pub(crate) fn write(wb: &Workbook, max_bytes: u64) -> Result<Vec<u8>> {
     }
     let (out, lift) = Out::new(0, max_bytes);
     let mut pkg = Package {
-        _lift: lift,
-        z: zip::ZipWriter::new(out),
+        lift,
+        z: ZipWriter::new(out),
         content_types: vec![],
         defaults: vec![
             (
@@ -1002,7 +1001,7 @@ pub(crate) fn write(wb: &Workbook, max_bytes: u64) -> Result<Vec<u8>> {
     }
     ct.push_str("</Types>");
     pkg.put("[Content_Types].xml", ct.as_bytes())?;
-    pkg._lift.lift();
+    pkg.lift.lift();
     let out = pkg.z.finish().map_err(zip_err)?;
     Ok(out.into_inner())
 }

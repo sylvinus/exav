@@ -2,13 +2,19 @@
 
 use hayro_jpeg2000::{ColorSpace, DecodeSettings, DecoderContext, Image};
 
-use super::{Channels, Error, Pixels, Samples, cmyk_to_rgb, within, ycc_to_rgb};
+use super::{Channels, Error, Pixels, Samples, cmyk_to_rgb, within};
 
-pub(super) fn decode(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
+/// With `strict`, a truncated or damaged file is refused; else it is decoded as
+/// far as it goes.
+pub(super) fn decode(data: &[u8], max_alloc: u64, strict: bool) -> Result<Pixels, Error> {
     if crate::formats::jp2_tiles::has_too_many_tiles(data) {
         return Err(Error::Undecodable);
     }
-    let image = Image::new(data, &DecodeSettings::default()).map_err(|_| Error::Undecodable)?;
+    let settings = DecodeSettings {
+        strict,
+        ..DecodeSettings::default()
+    };
+    let image = Image::new(data, &settings).map_err(|_| Error::Undecodable)?;
     let (width, height) = (image.width(), image.height());
     let colour = u64::from(image.color_space().num_channels());
     let channels = colour + u64::from(image.has_alpha());
@@ -21,7 +27,6 @@ pub(super) fn decode(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
             .saturating_mul(5),
         max_alloc,
     )?;
-    let ycc = chroma_subsampled_codestream(data);
     let grey_bands = enumerated_colourspace(data) == Some(GREYSCALE);
     let data = image
         .decode(&mut DecoderContext::default())
@@ -41,7 +46,6 @@ pub(super) fn decode(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
         ),
         (_, 1, false) => (Channels::Luma, data),
         (_, 1, true) => (Channels::LumaAlpha, data),
-        (_, 3, false) if ycc => (Channels::Rgb, ycc_to_rgb(data)),
         (_, 3, false) => (Channels::Rgb, data),
         (_, 3, true) => (Channels::Rgba, data),
         // A two-component image with no colour specification.
@@ -57,19 +61,6 @@ pub(super) fn decode(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
         channels,
         samples: Samples::U8(samples),
     })
-}
-
-/// A bare codestream of three components whose second is subsampled has no
-/// colour box to say so, and is YCbCr (the reading of OpenJPEG's tools).
-fn chroma_subsampled_codestream(data: &[u8]) -> bool {
-    // SOC, SIZ, then Csiz at 40 and one (Ssiz, XRsiz, YRsiz) per component.
-    if !data.starts_with(&[0xFF, 0x4F, 0xFF, 0x51]) || data.get(40..42) != Some(&[0, 3]) {
-        return false;
-    }
-    let Some(c) = data.get(42..51) else {
-        return false;
-    };
-    c[1] == c[2] && c[4] != 1
 }
 
 /// The enumerated colour space for greyscale in a colour box.

@@ -65,4 +65,5 @@ jobs:
           v="$CHART_VERSION"
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           helm package deploy/helm/exav-chart --version "$v" --app-version "$v" -d dist
+          python3 -I scripts/check-build-paths.py "dist/exav-chart-$v.tgz"
           helm push "dist/exav-chart-$v.tgz" "oci://ghcr.io/$owner"

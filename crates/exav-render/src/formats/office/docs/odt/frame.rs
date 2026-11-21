@@ -201,20 +201,13 @@ impl Odt<'_> {
                 .attr("draw:z-index")
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(0);
-            a.dist = [
-                p.pt("graphic/fo:margin-top")
+            let dist = |side: &str| {
+                p.margin("graphic", side)
+                    .and_then(odf::pt)
                     .map(|v| (v * 12_700.0) as i64)
-                    .unwrap_or(0),
-                p.pt("graphic/fo:margin-bottom")
-                    .map(|v| (v * 12_700.0) as i64)
-                    .unwrap_or(0),
-                p.pt("graphic/fo:margin-left")
-                    .map(|v| (v * 12_700.0) as i64)
-                    .unwrap_or(0),
-                p.pt("graphic/fo:margin-right")
-                    .map(|v| (v * 12_700.0) as i64)
-                    .unwrap_or(0),
-            ];
+                    .unwrap_or(0)
+            };
+            a.dist = [dist("top"), dist("bottom"), dist("left"), dist("right")];
             Some(a)
         };
         Ok(Some(Drawing {

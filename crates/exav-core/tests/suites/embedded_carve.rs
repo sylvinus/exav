@@ -3,6 +3,7 @@
 //! without embedded-archive carving the payload in the overlay is invisible.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::io::Write;
 
 /// A text carrier holding `n` copies of `item`, each after some filler, so no
@@ -85,9 +86,8 @@ fn the_carving_caps_are_limits() {
 /// later member of the same container is still found.
 #[test]
 fn a_member_at_the_carving_cap_does_not_hide_its_siblings() {
-    let stored =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    let mut alone = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let stored = FileOptions::default().method(Method::Stored);
+    let mut alone = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     alone.start_file("decoys.bin", stored).unwrap();
     alone.write_all(&carrier(tiny_pe(), 17)).unwrap();
     let alone = alone.finish().unwrap().into_inner();
@@ -96,12 +96,11 @@ fn a_member_at_the_carving_cap_does_not_hide_its_siblings() {
         "the capped member alone makes the archive not fully scanned"
     );
 
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     zip.start_file("decoys.bin", stored).unwrap();
     zip.write_all(&carrier(tiny_pe(), 17)).unwrap();
     // Deflated, so EICAR is not in the ZIP's own bytes: only the member has it.
-    let deflated = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let deflated = FileOptions::default().method(Method::Deflated);
     zip.start_file("payload.txt", deflated).unwrap();
     let eicar = exav_core::unpack::eicar();
     // Long and repetitive, so the compressor codes it rather than storing it.
@@ -141,11 +140,10 @@ fn appended_overlay_zip_is_carved_and_scanned() {
 /// one per entry: it is scanned once and does not trip the carving cap.
 #[test]
 fn a_zip_of_many_entries_stapled_into_a_document_is_clean() {
-    let stored =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let stored = FileOptions::default().method(Method::Stored);
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for k in 0..300 {
-        z.start_file(format!("entry{k}.txt"), stored).unwrap();
+        z.start_file(&format!("entry{k}.txt"), stored).unwrap();
         z.write_all(b"nothing to see here").unwrap();
     }
     let z = z.finish().unwrap().into_inner();
@@ -162,9 +160,8 @@ fn a_zip_of_many_entries_stapled_into_a_document_is_clean() {
 #[test]
 fn a_second_zip_at_the_offset_the_first_one_names_is_still_found() {
     let eicar = exav_core::unpack::eicar();
-    let deflated = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
-    let mut x = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = FileOptions::default().method(Method::Deflated);
+    let mut x = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     x.start_file("p.txt", deflated).unwrap();
     x.write_all(&[eicar, b"\n"].concat().repeat(64)).unwrap();
     let x = x.finish().unwrap().into_inner();
@@ -257,9 +254,8 @@ fn an_ole2_file_is_carved_from_its_own_bytes() {
 fn a_damaged_executable_in_a_carrier_does_not_hide_the_archive_with_the_payload() {
     // `upx_nrv2d.upx` with five bytes of its compressed data changed.
     let decoy = include_bytes!("../fixtures/upx_damaged.elf");
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let deflated = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = FileOptions::default().method(Method::Deflated);
     zip.start_file("e.com", deflated).unwrap();
     // Repetitive, so the compressor codes it and the string is not in the bytes.
     zip.write_all(&[exav_core::unpack::eicar(), b"\n"].concat().repeat(64))

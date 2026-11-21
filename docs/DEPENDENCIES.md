@@ -37,8 +37,8 @@ So we are deliberate about what we pull in.
      in) and drawings (exav-render's model, already in). No C.
    - **Office formats** (exav-render's `office-sheets`, `office-slides`,
      `office-docs`, off by default; `visible-text-office` and `text-office` add
-     their text): `zip`, `quick-xml`, `encoding_rs`, `md-5` and `sha1`
-     (Numbers and iWork) and what they pull in: 21 more crates than the
+     their text): exav-unpack's ZIP reader, `quick-xml`, `encoding_rs`, `md-5` and
+     `sha1` (Numbers and iWork) and what they pull in: 26 more crates than the
      default `exav-render` tree (`cargo tree -p exav-render --features
      office`). The viewer builds them for the browser; the scanner reads them
      only when `visible-text-office` is on.
@@ -398,7 +398,9 @@ What we want, in this order when they conflict:
 2. **No `unsafe` in what ships**, ours or theirs. A dependency's `unsafe` goes
    by turning off the feature that holds it, by vendoring the safe part, or by
    replacing the crate. Only then is it accepted, and it is listed with its
-   reason on the site's dependencies page.
+   reason on the site's dependencies page. A feature only another crate's
+   manifest can turn off (`simd-adler32` through flate2 and png, `moxcms`
+   through `image`) is a vendoring decision, not a switch.
 3. **One copy of each thing**: one version of a crate in the tree, one reader
    per format ([ARCHITECTURE.md](ARCHITECTURE.md)), one vendored copy of an
    upstream.

@@ -54,9 +54,9 @@ lzma-rust2 = { version = "0.25", default-features = false, features = ["std"], o
 # BC1 to BC7 blocks for the viewer's DDS fallback (`decode_any`): safe, no
 # dependencies, MIT.
 bcdec_rs = { version = "=0.2.0", optional = true }
-hayro-jpeg2000 = { version = "=0.4.1", default-features = false, features = ["std"], optional = true }
-hayro-jbig2 = { version = "=0.3.1", default-features = false, features = ["std"], optional = true }
-hayro-ccitt = { version = "=0.4.0", optional = true }
+hayro-jpeg2000 = { version = "=0.5.0", default-features = false, features = ["std"], optional = true }
+hayro-jbig2 = { version = "=0.4.0", default-features = false, features = ["std"], optional = true }
+hayro-ccitt = { version = "=0.5.0", optional = true }
 # JPEG XL: zenjxl-decoder, a fork of the libjxl team's jxl-rs that is
 # `#![forbid(unsafe_code)]` unless its `allow-unsafe` feature is on, with
 # limits on pixels and memory. Built without its SIMD (the default
@@ -72,9 +72,6 @@ exav-unpack = { path = "../exav-unpack", version = "0.0.3", default-features = f
 # its `html` and `simd` features: no markup is made, and its only `unsafe`
 # (the SIMD scanners) is off.
 pulldown-cmark = { version = "=0.13.6", default-features = false, optional = true }
-# The office converters (`office-*`): packages are read, and the XLSX, PPTX
-# and DOCX written, as ZIP. Below 9.1 as in exav-unpack.
-zip = { version = ">=9.0.5, <9.1", default-features = false, features = ["deflate-flate2"], optional = true }
 # ODF's XML. 0.41 bounds namespace declarations per element and checks
 # duplicate attributes in linear time (RUSTSEC-2026-0194, -0195).
 quick-xml = { version = "0.42", optional = true }
@@ -134,8 +131,8 @@ obj = []
 ply = []
 gltf = []
 # Markdown into a tree of blocks and inlines (`markdown`), as data: no HTML
-# is ever made.
-markdown = ["dep:pulldown-cmark"]
+# is ever made. exav-unpack for the characters a link target may not hold.
+markdown = ["dep:pulldown-cmark", "dep:exav-unpack"]
 # JSON and XML indented and a diff's lines marked, as data (`text_view`), for
 # the viewer's text pages. No dependency.
 text-view = []
@@ -160,7 +157,7 @@ text-office = ["text", "office"]
 # What every office converter shares (`formats::office::common`): ZIP
 # packages, ODF's XML, style sheets, and the readers of exav-unpack (compound
 # files, BIFF, code pages, HTML, BinHex). Not a feature to ask for.
-_office = ["dep:zip", "dep:flate2", "dep:quick-xml", "dep:encoding_rs", "dep:exav-unpack", "exav-unpack/ole", "exav-unpack/binhex", "exav-unpack/html"]
+_office = ["dep:flate2", "dep:quick-xml", "dep:encoding_rs", "dep:exav-unpack", "exav-unpack/ole", "exav-unpack/binhex", "exav-unpack/html", "exav-unpack/zip", "exav-unpack/zip-write"]
 # Spreadsheets into XLSX (`sheets`): Excel 2 to 2003, ODS, FODS, OTS, Apple
 # Numbers, XML Spreadsheet 2003, HTML tables and SYLK. Also the chart writer
 # the presentations use for ODF charts.
@@ -185,15 +182,13 @@ office-test-util = ["_office", "exav-unpack/test-util"]
 
 [dev-dependencies]
 serde_json = "1"
-# The writers of compound files and encrypted workbooks the converters' own
-# tests build their inputs with.
-exav-unpack = { path = "../exav-unpack", default-features = false, features = ["ole", "offcrypto", "test-util"] }
+# The writers of compound files, ZIP packages and encrypted workbooks the
+# converters' own tests build their inputs with.
+exav-unpack = { path = "../exav-unpack", default-features = false, features = ["ole", "offcrypto", "test-util", "zip-write"] }
 # The drawing fixtures are gzipped.
 flate2 = "1.1.10"
 # The DWG oracle test names local corpus files by hash.
 sha2 = "0.11"
-# The packages the text tests read.
-zip = { version = ">=9.0.5, <9.1", default-features = false, features = ["deflate-flate2"] }
 # Draws the QR codes the `qr` tests read.
 qrcode = { version = "0.14", default-features = false }
 

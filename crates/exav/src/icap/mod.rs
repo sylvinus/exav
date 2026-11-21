@@ -116,10 +116,21 @@ use crate::daemon::SharedDb;
 /// Version string reported in the `Service` and `Server` headers.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Build the server configuration from the parsed arguments.
+/// Build the server configuration from the parsed arguments: from the first
+/// ICAP address, or the defaults when there is none.
+#[cfg(test)]
 pub fn config_from_cli(cli: &Cli) -> Result<IcapConfig, String> {
+    config_for(cli, crate::icap_endpoints(cli).first())
+}
+
+/// Build the server configuration of one ICAP address, every setting of the
+/// address on that address.
+pub fn config_for(
+    cli: &Cli,
+    endpoint: Option<&crate::endpoint::Endpoint>,
+) -> Result<IcapConfig, String> {
     let d = IcapConfig::default();
-    let endpoint = crate::icap_endpoint(cli);
+    let endpoint = endpoint.cloned();
 
     // Naming services replaces the default set rather than adding to it: an
     // operator who names them means that set exactly, and silently adding the
@@ -263,16 +274,11 @@ pub fn spawn(server: Server, db: Arc<SharedDb>, opts: Arc<ScanOptions>) {
 /// signature swap needs no in-process machinery at all. The retired child
 /// finishes the requests it is serving before it exits.
 #[cfg(unix)]
-pub fn forked_child(server: Server, metrics_interval: Duration) -> crate::daemon::SideListener {
+pub fn forked_child(server: Server) -> crate::daemon::SideListener {
     crate::daemon::SideListener {
-        name: "icap",
+        name: format!("icap {}", server.config().listen),
         serve: Box::new(move |db, opts, retire| {
             announce(&server);
-            // A child of its own, so its counters are its own: the clamd
-            // workers' `STATS` cannot see them and this log line is where they
-            // surface. Started here rather than before the fork, because a
-            // thread does not survive one.
-            crate::metrics::spawn_reporter(metrics_interval, "icap");
             let handle: Arc<dyn Signatures> = Arc::new(FixedDb::from_arc(db));
             // Shared with the other generation's child during a reload, so
             // both wait for readiness instead of blocking in accept.

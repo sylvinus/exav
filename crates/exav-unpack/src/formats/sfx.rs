@@ -41,9 +41,6 @@ fn starts_with_exe(data: &[u8]) -> bool {
     data.starts_with(b"MZ") || data.starts_with(b"\x7fELF")
 }
 
-/// Locate the *earliest* embedded archive magic strictly past offset 0. Returns
-/// `(offset, label)` or `None`. Searching from offset 1 skips the container's
-/// own magic so a bare archive isn't reported as its own SFX payload.
 /// Does a plausible ARJ main header start here?
 ///
 /// `60 EA` is two bytes, so across a megabyte of executable it turns up by
@@ -93,6 +90,9 @@ fn plausible_cab_header(data: &[u8], off: usize) -> bool {
     h[24..26] == [3, 1] && size >= 36 && (36..=size).contains(&files)
 }
 
+/// Locate the *earliest* embedded archive magic strictly past offset 0. Returns
+/// `(offset, label)` or `None`. Searching from offset 1 skips the container's
+/// own magic so a bare archive isn't reported as its own SFX payload.
 fn find_embedded_archive(data: &[u8]) -> Option<(usize, &'static str)> {
     find_archive_from(data, 1)
 }
@@ -166,12 +166,21 @@ pub(crate) fn walk(
 /// The payload `[off, end)` of the self-extractor `src`, where [`payload_at`]
 /// finds it, as detection does.
 fn regions(src: &dyn crate::source::ByteSource) -> Vec<(String, u64, u64)> {
-    let len = src.len();
-    let start = src.window(0, len.min(crate::DETECT_HEAD));
-    match payload_at(&start, &|o, n| src.window(o, n), len) {
-        Some(off) => vec![("sfx-payload".to_string(), off as u64, (len - off) as u64)],
+    match stub_len(src) {
+        Some(off) => vec![(
+            "sfx-payload".to_string(),
+            off as u64,
+            (src.len() - off) as u64,
+        )],
         None => Vec::new(),
     }
+}
+
+/// The length of the stub of the self-extractor `src`: where its payload starts.
+pub(crate) fn stub_len(src: &dyn crate::source::ByteSource) -> Option<usize> {
+    let len = src.len();
+    let start = src.window(0, len.min(crate::DETECT_HEAD));
+    payload_at(&start, &|o, n| src.window(o, n), len)
 }
 
 #[cfg(test)]

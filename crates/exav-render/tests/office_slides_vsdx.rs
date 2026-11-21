@@ -4,7 +4,8 @@
 
 use exav_render::formats::office::test_util::{PackageWriter, build_cfb};
 use exav_render::slides::{Error, Format, Limits, convert, convert_first, convert_first_from};
-use std::io::{Cursor, Read};
+use exav_unpack::package::Package;
+use std::io::Cursor;
 
 const NS: &str = "xmlns='http://schemas.microsoft.com/office/visio/2012/main' xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'";
 const REL: &str = "http://schemas.microsoft.com/visio/2010/relationships";
@@ -19,20 +20,16 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 fn part(pptx: &[u8], name: &str) -> String {
-    let mut z = zip::ZipArchive::new(Cursor::new(pptx)).unwrap();
-    let mut s = String::new();
-    z.by_name(name)
-        .unwrap_or_else(|_| panic!("no part {name}"))
-        .read_to_string(&mut s)
-        .unwrap();
-    s
+    let part = Package::from_bytes(pptx)
+        .unwrap()
+        .read(name, u64::MAX)
+        .unwrap()
+        .unwrap_or_else(|| panic!("no part {name}"));
+    String::from_utf8(part).unwrap()
 }
 
 fn has_part(pptx: &[u8], name: &str) -> bool {
-    zip::ZipArchive::new(Cursor::new(pptx))
-        .unwrap()
-        .by_name(name)
-        .is_ok()
+    Package::from_bytes(pptx).unwrap().size(name).is_some()
 }
 
 fn rels(items: &[(&str, &str, &str)]) -> String {

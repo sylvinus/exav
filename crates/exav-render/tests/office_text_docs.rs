@@ -554,6 +554,20 @@ fn the_fixtures_have_their_words() {
     );
 }
 
+/// The header is `{\rt` and what follows is free: `{\rt0` is read as `{\rtf1`
+/// is, and a header that is not RTF's is refused.
+#[test]
+fn an_rtf_with_a_short_header_is_read() {
+    let body = b"\\ansi\\deff0{\\fonttbl{\\f0 Arial;}}\\pard Alpha beta gamma\\par}";
+    let with = |header: &[u8]| [header, body].concat();
+    let t = extract(&with(b"{\\rt0"), Format::Rtf);
+    assert_eq!(t.text, extract(&with(b"{\\rtf1"), Format::Rtf).text);
+    assert!(t.text.contains("Alpha beta gamma"), "{:?}", t.text);
+    let refused = text(&with(b"{\\r0"), Format::Rtf, &Limits::default(), CAP);
+    assert!(refused.is_err());
+    assert!(convert(&with(b"{\\rt0"), Format::Rtf, &Limits::default()).is_ok());
+}
+
 #[test]
 fn every_document_has_the_words_of_the_docx_the_converter_writes() {
     for (name, input, f) in every_document() {

@@ -17,6 +17,28 @@ permissions:
   contents: read
 
 jobs:
+  # exav-unpack's LZFSE, LZVN and DCL decoders against Apple's lzfse and zlib's
+  # blast, built with sanitizers from their fetched sources: a differential
+  # test, so not a merge gate, and it needs the network.
+  oracles:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make test-oracles
+
+  # exav-unpack's Inno Setup reader over Inno Setup's own released installers
+  # (versions and SHA-256 in crates/exav-unpack/tests/inno/installers.txt):
+  # every file must come out whole with its stored checksum. Needs the network.
+  inno:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make test-inno
+
   campaign:
     runs-on: ubuntu-latest
     timeout-minutes: 360

@@ -402,6 +402,10 @@ fn any_other_target_is_its_label_alone() {
         "mailto:",
         "tel:+123",
         "https://exa\u{202e}mple.com/",
+        // The three marks that move what is around them, invisible in a link.
+        "https://exa\u{200e}mple.com/",
+        "https://example.com/a\u{200f}b",
+        "https://example.com/a\u{61c}b",
         "https://example.com/a\u{2028}b",
         "https://example.com/a\u{85}b",
         "https://example.com/a b",

@@ -880,6 +880,26 @@ for (const mode of ["sandbox", "page"] as const) {
         await expect(frame.locator(".exav-viewer-layer")).toHaveCount(6);
       });
 
+      test("a ZIP of as many members as the detection takes is listed", async ({ page }) => {
+        await page.goto(`./?lang=en${query}`);
+        // Past the 5,000 the archive view once took, within the 20,000 of the detection.
+        const zip = storedZip(Array.from({ length: 6000 }, (_, i) => [`f${i}.txt`, Buffer.from("x")] as [string, Buffer]));
+        await page.getByTestId("file-input").setInputFiles({ name: "many.zip", mimeType: "application/zip", buffer: zip });
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+        await expect(page.locator(".demo-frame .exav-viewer-archive-head")).toHaveText(/^6[,.  ]?000 files$/);
+      });
+
+      test("a document inside an archive, under a name that does not say so, opens as the document", async ({ page }) => {
+        await page.goto(`./?lang=en${query}`);
+        const zip = storedZip([["notes.zip", sample("notes.docx")]]);
+        await page.getByTestId("file-input").setInputFiles({ name: "attachments.zip", mimeType: "application/zip", buffer: zip });
+        const frame = page.locator(".demo-frame");
+        await frame.getByRole("button", { name: /notes\.zip/ }).click();
+        await expect(frame.locator(".exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+        // A document, not the list of another archive.
+        await expect(frame.locator(".exav-viewer-archive-head")).toHaveCount(0);
+      });
+
       test("a member is shown as what its bytes are, whatever its name says", async ({ page }) => {
         await page.goto(`./?lang=en${query}`);
         const zip = storedZip([
@@ -1220,7 +1240,7 @@ test("the sidebar lists each sample of samples.json and each example of examples
     for (const name of names) {
       const served = await request.get(`${folder}/${name}`);
       expect(served.ok(), name).toBe(true);
-      // The preview server sends a .gz with Content-Encoding: gzip, and the request decodes it.
+      // The preview server compresses some answers (Content-Encoding: gzip), and the request decodes them.
       if (served.headers()["content-encoding"] !== "gzip") expect((await served.body()).length, name).toBe(fs.statSync(path.join(root, name)).size);
       expect(credits, name).toContain(`\n${name}\n`);
     }

@@ -115,6 +115,18 @@ test.describe("what is not drawn", () => {
     await expect(warnings).toContainText("3 external references are not drawn. photo.png, walls.dwg");
   });
 
+  test("in the sandboxed frame, a file named past the protocol's limit is said cut, beside the drawing's controls", async ({ page }) => {
+    // The xref's file named with 300 letters.
+    const long = `${"w".repeat(300)}.dwg`;
+    const dxf = sample("cad-not_drawn.dxf").toString("latin1").replaceAll("walls.dwg", long);
+    await page.goto("./?lang=en");
+    await page.getByTestId("file-input").setInputFiles({ name: "long-xref.dxf", mimeType: "", buffer: Buffer.from(dxf, "latin1") });
+    await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+    const warnings = page.locator(".demo-frame .exav-viewer-warnings");
+    await expect(warnings).toContainText(`3 external references are not drawn. photo.png, ${"w".repeat(255)}…`);
+    await expect(page.locator(".demo-frame .exav-viewer-tools")).toBeVisible();
+  });
+
   test("a drawing with nothing drawn here keeps the thumbnail it was saved with", async ({ page }) => {
     await open(page, "cad-solid_only.dxf");
     const preview = page.locator(".demo-frame .exav-viewer-cad-preview");

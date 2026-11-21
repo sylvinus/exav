@@ -50,13 +50,15 @@ Readers that exist today:
 | `charset` | Text in a Windows code page number | the BIFF reader, the office converters |
 | `html` | HTML as tokens (html5gum), and a page's bytes as text in the encoding it names | the scanner's text view, the spreadsheet and text document converters |
 | `offcrypto` | Excel workbooks with a password: RC4, RC4 CryptoAPI, XOR | the scanner, the XLS converter |
+| `package` | The parts of a ZIP package (OOXML, OpenDocument, iWork) by name, Stored or Deflated, opened and decoded as the scanner's walk does | the ODF, Pages, Numbers, Keynote and Visio converters |
 | `rtf` | The RTF tokenizer | the scanner (embedded objects), the RTF converter |
 | `dxf`, `dwg` | AutoCAD drawings | the scanner (embedded payloads), the drawing model of `exav-render` |
 | `text` | The text of HTML, the XML parts of office files and PDF | the scanner's text views, `exav-render`'s `text` |
 
 The readers sit behind the same Cargo features as the formats, and
 `exav-render` turns on the ones its converters need (`exav-unpack/ole`,
-`html`, `offcrypto`, `rtf`), so a build of one converter links only those.
+`html`, `offcrypto`, `rtf`, `zip`), so a build of one converter links only
+those.
 
 ## How a file is read
 
@@ -107,7 +109,6 @@ These are the duplications left; each is a reader to extract into
 |---|---|---|
 | PowerPoint records | `ole.rs` (embedded storages) | `slides/ppt/records.rs` |
 | Word FIB | `ole.rs` (the encryption flag) | `docs/doc/fib.rs` |
-| ZIP packages | `formats/zip.rs` | `common/package.rs` (the `zip` crate, its own limits) |
 | XML trees | `text/xml.rs` | `common/xml.rs` (one tree for the three converters) |
 | Code pages | `formats/codepage.rs` (drawings, by AutoCAD's names) | `formats/charset.rs` (by number, with the tables) |
 

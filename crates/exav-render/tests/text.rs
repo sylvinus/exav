@@ -50,6 +50,21 @@ fn markdown_html_and_package_parts_by_what_they_are() {
     );
 }
 
+/// A SpreadsheetML file whose `<Table>` is in its first kilobyte is read as
+/// the workbook it says it is, not as a page of HTML.
+#[cfg(feature = "text-office")]
+#[test]
+fn a_spreadsheet_with_a_table_near_its_start_is_a_spreadsheet() {
+    let xml: &[u8] = b"<?xml version=\"1.0\"?>\
+        <Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\" \
+        xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\">\
+        <Worksheet ss:Name=\"Prices\"><Table><Row><Cell><Data ss:Type=\"String\">tea</Data></Cell>\
+        </Row></Table></Worksheet></Workbook>";
+    let v = visible_text("book.xml", xml, 1 << 20, &Limits::default()).unwrap();
+    assert_eq!(v.text, "Prices\ntea\n");
+    assert_eq!(v.sections.len(), 1, "{:?}", v.sections);
+}
+
 /// Found by the `visible_text` fuzz target: the reader took a binary file with
 /// a SpreadsheetML marker among its first bytes for that document, where
 /// `wants`, which the scanner asks first, wants text to begin with.
@@ -128,8 +143,9 @@ fn a_compound_file_holding_several_documents_gives_the_text_of_each() {
 
 #[test]
 fn an_ooxml_packages_links_join_their_labels_to_their_targets() {
+    use exav_unpack::zip_write::{FileOptions, ZipWriter};
     use std::io::Write;
-    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut w = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for (name, data) in [
         (
             "word/document.xml",
@@ -140,8 +156,7 @@ fn an_ooxml_packages_links_join_their_labels_to_their_targets() {
             r#"<Relationships><Relationship Id="rId1" Type="x/hyperlink" Target="http://evil.example/" TargetMode="External"/></Relationships>"#,
         ),
     ] {
-        w.start_file(name, zip::write::SimpleFileOptions::default())
-            .unwrap();
+        w.start_file(name, FileOptions::default()).unwrap();
         w.write_all(data.as_bytes()).unwrap();
     }
     let docx = w.finish().unwrap().into_inner();

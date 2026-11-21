@@ -582,6 +582,48 @@ fn the_size_flags_take_suffixes_and_off() {
     assert!(stdout(&o).contains("o.zip!inner.gz!gzip-content!deep.txt:10001:"));
 }
 
+/// A spill directory whose name is not UTF-8 is accepted, by flag and by
+/// variable, and the inner container is opened through a file there.
+#[test]
+fn a_spill_dir_that_is_not_utf8_is_accepted() {
+    use std::os::unix::ffi::OsStrExt;
+    let s = Scratch::new("spillbytes");
+    let f = nested_zip(&s);
+    let dir = s.path().join(std::ffi::OsStr::from_bytes(b"sp\xe9"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = ["-F", "needle", "--max-object-bytes", "64K"];
+    let go = |flag: bool| {
+        let mut c = Command::new(BIN);
+        for var in LIMIT_VARS {
+            c.env_remove(var);
+        }
+        c.args(base);
+        if flag {
+            c.arg("--spill-dir").arg(&dir);
+        } else {
+            c.env("EXAV_SPILL_DIR", &dir);
+        }
+        c.arg(&f).output().expect("spawn exav-grep")
+    };
+    for flag in [true, false] {
+        let o = go(flag);
+        assert_eq!(code(&o), 0, "flag {flag}: {}", stderr(&o));
+        assert!(stdout(&o).contains("o.zip!inner.gz!gzip-content!deep.txt:10001:"));
+    }
+    // Without a place to spill the same run is partial, so the directory is
+    // what made it complete.
+    let o = run(&[
+        "-F",
+        "needle",
+        "--max-object-bytes",
+        "64K",
+        "--spill-dir",
+        "off",
+        f.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 3, "{}", stderr(&o));
+}
+
 /// Each limit has a variable, named as the scanner names it, that does what
 /// the flag does, and the flag wins over it.
 #[test]
@@ -612,6 +654,11 @@ fn a_limit_is_read_from_its_variable_and_the_flag_wins() {
         (0, "after.txt", b"the needle\n", 11),
     ]);
     let ratio = s.write("ratio.zip", &ratio);
+    // An ext4 volume holding a sparse file of 48 MiB, mostly holes.
+    let sparse = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../exav-unpack/tests/fixtures/fs/ext4_sparse.img.gz"
+    );
     let (nested, two, spill, pdf, ratio) = (
         nested.to_str().unwrap(),
         two.to_str().unwrap(),
@@ -622,7 +669,21 @@ fn a_limit_is_read_from_its_variable_and_the_flag_wins() {
     // The variable, its value, the flag that says the same, the arguments it
     // is tried with, and a flag that undoes it.
     type Case<'a> = (&'a str, &'a str, [&'a str; 2], Vec<&'a str>, [&'a str; 2]);
-    let cases: [Case; 7] = [
+    let cases: [Case; 9] = [
+        (
+            "EXAV_MAX_MATCHER_BYTES",
+            "4",
+            ["--max-matcher-bytes", "4"],
+            vec!["-F", "needle", two],
+            ["--max-matcher-bytes", "off"],
+        ),
+        (
+            "EXAV_MAX_HOLE_BYTES",
+            "1M",
+            ["--max-hole-bytes", "1M"],
+            vec!["-F", "needle", sparse],
+            ["--max-hole-bytes", "off"],
+        ),
         (
             "EXAV_MAX_OBJECT_BYTES",
             "64K",

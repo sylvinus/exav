@@ -7,4 +7,5 @@ pub(crate) mod crypt;
 pub(crate) mod filters;
 pub(crate) mod lex;
 pub(crate) mod parse;
+pub(crate) mod predictor;
 pub(crate) mod types;

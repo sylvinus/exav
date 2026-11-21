@@ -45,7 +45,7 @@ import {
   checkOptions,
   frameMatcher,
   HELLO,
-  linkTarget,
+  followTarget,
   MAX_DRAWS,
   NAV_KEYS,
   PROTOCOL,
@@ -62,6 +62,7 @@ import {
   type NavKey,
   type OpenMessage,
   type OpenSource,
+  type PingMessage,
   type RasterMessage,
   type RasterResult,
   type ReplaceMessage,
@@ -100,7 +101,8 @@ export interface SandboxConfig {
   options?: FrameOptions;
   /**
    * Asked before a link the user followed in a document is opened in a new
-   * tab (`noopener,noreferrer`). Only absolute http(s) links get here.
+   * tab (`noopener,noreferrer`), or a `mailto:` one in the mail program.
+   * Only absolute http(s) links and `mailto:` ones get here.
    * Default: the browser's `confirm`.
    */
   confirmLink?: (url: string, file: ViewerFile) => boolean | Promise<boolean>;
@@ -112,6 +114,14 @@ export interface SandboxConfig {
   linkQuietMs?: number;
   /** How long the frame may take to start. Default 20_000 ms. */
   startTimeoutMs?: number;
+  /**
+   * How long the frame may go without answering this page, in milliseconds,
+   * once it has started: this page pings it, a third of this value apart, and
+   * the session fails when a ping stays unanswered this long (the frame
+   * crashed, navigated away, or its main thread hangs). Default 30,000;
+   * 0: no ping.
+   */
+  frameTimeoutMs?: number;
   /**
    * How long the detection of a file's first bytes may take, in milliseconds,
    * before the file's name and type decide. The detection runs in the frame,
@@ -190,7 +200,7 @@ function toStatus(s: StatusSnapshot): Status {
   return s.phase === "error" ? { phase: "error", error: { code: s.code } } : s;
 }
 
-const defaultConfirm = (url: string) => window.confirm(`Open this link in a new tab?\n\n${url}`);
+const defaultConfirm = (url: string) => window.confirm(`${url.startsWith("mailto:") ? "Write this email in your mail program?" : "Open this link in a new tab?"}\n\n${url}`);
 
 /** The default of `linkQuietMs`. */
 export const LINK_QUIET_MS = 2000;
@@ -201,12 +211,47 @@ function checkLinkQuietMs(n: number | undefined): number {
   return n;
 }
 
+/** The directives a page's policy refuses a frame's address with: the `effectiveDirective` of the violation. */
+const FRAME_DIRECTIVES = ["frame-src", "child-src", "default-src"];
+
+/** The origin of an address (relative to `base` when given), or null where it is none (`inline`, `eval`, an empty string). */
+function originOf(address: string, base?: string): string | null {
+  try {
+    const { origin } = new URL(address, base);
+    return origin === "null" ? null : origin;
+  } catch {
+    return null;
+  }
+}
+
+/** The default of `frameTimeoutMs`. */
+export const FRAME_TIMEOUT_MS = 30_000;
+
+function checkFrameTimeoutMs(ms: number | undefined): number {
+  if (ms === undefined) return FRAME_TIMEOUT_MS;
+  if (!Number.isFinite(ms) || ms < 0) throw new RangeError(`frameTimeoutMs: a number of milliseconds, 0 for no ping, not ${String(ms)}`);
+  return ms;
+}
+
 /**
  * Whether the user has just clicked or pressed a key in this page, or in a
  * frame of it, which activates the page too. True where the browser cannot say.
  */
 function activated(): boolean {
   return "userActivation" in navigator ? navigator.userActivation.isActive : true;
+}
+
+/**
+ * A controller of its own that `parent` aborts too, where `AbortSignal.any`
+ * would need Safari 17.4. `release` once the work is over: the session's
+ * signal outlives every read.
+ */
+function follows(parent: AbortSignal): { own: AbortController; release: () => void } {
+  const own = new AbortController();
+  const stop = () => own.abort();
+  if (parent.aborted) own.abort();
+  else parent.addEventListener("abort", stop, { once: true });
+  return { own, release: () => parent.removeEventListener("abort", stop) };
 }
 
 /** The size a file of the tree states before it is read, or null (a URL, a source resolved on demand). */
@@ -237,6 +282,7 @@ export function createSandboxedViewer(config: SandboxConfig): SandboxedViewer {
   checkDelivery(config.delivery, config.origins);
   const limits = checkPackageLimits(config);
   const linkQuietMs = checkLinkQuietMs(config.linkQuietMs);
+  const frameTimeoutMs = checkFrameTimeoutMs(config.frameTimeoutMs);
   checkSniffTimeout(config.sniffTimeoutMs);
   const formats = (config.formats ?? DEFAULT).filter((f) => ALL.includes(f));
   // By name and type only: the bytes are told in the frame (`sniff`).
@@ -249,7 +295,7 @@ export function createSandboxedViewer(config: SandboxConfig): SandboxedViewer {
   );
   /** Each frame shown, by what sends it its theme again. */
   const shown = new Set<() => void>();
-  const mount = (host: HTMLElement, file: ViewerFile): Session => mountFrame({ ...config, linkQuietMs }, formats, detector, host, file, shown);
+  const mount = (host: HTMLElement, file: ViewerFile): Session => mountFrame({ ...config, linkQuietMs, frameTimeoutMs }, formats, detector, host, file, shown);
   return {
     ...detector,
     plugins: [],
@@ -313,11 +359,19 @@ function mountFrame(
   let port: MessagePort | null = null;
   let iframe: HTMLIFrameElement | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  /** Pings the frame once it is ready (`frameTimeoutMs`). */
+  let pinger: ReturnType<typeof setInterval> | undefined;
+  /** When the ping the frame has not answered was sent, or null. */
+  let pingSince: number | null = null;
+  /** Stops listening for the page's policy refusing the frame. */
+  let unwatchPolicy: () => void = () => {};
   let confirming = false;
   /** Until when the frame's links are dropped: a moment after each answer, so that a frame cannot ask again at once. */
   let quietUntil = 0;
   /** The formats the frame was published for, null for all of them, once it is ready. */
   let published: readonly BuiltinFormat[] | null = null;
+  /** Whether the frame said `ready`: a second one is ignored. */
+  let greeted = false;
   let isReady: () => void = () => {};
   const ready = new Promise<void>((resolve) => (isReady = resolve));
   /** The `sniff` calls not answered yet: undefined is no answer. */
@@ -397,6 +451,8 @@ function mountFrame(
 
   const teardown = () => {
     clearTimeout(timer);
+    clearInterval(pinger);
+    unwatchPolicy();
     // Stops the download, and every read the frame asked for.
     abort.abort();
     reads.clear();
@@ -437,22 +493,23 @@ function mountFrame(
       refusedOnce = true;
       return reply({ type: "bytes", id, error: "refused" });
     }
-    const own = new AbortController();
+    const { own, release } = follows(abort.signal);
     reads.set(id, { length, abort: own });
     outstanding += length;
     ranges!
-      .read(offset, length, AbortSignal.any([abort.signal, own.signal]))
+      .read(offset, length, own.signal)
       .then(
         (bytes): BytesMessage => {
           // A copy to transfer: the buffer may be one the host keeps.
           return { type: "bytes", id, data: bytes.slice().buffer as ArrayBuffer };
         },
         (error): BytesMessage => {
-          if (!abort.signal.aborted && !own.signal.aborted) console.warn(`${format ?? "viewer"}: a read for the sandboxed frame failed`, error);
+          if (!own.signal.aborted) console.warn(`${format ?? "viewer"}: a read for the sandboxed frame failed`, error);
           return { type: "bytes", id, error: "failed" };
         },
       )
       .then((m) => {
+        release();
         if (reads.get(id)?.abort !== own) return;
         reads.delete(id);
         outstanding -= length;
@@ -474,12 +531,15 @@ function mountFrame(
     };
     if (!tree || !tree.paths.slice(0, TREE.maxPaths).includes(path)) return refuse("it is not in the tree");
     if (reads.size >= READS.maxReads) return refuse("too many reads at once");
-    const own = new AbortController();
+    const { own, release } = follows(abort.signal);
     reads.set(id, { length: 0, abort: own });
-    const signal = AbortSignal.any([abort.signal, own.signal]);
+    const signal = own.signal;
     let opened: ReturnType<typeof createSourceReader> | undefined;
     /** What this fetch adds to `fetching`. */
     let counted = 0;
+    /** The fetches together went past the limit while this one was read. */
+    let over = false;
+    let stopCounting = () => {};
     void (async (): Promise<BytesMessage> => {
       const source = await tree.open(path, signal);
       // A source that states its size is judged before it is read.
@@ -489,17 +549,35 @@ function mountFrame(
         counted = size;
         fetching += size;
       }
-      opened = createSourceReader(source, signal);
+      opened = createSourceReader(source, signal, TREE.maxFileBytes);
+      // One that does not is counted as it arrives.
+      if (size === null)
+        stopCounting = opened.progress.subscribe((p) => {
+          const more = (p?.loaded ?? counted) - counted;
+          counted += more;
+          fetching += more;
+          if (fetching > TREE.maxFileBytes) {
+            // This one is refused, and gives its share back at once: the others go on.
+            over = true;
+            fetching -= counted;
+            counted = 0;
+            stopCounting();
+            own.abort();
+          }
+        });
       const bytes = await opened.bytes();
-      if (bytes.byteLength > TREE.maxFileBytes) return { type: "bytes", id, error: "refused" };
+      if (over || bytes.byteLength > TREE.maxFileBytes) return { type: "bytes", id, error: "refused" };
       // Its own buffer, to transfer: the source may keep the one it read.
       return { type: "bytes", id, data: bytes.slice().buffer as ArrayBuffer };
     })()
       .catch((error): BytesMessage => {
-        if (!abort.signal.aborted && !own.signal.aborted) console.warn(`${format ?? "viewer"}: a file for the sandboxed frame could not be read`, error);
+        if (over || error instanceof RangeError) return { type: "bytes", id, error: "refused" };
+        if (!own.signal.aborted) console.warn(`${format ?? "viewer"}: a file for the sandboxed frame could not be read`, error);
         return { type: "bytes", id, error: "failed" };
       })
       .then((m) => {
+        stopCounting();
+        release();
         opened?.dispose();
         fetching -= counted;
         if (reads.get(id)?.abort !== own) return;
@@ -771,9 +849,35 @@ function mountFrame(
     return c;
   };
 
+  /**
+   * Pings the frame every third of `frameTimeoutMs` while no ping is
+   * unanswered, and fails the session when one stays so for the whole of it.
+   * A tick more than twice its interval after the one before (the tab was
+   * frozen or throttled, so neither this page nor the frame ran) does not
+   * count that gap: the ping is sent again and the wait starts over.
+   */
+  const startPings = () => {
+    const timeout = config.frameTimeoutMs ?? FRAME_TIMEOUT_MS;
+    if (timeout === 0) return;
+    let lastTick = performance.now();
+    pinger = setInterval(() => {
+      if (!port) return;
+      const now = performance.now();
+      const late = now - lastTick > (2 * timeout) / 3;
+      lastTick = now;
+      if (pingSince === null || late) {
+        pingSince = now;
+        port.postMessage({ type: "ping" } satisfies PingMessage);
+      } else if (now - pingSince >= timeout) fail(errorCode(format), new Error(`the frame did not answer in ${timeout} ms`));
+    }, timeout / 3);
+  };
+
   const receive = (message: FrameMessage) => {
     switch (message.type) {
       case "ready": {
+        // Once: another would have the file sent again, and its reads answered again.
+        if (greeted) return;
+        greeted = true;
         clearTimeout(timer);
         if (message.protocol !== PROTOCOL) return fail(errorCode(format), new Error(`the frame speaks protocol ${message.protocol}, not ${PROTOCOL}`));
         // Its policy is fixed where it is deployed: one that does not allow
@@ -783,6 +887,7 @@ function mountFrame(
         if (mismatch) return fail(errorCode(format), new Error(mismatch));
         published = message.formats;
         isReady();
+        startPings();
         // Likewise a frame published without this file's format: said here, with its cause.
         // The format is the bytes' where they are read, so after they are.
         void (decision ?? Promise.resolve(null)).then(
@@ -795,6 +900,9 @@ function mountFrame(
         );
         return;
       }
+      case "pong":
+        pingSince = null;
+        return;
       case "read":
         return read(message.id, message.generation, message.offset, message.length);
       case "fetch":
@@ -851,7 +959,7 @@ function mountFrame(
         return;
       }
       case "link": {
-        const url = linkTarget(message.url);
+        const url = followTarget(message.url);
         // One question at a time, none right after an answer, and none the
         // user did not just click or press a key for: a frame can neither
         // queue a hundred, nor ask again as soon as one is answered, nor ask
@@ -859,7 +967,7 @@ function mountFrame(
         if (!url || confirming || performance.now() < quietUntil || !activated()) return;
         confirming = true;
         void Promise.resolve()
-          .then(() => (config.confirmLink ?? defaultConfirm)(url, file))
+          .then(() => (config.confirmLink ?? defaultConfirm)(url, current))
           .then((yes) => {
             if (yes && !ended) window.open(url, "_blank", "noopener,noreferrer");
           })
@@ -1026,9 +1134,10 @@ function mountFrame(
     if (nextFormat !== known) return false;
     const mine = ++latest;
     superseding?.abort();
-    const own = new AbortController();
+    // Not released: the document's source keeps the signal for its later requests (a signed address asked again).
+    const { own } = follows(abort.signal);
     superseding = own;
-    const signal = AbortSignal.any([abort.signal, own.signal]);
+    const signal = own.signal;
     let p: Prepared;
     try {
       p = await prepare(nextSource, known, next, { delivery: config.delivery, origins: config.origins, signal });
@@ -1096,6 +1205,18 @@ function mountFrame(
       // and nothing else. Everything after it goes over the port.
       frame.contentWindow?.postMessage({ type: HELLO, protocol: PROTOCOL }, "*", [channel.port2]);
     });
+    // The page's own policy refusing the frame: a `frame-src`, or the
+    // `child-src` or `default-src` it falls back to, that does not name its
+    // origin. Said now, with what to add.
+    const origin = originOf(config.url, document.baseURI);
+    const onViolation = (e: Event) => {
+      const v = e as SecurityPolicyViolationEvent;
+      if (!origin || v.disposition !== "enforce" || !FRAME_DIRECTIVES.includes(v.effectiveDirective) || originOf(v.blockedURI) !== origin) return;
+      // Browsers report `frame-src` whichever of the three the page has set.
+      fail(errorCode(format), new Error(`the page's Content-Security-Policy blocks the frame: add ${origin} to its frame-src (to its child-src or default-src when it has no frame-src)`));
+    };
+    document.addEventListener("securitypolicyviolation", onViolation);
+    unwatchPolicy = () => document.removeEventListener("securitypolicyviolation", onViolation);
     timer = setTimeout(() => fail(errorCode(format), new Error("the frame did not start")), config.startTimeoutMs ?? 20_000);
     frame.src = config.url;
     iframe = frame;

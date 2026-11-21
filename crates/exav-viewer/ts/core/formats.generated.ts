@@ -300,6 +300,11 @@ export const REGISTERED: Readonly<Record<string, Registered>> = {
     extensions: [".numbers"],
     types: ["application/vnd.apple.numbers", "application/x-iwork-numbers-sffnumbers"],
   },
+  "pages": {
+    plugin: "pages",
+    extensions: [".pages"],
+    types: ["application/vnd.apple.pages", "application/x-iwork-pages-sffpages"],
+  },
   "csv": {
     plugin: "csv",
     extensions: [".csv", ".tsv"],

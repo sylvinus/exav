@@ -204,7 +204,7 @@ impl Typing {
         // and for the scanner uncompressed Flash, which `detect` does not type
         // (there is nothing to decode in it).
         if exe.is_none() {
-            if start.starts_with(b"{\\rtf") {
+            if crate::is_rtf(&start) {
                 return Typed::Container(Format::Rtf);
             }
             if self.scanner && start.starts_with(b"FWS") {
@@ -411,6 +411,18 @@ mod tests {
         pe.resize(600, 0);
         assert_eq!(read(Typing::WALK, &pe), None);
         assert_eq!(read(scanner(), &pe), None);
+    }
+
+    /// The RTF header is `{\rt`: `{\rt0` is typed as `{\rtf1` is, `{\r` is not.
+    #[test]
+    fn an_rtf_with_a_short_header_is_typed_before_the_strings() {
+        let mut rtf = b"{\\rt0 ".to_vec();
+        rtf.resize(257, b' ');
+        rtf.extend_from_slice(b"ustar  ");
+        assert_eq!(crate::detect(&&rtf[..]), Some(Format::Tar));
+        assert_eq!(read(Typing::WALK, &rtf), Some(Format::Rtf));
+        rtf[2] = b' ';
+        assert_eq!(read(Typing::WALK, &rtf), Some(Format::Tar));
     }
 
     /// A type a signature gave an object decides which reader opens it, as

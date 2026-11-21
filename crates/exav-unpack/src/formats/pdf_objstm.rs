@@ -106,10 +106,12 @@ pub(super) fn table(decoded: &[u8], count: i64, first: i64, at_most: u64) -> Vec
 }
 
 /// The object that starts at `offset` in `decoded`, and where its parse ended.
-/// An object that does not parse can have run to the end.
-pub(super) fn object_at(decoded: &[u8], offset: usize) -> (Option<Primitive>, usize) {
+/// An object that does not parse can have run to the end. The last value is
+/// whether a value of the object was passed over for its depth.
+pub(super) fn object_at(decoded: &[u8], offset: usize) -> (Option<Primitive>, usize, bool) {
     let mut lex = Lexer::new(decoded);
     lex.set_pos(offset);
     let object = parse_object(&mut lex);
-    (object, lex.pos())
+    let passed_over = lex.take_passed_over();
+    (object, lex.pos(), passed_over)
 }

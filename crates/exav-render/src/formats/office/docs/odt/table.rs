@@ -129,7 +129,7 @@ impl Odt<'_> {
             Some("right") => Some(Jc::Right),
             _ => None,
         };
-        if let Some(l) = tp.twips("table/fo:margin-left") {
+        if let Some(l) = tp.margin("table", "left").and_then(odf::twips) {
             table.props.indent = Some(l);
         }
         if tp

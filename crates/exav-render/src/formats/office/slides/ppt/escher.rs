@@ -5,7 +5,6 @@
 
 use super::records::{Rec, read_at};
 use crate::formats::office::common::bytes::Cur;
-use std::io::Read;
 
 pub const DG_CONTAINER: u16 = 0xF002;
 pub const SPGR_CONTAINER: u16 = 0xF003;
@@ -327,10 +326,8 @@ pub fn blip(r: &Rec) -> Option<Blip> {
     let body = d.get(skip + 34..)?;
     let data = if hdr[32] == 0 {
         let mut out = Vec::new();
-        flate2::read::ZlibDecoder::new(body)
-            .take(MAX_METAFILE + 1)
-            .read_to_end(&mut out)
-            .ok()?;
+        let mut z = flate2::read::ZlibDecoder::new(body);
+        exav_unpack::source::read_capped(&mut z, &mut out, MAX_METAFILE + 1).ok()?;
         if out.len() as u64 > MAX_METAFILE {
             return None;
         }

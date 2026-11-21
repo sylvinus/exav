@@ -81,8 +81,13 @@ needs:
 | `--max-extracted-bytes <SIZE\|off>` | The most bytes of members that a format decodes into memory itself (PDF streams, OLE streams, RTF objects and the like), summed over one file (default 1 GiB); K/M/G/T suffixes, `off` or `0` sets no limit. The bytes a PDF is read again to follow its objects count too. A file that reaches it is reported unreadable. Environment: `EXAV_MAX_EXTRACTED_BYTES` |
 | `--object-cache-bytes <SIZE\|off>` | Memory of the block cache of an object that is read where it lies (default 32 MiB, one cache per such object being searched, nested ones included); never below two blocks, `off` or `0` is that least. Environment: `EXAV_OBJECT_CACHE_BYTES` |
 | `--object-cache-block-bytes <SIZE\|off>` | One block of that cache (default 1 MiB); `off` or `0` is a byte. Environment: `EXAV_OBJECT_CACHE_BLOCK_BYTES` |
-| `--max-members <N\|off>` | Cap on members visited inside each input file; `off` or `0` sets no limit. Environment: `EXAV_MAX_MEMBERS` |
+| `--max-matcher-bytes <SIZE\|off>` | The most bytes searched for one file named on the command line, its members summed (default 10 GiB): a CPU and time bound, not a memory one. A file that reaches it is reported unreadable. K/M/G/T suffixes, `off` or `0` sets no limit. Environment: `EXAV_MAX_MATCHER_BYTES` |
+| `--max-hole-bytes <SIZE\|off>` | The most bytes of holes (the unwritten stretches of a sparse file in a filesystem image) searched as zeros for one file named on the command line (default 10 GiB); they count here instead of toward `--max-matcher-bytes`. K/M/G/T suffixes, `off` or `0` sets no limit. Environment: `EXAV_MAX_HOLE_BYTES` |
+| `--max-members <N\|off>` | Cap on members visited inside each input file (default 100000); `off` or `0` sets no limit. Environment: `EXAV_MAX_MEMBERS` |
 | `--max-compression-ratio <N\|off>` | A member that decodes to more than N times its size in its container (default 1000), once it is past `--max-object-bytes`, is left out and reported unreadable; the other members are still searched. Below `--max-object-bytes` a member is held in memory, so with `--max-object-bytes off` the ratio never acts. `off` or `0` sets no limit. Environment: `EXAV_MAX_COMPRESSION_RATIO` |
+| `--max-pe-emulation-steps <N\|off>` | Most x86 instructions the emulator that unpacks packed executables may run for one file named on the command line, summed over every packed executable in it (default 1000000000); a file that runs out is reported unreadable. `off` or `0` sets no limit. Environment: `EXAV_MAX_PE_EMULATION_STEPS` |
+| `--max-pe-stub-steps <N\|off>` | Most x86 instructions that emulator may run for one packed executable (default 500000000); what the stub rebuilt by then is still searched, and the file is reported unreadable. `off` or `0` sets no limit. Environment: `EXAV_MAX_PE_STUB_STEPS` |
+| `--max-pe-idle-steps <N\|off>` | Most instructions a packed executable's stub may run in that emulator without writing a page it has not written before (default 64000000); a stub that goes that long is looping on nothing, and the run stops. `off` or `0` sets no limit. Environment: `EXAV_MAX_PE_IDLE_STEPS` |
 | `--max-unpack-depth <N>` | Cap on archive-within-archive nesting; `0` opens no archive, and each file is searched as it stands. There is no `off`. Environment: `EXAV_MAX_UNPACK_DEPTH` |
 | `--spill-dir <DIR\|off>` | Where a container inside a member over `--max-object-bytes` is written to be opened (default: the system temporary directory); `off` writes nothing. See [Memory](#memory). Environment: `EXAV_SPILL_DIR` |
 | `--max-total-spill-bytes <SIZE\|off>` | The most the spill files open at once may hold (default 2 GiB); K/M/G/T suffixes, `off` or `0` sets no ceiling. Environment: `EXAV_MAX_TOTAL_SPILL_BYTES` |
@@ -183,7 +188,7 @@ as well. An image past `--max-qr-pixels`, whose reading takes longer than
 `--max-qr-millis`, or that holds more than `--max-qr-codes` codes,
 `--max-qr-finders` finder patterns or `--max-qr-grids` candidate grids, is
 reported unreadable. An image that does not decode, or a PDF image in a color
-space or with a predictor that is not read, is reported unreadable (exit `3`)
+space that is not read, is reported unreadable (exit `3`)
 like one past a limit. For all five, `off` or `0` sets no limit. To print the
 payloads rather than search them, use [exav-qr](/subprojects/exav-qr/).
 

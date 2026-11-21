@@ -547,6 +547,62 @@ fn a_complete_set_is_rejoined_and_scanned() {
     }
 }
 
+/// A set whose member matches two signatures is listed with both by the
+/// `_all` entry point, and with the first by the other. Each part holds half of
+/// each marker, so only the rejoin finds them.
+#[test]
+fn a_rejoined_set_lists_every_detection_with_the_all_entry_point() {
+    let mut b = exav_core::loader::Builder::new();
+    b.add_named_bytes(
+        "two.ndb",
+        b"Test.Alpha:0:*:6e6565646c652d616c706861\nTest.Beta:0:*:6e6565646c652d62657461\n",
+        false,
+    );
+    let db = b.build().expect("database");
+    let zip = zip_with(&[("payload.txt", b"needle-alpha and needle-beta")]);
+    let at = |marker: &[u8]| zip.windows(marker.len()).position(|w| w == marker).unwrap();
+    let (a, b) = (at(b"needle-alpha") + 6, at(b"needle-beta") + 6);
+    let parts = [
+        ("m.zip.001".to_string(), zip[..a].to_vec()),
+        ("m.zip.002".to_string(), zip[a..b].to_vec()),
+        ("m.zip.003".to_string(), zip[b..].to_vec()),
+    ];
+    for (_, p) in &parts {
+        assert!(
+            !p.windows(11)
+                .any(|w| w == b"needle-beta" || w == b"needle-alph")
+        );
+    }
+    let names: Vec<String> = parts.iter().map(|(n, _)| n.clone()).collect();
+    let fetch = |want: &str| {
+        parts
+            .iter()
+            .find(|(n, _)| n == want)
+            .map(|(_, d)| d.clone())
+            .ok_or_else(|| std::io::Error::other("no such file"))
+    };
+    let opts = ScanOptions::default();
+    let first = exav_core::analyze_volume_sets(&db, &names, &opts, fetch);
+    assert_eq!(first.len(), 3);
+    for v in &first {
+        assert!(
+            matches!(v.report.verdict, Verdict::Infected { .. }),
+            "{}: {:?}",
+            v.name,
+            v.report.verdict
+        );
+    }
+    let all = exav_core::analyze_volume_sets_all(&db, &names, &opts, fetch);
+    assert_eq!(all.len(), 3, "one result per part");
+    for m in &all {
+        let mut found: Vec<&str> = m.found.iter().map(|(n, _)| n.as_str()).collect();
+        found.sort();
+        assert_eq!(found, ["Test.Alpha", "Test.Beta"], "{}", m.name);
+        assert_eq!(m.outcome, exav_core::AllMatchOutcome::Complete);
+        assert_eq!(m.set, "m.zip");
+    }
+}
+
 #[test]
 fn a_set_whose_last_part_cannot_be_read_is_never_called_clean() {
     // The dangerous shape. Parts 1 and 2 arrive and their indices run

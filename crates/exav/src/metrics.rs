@@ -230,33 +230,68 @@ pub(crate) fn in_flight() -> u64 {
         .sum()
 }
 
-/// Log the totals every `interval`, from whichever process is serving.
+/// The label of the totals lines, whatever the deployment: the thread model and
+/// the pool's supervisor write one process's worth of them, so a log reader
+/// matches one prefix.
+const REPORT_LABEL: &str = "daemon";
+
+/// The totals lines of one serving process, written every `interval`.
 ///
-/// `STATS` answers only where a clamd listener exists and only for the process
-/// that answers it, and neither is a given: an ICAP-only deployment binds no
-/// clamd port at all, and under the worker pool ICAP is a forked child of its
-/// own. A line in the log is the one channel every arrangement has, which for a
-/// container means `docker logs` answers "how busy, how fast" without anything
-/// being wired up first.
+/// `STATS` answers only where a clamd listener exists, and neither is a given:
+/// an ICAP-only deployment binds no clamd port at all. A line in the log is the
+/// one channel every arrangement has, which for a container means `docker logs`
+/// answers "how busy, how fast" without anything being wired up first.
 ///
-/// Started per serving process, after any fork, because threads do not survive
-/// one. Silent while nothing is being scanned, so an idle deployment stays quiet.
-pub(crate) fn spawn_reporter(interval: Duration, what: &'static str) {
-    if interval.is_zero() {
-        return;
+/// Silent while nothing is being scanned, so an idle deployment stays quiet.
+/// One per deployment: the thread model runs it on a thread
+/// ([`spawn_reporter`]), the pool's supervisor from its own loop
+/// ([`Reporter::poll`]), because it forks and a thread does not survive a fork.
+pub(crate) struct Reporter {
+    interval: Duration,
+    /// Scan count at the last check.
+    last: u64,
+    /// The last check, or the start.
+    since: std::time::Instant,
+}
+
+impl Reporter {
+    /// `None` when `interval` is zero (off).
+    pub(crate) fn new(interval: Duration) -> Option<Self> {
+        (!interval.is_zero()).then(|| Self {
+            interval,
+            last: c().scans.load(Ordering::Relaxed),
+            since: std::time::Instant::now(),
+        })
     }
-    std::thread::spawn(move || {
-        let mut last = c().scans.load(Ordering::Relaxed);
-        loop {
-            std::thread::sleep(interval);
-            let now = c().scans.load(Ordering::Relaxed);
-            if now == last {
-                continue;
-            }
-            last = now;
+
+    /// Write the totals if the interval has passed and the scan count moved
+    /// since the last check. Returns how long until the next one is due.
+    pub(crate) fn poll(&mut self) -> Duration {
+        let elapsed = self.since.elapsed();
+        if elapsed < self.interval {
+            return self.interval - elapsed;
+        }
+        self.since = std::time::Instant::now();
+        let now = c().scans.load(Ordering::Relaxed);
+        if now != self.last {
+            self.last = now;
             for line in stats_block().lines() {
-                eprintln!("exav: {what}: {line}");
+                eprintln!("exav: {REPORT_LABEL}: {line}");
             }
+        }
+        self.interval
+    }
+}
+
+/// Write the totals every `interval` from a thread of its own, for a process
+/// that serves on threads. Started after any fork.
+pub(crate) fn spawn_reporter(interval: Duration) {
+    let Some(mut reporter) = Reporter::new(interval) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(reporter.poll());
         }
     });
 }

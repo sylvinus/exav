@@ -32,8 +32,9 @@ PPTX and text documents (`docs`) to DOCX, each behind a feature
 (`office-sheets`, `office-slides`, `office-docs`, or `office` for the three),
 and a `common` module they share (ZIP packages, ODF's XML, code pages,
 compound files, iWork archives) that is not public. None is in the default
-feature set. Under the office features the crate adds `zip`, `quick-xml`,
-`encoding_rs`, `md-5` and `sha1` to its dependencies (`flate2`, which they use
+feature set. Under the office features the crate adds `quick-xml`,
+`encoding_rs`, `md-5` and `sha1` to its dependencies (ZIP packages are read
+and written by exav-unpack) (`flate2`, which they use
 too, is already there for the image decoders). The scanner links all of them
 already, through exav-unpack, so `visible-text-office` adds code but no crate.
 The viewer builds `sheets`, `slides` and `docs` into one wasm module each.

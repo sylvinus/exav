@@ -507,16 +507,38 @@ impl Wml<'_> {
                     items: vec![RunItem::CommentRef(id)],
                 }));
             }
-            Some("Word.Insertion") => {
+            // Tracked changes, as an editor shows them, as the DOC reader
+            // does: what the file holds, both sides of the change.
+            Some(kind @ ("Word.Insertion" | "Word.Deletion")) => {
                 if let Some(content) = c.child("aml:content") {
+                    let start = out.len();
                     self.inlines(content, out)?;
+                    mark_revision(&mut out[start..], kind == "Word.Deletion");
                 }
             }
             _ => {}
         }
         Ok(())
     }
+}
 
+/// The runs of a tracked change, the deleted or inserted text marked as such,
+/// inside fields and hyperlinks too.
+fn mark_revision(inlines: &mut [Inline], deleted: bool) {
+    for i in inlines {
+        match i {
+            Inline::Run(r) => r.props.revision(deleted),
+            Inline::Field { props, result, .. } => {
+                props.revision(deleted);
+                mark_revision(result, deleted);
+            }
+            Inline::Hyperlink { content, .. } => mark_revision(content, deleted),
+            _ => {}
+        }
+    }
+}
+
+impl Wml<'_> {
     fn run(&mut self, n: &Node, out: &mut Vec<Inline>) -> Result<()> {
         let props = n.child("w:rPr").map(run_props).unwrap_or_default();
         let mut items: Vec<RunItem> = vec![];
@@ -530,7 +552,8 @@ impl Wml<'_> {
         };
         for c in n.nodes() {
             match c.name.as_str() {
-                "w:t" => {
+                // The text of a run, and of one a tracked change deleted.
+                "w:t" | "w:delText" => {
                     let t = crate::formats::office::common::odf::text_of(c);
                     if !t.is_empty() {
                         items.push(RunItem::Text(t));
@@ -722,5 +745,49 @@ mod tests {
         let doc = read(x.as_bytes(), &mut b).unwrap();
         assert!(b.used() >= 10_000 * LIST_BYTES, "{}", b.used());
         assert_eq!(doc.numbering.nums[0].abstract_id, 7);
+    }
+
+    /// Tracked changes are shown as the DOC reader shows them: the deleted
+    /// text struck through and the inserted text underlined, both in the
+    /// revision colour, and both in the document.
+    #[test]
+    fn tracked_changes_are_shown_as_an_editor_shows_them() {
+        let x = r#"<w:wordDocument xmlns:w="http://schemas.microsoft.com/office/word/2003/wordml" xmlns:aml="http://schemas.microsoft.com/aml/2001/core"><w:body><w:p><w:r><w:t>kept </w:t></w:r><aml:annotation w:type="Word.Deletion"><aml:content><w:r><w:delText>old</w:delText></w:r></aml:content></aml:annotation><aml:annotation w:type="Word.Insertion"><aml:content><w:r><w:t>new</w:t></w:r></aml:content></aml:annotation></w:p></w:body></w:wordDocument>"#;
+        let doc = read(x.as_bytes(), &mut Budget::new(Limits::default())).unwrap();
+        let Block::Para(p) = &doc.body[0] else {
+            panic!("{:?}", doc.body[0]);
+        };
+        let runs: Vec<(String, Option<bool>, Option<&str>, bool)> = p
+            .content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r),
+                _ => None,
+            })
+            .map(|r| {
+                let text = r
+                    .items
+                    .iter()
+                    .filter_map(|i| match i {
+                        RunItem::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                (
+                    text,
+                    r.props.strike,
+                    r.props.underline,
+                    r.props.color.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                ("kept ".to_string(), None, None, false),
+                ("old".to_string(), Some(true), None, true),
+                ("new".to_string(), None, Some("single"), true),
+            ]
+        );
     }
 }

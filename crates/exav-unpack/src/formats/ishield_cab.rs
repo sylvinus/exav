@@ -1038,8 +1038,8 @@ pub(crate) mod tests {
             return;
         }
         // Inside a ZIP, the member is typed as a cabinet.
-        let mut z = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
-        z.start_file("data1.cab", zip::write::SimpleFileOptions::default())
+        let mut z = crate::zip_write::ZipWriter::new(io::Cursor::new(Vec::new()));
+        z.start_file("data1.cab", crate::zip_write::FileOptions::default())
             .unwrap();
         z.write_all(&cab).unwrap();
         let z = z.finish().unwrap().into_inner();

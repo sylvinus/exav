@@ -130,7 +130,7 @@ Camera RAW previews (`raw`)
 src/formats/image/raw.rs and raw/ are written from TIFF 6.0, the Adobe
 Digital Negative (DNG) Specification 1.7.1.0, Exif 2.32 (CIPA DC-008-2019),
 ITU-T T.81 and ISO/IEC 14496-12, and from CC0 sample files; the repository's
-NOTICE (section 1p) says more. The DNG Specification's patent licence asks
+NOTICE (section 1o) says more. The DNG Specification's patent licence asks
 for this notice:
 
   This product includes DNG technology under license by Adobe.

@@ -80,7 +80,9 @@ Copyright (c) 2024. The YARA-X Authors. All Rights Reserved.
   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Other BSD-3-Clause components linked by exav (same 3-clause terms above, with
-their respective copyright holders): subtle, tlsh2, and, in exav-render's `jxl`
+their respective copyright holders): subtle, tlsh2, the TLSH tables and
+algorithm in exav-core's `yara/modules/tlsh.rs` ("Copyright (c) 2013, Trend
+Micro Incorporated", also offered under Apache-2.0), and, in exav-render's `jxl`
 feature (JPEG XL in @exav/viewer's image module), zenjxl-decoder with its
 zenjxl-decoder-simd and zenjxl-decoder-macros: "Copyright (c) the JPEG XL
 Project Authors. All rights reserved." It is a fork of the libjxl team's
@@ -253,8 +255,8 @@ distributor's choice (both reproduced/referenced elsewhere in this file).
 
 The ZOO structures in crates/exav-unpack/src/formats/zoo_parse.rs are vendored
 and adapted from the same crate, for the same reason the ARJ reader was: linking
-it brings in a second `zip` with default features, and Cargo's feature
-unification then enables the `zip` crate's own LZMA/bzip2/deflate64 decoders
+it brings in the `zip` crate with default features, and Cargo's feature
+unification then enables that crate's own LZMA/bzip2/deflate64 decoders
 inside exav, bypassing exav's per-member budget. Adapted to exav's error
 handling, with the variable-length part of a directory entry (long filename,
 directory name) actually read.
@@ -279,7 +281,7 @@ InstallShield `.z` archives as the `unshield` crate 0.2.0 does, and
 crates/exav-unpack/src/formats/dcl_explode.rs decodes their PKWARE Data
 Compression Library "implode" members as the `explode` crate 0.1.2 does. Both
 crates are MIT. `explode` is a port of Mark Adler's `blast.c` (zlib
-`contrib/blast`, zlib licence, text in section 1l; Copyright (C) Mark Adler),
+`contrib/blast`, zlib licence, text in section 1k; Copyright (C) Mark Adler),
 whose algorithm and code-length tables dcl_explode.rs keeps; it is altered
 from both: it decodes a whole slice into a capped buffer.
 
@@ -547,21 +549,7 @@ Copyright (c) Philippe Lagadec.
 
 
 -------------------------------------------------------------------------------
-1i. aPLib reference (depack), public domain (freeware)
--------------------------------------------------------------------------------
-
-The aPLib depacker in crates/exav-unpack/src/formats/aplib.rs is a clean-room
-implementation of the published aPLib on-disk format. The bit/gamma reader
-follows the algorithm published in the freely-distributable aPLib package's
-reference `depack.c` by Jørgen Ibsen, which the author released for unrestricted
-use ("free to use"). No attribution is legally required; this entry is recorded
-for completeness. It does not derive from any GPL source.
-
-Upstream: https://ibsensoftware.com/products_aPLib.html
-
-
--------------------------------------------------------------------------------
-1j. Microsoft Script Encoder decode tables, public domain
+1i. Microsoft Script Encoder decode tables, public domain
 -------------------------------------------------------------------------------
 
 The substitution/decode tables in crates/exav-unpack/src/formats/screnc.rs are
@@ -573,7 +561,7 @@ Upstream: https://blog.didierstevens.com/programs/
 
 
 -------------------------------------------------------------------------------
-1k. AutoIt-Ripper, MIT (reference implementation)
+1j. AutoIt-Ripper, MIT (reference implementation)
 -------------------------------------------------------------------------------
 
 crates/exav-unpack/src/formats/autoit.rs implements the compiled-AutoIt3 script
@@ -606,7 +594,7 @@ Copyright (c) nazywam and contributors.
 
 
 -------------------------------------------------------------------------------
-1l. NSIS format headers, zlib
+1k. NSIS format headers, zlib
 -------------------------------------------------------------------------------
 
 crates/exav-unpack/src/formats/nsis.rs implements the installer layout (the
@@ -639,7 +627,7 @@ Zlib terms: (C) 2024 Trifecta Tech Foundation.
 
 
 -------------------------------------------------------------------------------
-1m. sevenz-rust2, Apache-2.0 (design reference)
+1l. sevenz-rust2, Apache-2.0 (design reference)
 -------------------------------------------------------------------------------
 
 crates/exav-unpack/src/formats/sevenz/ takes its reader structure from
@@ -653,7 +641,7 @@ Licensed under the Apache License, Version 2.0 (text in section 4).
 
 
 -------------------------------------------------------------------------------
-1n. NewStroke (CC0-1.0) and the viewer's fonts (OFL-1.1)
+1m. NewStroke (CC0-1.0) and the viewer's fonts (OFL-1.1)
 -------------------------------------------------------------------------------
 
 These reach only exav-render's `dwg` feature and the @exav/viewer npm package;
@@ -671,7 +659,7 @@ version, and OFL-1.1.txt the licence.
 
 
 -------------------------------------------------------------------------------
-1o. numbers-parser data (MIT) and the OpenOffice.org Excel format documentation
+1n. numbers-parser data (MIT) and the OpenOffice.org Excel format documentation
 -------------------------------------------------------------------------------
 
 These are the office converters of exav-render (the `office-sheets`,
@@ -703,7 +691,7 @@ read.
 
 
 -------------------------------------------------------------------------------
-1p. Camera RAW previews (exav-render `raw`): specifications and sample files
+1o. Camera RAW previews (exav-render `raw`): specifications and sample files
 -------------------------------------------------------------------------------
 
 crates/exav-render/src/formats/image/raw.rs and raw/ read the previews of
@@ -744,7 +732,7 @@ converter.
 
 
 -------------------------------------------------------------------------------
-1q. Example files of the @exav/viewer demo
+1p. Example files of the @exav/viewer demo
 -------------------------------------------------------------------------------
 
 The @exav/viewer demo lists example files kept in
@@ -759,7 +747,7 @@ test inputs only and are not part of any published package.
 
 
 -------------------------------------------------------------------------------
-1r. IFC geometry (exav-render `ifc`): specifications
+1q. IFC geometry (exav-render `ifc`): specifications
 -------------------------------------------------------------------------------
 
 The curved-face, sweep-parameter, alignment, grid and storey code is written
@@ -769,7 +757,7 @@ definitions of ISO 10303-42. No code from another IFC library was read.
 
 
 -------------------------------------------------------------------------------
-1s. yoke, yoke-derive, zerofrom, zerofrom-derive, Unicode License v3
+1r. yoke, yoke-derive, zerofrom, zerofrom-derive, Unicode License v3
 -------------------------------------------------------------------------------
 
 These crates (the ICU4X project's, linked through hayro-interpret, the PDF
@@ -875,6 +863,7 @@ the distributor's choice. Notable examples:
   sha1, sha2, md-5, digest (RustCrypto)  hashing
   flate2, miniz_oxide                    DEFLATE / gzip / zlib
   delharc, lzxd                          LHA/CAB codecs
+  elf                                    ELF records for YARA's `elf` module
   bitstream-io                           bit-level readers for decoders
   stringprep                             PDF password normalization
   image                                  image decoding (image hashing)
@@ -885,8 +874,8 @@ the distributor's choice. Notable examples:
                                            feature): the tokenizer; MIT,
                                            2021 Markus Unterwaditzer
   hayro-interpret, hayro-syntax,         PDF text in exav-unpack (`text-pdf`
-    hayro-cmap, hayro-postscript           feature, off by default): Apache-2.0
-                                           OR MIT, Laurenz Stampfl
+    hayro-cmap, hayro-font,                feature, off by default): Apache-2.0
+    hayro-postscript                       OR MIT, Laurenz Stampfl
   phf                                    glyph-name tables in hayro; MIT,
                                            2014-2022 Steven Fackler, Yuki
                                            Okushi
@@ -902,7 +891,7 @@ the distributor's choice. Notable examples:
     wasm-bindgen-futures                   the published npm artifact
 
 sevenz-rust2, bzip2, ppmd-rust, lzfse_rust and tar are dev-only: they build
-test fixtures. The shipped 7z reader is native (§1m), the bzip2 decoder is
+test fixtures. The shipped 7z reader is native (§1l), the bzip2 decoder is
 vendored (§1h3), the LZFSE decoder is ported from Apple's (§1h6) and the tar
 reader is exav's own, written from the POSIX and GNU format descriptions.
 
@@ -911,7 +900,7 @@ the MIT text is in the exav LICENSE file): ascii_tree, bcdec_rs (2023 SMG;
 a port of bcdec, MIT or public domain, 2022 Sergii Kudlai), cfb, color_quant,
 deflate64, fax, fax_derive, goblin, lznt1, quick-xml,
 rmp, rmp-serde, ruzstd, scroll, scroll_derive, simd-adler32, slab,
-strsim, xz4rust, zip, zmij, and bytes (`http` features only). fancy-regex and
+strsim, xz4rust, zmij, and bytes (`http` features only). fancy-regex and
 tiff are vendored, and Pillow's resampler ported (§1h5); unshield and explode
 are ported (§1h1).
 
@@ -923,9 +912,9 @@ BSD-3-Clause: yara-x-parser (§1), and subtle (`http` features only). tlsh2 is
 Apache-2.0 OR BSD-3-Clause.
 
 RustCrypto crates are MIT OR Apache-2.0. Offered under Zlib among other
-licenses: miniz_oxide, tinyvec, bytemuck. Zlib: zlib-rs (§1l). Unicode-3.0:
+licenses: miniz_oxide, tinyvec, bytemuck. Zlib: zlib-rs (§1k). Unicode-3.0:
 unicode-ident (build-time), and yoke, yoke-derive, zerofrom and
-zerofrom-derive (§1s). Other permissive
+zerofrom-derive (§1r). Other permissive
 licenses: CDLA-Permissive-2.0 (webpki-roots, TLS root store, `http` features only). The
 dev-only crates add CC0-1.0 / MIT-0 (ppmd-rust) and bzip2-1.0.6
 (libbz2-rs-sys), which reach no shipped artifact.

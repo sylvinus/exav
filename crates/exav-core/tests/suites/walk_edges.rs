@@ -9,6 +9,7 @@ use std::io::Write;
 use exav_core::{
     AllMatchOutcome, ScanOptions, Scanner, Verdict, analyze_all_seekable, scan_seekable,
 };
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()
@@ -169,17 +170,14 @@ fn a_partition_that_is_the_whole_disk_is_skipped() {
 }
 
 fn zip_of(name: &str, data: &[u8], deflated: bool) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let method = if deflated {
-        zip::CompressionMethod::Deflated
+        Method::Deflated
     } else {
-        zip::CompressionMethod::Stored
+        Method::Stored
     };
-    z.start_file(
-        name,
-        zip::write::SimpleFileOptions::default().compression_method(method),
-    )
-    .unwrap();
+    z.start_file(name, FileOptions::default().method(method))
+        .unwrap();
     z.write_all(data).unwrap();
     z.finish().unwrap().into_inner()
 }
@@ -207,18 +205,15 @@ fn a_plain_member_at_the_depth_limit_is_scanned_and_a_container_is_not_opened() 
 
 /// A ZIP of the given `(name, data, deflated)` members, in order.
 fn zip_of_many(members: &[(&str, &[u8], bool)]) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for (name, data, deflated) in members {
         let method = if *deflated {
-            zip::CompressionMethod::Deflated
+            Method::Deflated
         } else {
-            zip::CompressionMethod::Stored
+            Method::Stored
         };
-        z.start_file(
-            *name,
-            zip::write::SimpleFileOptions::default().compression_method(method),
-        )
-        .unwrap();
+        z.start_file(name, FileOptions::default().method(method))
+            .unwrap();
         z.write_all(data).unwrap();
     }
     z.finish().unwrap().into_inner()

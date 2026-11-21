@@ -71,7 +71,15 @@ describe("what the bytes are", () => {
     expect(sniffDocs(bytes("{\\rtf1\\ansi "))).toBe("rtf");
     expect(sniffDocs(bytes("\r\n  {\\rtf1"))).toBe("rtf");
     expect(sniffDocs(bytes([0xef, 0xbb, 0xbf], "{\\rtf1"))).toBe("rtf");
-    expect(sniffDocs(bytes("{\\rt"))).toBeNull();
+    expect(sniffDocs(bytes("{\\r hello}"))).toBeNull();
+  });
+
+  it("reads RTF whose header is only {\\rt", () => {
+    expect(sniffDocs(bytes("{\\rt0\\ansi hello}"))).toBe("rtf");
+    expect(sniffDocs(bytes("{\\rt"))).toBe("rtf");
+    expect(sniffDocs(bytes("\r\n  {\\rt0\\ansi"))).toBe("rtf");
+    expect(sniffDocs(bytes([0xef, 0xbb, 0xbf], "{\\rt0"))).toBe("rtf");
+    expect(sniffDocs(bytes("{\\RT0\\ansi"))).toBeNull();
   });
 
   it("tells the packages apart by their members", () => {
@@ -81,6 +89,9 @@ describe("what the bytes are", () => {
     expect(sniffDocs(zip("[Content_Types].xml ... word/document.xml"))).toBe("docx");
     expect(sniffDocs(zip("[Content_Types].xml ... ppt/presentation.xml"))).toBeNull();
     expect(sniffDocs(zip("Index/Document.iwa Index/DocumentStylesheet.iwa"))).toBe("pages");
+    // Pages '09: an XML package, which `docs` recognises to say it is unsupported.
+    expect(sniffDocs(zip("QuickLook/Thumbnail.jpg index.xml"))).toBe("pages");
+    expect(sniffDocs(zip("Doc.pages/index.xml.gz"))).toBe("pages");
     expect(sniffDocs(zip("Index/Document.iwa Index/Tables/Tile.iwa"))).toBeNull();
     expect(sniffDocs(zip("Index/Document.iwa Index/Slide-1.iwa"))).toBeNull();
     // An OpenDocument package whose mimetype is not first: told by its members, unless they are a deck's or a workbook's.
@@ -165,7 +176,7 @@ function context(data: Uint8Array, options: ConversionOptions, external: boolean
 const EXAV: ConversionOptions = { converter: "exav" };
 
 /** The error `mount` fails with. */
-const failure = async (kind: "doc" | "odt" | "rtf", ctx: RenderContext<ConversionOptions>) => {
+const failure = async (kind: "doc" | "odt" | "rtf" | "pages", ctx: RenderContext<ConversionOptions>) => {
   const { rendererFor } = await import("./convert.js");
   return Promise.resolve(rendererFor(kind).mount(document.createElement("div"), ctx)).then(
     () => null,
@@ -197,14 +208,16 @@ describe("a text document opened with converter: exav", () => {
       ["unreachable", "crashed"],
     ]) {
       convertDocs.mockRejectedValue(new Error(reason));
-      // With an external converter set, as without: it never gets the file.
+      // With an external converter set, as without: an external converter set
+      // gets the file next, and failing too, leaves the first error the file's.
       for (const external of [true, false]) {
+        convertExternal.mockClear();
         const { ctx, nested } = context(DOC, EXAV, external);
         const error = await failure("doc", ctx);
         expect(error, reason).toBeInstanceOf(DocConversionError);
         expect((error as DocConversionError).kind).toBe(kind);
         expect(nested).not.toHaveBeenCalled();
-        expect(convertExternal).not.toHaveBeenCalled();
+        expect(convertExternal).toHaveBeenCalledTimes(external ? 1 : 0);
       }
     }
   });
@@ -261,10 +274,44 @@ describe("a text document opened with converter: exav", () => {
   });
 });
 
+describe("a Pages document", () => {
+  const IWA = zip("Index/Document.iwa Index/DocumentStylesheet.iwa");
+  const XML = zip("QuickLook/Thumbnail.jpg index.xml");
+
+  it("is converted by exav-render's docs, as pages, and shown as DOCX", async () => {
+    const { rendererFor } = await import("./convert.js");
+    convertDocs.mockResolvedValue({ docx: new Uint8Array([1, 2, 3]).buffer, paragraphs: 1, warnings: "" });
+    const { ctx, nested } = context(IWA, {}, false);
+    await rendererFor("pages").mount(document.createElement("div"), ctx);
+    expect(convertDocs).toHaveBeenCalledWith(IWA, "pages", expect.objectContaining({ signal: ctx.signal }));
+    expect((nested.mock.calls[0] as unknown as [unknown, { format: string }])[1].format).toBe("docx");
+  });
+
+  it("fails with the converter's reason when it is a Pages '09 file and no external converter is set", async () => {
+    convertDocs.mockRejectedValue(new Error("unsupported"));
+    const { ctx, nested } = context(XML, {}, false);
+    const error = await failure("pages", ctx);
+    expect(error).toBeInstanceOf(DocConversionError);
+    expect(error).toMatchObject({ kind: "unsupported", format: "pages", message: "the pages file could not be converted: unsupported" });
+    expect(nested).not.toHaveBeenCalled();
+  });
+
+  it("goes on to the external converter when `docs` cannot read it", async () => {
+    const { rendererFor } = await import("./convert.js");
+    convertExternal.mockResolvedValue({ format: "pdf", bytes: new Uint8Array([5]) });
+    convertDocs.mockRejectedValue(new Error("unsupported"));
+    const { ctx, nested } = context(XML, { converter: { pages: "exav" } }, true);
+    await rendererFor("pages").mount(document.createElement("div"), ctx);
+    expect(convertDocs).toHaveBeenCalledTimes(1);
+    expect(convertExternal).toHaveBeenCalledWith(XML, expect.objectContaining({ hint: "pages" }));
+    expect((nested.mock.calls[0] as unknown as [unknown, { format: string }])[1].format).toBe("pdf");
+  });
+});
+
 describe("prefetching a text document", () => {
   it("names nothing for the kinds `docs` converts, whose module is the viewer's, but the external converter's files where it takes them", async () => {
     const { prefetchUrls } = await import("./convert.js");
-    for (const kind of ["doc", "odt", "rtf"] as const) {
+    for (const kind of ["doc", "odt", "rtf", "pages"] as const) {
       expect(await prefetchUrls(kind, "/assets/", EXAV)).toEqual([]);
       expect(await prefetchUrls(kind, "/assets/", {})).toEqual([]);
       // With an external converter set the kind goes to it by default: its module, and what it names.

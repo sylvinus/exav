@@ -32,9 +32,13 @@ memchr = "2"
 md-5 = "0.11"
 sha1 = "0.11"
 sha2 = "0.11"
-# PE and ELF parsing. Without Mach-O, `ar` archives and TE images, which exav
-# reads with its own code or not at all: fewer of goblin's parsers compiled.
-goblin = { version = "0.10", default-features = false, features = ["std", "elf32", "elf64", "pe32", "pe64"] }
+# PE parsing. Without ELF, Mach-O, `ar` archives and TE images, which exav
+# reads with its own code, with the `elf` crate (YARA's `elf` module) or not at
+# all: fewer of goblin's parsers compiled.
+goblin = { version = "0.10", default-features = false, features = ["std", "pe32", "pe64"] }
+# ELF records for YARA's `elf` module: no dependencies and `forbid(unsafe_code)`.
+# Its `to_str` names are not wanted.
+elf = { version = "0.8", default-features = false, optional = true }
 # x86 instruction decoder for the bytecode disasm_x86 API. Decode-only, in the
 # workspace, and dependency-free: a general-purpose decoder covers the whole ISA
 # at the cost of hundreds of `unsafe` blocks, which is a poor trade for one API.
@@ -85,7 +89,7 @@ yara-x-parser = { version = "1.19", optional = true }
 # Byte-oriented regex engine with anchored search: YARA regexp patterns, the
 # `matches` operator and hex patterns (lowered to byte regexes), and the lazy
 # DFAs that run a regex over an object read through the block cache.
-regex-automata = "0.4"
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "perf", "unicode", "meta", "nfa", "hybrid"] }
 # Regex HIR, which the lazy DFAs are built from, and required-literal
 # extraction, used to build the atom prefilter that gates which YARA patterns
 # are scanned. Same crate (and analysis) the `regex` crate uses for its own
@@ -93,7 +97,7 @@ regex-automata = "0.4"
 # match is ever missed).
 regex-syntax = "0.8"
 # base64 alphabet handling for the `base64`/`base64wide` string modifiers.
-base64 = { version = "0.23", optional = true }
+base64 = { version = "0.23", default-features = false, features = ["std"], optional = true }
 # The database file's checksum, and crc32/checksum32 for YARA's `hash` module.
 crc32fast = "1"
 # JSON output for the WASI binary (`wasi-bin`), nothing else.
@@ -134,7 +138,7 @@ image-hash = ["dep:exav-imagehash"]
 # Full YARA rule matching (the native in-tree engine under `src/yara/`). On by
 # default; disable for a smaller build that stores but never matches `.yar`/
 # `.yara` rules (the `YaraDb` type stays present for the on-disk format).
-yara = ["dep:yara-x-parser", "dep:base64"]
+yara = ["dep:yara-x-parser", "dep:base64", "dep:elf"]
 
 # Opt-in DLP structured-data heuristic (credit-card / SSN counting, ClamAV's
 # `--structured-*-count`). Tiny, pure-Rust, no extra deps; on by default. The
@@ -268,8 +272,6 @@ wasi-bin = ["dep:serde_json"]
 # Temp files for tests are `src/tmpfile.rs`, deliberately not a dependency (see
 # the note there): the ready-made crates bring `rustix` + `linux-raw-sys` and
 # their thousands of unsafe blocks along for a page of `std::fs`.
-# only for building test ZIPs in unit tests
-zip = { version = ">=9.0.5, <9.1", default-features = false, features = ["deflate-flate2"] }
 # test fixtures only: build gzip/tar CVD fixtures + gzip scan inputs.
 # `default-features = false` turns off tar's `xattr` support, which is for
 # restoring extended attributes to a real filesystem (these fixtures are built
@@ -277,11 +279,11 @@ zip = { version = ">=9.0.5, <9.1", default-features = false, features = ["deflat
 # into the build at all.
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
-cfb = "0.15"
+cfb = "0.16"
 # Writes the MSZIP cabinets the damaged-member tests break.
 cab = "0.6.0"
 # only for the base64-embedded-executable end-to-end test
-base64 = "0.23"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 # Reads formats/registry.json, which the detection is checked against.
 serde_json = "1.0.154"
 # The reference PPMd8 encoder, for the ZIP method-98 end-to-end test.
@@ -296,8 +298,12 @@ quickcheck = { version = "1.1", default-features = false }
 # Small chunks when reading a source, so tests on small inputs cross many
 # chunk seams. Features only: which formats are built stays with the
 # dependency above. `test-util` is the spill held in memory that the tests
-# hand to a scan.
-exav-unpack = { path = "../exav-unpack", default-features = false, features = ["small-chunks", "test-util"] }
+# hand to a scan, `zip-write` the writer they build their ZIPs with.
+exav-unpack = { path = "../exav-unpack", default-features = false, features = ["small-chunks", "test-util", "zip-write"] }
+
+# Checks the `O_NONBLOCK` value written per target in `src/lib.rs`.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2.191"
 
 # All examples reach into the (unstable) engine internals (the `engine`/
 # `bytecode`/`pe` modules or `Database::engine()`), so they only build with the
@@ -374,6 +380,10 @@ required-features = ["yara"]
 [[test]]
 name = "yara_elf_module"
 required-features = ["yara"]
+
+[[test]]
+name = "exav_wasm_cli"
+required-features = ["wasi-bin"]
 
 # docs.rs builds with every feature on, so the parts gated behind a feature
 # (in particular exav-core's `unstable-internals`) appear on the rendered page

@@ -60,16 +60,6 @@ fn has_extension(name: &str, list: &[&str]) -> bool {
     list.iter().any(|e| lower.ends_with(e))
 }
 
-fn is_rtf(head: &[u8]) -> bool {
-    let h = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
-    let at = h
-        .iter()
-        .take(16)
-        .take_while(|b| b.is_ascii_whitespace())
-        .count();
-    h[at..].starts_with(b"{\\rtf")
-}
-
 /// The XML a flat file's first bytes say it is.
 fn xml_kind(head: &str) -> Option<Doc> {
     if head.contains("urn:schemas-microsoft-com:office:spreadsheet")
@@ -103,11 +93,21 @@ fn xml_kind(head: &str) -> Option<Doc> {
     None
 }
 
+/// Whether `head`, a file's first kilobyte, says it is one of the flat XML
+/// documents read here (SpreadsheetML or Word 2003 XML, a flat
+/// OpenDocument file): a document that HTML's tags in it (a SpreadsheetML
+/// `<Table>`) do not make a page.
+pub(crate) fn flat_xml(head: &[u8]) -> bool {
+    let first = &head[..head.len().min(1024)];
+    let utf16 = first.starts_with(&[0xFF, 0xFE]) || first.starts_with(&[0xFE, 0xFF]);
+    (utf16 || exav_unpack::text::looks_text(first)) && xml_kind(&ascii_head(first, 1024)).is_some()
+}
+
 /// Whether a file or member called `name`, starting with `head` (a kilobyte
 /// is enough), may be an office document read here. Cheap: nothing is
 /// parsed, and a compound file or an archive is told by its name.
 pub fn wants(name: &str, head: &[u8]) -> bool {
-    if is_rtf(head) {
+    if exav_unpack::is_rtf_after_space(head) {
         return true;
     }
     if head.starts_with(&OLE2) {
@@ -143,7 +143,7 @@ fn compound_kinds(data: &[u8]) -> Vec<Doc> {
 /// What kind of document `data` is, when it is one read here.
 fn kind(name: &str, data: &[u8]) -> Option<Doc> {
     let head = &data[..data.len().min(4096)];
-    if is_rtf(head) {
+    if exav_unpack::is_rtf_after_space(head) {
         return Some(Doc::Docs(docs::Format::Rtf));
     }
     if head.starts_with(&OLE2) {
@@ -258,38 +258,146 @@ fn read_all(kinds: &[Doc], data: &[u8], cap: usize, limits: &exav_unpack::Limits
     }
 }
 
+/// The three converters' limits, derived from the scanner's.
+#[derive(Debug, PartialEq, Eq)]
+struct Converters {
+    docs: docs::Limits,
+    sheets: sheets::Limits,
+    slides: slides::Limits,
+}
+
+/// The size the converters' limits follow: the object limit, or when that is
+/// off the extraction budget, or when both are off the object limit's default.
+/// Never unbounded, so a converter's memory always has a ceiling.
+fn bound(limits: &exav_unpack::Limits) -> u64 {
+    [limits.max_buffer_bytes, limits.max_extracted_bytes]
+        .into_iter()
+        .find(|&b| b != u64::MAX)
+        .unwrap_or(exav_unpack::Limits::default().max_buffer_bytes)
+}
+
+/// The converters' limits for a scan under `limits`. Sizes (one part, memory)
+/// are the bound itself; counts grow in proportion to it from their defaults,
+/// which are what the bound's default gives; an input is at least its default.
+fn converters(limits: &exav_unpack::Limits) -> Converters {
+    let bound = bound(limits);
+    let base = exav_unpack::Limits::default().max_buffer_bytes;
+    let count = |n: u64| {
+        let scaled = u128::from(n) * u128::from(bound) / u128::from(base);
+        u64::try_from(scaled).unwrap_or(u64::MAX).max(n)
+    };
+    let count32 = |n: u32| u32::try_from(count(n.into())).unwrap_or(u32::MAX);
+    let (d, s, p) = (
+        docs::Limits::default(),
+        sheets::Limits::default(),
+        slides::Limits::default(),
+    );
+    Converters {
+        docs: docs::Limits {
+            max_input: bound.max(d.max_input),
+            max_memory: bound,
+            max_part: bound,
+            max_paragraphs: count(d.max_paragraphs),
+            max_cells: count(d.max_cells),
+        },
+        sheets: sheets::Limits {
+            max_input: bound.max(s.max_input),
+            max_cells: count(s.max_cells),
+            max_memory: bound,
+            max_part: bound,
+            max_sheets: count32(s.max_sheets),
+        },
+        slides: slides::Limits {
+            max_input: bound.max(p.max_input),
+            max_memory: bound,
+            max_part: bound,
+            max_slides: count32(p.max_slides),
+            max_shapes: count(p.max_shapes),
+        },
+    }
+}
+
 fn read_one(doc: Doc, data: &[u8], cap: usize, limits: &exav_unpack::Limits) -> Option<Read> {
-    let memory = limits.max_buffer_bytes;
+    let c = converters(limits);
     let made = match doc {
-        Doc::Docs(f) => docs::text(
-            data,
-            f,
-            &docs::Limits::default()
-                .with_max_memory(memory.min(docs::Limits::default().max_memory)),
-            cap,
-        )
-        .map_err(|e| (e.kind(), e.to_string())),
-        Doc::Sheets(f) => sheets::text(
-            data,
-            f,
-            &sheets::Limits::default()
-                .with_max_memory(memory.min(sheets::Limits::default().max_memory)),
-            cap,
-        )
-        .map_err(|e| (e.kind(), e.to_string())),
-        Doc::Slides(f) => slides::text(
-            data,
-            f,
-            &slides::Limits::default()
-                .with_max_memory(memory.min(slides::Limits::default().max_memory)),
-            cap,
-        )
-        .map_err(|e| (e.kind(), e.to_string())),
+        Doc::Docs(f) => docs::text(data, f, &c.docs, cap).map_err(|e| (e.kind(), e.to_string())),
+        Doc::Sheets(f) => {
+            sheets::text(data, f, &c.sheets, cap).map_err(|e| (e.kind(), e.to_string()))
+        }
+        Doc::Slides(f) => {
+            slides::text(data, f, &c.slides, cap).map_err(|e| (e.kind(), e.to_string()))
+        }
     };
     match made {
         Ok(t) => Some(Read::Text(t)),
         // Not that kind of file after all: nothing to say.
         Err(("not-format", _)) => None,
         Err((kind, why)) => Some(Read::Unreadable(format!("{kind}: {why}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: u64 = 1 << 20;
+
+    fn with_object(bytes: u64) -> exav_unpack::Limits {
+        let mut l = exav_unpack::Limits::default();
+        l.max_buffer_bytes = bytes;
+        l
+    }
+
+    #[test]
+    fn the_default_object_limit_gives_the_numbers_the_converters_always_had() {
+        assert_eq!(
+            converters(&exav_unpack::Limits::default()),
+            Converters {
+                docs: docs::Limits::default().with_max_memory(256 * MIB),
+                sheets: sheets::Limits::default().with_max_memory(256 * MIB),
+                slides: slides::Limits::default().with_max_memory(256 * MIB),
+            }
+        );
+    }
+
+    #[test]
+    fn a_raised_object_limit_raises_sizes_to_it_and_counts_in_proportion() {
+        let c = converters(&with_object(2048 * MIB));
+        assert_eq!(c.docs.max_memory, 2048 * MIB);
+        assert_eq!(c.docs.max_part, 2048 * MIB);
+        assert_eq!(c.docs.max_input, 2048 * MIB);
+        assert_eq!(c.docs.max_paragraphs, 40_000_000);
+        assert_eq!(c.docs.max_cells, 16_000_000);
+        assert_eq!(c.sheets.max_input, 2048 * MIB);
+        assert_eq!(c.sheets.max_cells, 32_000_000);
+        assert_eq!(c.sheets.max_sheets, 32_768);
+        assert_eq!(c.slides.max_slides, 80_000);
+        assert_eq!(c.slides.max_shapes, 8_000_000);
+    }
+
+    #[test]
+    fn a_lowered_object_limit_lowers_sizes_but_not_counts() {
+        let c = converters(&with_object(8 * MIB));
+        assert_eq!(c.sheets.max_memory, 8 * MIB);
+        assert_eq!(c.sheets.max_part, 8 * MIB);
+        assert_eq!(c.sheets.max_input, 256 * MIB);
+        assert_eq!(c.sheets.max_cells, sheets::Limits::default().max_cells);
+        assert_eq!(
+            c.docs.max_paragraphs,
+            docs::Limits::default().max_paragraphs
+        );
+    }
+
+    #[test]
+    fn with_the_object_limit_off_the_converters_follow_the_extraction_budget() {
+        let mut l = with_object(u64::MAX);
+        let c = converters(&l);
+        assert_eq!(c.docs.max_memory, l.max_extracted_bytes);
+        assert_eq!(c.sheets.max_cells, 4 * sheets::Limits::default().max_cells);
+        // Both off: the object limit's default, never unbounded.
+        l.max_extracted_bytes = u64::MAX;
+        let c = converters(&l);
+        assert_eq!(c.slides.max_memory, 256 * MIB);
+        assert_eq!(c.slides.max_part, 256 * MIB);
     }
 }

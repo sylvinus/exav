@@ -9,6 +9,10 @@ use lzma_rust2::{Action, Lzma2Stream, LzmaStream, Status, StreamResult};
 /// Errors are deferred: a read hands over what it decoded before one, and for
 /// a stream the file ends inside, the symbols of its last bytes too, which the
 /// sans-I/O decoder keeps back (the rest is absent: `UnexpectedEof`).
+#[cfg_attr(
+    not(any(feature = "sevenz", all(feature = "zip", feature = "lzip"))),
+    allow(dead_code)
+)]
 pub(crate) fn member_reader<'a>(
     raw: impl Read + 'a,
     size: u64,
@@ -35,6 +39,7 @@ pub(crate) trait Process {
 
     /// Bytes of input the stream used, not counting what it took in ahead of
     /// its end. Only an LZMA stream says; the other counts what it took in.
+    #[cfg_attr(not(feature = "lzip"), allow(dead_code))]
     fn used_input(&self) -> u64;
 }
 

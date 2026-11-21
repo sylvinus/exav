@@ -123,7 +123,9 @@ export function createFetcher(first: Address, resolve: Resolve | null, signal: A
       for (let attempt = 0; ; attempt++) {
         const { url, init } = await at;
         const headers = span ? { ...Object.fromEntries(new Headers(init?.headers).entries()), range: header(span) } : init?.headers;
-        const response = await fetch(url, { ...init, headers, signal: requestSignal });
+        // A part kept in the browser's cache is joined to a later request for
+        // the whole file, which of a compressed answer gives broken bytes.
+        const response = await fetch(url, { ...init, headers, signal: requestSignal, ...(span && { cache: "no-store" as const }) });
         if ((response.status === 401 || response.status === 403) && resolve && attempt === 0) {
           void response.body?.cancel();
           at = resign(at);
@@ -142,13 +144,23 @@ export function createFetcher(first: Address, resolve: Resolve | null, signal: A
  *   `ranged`: false when the server ignored the range and answered 200.
  * - `unreadable`: a 206 whose Content-Range the page cannot read (across
  *   origins it must be exposed); `bytes` are what the body began with.
+ * - `encoded`: the server compressed its answer (`Content-Encoding`), so
+ *   the range is of the compressed bytes and what the browser decodes is not
+ *   the span. The file can be read whole, which the browser decodes.
  * - `refused`: any other answer, or one that is not the bytes asked for.
  */
 export type Answer =
   | { kind: "empty" }
   | { kind: "part"; bytes: Uint8Array; total: number | null; ranged: boolean }
   | { kind: "unreadable"; bytes: Uint8Array }
+  | { kind: "encoded" }
   | { kind: "refused"; status: number; why: string };
+
+/** Whether a response's body has a content coding, as far as this page may read its headers. */
+function encoded(response: Response): boolean {
+  const coding = response.headers.get("content-encoding")?.trim().toLowerCase();
+  return !!coding && coding !== "identity";
+}
 
 /** A 200, handed back unread to a caller that asked to keep it. */
 export type Whole = { kind: "whole"; response: Response };
@@ -193,6 +205,10 @@ export async function requestRange(http: Fetcher, span: Span, signal: AbortSigna
     return { kind: "part", bytes: joinChunks(body), total, ranged: false };
   }
   if (response.status !== 206) return refuse();
+  if (encoded(response)) {
+    void response.body?.cancel();
+    return { kind: "encoded" };
+  }
   const got = contentRange(response.headers.get("content-range"));
   if (!got) {
     const body = await bodyChunks(response, "from" in span ? span.to - span.from + 1 : span.suffix);

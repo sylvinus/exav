@@ -935,6 +935,16 @@ impl RuleCtx<'_> {
             Some(obj) => {
                 let module = match self.resolve_module_expr(obj)? {
                     Resolved::Module(kind) => kind,
+                    r @ (Resolved::Access(..) | Resolved::VarAccess(..)) if name == "len" => {
+                        if !fc.args.is_empty() {
+                            return Err(Error::new("`len()` takes no arguments"));
+                        }
+                        let (node, cond) = self.typed_access(r)?;
+                        if node.iterable().is_none() {
+                            return Err(Error::new("`len()` applies to an array or a map"));
+                        }
+                        return Ok(Cond::Len(Box::new(cond)));
+                    }
                     _ => {
                         return Err(Error::unsupported(format!(
                             "method call `{name}()` on a non-module value"
@@ -949,6 +959,27 @@ impl RuleCtx<'_> {
                 let func = modules::resolve_func(module, name, &args)?;
                 Ok(Cond::ModCall(func, args))
             }
+        }
+    }
+
+    /// A resolved module or variable chain as its condition and the schema
+    /// node it ends on.
+    fn typed_access(&self, r: Resolved) -> Result<(SchemaNode, Cond)> {
+        match r {
+            Resolved::Access(kind, path) => {
+                let node = module_terminal_node(kind, &path)?;
+                let cond = self.resolved_to_cond(Resolved::Access(kind, path))?;
+                Ok((node, cond))
+            }
+            Resolved::VarAccess(slot, node, path) => {
+                let cond = if path.is_empty() {
+                    Cond::Var(slot)
+                } else {
+                    Cond::VarAccess(slot, path)
+                };
+                Ok((node, cond))
+            }
+            _ => Err(Error::new("expected a module field or a bound variable")),
         }
     }
 
@@ -1273,17 +1304,8 @@ impl RuleCtx<'_> {
             match self.resolve_module_expr(e)? {
                 Resolved::Value(c) => return Ok((c, VarKind::Scalar)),
                 Resolved::VarValue(slot) => return Ok((Cond::Var(slot), VarKind::Scalar)),
-                Resolved::Access(kind, path) => {
-                    let node = module_terminal_node(kind, &path)?;
-                    let cond = self.resolved_to_cond(Resolved::Access(kind, path))?;
-                    return Ok((cond, node_var_kind(node)));
-                }
-                Resolved::VarAccess(slot, node, path) => {
-                    let cond = if path.is_empty() {
-                        Cond::Var(slot)
-                    } else {
-                        Cond::VarAccess(slot, path)
-                    };
+                r @ (Resolved::Access(..) | Resolved::VarAccess(..)) => {
+                    let (node, cond) = self.typed_access(r)?;
                     return Ok((cond, node_var_kind(node)));
                 }
                 Resolved::Module(kind) => {
@@ -1319,19 +1341,7 @@ impl RuleCtx<'_> {
             I::Expr(e) => {
                 // Must be a module array/map value.
                 let (node, cond) = match self.resolve_module_expr(e)? {
-                    Resolved::Access(kind, path) => {
-                        let node = module_terminal_node(kind, &path)?;
-                        let cond = self.resolved_to_cond(Resolved::Access(kind, path))?;
-                        (node, cond)
-                    }
-                    Resolved::VarAccess(slot, node, path) => {
-                        let cond = if path.is_empty() {
-                            Cond::Var(slot)
-                        } else {
-                            Cond::VarAccess(slot, path)
-                        };
-                        (node, cond)
-                    }
+                    r @ (Resolved::Access(..) | Resolved::VarAccess(..)) => self.typed_access(r)?,
                     _ => {
                         return Err(Error::new(
                             "expression is not iterable (expected an array or map)",

@@ -37,8 +37,8 @@ export type ConvertProgress =
 /** What the viewer hands `convert`. */
 export interface ExternalConvertOptions {
   /**
-   * What the viewer took the file for: "rtf", "doc", "odt", "ppt", "odp",
-   * "keynote", "xls", "ods", "numbers", "odg", "visio", "coreldraw",
+   * What the viewer took the file for: "rtf", "doc", "odt", "pages", "ppt",
+   * "odp", "keynote", "xls", "ods", "numbers", "odg", "visio", "coreldraw",
    * "publisher", "pagemaker", "freehand", "quarkxpress", "zonerdraw" or
    * "wpg". A hint: the bytes decide, and a converter may refuse a file that
    * is not what it was said to be.

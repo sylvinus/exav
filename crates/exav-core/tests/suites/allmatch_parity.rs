@@ -16,6 +16,7 @@
 //! This test pins the invariant rather than the one bug.
 
 use exav_core::{ScanOptions, Scanner, analyze, analyze_all, loader};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::io::Write;
 
 /// A macro-stream signature: `Target:2` (OLE2) with a literal body, the exact
@@ -232,9 +233,8 @@ fn zip_with_oversized_member(payload_tail: &[u8]) -> Vec<u8> {
     body.extend_from_slice(payload_tail);
     let mut out = Vec::new();
     {
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
-        let o = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+        let mut z = ZipWriter::new(std::io::Cursor::new(&mut out));
+        let o = FileOptions::default().method(Method::Deflated);
         z.start_file("big.bin", o).unwrap();
         std::io::Write::write_all(&mut z, &body).unwrap();
         z.finish().unwrap();
@@ -520,11 +520,10 @@ fn allmatch_reports_every_signature_inside_a_single_streamed_member() {
     // not Stored: a stored member's bytes appear verbatim in the container, so
     // the top-level raw scan would find both signatures without the walk ever
     // being involved, and the test would pass no matter what the walk did.
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     z.start_file(
         "payload.txt",
-        zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated),
+        FileOptions::default().method(Method::Deflated),
     )
     .expect("start zip member");
     z.write_all(&member).expect("write zip member");

@@ -115,12 +115,13 @@ be named) and carries nothing else. Everything else goes over the port:
 
 | From | Messages |
 |---|---|
-| host | `open` (the file as its delivery says, below; its name and type, the paths of the files around it when it has a tree, the formats, the plugin options as plain data, the theme, its highlights), `command` (go to a page, zoom, fit, a layer on or off, a layout, the ground, open or leave an archive member, a sheet, play, pause, seek, the volume, set the highlights or go to one), `bytes` (the answer to a `read` or a `fetch`), `theme` (the page's colours again), `replace` (the next document of the session, delivered as `open` delivers the first), `raster` and `unraster` (a page as a picture, with its size and region; stop drawing it), `watch` and `unwatch` (follow the viewport, whose upkeep costs: from a first listener or a read to the last one leaving), `sniff` (what a file is, from its first bytes or its address) |
-| frame | `ready` (with its page's policy, and the formats it was published for), `status`, `controllers` and `state` (each controller's value; the viewport's only while the host watches it), `done` (a command finished), `replaced` (a `replace` finished, or refused), `link`, `read` and `cancel` (bytes of a file read by ranges, the read naming the document it is for), `fetch` (a whole file of the tree the host listed, by its path), `key` (a key the document did not use), `rastered` (the picture asked for, with the region it shows, or why there is none), `sniffed` (the format a `sniff` found, or none) |
+| host | `open` (the file as its delivery says, below; its name and type, the paths of the files around it when it has a tree, the formats, the plugin options as plain data, the theme, its highlights), `command` (go to a page, zoom, fit, a layer on or off, a layout, the ground, open or leave an archive member, a sheet, play, pause, seek, the volume, set the highlights or go to one), `bytes` (the answer to a `read` or a `fetch`), `theme` (the page's colours again), `replace` (the next document of the session, delivered as `open` delivers the first), `raster` and `unraster` (a page as a picture, with its size and region; stop drawing it), `watch` and `unwatch` (follow the viewport, whose upkeep costs: from a first listener or a read to the last one leaving), `sniff` (what a file is, from its first bytes or its address), `ping` (whether the frame's main thread still runs) |
+| frame | `ready` (with its page's policy, and the formats it was published for), `status`, `controllers` and `state` (each controller's value; the viewport's only while the host watches it), `done` (a command finished), `replaced` (a `replace` finished, or refused), `link`, `read` and `cancel` (bytes of a file read by ranges, the read naming the document it is for), `fetch` (a whole file of the tree the host listed, by its path), `key` (a key the document did not use), `rastered` (the picture asked for, with the region it shows, or why there is none), `sniffed` (the format a `sniff` found, or none), `pong` (the answer to a `ping`) |
 
-The protocol is versioned: the frame says which in `ready` (`PROTOCOL`, now 7),
+The protocol is versioned: the frame says which in `ready` (`PROTOCOL`, now 8),
 and a host that does not speak it refuses the frame, so the page and the frame
-must come from the same release. Version 7 added the file's highlights to
+must come from the same release. Version 8 added `ping` and `pong`
+(`frameTimeoutMs`). Version 7 added the file's highlights to
 `open`, the `highlights` controller (where each one is: its id, state, page
 and boxes, never its label or text, which the host keeps) and its `set` and
 `goTo` commands. Version 6 added `sniff` and `sniffed` (the detection below),
@@ -135,7 +136,8 @@ A file shown with others around it (a drawing with the files its external
 references name, a split archive's parts) has a tree: the host lists the paths
 in `open`, and the frame asks for a file by one of them with `fetch`. The host
 answers only for a path it listed, spelled as it listed it, reads at most
-256 MiB for it and keeps eight reads and fetches outstanding at most; any other
+256 MiB for all its fetches together (a download whose size is not known is
+stopped there) and keeps eight reads and fetches outstanding at most; any other
 path, a file too large or a tree the file has none of is refused. A frame can
 know, then, only the names the user gave the page together with the file, and
 read no file the page did not hold.
@@ -179,8 +181,9 @@ checks it too: known properties only, colours, lengths and font names, so
 that nothing in it is a URL.
 
 A link the user follows in a document (a PDF's links, Word, Excel and
-PowerPoint hyperlinks) becomes a `link` message. The host takes absolute `http:` and
-`https:` URLs only, asks first (`confirmLink`, by default the browser's
+PowerPoint hyperlinks, a Markdown file's) becomes a `link` message. The host takes absolute `http:` and
+`https:` URLs and `mailto:` addresses only (an address the frame is given
+to read is `http:` or `https:` always), asks first (`confirmLink`, by default the browser's
 `confirm`, translated in the React UI), one question at a time, and opens
 it with `noopener,noreferrer`. It asks only when the user has just clicked
 or pressed a key, in the page or in the frame (an activation in a frame
@@ -232,9 +235,10 @@ answers the first range request with the whole file (`200`), or without a
 `Content-Range` it can read, gets a whole download instead, and the viewer
 says so (a `source_read_whole` warning), as does the console.
 
-For `"url"`, the host gives only an absolute `http(s)` address, without
-credentials in it, from a source without `init` (an element cannot send
-headers), on one of the origins the frame's policy names. With an explicit
+For `"url"`, the host gives only an absolute `http(s)` address of at most
+2,048 characters, without credentials in it, from a source without `init`
+(an element cannot send headers), on one of the origins the frame's policy
+names. With an explicit
 `"url"`, any other address is an error before the frame gets anything; by
 default, the file goes as a `Blob`. The image engine shows such an image
 without `crossOrigin`, so nothing in the frame reads its pixels back.
@@ -331,7 +335,10 @@ package is updated. The frame's files are named without hashes: serve them
 
 The host page's `frame-src` and `child-src` must name the frame's origin
 and nothing else: they are what keeps the frame from navigating to any
-other address (see "Its own policy"). In this mode the page needs none of
+other address (see "Its own policy"). A page whose policy does not name it
+fails the session at once, with the origin to add; browsers report the
+refusal as `frame-src` whichever of `frame-src`, `child-src` or
+`default-src` applied. In this mode the page needs none of
 what the engines need: no `worker-src blob:`, no `blob:` sources, no
 `'unsafe-inline'` styles; `img-src blob:` only to print (`printPictures`).
 
