@@ -14,7 +14,8 @@
 //! `random.Random(77)`, whose rejoined archive (`zip -s 0`) holds the payload.
 
 use exav_core::{
-    ScanOptions, Scanner, Verdict, analyze, analyze_split_sets, analyze_split_sets_seekable, loader,
+    AllMatchOutcome, ScanOptions, Scanner, Verdict, analyze, analyze_split_sets,
+    analyze_split_sets_seekable, analyze_split_sets_seekable_all, loader,
 };
 use std::cell::RefCell;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
@@ -401,6 +402,33 @@ fn rar_sets_are_scanned_where_their_volumes_lie() {
     }
 }
 
+/// A set read where it lies lists every signature its member matches with the
+/// `_all` entry point, and the first one only with the other.
+#[test]
+fn a_set_listed_with_every_detection_reports_all_of_them() {
+    // The MD5 of the other member of the set, `text.txt`.
+    let text_md5 = "f704b62a1885c3912e30df545aca774a";
+    let scanner = db(&[(
+        "t.hdb",
+        &format!("{NOISE_MD5}:20000:Test.Noise\n{text_md5}:14661:Test.Text\n"),
+    )]);
+    let opts = ScanOptions::default();
+    let parts = ["set5.part1.rar", "set5.part2.rar", "set5.part3.rar"];
+    let open = |n: &str| Ok(Cursor::new(fixture(n)));
+    let first = analyze_split_sets_seekable(&scanner, &names(&parts), &opts, open);
+    assert_eq!(first.len(), 3);
+    assert!(first.iter().all(|v| infected(&v.report.verdict).is_some()));
+    let all = analyze_split_sets_seekable_all(&scanner, &names(&parts), &opts, open);
+    assert_eq!(all.len(), 3);
+    for m in &all {
+        let mut found: Vec<&str> = m.found.iter().map(|(n, _)| n.as_str()).collect();
+        found.sort();
+        assert_eq!(found, ["Test.Noise", "Test.Text"], "{}", m.name);
+        assert_eq!(m.outcome, AllMatchOutcome::Complete);
+        assert_eq!(m.set, "set5.rar");
+    }
+}
+
 #[test]
 fn a_rar_set_the_seekable_form_cannot_join_is_reported_not_dropped() {
     let scanner = db(&[("t.hdb", &format!("{NOISE_MD5}:20000:Test.Noise\n"))]);
@@ -654,5 +682,71 @@ fn a_set_with_a_volume_that_fails_where_no_member_is_read_is_not_clean() {
             panic!("{}: {:?}", v.name, v.report.verdict);
         };
         assert!(reason.contains("the disk is gone"), "{reason}");
+    }
+}
+
+/// A set whose last volume is cut inside the member is scanned as far as the
+/// volumes go, and gives what an archive cut at the same place gives: a
+/// signature in what is there is found, one in the part cut off is not (it is
+/// absent, as in the single file). A set that ends where the member goes on, in
+/// a volume not given, finds the same and is not clean.
+#[test]
+fn a_rar_set_whose_last_volume_is_cut_is_scanned_as_far_as_it_goes() {
+    const HEAD: &[u8] = b"EXAV-SET-HEAD-MARKER";
+    const TAIL: &[u8] = b"EXAV-SET-TAIL-MARKER";
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let mut payload: Vec<u8> = (0..99_999).map(|i| (i * 7 % 251) as u8).collect();
+    payload[100..100 + HEAD.len()].copy_from_slice(HEAD);
+    payload[95_000..95_000 + TAIL.len()].copy_from_slice(TAIL);
+    let vols = rar5_set(&payload, &[b' '; 70_000]);
+    // The third volume ends inside the third share of the member.
+    let mut cut = vols.clone();
+    cut[2].truncate(20_000);
+    // The same member in one archive, cut after 60,000 bytes of it.
+    let header = member5("big.bin", 0, payload.len(), &[]).len();
+    let mut single = b"Rar!\x1a\x07\x01\x00".to_vec();
+    single.extend(block5([1, 0, 0].map(vint).concat()));
+    single.extend(member5("big.bin", 0, payload.len(), &payload));
+    single.truncate(single.len() - payload.len() + 60_000);
+    assert!(single.len() > header + 60_000);
+
+    let given = names(&["big.part1.rar", "big.part2.rar", "big.part3.rar"]);
+    let opts = ScanOptions::default();
+    for (what, set, which) in [
+        ("cut", &cut, &given[..]),
+        ("last not given", &vols, &given[..2]),
+    ] {
+        for (marker, found) in [(HEAD, true), (TAIL, false)] {
+            let sig = format!("Test.Marker:0:*:{}\n", hex(marker));
+            let scanner = db(&[("t.ndb", &sig)]);
+            let file = |n: &str| set[usize::from(n.as_bytes()[8] - b'1')].clone();
+            let got = [
+                analyze_split_sets(&scanner, which, &opts, |n, _| Ok(file(n))),
+                analyze_split_sets_seekable(&scanner, which, &opts, |n| Ok(Cursor::new(file(n)))),
+            ];
+            for got in got {
+                assert_eq!(got.len(), which.len(), "{what}");
+                for v in &got {
+                    let name =
+                        format!("{what}: {} for {}", v.name, String::from_utf8_lossy(marker));
+                    match (found, what) {
+                        (true, _) => {
+                            assert_eq!(infected(&v.report.verdict), Some("Test.Marker"), "{name}")
+                        }
+                        // The cut file's own answer, which the set gives too.
+                        (false, "cut") => {
+                            let alone = analyze(&scanner, &single, &opts);
+                            assert!(matches!(alone.verdict, Verdict::Clean), "{name}");
+                            assert!(matches!(v.report.verdict, Verdict::Clean), "{name}");
+                        }
+                        (false, _) => assert!(
+                            matches!(v.report.verdict, Verdict::Unscannable { .. }),
+                            "{name}: {:?}",
+                            v.report.verdict
+                        ),
+                    }
+                }
+            }
+        }
     }
 }

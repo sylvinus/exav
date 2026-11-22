@@ -231,10 +231,15 @@ fn handle(
 fn clamd(r: Box<dyn Read + Send>, mut w: &mut dyn Write, version: &dyn Fn() -> String) {
     let mut r = BufReader::new(r);
     for _ in 0..8 {
-        let Ok(Some((cmd, delim))) = daemon::read_command(&mut r) else {
-            return;
+        let (cmd, delim) = match daemon::read_command(&mut r) {
+            Ok(Some(c)) => c,
+            Ok(None) => return,
+            Err(e) => {
+                daemon::write_refusal(&mut w, None, &e);
+                return;
+            }
         };
-        let word = cmd.split_whitespace().next().unwrap_or("");
+        let word = daemon::Command::parse(&cmd).word;
         let reply = if word.eq_ignore_ascii_case("PING") {
             "PONG".to_string()
         } else if word.eq_ignore_ascii_case("VERSION") {
@@ -244,7 +249,7 @@ fn clamd(r: Box<dyn Read + Send>, mut w: &mut dyn Write, version: &dyn Fn() -> S
         } else {
             "health listener: only PING, VERSION and STATS are answered ERROR".to_string()
         };
-        if daemon::write_reply(&mut w, None, &reply, delim).is_err() {
+        if daemon::write_reply(&mut w, None, reply.as_bytes(), delim).is_err() {
             return;
         }
     }
@@ -295,7 +300,7 @@ pub(crate) fn spawn(listeners: Vec<Listener>, version: Version) {
 pub(crate) fn side_listener(listeners: Vec<Listener>) -> daemon::SideListener {
     let listeners: Vec<Arc<Listener>> = listeners.into_iter().map(Arc::new).collect();
     daemon::SideListener {
-        name: "health",
+        name: "health".to_string(),
         serve: Box::new(move |db, _opts, retire| {
             let line = daemon::clamav_version(&db);
             let version: Version = Arc::new(move || line.clone());
@@ -410,6 +415,16 @@ mod tests {
         assert!(reply.starts_with("POOLS: 1"), "{reply}");
         assert!(reply.contains("SCANSTATS: scans "), "{reply}");
         assert!(reply.trim_end().ends_with("END"), "{reply}");
+    }
+
+    /// A command the listener cannot read is answered, in its framing, before
+    /// the connection closes: the scan listener's reply for the same command.
+    #[test]
+    fn clamd_answers_a_command_it_refuses_to_read() {
+        let mut long = b"nPING ".to_vec();
+        long.resize(200_000, b'x');
+        let reply = answer(Proto::Clamd, &long);
+        assert_eq!(reply, "command line exceeds limit ERROR\n");
     }
 
     #[test]

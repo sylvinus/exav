@@ -207,8 +207,8 @@ fn hash_matchable(size: u64) -> bool {
 /// ask makes one read for all of them.
 pub(crate) struct Facts<'a> {
     data: &'a dyn ByteSource,
-    /// What [`unpack::detect`] makes of it: for an object with no magic at its
-    /// start, detection searches all of it.
+    /// What [`unpack::detect`] makes of it: it reads the start of the object,
+    /// its end, and the places its structure names.
     fmt: std::cell::OnceCell<Option<unpack::Format>>,
     /// Its whole-object digests, for the allowlist and the hash signatures.
     digests: std::cell::OnceCell<hashes::Digests>,
@@ -230,7 +230,8 @@ pub(crate) struct Facts<'a> {
     /// What that read found of YARA's patterns: those slated to run, and
     /// their matches.
     yara_pass: std::cell::RefCell<Option<yara::YaraPass>>,
-    /// Whether the object holds a UPX pack header, once asked.
+    /// Whether the object holds a UPX pack header in its start: known once
+    /// detection has read the start, else once asked.
     upx: std::cell::OnceCell<bool>,
     /// How often each byte occurs in it, when that read counted them.
     counts: std::cell::OnceCell<Box<[u64; 256]>>,
@@ -293,7 +294,13 @@ impl<'a> Facts<'a> {
     }
 
     pub(crate) fn format(&self) -> Option<unpack::Format> {
-        *self.fmt.get_or_init(|| unpack::detect(self.data))
+        *self.fmt.get_or_init(|| {
+            let (format, upx) = unpack::detect_with_upx(self.data);
+            if let Some(upx) = upx {
+                let _ = self.upx.set(upx);
+            }
+            format
+        })
     }
 
     /// The digests the allowlist and the hash signatures of `db` can match at
@@ -705,7 +712,9 @@ fn one_line(reason: String) -> String {
 #[non_exhaustive]
 pub struct ScanOptions {
     /// Max bytes for a single top-level file. `None` = unlimited (default).
-    /// Exceeding yields `LimitsExceeded`.
+    /// Exceeding yields `LimitsExceeded`. Applied by [`scan_seekable`] and the
+    /// scans over a reader; [`analyze`] and the other functions over a slice
+    /// scan the slice whole.
     pub max_scan_size: Option<u64>,
     /// Memory of the block cache of an object read in place, in bytes
     /// (`--object-cache-bytes`): an object past `limits.max_buffer_bytes`, a spilled
@@ -755,6 +764,13 @@ pub struct ScanOptions {
     /// (`LIMITS-EXCEEDED`) unless something is found. `None` = no limit.
     /// Default 100,000,000.
     pub max_regex_steps: Option<u64>,
+    /// Steps the conditions of the YARA rules may take in one scan, all the
+    /// rules together (`--max-yara-steps`). A rule's range loop takes its
+    /// bounds from the rule, not from the object. A condition that runs out
+    /// does not match, nor do those after it, and the scan is incomplete
+    /// (`LIMITS-EXCEEDED`) unless something is found. `None` = no limit.
+    /// Default 20,000,000, also under `--clamav-compat`.
+    pub max_yara_steps: Option<u64>,
     /// Steps the verifier of the body signatures with wildcards and gaps may
     /// take per MiB of an object (`--max-matcher-steps`), counted for an
     /// object of at least 256 MiB: one that size or smaller has 256 times this
@@ -860,12 +876,13 @@ pub struct ScanOptions {
     pub verify_checksums: bool,
     /// DLP structured-data heuristic (ClamAV `--structured-cc-count`): alert with
     /// `Heuristics.Structured.CreditCardNumber` when a textual buffer contains at
-    /// least this many valid credit-card numbers. `None` (default) = off. Requires
-    /// the `dlp` feature.
+    /// least this many valid credit-card numbers (`Some(0)` is 1). `None`
+    /// (default) = off. Requires the `dlp` feature.
     pub structured_cc_count: Option<u32>,
     /// DLP structured-data heuristic (ClamAV `--structured-ssn-count`): alert with
     /// `Heuristics.Structured.SSN` when a textual buffer contains at least this
-    /// many valid US SSNs. `None` (default) = off. Requires the `dlp` feature.
+    /// many valid US SSNs (`Some(0)` is 1). `None` (default) = off. Requires the
+    /// `dlp` feature.
     pub structured_ssn_count: Option<u32>,
     /// Opt-in ClamAV heuristic (`--alert-encrypted`): report an encrypted /
     /// password-protected member as `Heuristics.Encrypted.*` (a detection)
@@ -1032,6 +1049,7 @@ impl Default for ScanOptions {
             http_spill: false,
             max_pcre_bytes: None,
             max_regex_steps: Some(engine::DEFAULT_REGEX_STEPS as u64),
+            max_yara_steps: Some(engine::DEFAULT_YARA_STEPS),
             max_matcher_steps: Some(engine::DEFAULT_MATCHER_STEPS),
             min_scan_bytes: MIN_SCAN_BYTES,
             heuristics: false,
@@ -1094,6 +1112,7 @@ impl ScanOptions {
             // ClamAV's PCREMaxFileSize default.
             max_pcre_bytes: Some(100 * 1024 * 1024),
             max_regex_steps: Some(engine::DEFAULT_REGEX_STEPS as u64),
+            max_yara_steps: Some(engine::DEFAULT_YARA_STEPS),
             max_matcher_steps: Some(engine::DEFAULT_MATCHER_STEPS),
             min_scan_bytes: MIN_SCAN_BYTES,
             // exav-exclusive TLSH/ML stay off (they'd be diff-run false positives);
@@ -1356,7 +1375,8 @@ impl Scanner {
 /// Scan a local file: [`scan_seekable`] over the opened file, with its path
 /// as the YARA `filepath`/`filename`/`extension` unless `opts.filename` is
 /// set. The file must be able to seek; a FIFO or other stream is buffered by
-/// the caller first.
+/// the caller first. A FIFO named here is an [`io::ErrorKind::Unsupported`]
+/// error, and the open does not wait for a writer.
 ///
 /// # Errors
 ///
@@ -1377,9 +1397,87 @@ impl Scanner {
 /// arbitrary input needs an out-of-process bound; see `SECURITY.md`.
 pub fn scan_path(db: &Scanner, path: &Path, opts: &ScanOptions) -> io::Result<ScanReport> {
     let opts = named(opts, path);
-    let file = File::open(path)?;
-    let size = file.metadata()?.len();
+    let (file, size) = open_file(path)?;
     scan_seekable(db, file, size, &opts)
+}
+
+/// The platform's `O_NONBLOCK`, whose value differs between systems and, on
+/// Linux, between architectures. Written here rather than taken from the
+/// `libc` crate; a test compares it with `libc`'s.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "mips32r6",
+        target_arch = "mips64r6"
+    )
+))]
+const O_NONBLOCK: i32 = 0o200;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "sparc", target_arch = "sparc64")
+))]
+const O_NONBLOCK: i32 = 0x4000;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "mips32r6",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    ))
+))]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+const O_NONBLOCK: i32 = 0x4;
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+const O_NONBLOCK: i32 = 0x80;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))
+))]
+compile_error!("O_NONBLOCK is not written for this system: add its value next to the others");
+
+/// Open `path` to be read, with its size. A FIFO is refused, as a file that
+/// cannot be scanned in place: the type is read from the open descriptor, and
+/// the open does not wait for a writer, so a path that became a FIFO after the
+/// caller looked at it does not hold the scan.
+///
+/// On Unix the descriptor stays `O_NONBLOCK`, which a regular file ignores.
+fn open_file(path: &Path) -> io::Result<(File, u64)> {
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, O_NONBLOCK);
+    let file = open.open(path)?;
+    let meta = file.metadata()?;
+    #[cfg(unix)]
+    if std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Not supported file type",
+        ));
+    }
+    Ok((file, meta.len()))
 }
 
 /// As [`analyze_all_seekable`], for the file at `path`, named for YARA as
@@ -1390,8 +1488,7 @@ pub fn analyze_all_path(
     opts: &ScanOptions,
 ) -> io::Result<(Vec<(String, Method)>, AllMatchOutcome)> {
     let opts = named(opts, path);
-    let file = File::open(path)?;
-    let size = file.metadata()?.len();
+    let (file, size) = open_file(path)?;
     analyze_all_seekable(db, file, size, &opts)
 }
 
@@ -1969,7 +2066,25 @@ fn walk_members(
     {
         return o;
     }
-    // Password protection over a limit over the rest, as the reasons fold.
+    // A bound a reader noted on a member is reported as the walk's own stops
+    // are, as its alert under `--alert-exceeds-max`, and that is a detection:
+    // it beats password protection and a stop at damage.
+    if opts.alert_exceeds_max
+        && !matches!(terminal, Some(DeepOutcome::Infected { .. }))
+        && let Some(tree::Reason {
+            kind: tree::ReasonKind::Limit(kind),
+            text,
+            ..
+        }) = &reasons.limits
+        && limits_alert_name(*kind).is_some()
+    {
+        return limits_outcome_at(opts, sink, *kind, text.clone());
+    }
+    // Password protection over a limit over the rest, as the reasons fold,
+    // and a detection over all: a walk that stopped at a limit or at damage
+    // still reports a member it found encrypted before.
+    let terminal = terminal
+        .filter(|t| matches!(t, DeepOutcome::Infected { .. }) || reasons.password.is_none());
     terminal.unwrap_or_else(|| match reasons.into_first() {
         // A bound a reader noted on a member is reported as the walk's own
         // stops are, as its alert under `--alert-exceeds-max`.
@@ -1994,6 +2109,22 @@ pub struct VolumeSetVerdict {
     /// The name of the archive the part belongs to (`big.7z` for `big.7z.001`).
     pub set: String,
     pub report: ScanReport,
+}
+
+/// Every detection in a multi-volume archive, reported against one of its
+/// parts: [`VolumeSetVerdict`] for the `_all` entry points.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct VolumeSetMatches {
+    /// The part this result is attributed to: one of the names given.
+    pub name: String,
+    /// The name of the archive the part belongs to.
+    pub set: String,
+    /// The detections, as [`analyze_all_with_outcome`] lists them.
+    pub found: Vec<(String, Method)>,
+    /// Whether the search finished. A set that cannot be joined has no
+    /// detections and an [`AllMatchOutcome::Unscannable`] outcome.
+    pub outcome: AllMatchOutcome,
 }
 
 /// Scan the **multi-volume archives** spread across a group of files that
@@ -2035,38 +2166,125 @@ pub fn analyze_volume_sets<F>(
 where
     F: FnMut(&str) -> io::Result<Vec<u8>>,
 {
-    analyze_volume_sets_with(db, names, opts, &mut fetch)
+    first_verdicts(byte_split_sets(db, names, opts, false, &mut fetch))
 }
 
-/// [`analyze_volume_sets`], the one compiled copy.
-fn analyze_volume_sets_with(
+/// As [`analyze_volume_sets`], listing every detection of each set as
+/// [`analyze_all_with_outcome`] does, in place of the first.
+#[inline]
+pub fn analyze_volume_sets_all<F>(
     db: &Scanner,
     names: &[String],
     opts: &ScanOptions,
-    fetch: &mut dyn FnMut(&str) -> io::Result<Vec<u8>>,
-) -> Vec<VolumeSetVerdict> {
+    mut fetch: F,
+) -> Vec<VolumeSetMatches>
+where
+    F: FnMut(&str) -> io::Result<Vec<u8>>,
+{
+    all_matches(byte_split_sets(db, names, opts, true, &mut fetch))
+}
+
+/// A set scanned: its parts, its name and what the scan found.
+struct ScannedSet {
+    parts: Vec<String>,
+    set: String,
+    scan: SetScan,
+}
+
+/// What the scan of a set found: the first match or every match.
+enum SetScan {
+    First(ScanReport),
+    All(Vec<(String, Method)>, AllMatchOutcome),
+}
+
+/// Scan a joined set, or report why it could not be joined. `all` lists every
+/// detection instead of the first.
+fn scan_set(
+    db: &Scanner,
+    opts: &ScanOptions,
+    all: bool,
+    joined: Result<&dyn ByteSource, String>,
+) -> SetScan {
+    match (joined, all) {
+        (Ok(src), false) => SetScan::First(analyze_joined(db, src, opts)),
+        (Ok(src), true) => {
+            let (found, outcome) = analyze_all_joined(db, src, opts);
+            SetScan::All(found, outcome)
+        }
+        (Err(why), false) => SetScan::First(ScanReport::unscannable(why, Vec::new())),
+        (Err(why), true) => SetScan::All(Vec::new(), AllMatchOutcome::Unscannable(one_line(why))),
+    }
+}
+
+/// The scan of each set under every one of its parts, as [`VolumeSetVerdict`]s.
+fn first_verdicts(sets: Vec<ScannedSet>) -> Vec<VolumeSetVerdict> {
     let mut out = Vec::new();
+    for ScannedSet { parts, set, scan } in sets {
+        // Built by `scan_set` with `all` false.
+        if let SetScan::First(report) = scan {
+            for part in parts {
+                out.push(VolumeSetVerdict {
+                    name: part,
+                    set: set.clone(),
+                    report: report.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The scan of each set under every one of its parts, as [`VolumeSetMatches`].
+fn all_matches(sets: Vec<ScannedSet>) -> Vec<VolumeSetMatches> {
+    let mut out = Vec::new();
+    for ScannedSet { parts, set, scan } in sets {
+        // Built by `scan_set` with `all` true.
+        if let SetScan::All(found, outcome) = scan {
+            for part in parts {
+                out.push(VolumeSetMatches {
+                    name: part,
+                    set: set.clone(),
+                    found: found.clone(),
+                    outcome: outcome.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Rejoin each byte-split set among `names` and scan it with [`scan_set`].
+fn byte_split_sets(
+    db: &Scanner,
+    names: &[String],
+    opts: &ScanOptions,
+    all: bool,
+    fetch: &mut dyn FnMut(&str) -> io::Result<Vec<u8>>,
+) -> Vec<ScannedSet> {
     // Each set gets its own budget, as every file in a scan does. A set needs at
     // least two parts, and the caller scans each of those parts on its own
     // anyway, so rejoining adds at most one budgeted scan per two files the
     // caller had already committed to. Held bytes across all sets are capped by
     // the rejoin, so no aggregate budget is threaded through here.
-    for set in unpack::volume::rejoin_byte_split(names, opts.limits.max_buffer_bytes, fetch) {
-        let report = match set.state {
-            unpack::volume::State::Joined(data) => analyze(db, &data, opts),
-            unpack::volume::State::Unjoinable(reason) => {
-                ScanReport::unscannable(reason.to_string(), Vec::new())
+    unpack::volume::rejoin_byte_split(names, opts.limits.max_buffer_bytes, fetch)
+        .into_iter()
+        .map(|set| {
+            let scan = match &set.state {
+                unpack::volume::State::Joined(data) => {
+                    let bytes: &[u8] = data;
+                    scan_set(db, opts, all, Ok(&bytes))
+                }
+                unpack::volume::State::Unjoinable(reason) => {
+                    scan_set(db, opts, all, Err(reason.to_string()))
+                }
+            };
+            ScannedSet {
+                parts: set.parts,
+                set: set.set,
+                scan,
             }
-        };
-        for part in set.parts {
-            out.push(VolumeSetVerdict {
-                name: part,
-                set: set.set.clone(),
-                report: report.clone(),
-            });
-        }
-    }
-    out
+        })
+        .collect()
 }
 
 /// The sets of **format-aware volumes** among a group of files that arrived
@@ -2099,12 +2317,13 @@ pub fn analyze_split_sets<F>(
 where
     F: FnMut(&str, Option<usize>) -> io::Result<Vec<u8>>,
 {
-    split_sets(
+    first_verdicts(split_sets(
         db,
         names,
         opts,
+        false,
         &mut unpack::volume::Parts::Memory(&mut fetch),
-    )
+    ))
 }
 
 /// As [`analyze_split_sets`], reading each part where it lies: `open(name)`
@@ -2126,7 +2345,51 @@ where
     R: Read + Seek + 'static,
     F: FnMut(&str) -> io::Result<R>,
 {
-    let mut part = |name: &str, of: usize| -> io::Result<Box<dyn ByteSource>> {
+    let mut part = cached_part(opts, &mut open);
+    first_verdicts(split_sets(
+        db,
+        names,
+        opts,
+        false,
+        &mut unpack::volume::Parts::Files(&mut part),
+    ))
+}
+
+/// As [`analyze_split_sets_seekable`], listing every detection of each set as
+/// [`analyze_all_with_outcome`] does, in place of the first.
+#[cfg(feature = "all-formats")]
+pub fn analyze_split_sets_seekable_all<R, F>(
+    db: &Scanner,
+    names: &[String],
+    opts: &ScanOptions,
+    mut open: F,
+) -> Vec<VolumeSetMatches>
+where
+    R: Read + Seek + 'static,
+    F: FnMut(&str) -> io::Result<R>,
+{
+    let mut part = cached_part(opts, &mut open);
+    all_matches(split_sets(
+        db,
+        names,
+        opts,
+        true,
+        &mut unpack::volume::Parts::Files(&mut part),
+    ))
+}
+
+/// Each part of a set opened through a block cache, the caches of a set sharing
+/// `object_cache_bytes`.
+#[cfg(feature = "all-formats")]
+fn cached_part<'a, R, F>(
+    opts: &'a ScanOptions,
+    open: &'a mut F,
+) -> impl FnMut(&str, usize) -> io::Result<Box<dyn ByteSource>> + 'a
+where
+    R: Read + Seek + 'static,
+    F: FnMut(&str) -> io::Result<R>,
+{
+    move |name: &str, of: usize| {
         let (block, bytes) = opts.cache_sizes();
         // Room for two blocks at least in each cache: smaller blocks when
         // there are many parts.
@@ -2137,44 +2400,55 @@ where
             block,
             share,
         )?))
-    };
-    split_sets(
-        db,
-        names,
-        opts,
-        &mut unpack::volume::Parts::Files(&mut part),
-    )
+    }
 }
 
+/// Plan and join each set of format-aware volumes among `names` and scan it
+/// with [`scan_set`].
 #[cfg(feature = "all-formats")]
 fn split_sets(
     db: &Scanner,
     names: &[String],
     opts: &ScanOptions,
+    all: bool,
     files: &mut unpack::volume::Parts<'_>,
-) -> Vec<VolumeSetVerdict> {
-    let mut out = Vec::new();
+) -> Vec<ScannedSet> {
     let mut held_total = 0usize;
+    let mut out = Vec::new();
     for set in unpack::volume::plan(names, files) {
-        let report = match unpack::volume::join(&set, files, opts.hold_limit(), &mut held_total) {
-            Ok(joined) => analyze_joined(db, &*joined, opts),
-            Err(why) => ScanReport::unscannable(why, Vec::new()),
-        };
-        for part in &set.parts {
-            out.push(VolumeSetVerdict {
-                name: part.clone(),
-                set: set.name.clone(),
-                report: report.clone(),
-            });
-        }
+        let joined = unpack::volume::join(&set, files, opts.hold_limit(), &mut held_total);
+        out.push(ScannedSet {
+            scan: scan_set(db, opts, all, joined.as_deref().map_err(String::clone)),
+            parts: set.parts,
+            set: set.name,
+        });
     }
     out
+}
+
+/// [`analyze_joined`] listing every detection. A part that could not be read
+/// leaves bytes the scan never saw, so the search is not complete, whatever it
+/// found.
+fn analyze_all_joined(
+    db: &Scanner,
+    joined: &dyn ByteSource,
+    opts: &ScanOptions,
+) -> (Vec<(String, Method)>, AllMatchOutcome) {
+    let (found, outcome) = analyze_all_source(db, joined, opts);
+    match (&outcome, joined.read_error()) {
+        (AllMatchOutcome::Complete, Some(_)) => (
+            found,
+            AllMatchOutcome::Unscannable(
+                "part of a multi-volume set one of whose volumes could not be read".to_string(),
+            ),
+        ),
+        _ => (found, outcome),
+    }
 }
 
 /// [`analyze_source`] over the parts of a set read as one archive. A part that
 /// could not be read leaves bytes the scan never saw, so a scan that found
 /// nothing is not clean.
-#[cfg(feature = "all-formats")]
 fn analyze_joined(db: &Scanner, joined: &dyn ByteSource, opts: &ScanOptions) -> ScanReport {
     let report = analyze_source(db, joined, opts);
     match (&report.verdict, joined.read_error()) {
@@ -2216,7 +2490,25 @@ where
     Vec::new()
 }
 
-/// Scan an object held in memory: [`scan_seekable`] without the reader.
+/// As [`analyze_split_sets_seekable_all`] without `all-formats`: nothing is
+/// joined.
+#[cfg(not(feature = "all-formats"))]
+pub fn analyze_split_sets_seekable_all<R, F>(
+    _db: &Scanner,
+    _names: &[String],
+    _opts: &ScanOptions,
+    _open: F,
+) -> Vec<VolumeSetMatches>
+where
+    R: Read + Seek + 'static,
+    F: FnMut(&str) -> io::Result<R>,
+{
+    Vec::new()
+}
+
+/// Scan an object held in memory: [`scan_seekable`] without the reader, and
+/// without its [`ScanOptions::max_scan_size`] check: the slice is scanned
+/// whole.
 pub fn analyze(db: &Scanner, data: &[u8], opts: &ScanOptions) -> ScanReport {
     analyze_source(db, &data, opts)
 }
@@ -2301,7 +2593,9 @@ fn unfinished(opts: &ScanOptions) -> Option<DeepOutcome> {
             at: String::new(),
         }));
     }
-    engine::scan_was_truncated().then(|| DeepOutcome::Limits(SEARCH_INCOMPLETE.into()))
+    engine::scan_was_truncated().then(|| {
+        DeepOutcome::Limits(engine::scan_search_cut().unwrap_or_else(|| SEARCH_INCOMPLETE.into()))
+    })
 }
 
 /// Every detection on `data` or its (recursively unpacked) members,
@@ -3723,14 +4017,12 @@ fn scan_unpacked(
         let name = tree::Name::new(&name, tree::NameKind::Derived);
         // An unpacker that fires again on its own output would never stop.
         let walk = opts.walk();
+        // Kept as a payload's limit is, so the checks after it still run; the
+        // buffers after it are as deep.
         if let Some(hit) = tree::Cx::new(&walk, budget).depth_hit(obj.depth) {
             let at = obj.path.child(name);
-            return Some(limits_outcome_at(
-                opts,
-                &mut sink.under(at),
-                hit.kind,
-                hit.reason,
-            ));
+            let o = limits_outcome_at(opts, &mut sink.under(at), hit.kind, hit.reason);
+            return part_outcome(budget, deferred, o);
         }
         let o = scan_child(
             db,
@@ -3783,6 +4075,50 @@ fn part_outcome(
             None
         }
     }
+}
+
+/// The second reading of a self-extractor: its stub, when UPX packed, read as
+/// UPX is and scanned as the executable it unpacks to. Only a detection is
+/// kept. A limit, damage or a method UPX does not support in the stub is not a
+/// reason of the scan (the stub is read as well as the archive, not instead of
+/// it), and the alerts about the reading itself are off, so that it cannot end
+/// the scan in a detection that is not of the unpacked stub.
+#[allow(clippy::too_many_arguments)]
+fn scan_sfx_stub(
+    db: &Scanner,
+    facts: &Facts,
+    obj: Obj<'_>,
+    ft: FileType,
+    opts: &ScanOptions,
+    budget: &mut Budget,
+    findings: &mut Vec<Finding>,
+    sink: &mut Sink,
+) -> Option<DeepOutcome> {
+    let data = facts.data;
+    // ClamAV unpacks UPX out of a PE only.
+    if !facts.upx_header() || (opts.clamav_compat && !data.window(0, 2).starts_with(b"MZ")) {
+        return None;
+    }
+    let stub = byte_source::Sub::new(data, 0, unpack::sfx_stub_len(data)?);
+    if !unpack::is_upx_source(&stub) {
+        return None;
+    }
+    let mut quiet = opts.clone();
+    quiet.alert_exceeds_max = false;
+    quiet.alert_encrypted = false;
+    quiet.alert_packed = false;
+    let verdict = walk_members(
+        db,
+        &stub,
+        obj,
+        ft,
+        unpack::Format::Upx,
+        &quiet,
+        budget,
+        findings,
+        sink,
+    );
+    matches!(verdict, DeepOutcome::Infected { .. }).then_some(verdict)
 }
 
 /// [`scan_object`] for anything but an archive: its own bytes, then what is
@@ -3890,6 +4226,11 @@ fn scan_file(
             return stop;
         }
         if !packed_executable {
+            if fmt == unpack::Format::Sfx
+                && let Some(o) = scan_sfx_stub(db, facts, obj, ft, opts, budget, findings, sink)
+            {
+                return o;
+            }
             // The members come first. The executable of an installer or
             // self-extractor then gets the lookups of any other PE: its
             // `tlsh:` lines, then the signatures on its imports, as clamscan
@@ -4472,8 +4813,9 @@ fn structured_data_scan(
         Some(d) => dlp::count_ssns(d, dlp::SsnMode::Both),
         None => dlp::count_ssns_in(&mut byte_source::Stepper::new(data), dlp::SsnMode::Both),
     };
+    // A threshold of 0 is 1, as in ClamAV: no number found is never a detection.
     if let Some(threshold) = opts.structured_cc_count
-        && count_cards() >= threshold as usize
+        && count_cards() >= threshold.max(1) as usize
         && let Some(o) = sink.hit(
             "Heuristics.Structured.CreditCardNumber".to_string(),
             0,
@@ -4483,7 +4825,7 @@ fn structured_data_scan(
         return Some(o);
     }
     if let Some(threshold) = opts.structured_ssn_count
-        && count_ssns() >= threshold as usize
+        && count_ssns() >= threshold.max(1) as usize
         && let Some(o) = sink.hit(
             "Heuristics.Structured.SSN".to_string(),
             0,
@@ -4702,7 +5044,11 @@ fn base64_capped() -> String {
 ///
 /// A message whose head has markup gets an HTML object's views, so that typing
 /// it as a message does not take them away.
-fn normalizations(ft: FileType, data: &dyn ByteSource) -> Vec<(ViewKind, FileType)> {
+///
+/// Under `compat` an HTML object has no view of the whole page through the
+/// script normaliser: clamscan normalises its script elements only, which the
+/// scripts view holds.
+fn normalizations(ft: FileType, data: &dyn ByteSource, compat: bool) -> Vec<(ViewKind, FileType)> {
     let head = data.window(0, 8192);
     let (kind, as_type) = match ft {
         FileType::Rtf => {
@@ -4718,7 +5064,9 @@ fn normalizations(ft: FileType, data: &dyn ByteSource) -> Vec<(ViewKind, FileTyp
     let mut v = vec![(kind, as_type)];
     if kind == ViewKind::Html || looks_like_script(ft, &head) {
         v.push((ViewKind::Javascript, as_type));
-        v.push((ViewKind::Deobfuscated, as_type));
+        if !(compat && kind == ViewKind::Html) {
+            v.push((ViewKind::Deobfuscated, as_type));
+        }
     }
     // The scripts of a page, which clamscan matches as text as well.
     if kind == ViewKind::Html {
@@ -4843,8 +5191,11 @@ enum ViewKind {
     Html,
     Text,
     Javascript,
+    /// The whole object through the script normaliser in its decoding mode.
+    /// exav's own: clamscan has no such view.
     Deobfuscated,
-    /// The `<script>` elements of a page, normalised as script.
+    /// The `<script>` elements of a page, normalised as script in clamscan's
+    /// mode, which the signatures written against its output match.
     PageScripts,
     /// Their contents before that, which [`ViewKind::PageScripts`] spills
     /// for an object not held in memory.
@@ -4872,7 +5223,7 @@ impl View {
 fn make_view(kind: ViewKind, data: &dyn ByteSource, opts: &ScanOptions) -> Option<View> {
     if kind == ViewKind::Deobfuscated {
         // Bounded by its own cap, so held in memory either way.
-        let (view, cut) = jsnorm::normalize_source(data);
+        let (view, cut) = jsnorm::normalize_source(data, jsnorm::Mode::Decoding);
         // The raw bytes are still scanned in full; only this view is short.
         if cut {
             engine::mark_scan_truncated();
@@ -4880,9 +5231,9 @@ fn make_view(kind: ViewKind, data: &dyn ByteSource, opts: &ScanOptions) -> Optio
         return Some(View::Mem(view));
     }
     if kind == ViewKind::PageScripts {
-        // The scripts the HTML view holds, normalised as script.
+        // The scripts the HTML view holds, normalised as script, each on its own.
         let scripts = make_view(ViewKind::HtmlScripts, data, opts)?;
-        let (view, cut) = jsnorm::normalize_source(scripts.source());
+        let (view, cut) = jsnorm::normalize_scripts(scripts.source());
         if cut {
             engine::mark_scan_truncated();
         }
@@ -4926,7 +5277,7 @@ fn make_view(kind: ViewKind, data: &dyn ByteSource, opts: &ScanOptions) -> Optio
         ViewKind::Text => normalize::text_into(&mut src, &mut out),
         ViewKind::HtmlScripts => {
             let mut s = normalize::Scripts::new(out);
-            normalize::html_into(&mut src, &mut s);
+            normalize::scripts_into(&mut src, &mut s);
             out = s.into_inner();
         }
         _ => normalize::javascript_into(&mut src, &mut out),
@@ -5016,6 +5367,7 @@ fn whole_limits(opts: &ScanOptions) -> engine::WholeLimits {
         regex_steps: opts
             .max_regex_steps
             .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX)),
+        yara_steps: opts.max_yara_steps,
         matcher_steps: opts.max_matcher_steps,
         all_image_formats: !opts.clamav_compat,
         // What lies within a quarter of a block of a hit is held while the
@@ -5157,7 +5509,7 @@ fn core_matches(
         // One at a time: each is a full-size copy of `data`, and nesting
         // stacks them (a container, its member and that member's member are
         // each mid-scan while the walk is inside them).
-        for (kind, as_type) in normalizations(ft, data) {
+        for (kind, as_type) in normalizations(ft, data, opts.clamav_compat) {
             let Some(view) = profile::timed("normalize", data.len() as u64, || {
                 make_view(kind, data, opts)
             }) else {
@@ -5292,6 +5644,12 @@ mod tests {
         let mut opts = ScanOptions::default();
         opts.limits.max_buffer_bytes = max;
         opts
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn o_nonblock_is_the_platforms() {
+        assert_eq!(O_NONBLOCK, libc::O_NONBLOCK);
     }
 
     /// A reader that counts the bytes read through it.
@@ -6156,10 +6514,10 @@ mod tests {
     }
 
     fn build_zip(members: &[(&str, &[u8])]) -> Vec<u8> {
-        use zip::write::SimpleFileOptions;
-        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        use exav_unpack::zip_write::{FileOptions, ZipWriter};
+        let mut w = ZipWriter::new(Cursor::new(Vec::new()));
         for (name, body) in members {
-            w.start_file(*name, SimpleFileOptions::default()).unwrap();
+            w.start_file(name, FileOptions::default()).unwrap();
             std::io::Write::write_all(&mut w, body).unwrap();
         }
         w.finish().unwrap().into_inner()
@@ -6168,12 +6526,11 @@ mod tests {
     /// As [`build_zip`], with every member deflated.
     #[cfg(any(feature = "zip", feature = "all-formats"))]
     fn build_zip_deflated(members: &[(&str, &[u8])]) -> Vec<u8> {
-        use zip::write::SimpleFileOptions;
-        let opts =
-            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
+        let opts = FileOptions::default().method(Method::Deflated);
+        let mut w = ZipWriter::new(Cursor::new(Vec::new()));
         for (name, body) in members {
-            w.start_file(*name, opts).unwrap();
+            w.start_file(name, opts).unwrap();
             std::io::Write::write_all(&mut w, body).unwrap();
         }
         w.finish().unwrap().into_inner()
@@ -6949,6 +7306,54 @@ mod tests {
         );
     }
 
+    /// What a bytecode unpacker made at the depth limit is a limit kept for
+    /// the end of its object's scan, as a payload's is, so the checks after
+    /// it still run; under `--alert-exceeds-max` it is a detection and ends it.
+    #[test]
+    fn an_unpacked_buffer_at_the_depth_limit_is_kept() {
+        let db = Scanner::builtin();
+        let mut opts = ScanOptions::default();
+        opts.limits.max_recursion = 0;
+        let run = |opts: &ScanOptions| {
+            let mut budget = scan_budget(&db, opts);
+            let mut first_at = None;
+            let mut sink = Sink {
+                mode: SinkMode::First(&db.ignored),
+                at: root_path(),
+                first_at: &mut first_at,
+            };
+            let mut deferred = DeepOutcome::Clean;
+            let bufs = vec![b"unpacked".to_vec(), b"twice".to_vec()];
+            let stop = scan_unpacked(
+                &db,
+                bufs,
+                Obj::top(opts),
+                opts,
+                &mut budget,
+                &mut Vec::new(),
+                &mut sink,
+                &mut deferred,
+            );
+            let show = |o: &DeepOutcome| match o {
+                DeepOutcome::Clean => "clean".to_string(),
+                DeepOutcome::Infected { signature, .. } => signature.clone(),
+                DeepOutcome::Limits(r) => format!("limits: {r}"),
+                DeepOutcome::Unscannable(r) | DeepOutcome::PasswordProtected(r) => r.text.clone(),
+            };
+            (stop.as_ref().map(show), show(&deferred))
+        };
+        assert_eq!(
+            run(&opts),
+            (None, "limits: recursion depth exceeds 0".to_string())
+        );
+        opts.alert_exceeds_max = true;
+        let (stop, _) = run(&opts);
+        assert_eq!(
+            stop.as_deref(),
+            Some("Heuristics.Limits.Exceeded.MaxRecursion")
+        );
+    }
+
     /// A member name is file content. Quoted in a reason, a newline in it would
     /// write a line of its own into a line-framed reply.
     #[test]
@@ -7007,12 +7412,12 @@ mod tests {
     /// A stored zip of `n` members of `memo_body`, the same in each when `same`.
     #[cfg(feature = "all-formats")]
     fn memo_zip(n: usize, same: bool) -> Vec<u8> {
+        use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
         use std::io::Write;
-        let stored = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let stored = FileOptions::default().method(Method::Stored);
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
         for k in 0..n {
-            z.start_file(format!("member{k}.txt"), stored).unwrap();
+            z.start_file(&format!("member{k}.txt"), stored).unwrap();
             z.write_all(&memo_body(if same { 0 } else { k })).unwrap();
         }
         z.finish().unwrap().into_inner()
@@ -7044,12 +7449,12 @@ mod tests {
     #[test]
     #[cfg(feature = "all-formats")]
     fn small_copies_are_each_scanned() {
+        use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
         use std::io::Write;
-        let stored = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let stored = FileOptions::default().method(Method::Stored);
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
         for k in 0..10 {
-            z.start_file(format!("m{k}.txt"), stored).unwrap();
+            z.start_file(&format!("m{k}.txt"), stored).unwrap();
             z.write_all(&memo_body(0)[..1000]).unwrap();
         }
         let z = z.finish().unwrap().into_inner();
@@ -7061,15 +7466,14 @@ mod tests {
     #[test]
     #[cfg(feature = "all-formats")]
     fn an_infected_member_after_clean_copies_is_found() {
+        use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
         use std::io::Write;
-        let stored = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let stored = FileOptions::default().method(Method::Stored);
         // Deflated, so the signature is in the member only, not in the zip's bytes.
-        let deflated = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let deflated = FileOptions::default().method(Method::Deflated);
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
         for k in 0..3 {
-            z.start_file(format!("clean{k}.bin"), stored).unwrap();
+            z.start_file(&format!("clean{k}.bin"), stored).unwrap();
             z.write_all(&memo_body(0)).unwrap();
         }
         let mut dirty = memo_body(0);
@@ -7121,10 +7525,10 @@ mod tests {
         // A ZIP holding a member named like an executable dropper.
         let mut zbuf = Vec::new();
         {
-            let mut zw = zip::ZipWriter::new(Cursor::new(&mut zbuf));
+            let mut zw = exav_unpack::zip_write::ZipWriter::new(Cursor::new(&mut zbuf));
             zw.start_file(
                 "payload_dropper.exe",
-                zip::write::SimpleFileOptions::default(),
+                exav_unpack::zip_write::FileOptions::default(),
             )
             .unwrap();
             zw.write_all(b"harmless looking bytes").unwrap();
@@ -7174,17 +7578,17 @@ mod tests {
         // `Html` and `Script` are script-like whatever they contain; `Text`
         // earns the two extra views only from what is in the bytes.
         assert_eq!(
-            normalizations(FileType::Text, plain),
+            normalizations(FileType::Text, plain, false),
             [(ViewKind::Text, FileType::TextView)],
             "a non-script textual file is matched against its text view"
         );
         assert_eq!(
-            normalizations(FileType::Text, script).len(),
+            normalizations(FileType::Text, script, false).len(),
             3,
             "script-shaped content adds the javascript and jsnorm views"
         );
         assert_eq!(
-            normalizations(FileType::Html, plain),
+            normalizations(FileType::Html, plain, false),
             [
                 (ViewKind::Html, FileType::HtmlView),
                 (ViewKind::Javascript, FileType::HtmlView),
@@ -7193,10 +7597,10 @@ mod tests {
             ],
             "an HTML file is script-like by type, whatever it holds"
         );
-        assert_eq!(normalizations(FileType::Rtf, script).len(), 2);
+        assert_eq!(normalizations(FileType::Rtf, script, false).len(), 2);
 
         // And each one produces something to scan.
-        for (i, (kind, _)) in normalizations(FileType::Text, script)
+        for (i, (kind, _)) in normalizations(FileType::Text, script, false)
             .into_iter()
             .enumerate()
         {
@@ -7739,18 +8143,18 @@ mod tests {
     }
 
     fn zip_bytes(members: &[(&str, &[u8], bool)]) -> Vec<u8> {
+        use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
         use std::io::Write;
-        use zip::write::SimpleFileOptions;
         let mut buf = Vec::new();
         {
-            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let mut w = ZipWriter::new(Cursor::new(&mut buf));
             for (name, data, stored) in members {
                 let opts = if *stored {
-                    SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored)
+                    FileOptions::default().method(Method::Stored)
                 } else {
-                    SimpleFileOptions::default()
+                    FileOptions::default()
                 };
-                w.start_file(*name, opts).unwrap();
+                w.start_file(name, opts).unwrap();
                 w.write_all(data).unwrap();
             }
             w.finish().unwrap();

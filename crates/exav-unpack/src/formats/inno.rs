@@ -1,5 +1,5 @@
 //! Inno Setup installers: the files of an installer whose data is in the
-//! executable, Inno Setup 5.1.5 to 6.4.
+//! executable, Inno Setup 5.1.5 to 7.1.0.
 //!
 //! The layout is read as `innoextract` reads it (Daniel Scharrer, zlib
 //! licence; attributed in `NOTICE`). Inno Setup's own source is not read.
@@ -8,8 +8,9 @@
 //! loader table   the executable's resource RCDATA 11111, as Setup finds it:
 //!                where the setup headers (setup-0) and the file data
 //!                (setup-1) start
-//! setup-0        a 64-byte version string, then two blocks: the setup
-//!                header and its lists, and the data entries
+//! setup-0        a 64-byte version string, from 6.5.0 a 53-byte encryption
+//!                header, then two blocks: the setup header and its lists,
+//!                and the data entries
 //! block          CRC-32, stored size, compressed flag, then the data in
 //!                4096-byte pieces each after its CRC-32, LZMA1 compressed
 //! data entry     where a file is: its chunk (offset and size in setup-1),
@@ -27,9 +28,10 @@
 //! filter comes out with the filter undone.
 //!
 //! What is not read is reported, never passed as clean: an installer of a
-//! version before 5.1.5 or past 6.4.0, one whose loader table or setup header
-//! is not found, an encrypted file (`PASSWORD-PROTECTED`), a file in a
-//! separate `setup-N.bin`, and a file the chunk ends before.
+//! version before 5.1.5 or past 7.1.0, one whose loader table or setup header
+//! is not found, an encrypted file or encrypted setup headers
+//! (`PASSWORD-PROTECTED`), a file in a separate `setup-N.bin`, and a file the
+//! chunk ends before.
 
 use std::io::{self, Read};
 
@@ -38,10 +40,13 @@ use crate::source::{ByteSource, Reader};
 use crate::stream::{MemberMeta, Visit, emit_stream};
 use crate::{Budget, LimitHit};
 
-/// The loader table, whose magic comes first.
-const LOADER_TABLE: usize = 44;
+/// The bytes of the loader table, whose magic comes first, that are read: the
+/// table of revision 2, the larger one.
+const LOADER_TABLE_2: usize = 64;
 const VERSION_STRING: usize = 64;
-const BLOCK_HEADER: usize = 9;
+/// From 6.5.0, after the version string: a CRC-32, a byte saying whether the
+/// installer is encrypted, and 48 bytes of key derivation data.
+const ENCRYPTION_HEADER: usize = 53;
 const CHUNK_MAGIC: &[u8; 4] = b"zlb\x1a";
 
 const CALL_FILTER: u16 = 1 << 4;
@@ -53,10 +58,52 @@ const COMPRESSED: u16 = 1 << 7;
 type Version = (u32, u32, u32, u32);
 
 /// The first version read, and the first one past those read: innoextract
-/// describes the layouts up to 6.4.0.1, the release of 6.4.0. The data
-/// version 6.4.3 has data entries of another size.
+/// describes the layouts up to 7.0.2, whose data version is 7.0.0.3 (data
+/// version 6.4.0.1 is the release of 6.4.0, and 6.4.1 writes it too; 6.5.4
+/// writes 6.5.2, 6.6.x write 6.6.0 and 6.6.1, 6.7.x write 6.7.0). The 7.0.0
+/// previews 1 to 3 write 6.7.0, 7.0.0.1 and 7.0.0.1, 7.0.0 beta to 7.0.2 and
+/// 7.1.0 write 7.0.0.3, and 7.1.1 writes 7.1.1, which is past.
 const FIRST: Version = (5, 1, 5, 0);
-const PAST: Version = (6, 4, 0, 2);
+const PAST: Version = (7, 0, 0, 4);
+/// Data versions between those two that innoextract has no layout for.
+const UNDESCRIBED: [Version; 2] = [(7, 0, 0, 0), (7, 0, 0, 2)];
+
+fn is_read(v: Version) -> bool {
+    (FIRST..PAST).contains(&v) && !UNDESCRIBED.contains(&v)
+}
+
+/// The bytes between the version string and the setup header's block.
+fn encryption_header(v: Version) -> usize {
+    if v >= (6, 5, 0, 0) {
+        ENCRYPTION_HEADER
+    } else {
+        0
+    }
+}
+
+/// The bytes of a block's header: the CRC-32 of the rest, the stored size (8
+/// bytes from 6.7.0, 4 before) and the compressed flag.
+fn block_header(v: Version) -> usize {
+    if v >= (6, 7, 0, 0) { 13 } else { 9 }
+}
+
+/// A block's stored size and its compressed flag, read from its header at
+/// `at`. `None` when the source ends inside it.
+fn block_head(src: &dyn ByteSource, at: usize, v: Version) -> Option<(u64, u8)> {
+    let size = block_header(v) - 5;
+    let h = src.window(at, block_header(v));
+    let stored = if size == 8 {
+        le64(&h, 4)?
+    } else {
+        u64::from(le32(&h, 4)?)
+    };
+    Some((stored, *h.get(4 + size)?))
+}
+
+/// An offset or a size, as far as the host's `usize` holds it.
+fn to_usize(n: u64) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
 
 fn le32(d: &[u8], o: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
@@ -91,8 +138,11 @@ fn parse_version(s: &[u8]) -> Option<(Version, bool)> {
     Some((version, unicode))
 }
 
-/// A data entry's slices, chunk offset, file offset and size, chunk size.
-const ENTRY_BASE: usize = 36;
+/// The bytes of a data entry up to its checksum: the slices, the chunk
+/// offset (4 bytes, 8 from 6.5.2), the file offset and size, the chunk size.
+fn entry_base(v: Version) -> usize {
+    if v >= (6, 5, 2, 0) { 40 } else { 36 }
+}
 
 /// Its checksum: MD5, SHA-1 from 5.3.9, SHA-256 from 6.4.0.
 fn checksum_size(v: Version) -> usize {
@@ -108,14 +158,35 @@ fn checksum_size(v: Version) -> usize {
 /// Where its flags are: after the checksum, the file time and the file
 /// version.
 fn flags_at(v: Version) -> usize {
-    ENTRY_BASE + checksum_size(v) + 16
+    entry_base(v) + checksum_size(v) + 16
 }
 
-/// The bytes of a data entry, which grow with the version: the flags take
-/// one byte up to 5.1.12, and a signing mode follows them from 6.3.0.
+/// The bytes its flags take: one up to 5.1.12, two from 5.1.13, one again
+/// from 6.4.3, which dropped four of the nine flags.
+fn flags_size(v: Version) -> usize {
+    if ((5, 1, 13, 0)..(6, 4, 3, 0)).contains(&v) {
+        2
+    } else {
+        1
+    }
+}
+
+/// The bytes of a data entry, which change with the version: the flags (see
+/// [`flags_size`]), and a signing mode after them from 6.3.0 to 6.4.2.
 fn entry_size(v: Version) -> usize {
-    let flags = if v >= (5, 1, 13, 0) { 2 } else { 1 };
-    flags_at(v) + flags + usize::from(v >= (6, 3, 0, 0))
+    flags_at(v) + flags_size(v) + usize::from(((6, 3, 0, 0)..(6, 4, 3, 0)).contains(&v))
+}
+
+/// The flags read as the bits of [`CALL_FILTER`], [`ENCRYPTED`] and
+/// [`COMPRESSED`]: from 6.4.3 they are the bits 2, 3 and 4.
+fn flags_of(v: Version, raw: u16) -> u16 {
+    if v < (6, 4, 3, 0) {
+        return raw;
+    }
+    [(2, CALL_FILTER), (3, ENCRYPTED), (4, COMPRESSED)]
+        .into_iter()
+        .filter(|&(bit, _)| raw & (1 << bit) != 0)
+        .fold(0, |flags, (_, flag)| flags | flag)
 }
 
 /// Where a file is.
@@ -124,7 +195,7 @@ struct Entry {
     index: usize,
     first_slice: u32,
     last_slice: u32,
-    chunk_offset: u32,
+    chunk_offset: u64,
     file_offset: u64,
     file_size: u64,
     chunk_size: u64,
@@ -133,22 +204,29 @@ struct Entry {
 
 fn entries(data: &[u8], v: Version) -> Vec<Entry> {
     let at = flags_at(v);
+    // The fields after the chunk offset move by the width it gained.
+    let wide = entry_base(v) - 36;
     data.chunks_exact(entry_size(v))
         .enumerate()
         .filter_map(|(index, e)| {
-            let flags = if v >= (5, 1, 13, 0) {
+            let flags = if flags_size(v) == 2 {
                 u16::from_le_bytes([e[at], e[at + 1]])
             } else {
                 u16::from(e[at])
             };
+            let flags = flags_of(v, flags);
             Some(Entry {
                 index,
                 first_slice: le32(e, 0)?,
                 last_slice: le32(e, 4)?,
-                chunk_offset: le32(e, 8)?,
-                file_offset: le64(e, 12)?,
-                file_size: le64(e, 20)?,
-                chunk_size: le64(e, 28)?,
+                chunk_offset: if wide == 0 {
+                    u64::from(le32(e, 8)?)
+                } else {
+                    le64(e, 8)?
+                },
+                file_offset: le64(e, 12 + wide)?,
+                file_size: le64(e, 20 + wide)?,
+                chunk_size: le64(e, 28 + wide)?,
                 flags,
             })
         })
@@ -158,12 +236,11 @@ fn entries(data: &[u8], v: Version) -> Vec<Entry> {
 /// A block's data as it is read: its pieces' CRCs taken out and, when it is
 /// compressed, decompressed. `None` when its header or its LZMA1 properties
 /// cannot be read.
-fn open_block(src: &dyn ByteSource, at: usize, max: u64) -> Option<Box<dyn Read + '_>> {
-    let h = src.window(at, BLOCK_HEADER);
-    let (stored, &compressed) = (le32(&h, 4)?, h.get(8)?);
-    let start = at.saturating_add(BLOCK_HEADER);
+fn open_block(src: &dyn ByteSource, at: usize, v: Version, max: u64) -> Option<Box<dyn Read + '_>> {
+    let (stored, compressed) = block_head(src, at, v)?;
+    let start = at.saturating_add(block_header(v));
     let mut pieces = Pieces {
-        inner: Reader::range(src, start, start.saturating_add(stored as usize)),
+        inner: Reader::range(src, start, start.saturating_add(to_usize(stored))),
         left: 0,
     };
     if compressed == 0 {
@@ -211,17 +288,22 @@ impl<R: Read> Read for Pieces<R> {
 /// A block's data, its pieces' CRCs taken out, and decompressed when it is
 /// compressed: at most `max` bytes, and whether it failed to decompress part
 /// way. `Err` when it is over `max`; `None` when it cannot be read.
-fn block(src: &dyn ByteSource, at: usize, max: u64) -> Result<Option<(Vec<u8>, bool)>, LimitHit> {
-    let Some(stored) = le32(&src.window(at, BLOCK_HEADER), 4) else {
+fn block(
+    src: &dyn ByteSource,
+    at: usize,
+    v: Version,
+    max: u64,
+) -> Result<Option<(Vec<u8>, bool)>, LimitHit> {
+    let Some((stored, _)) = block_head(src, at, v) else {
         return Ok(None);
     };
-    if u64::from(stored) > max {
+    if stored > max {
         return Err(LimitHit::new(format!(
             "Inno Setup header block is {stored} bytes, over the {max}-byte buffer \
              limit (--max-object-bytes): the installer's files were not scanned"
         )));
     }
-    let Some(mut dec) = open_block(src, at, max) else {
+    let Some(mut dec) = open_block(src, at, v, max) else {
         return Ok(None);
     };
     let mut out = Vec::new();
@@ -238,18 +320,24 @@ fn block(src: &dyn ByteSource, at: usize, max: u64) -> Result<Option<(Vec<u8>, b
     Ok(Some((out, damaged)))
 }
 
-/// One report for the whole installer.
+const SETUP_ENCRYPTED: &str = "Inno Setup installer with encrypted setup data, which needs its \
+     password: the files it installs were not examined";
+
+/// One report for the whole installer. `encrypted` when its setup data is
+/// encrypted: `reason` is then not used.
 fn report(
     src: &dyn ByteSource,
     budget: &mut Budget,
     visit: Visit<()>,
     reason: &'static str,
+    encrypted: bool,
 ) -> Result<Option<()>, LimitHit> {
     budget.count_entry()?;
     let meta = MemberMeta {
         name: "inno-setup-payload".to_string(),
         comp_size: src.len() as u64,
-        unsupported: Some(reason),
+        encrypted,
+        unsupported: Some(if encrypted { SETUP_ENCRYPTED } else { reason }),
         ..MemberMeta::default()
     };
     Ok(visit(&meta, None, budget))
@@ -261,11 +349,21 @@ fn report(
 fn loader(src: &dyn ByteSource) -> Option<(usize, usize)> {
     let mut found = None;
     for at in resource_offsets(&|off, len| src.window(off, len), RT_RCDATA, LOADER_RESOURCE)? {
-        let t = src.window(at, LOADER_TABLE);
+        let t = src.window(at, LOADER_TABLE_2);
         if !LOADER_MAGICS.iter().any(|m| t.starts_with(&m[..])) {
             return None;
         }
-        let pair = (le32(&t, 32)? as usize, le32(&t, 36)? as usize);
+        // Revision 2 has 64-bit offsets, in a table of 64 bytes where
+        // revision 1 has 44. Another revision is read as revision 1, as
+        // innoextract does.
+        let pair = if le32(&t, 12)? == 2 {
+            (
+                usize::try_from(le64(&t, 40)?).ok()?,
+                usize::try_from(le64(&t, 48)?).ok()?,
+            )
+        } else {
+            (le32(&t, 32)? as usize, le32(&t, 36)? as usize)
+        };
         if found.is_some_and(|f| f != pair) {
             return None;
         }
@@ -335,6 +433,9 @@ fn header_fields(r: &mut impl Read, v: Version, unicode: bool) -> Option<(Method
         + n(v >= (5, 5, 6, 0))
         + 2 * n(v >= (5, 6, 1, 0))
         + 2 * n(v >= (6, 3, 0, 0))
+        + n(v >= (6, 4, 2, 0))
+        + n(v >= (6, 5, 0, 0))
+        + 5 * n(v >= (6, 7, 0, 0))
         + 3 * n(v >= (5, 2, 5, 0))
         + n(((5, 2, 1, 0)..(5, 3, 10, 0)).contains(&v))
         + n(v >= (5, 2, 5, 0));
@@ -348,22 +449,37 @@ fn header_fields(r: &mut impl Read, v: Version, unicode: bool) -> Option<(Method
         skip(r, 32)?;
     }
     // The counts of languages, messages, permissions, types, components and
-    // tasks, then those of directories and files, the data entries, and the
-    // seven kinds that follow.
-    skip(r, 6 * 4 + 2 * 4)?;
+    // tasks, then those of directories, from 6.5.0 of signing keys, and of
+    // files, the data entries, and the seven kinds that follow.
+    skip(r, 6 * 4 + 4 + 4 * n(v >= (6, 5, 0, 0)) as u64 + 4)?;
     let entries = read_u32(r)?;
     skip(r, 7 * 4)?;
+    // From 7.0.0.3 the version of the compiled script.
+    skip(r, 4 * n(v >= (7, 0, 0, 3)) as u64)?;
     // The Windows versions it runs on.
     skip(r, 20)?;
     let mut fixed = 0u64;
     // Colours of the wizard, up to 6.4.0 (revision 1).
     fixed += 8 * n(v < (6, 4, 0, 1)) as u64;
     fixed += 4 * n(v < (5, 5, 7, 0)) as u64;
-    // Its style and how it resizes, then the alpha format of its images.
+    // Its style and how it resizes (from 6.6.0 its dark style, in another
+    // order), then the alpha format of its images.
     fixed += 9 * n(v >= (6, 0, 0, 0)) as u64;
     fixed += n(v >= (5, 5, 7, 0)) as u64;
-    // The password's hash and salt.
-    fixed += if v >= (6, 4, 0, 0) {
+    // The colours of the wizard's images, back in the header from 6.5.2.
+    fixed += 8 * n(v >= (6, 5, 2, 0)) as u64;
+    // Those of the dark theme from 6.6.0, and from 6.6.1 the images' opacity.
+    fixed += 8 * n(v >= (6, 6, 0, 0)) as u64;
+    fixed += n(v >= (6, 6, 1, 0)) as u64;
+    // From 6.7.0 the colour of the wizard's background and its dark one, then
+    // the opacity of its background image and the light control styling
+    // (a byte each).
+    fixed += (4 + 4 + 1 + 1) * n(v >= (6, 7, 0, 0)) as u64;
+    // The password's hash and salt, which 6.5.0 moved to the encryption
+    // header.
+    fixed += if v >= (6, 5, 0, 0) {
+        0
+    } else if v >= (6, 4, 0, 0) {
         4 + 44
     } else if v >= (5, 3, 9, 0) {
         20 + 8
@@ -591,7 +707,7 @@ fn header_block(
     budget: &mut Budget,
 ) -> Result<Option<(Method, u32)>, LimitHit> {
     let max = budget.limits().max_buffer_bytes;
-    let Some(block) = open_block(src, at, max) else {
+    let Some(block) = open_block(src, at, version, max) else {
         return Ok(None);
     };
     let mut r = block.take(max);
@@ -625,6 +741,7 @@ pub(crate) fn walk(
                 visit,
                 "Inno Setup installer of a version before 5.1.5, which exav does not \
                  read: the files it installs were not examined",
+                false,
             );
         }
         return report(
@@ -634,6 +751,7 @@ pub(crate) fn walk(
             "Inno Setup installer whose loader table exav does not find (a version \
              before 5.1.5, or a damaged file): \
              the files it installs were not examined",
+            false,
         );
     };
     let Some((version, unicode)) = parse_version(&src.window(setup0, VERSION_STRING)) else {
@@ -643,39 +761,57 @@ pub(crate) fn walk(
             visit,
             "Inno Setup installer whose setup data exav does not recognise: the \
              files it installs were not examined",
+            false,
         );
     };
-    if version < FIRST || version >= PAST {
+    if !is_read(version) {
         return report(
             src,
             budget,
             visit,
             "Inno Setup installer of a version exav does not read: the files it \
              installs were not examined",
+            false,
         );
     }
     let max = budget.limits().max_buffer_bytes;
-    let first = setup0.saturating_add(VERSION_STRING);
-    let first_stored = le32(&src.window(first, BLOCK_HEADER), 4);
-    let Some(first_stored) = first_stored else {
+    let after_version = setup0.saturating_add(VERSION_STRING);
+    // The byte of the encryption header that says whether the installer is
+    // encrypted: 0 when it is not.
+    let encryption = encryption_header(version);
+    let in_use = if encryption == 0 {
+        Some(false)
+    } else {
+        let h = src.window(after_version, encryption);
+        (h.len() == encryption).then(|| h[4] != 0)
+    };
+    let first = after_version.saturating_add(encryption);
+    let Some((in_use, (first_stored, compressed))) = in_use.zip(block_head(src, first, version))
+    else {
         return report(
             src,
             budget,
             visit,
             "Inno Setup installer cut short in its setup header: the files it \
              installs were not examined",
+            false,
         );
     };
+    // With the setup headers encrypted too, there is no block to read.
+    if in_use && compressed > 1 {
+        return report(src, budget, visit, SETUP_ENCRYPTED, true);
+    }
     let second = first
-        .saturating_add(BLOCK_HEADER)
-        .saturating_add(first_stored as usize);
-    let Some((data, damaged)) = block(src, second, max)? else {
+        .saturating_add(block_header(version))
+        .saturating_add(to_usize(first_stored));
+    let Some((data, damaged)) = block(src, second, version, max)? else {
         return report(
             src,
             budget,
             visit,
             "Inno Setup installer whose file table could not be read: the files \
              it installs were not examined",
+            in_use,
         );
     };
     // The chunks are decoded as the setup header says, which also counts the
@@ -701,6 +837,7 @@ pub(crate) fn walk(
             visit,
             "Inno Setup installer whose setup header exav does not recognise: the \
              files it installs were not examined",
+            in_use,
         );
     };
     if damaged
@@ -710,6 +847,7 @@ pub(crate) fn walk(
             visit,
             "Inno Setup installer whose file table is damaged part way: the files \
              past the damage were not examined",
+            false,
         )?
     {
         return Ok(Some(t));
@@ -778,7 +916,7 @@ fn walk_chunk(
     } else {
         None
     };
-    let at = setup1.saturating_add(first.chunk_offset as usize);
+    let at = setup1.saturating_add(usize::try_from(first.chunk_offset).unwrap_or(usize::MAX));
     let magic_ok = src.window(at, 4).as_ref() == CHUNK_MAGIC;
     let data_at = at.saturating_add(4);
     let reason = reason.or((!magic_ok).then_some((
@@ -983,16 +1121,21 @@ mod tests {
         out
     }
 
-    /// A block of setup-0: its header, then the data in pieces of 4096
-    /// bytes, each after a CRC-32 (not checked, so zero here).
-    fn block(data: &[u8], compressed: bool) -> Vec<u8> {
+    /// A block of setup-0: its header (the stored size has 8 bytes from
+    /// 6.7.0, 4 before), then the data in pieces of 4096 bytes, each after a
+    /// CRC-32 (not checked, so zero here).
+    fn block(v: Version, data: &[u8], compressed: bool) -> Vec<u8> {
         let mut raw = Vec::new();
         for piece in data.chunks(4096) {
             raw.extend_from_slice(&[0; 4]);
             raw.extend_from_slice(piece);
         }
         let mut out = vec![0u8; 4];
-        out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        if v >= (6, 7, 0, 0) {
+            out.extend_from_slice(&(raw.len() as u64).to_le_bytes());
+        } else {
+            out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        }
         out.push(u8::from(compressed));
         out.extend(raw);
         out
@@ -1109,6 +1252,18 @@ mod tests {
         if ge((6, 3, 0, 0)) {
             strings(&mut h, &[4, 5]);
         }
+        if ge((6, 4, 2, 0)) {
+            // The filter of the applications to close, its exclusions.
+            strings(&mut h, &[7]);
+        }
+        if ge((6, 5, 0, 0)) {
+            // The name of the 7-Zip library.
+            strings(&mut h, &[11]);
+        }
+        if ge((6, 7, 0, 0)) {
+            // The expressions of the five "use previous" settings.
+            strings(&mut h, &[2, 0, 5, 1, 3]);
+        }
         if ge((5, 2, 5, 0)) {
             strings(&mut h, &[5000, 1, 0]);
         }
@@ -1127,11 +1282,17 @@ mod tests {
             }
         };
         // Languages, messages, permissions, types, components, tasks,
-        // directories, files, data entries, and seven more kinds.
-        words(
-            &mut h,
-            &[1, 2, 3, 4, 5, 6, 7, 8, entries, 9, 10, 11, 12, 13, 14, 15],
-        );
+        // directories, signing keys (from 6.5.0), files, data entries, and
+        // seven more kinds.
+        words(&mut h, &[1, 2, 3, 4, 5, 6, 7]);
+        if ge((6, 5, 0, 0)) {
+            words(&mut h, &[99]);
+        }
+        words(&mut h, &[8, entries, 9, 10, 11, 12, 13, 14, 15]);
+        if ge((7, 0, 0, 3)) {
+            // The version of the compiled script.
+            words(&mut h, &[0xc0de]);
+        }
         h.extend_from_slice(&[0x55; 20]);
         if v < (6, 4, 0, 1) {
             h.extend_from_slice(&[0x11; 8]);
@@ -1145,7 +1306,27 @@ mod tests {
         if ge((5, 5, 7, 0)) {
             h.push(0x44);
         }
-        let password = if ge((6, 4, 0, 0)) {
+        if ge((6, 5, 2, 0)) {
+            h.extend_from_slice(&[0x45; 8]);
+        }
+        if ge((6, 7, 0, 0)) {
+            h.extend_from_slice(&[0x4c; 4]);
+        }
+        if ge((6, 6, 0, 0)) {
+            h.extend_from_slice(&[0x46; 8]);
+        }
+        if ge((6, 7, 0, 0)) {
+            h.extend_from_slice(&[0x4d; 4]);
+        }
+        if ge((6, 6, 1, 0)) {
+            h.push(0x47);
+        }
+        if ge((6, 7, 0, 0)) {
+            h.extend_from_slice(&[0x48, 0x49]);
+        }
+        let password = if ge((6, 5, 0, 0)) {
+            0
+        } else if ge((6, 4, 0, 0)) {
             4 + 44
         } else if ge((5, 3, 9, 0)) {
             20 + 8
@@ -1177,6 +1358,14 @@ mod tests {
         counted: Option<u32>,
         /// A second loader table in the stub, outside its resources.
         decoy: bool,
+        /// The loader table of revision 2, with 64-bit offsets.
+        table2: bool,
+        /// The upper 32 bits of every chunk offset (from 6.5.2).
+        chunk_high: u64,
+        /// The encryption header's byte (from 6.5.0), and whether the setup
+        /// headers are then unreadable.
+        encryption: u8,
+        scrambled: bool,
     }
 
     impl Setup {
@@ -1189,6 +1378,10 @@ mod tests {
                 header_method: None,
                 counted: None,
                 decoy: false,
+                table2: false,
+                chunk_high: 0,
+                encryption: 0,
+                scrambled: false,
             }
         }
 
@@ -1250,10 +1443,13 @@ mod tests {
             let mut table = Vec::new();
             for (chunk_off, file_off, f, chunk_size) in entries {
                 let mut e = vec![0u8; entry_size(v)];
-                e[8..12].copy_from_slice(&chunk_off.to_le_bytes());
-                e[12..20].copy_from_slice(&file_off.to_le_bytes());
-                e[20..28].copy_from_slice(&(f.data.len() as u64).to_le_bytes());
-                e[28..36].copy_from_slice(&chunk_size.to_le_bytes());
+                // The chunk offset is 8 bytes from 6.5.2, 4 before.
+                let wide = if v >= (6, 5, 2, 0) { 4 } else { 0 };
+                let chunk_off = u64::from(chunk_off) | self.chunk_high << 32;
+                e[8..12 + wide].copy_from_slice(&chunk_off.to_le_bytes()[..4 + wide]);
+                e[12 + wide..20 + wide].copy_from_slice(&file_off.to_le_bytes());
+                e[20 + wide..28 + wide].copy_from_slice(&(f.data.len() as u64).to_le_bytes());
+                e[28 + wide..36 + wide].copy_from_slice(&chunk_size.to_le_bytes());
                 let mut flags = f.flags;
                 if f.method != Method::Stored {
                     flags |= COMPRESSED;
@@ -1261,9 +1457,16 @@ mod tests {
                 if f.filtered {
                     flags |= CALL_FILTER;
                 }
+                if v >= (6, 4, 3, 0) {
+                    // Five flags are left: the call filter is bit 2,
+                    // encrypted 3, compressed 4.
+                    flags = u16::from(flags & CALL_FILTER != 0) << 2
+                        | u16::from(flags & ENCRYPTED != 0) << 3
+                        | u16::from(flags & COMPRESSED != 0) << 4;
+                }
                 let at = flags_at(v);
                 e[at] = flags as u8;
-                if v >= (5, 1, 13, 0) {
+                if ((5, 1, 13, 0)..(6, 4, 3, 0)).contains(&v) {
                     e[at + 1] = (flags >> 8) as u8;
                 }
                 table.extend(e);
@@ -1313,14 +1516,41 @@ mod tests {
                 self.header_method.unwrap_or(byte),
                 self.counted.unwrap_or(count),
             );
-            exe.extend(block(&compress(&header, Method::Lzma1), true));
-            exe.extend(block(&compress(&table, Method::Lzma1), true));
+            if v >= (6, 5, 0, 0) {
+                // A checksum, the byte, and the key derivation data.
+                exe.extend_from_slice(&[0xc5; 4]);
+                exe.push(self.encryption);
+                exe.extend_from_slice(&[0x5c; 48]);
+            }
+            let mut first = block(v, &compress(&header, Method::Lzma1), true);
+            let mut second = block(v, &compress(&table, Method::Lzma1), true);
+            if self.scrambled {
+                // Noise in the first block but for its size, and a size in
+                // the second that no limit allows.
+                first
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(i, _)| !(4..8).contains(i))
+                    .for_each(|(_, b)| *b ^= 0xa5);
+                second[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+            }
+            exe.extend(first);
+            exe.extend(second);
             // The loader table, in the stub's resource.
             let mut loader = LOADER_MAGICS[0].to_vec();
             for word in [1, 0, 0, 0, 0, setup0 as u32, setup1 as u32, 0] {
                 loader.extend_from_slice(&u32::to_le_bytes(word));
             }
-            exe[LOADER_AT..LOADER_AT + 44].copy_from_slice(&loader);
+            if self.table2 {
+                // Revision 2: sizes and offsets of 64 bits, a padding word.
+                loader.truncate(12);
+                loader.extend_from_slice(&2u32.to_le_bytes());
+                loader.extend_from_slice(&[0; 8 + 8 + 4 + 4]);
+                loader.extend_from_slice(&(setup0 as u64).to_le_bytes());
+                loader.extend_from_slice(&(setup1 as u64).to_le_bytes());
+                loader.extend_from_slice(&[0; 4 + 4]);
+            }
+            exe[LOADER_AT..LOADER_AT + loader.len()].copy_from_slice(&loader);
             if self.decoy {
                 // Another table where a search for the magic finds it first.
                 let mut other = LOADER_MAGICS[0].to_vec();
@@ -1384,6 +1614,15 @@ mod tests {
             (6, 3, 0, 0),
             (6, 4, 0, 0),
             (6, 4, 0, 1),
+            (6, 4, 2, 0),
+            (6, 4, 3, 0),
+            (6, 5, 0, 0),
+            (6, 5, 2, 0),
+            (6, 6, 0, 0),
+            (6, 6, 1, 0),
+            (6, 7, 0, 0),
+            (7, 0, 0, 1),
+            (7, 0, 0, 3),
         ] {
             // The one compression the setup header names, for every chunk;
             // a file it leaves stored is stored.
@@ -1505,7 +1744,16 @@ mod tests {
             code[at] = 0xe8;
             code[at + 1..at + 5].copy_from_slice(&rel.to_le_bytes());
         }
-        for v in [(5, 2, 0, 0), (5, 5, 7, 0)] {
+        for v in [
+            (5, 2, 0, 0),
+            (5, 5, 7, 0),
+            (6, 4, 2, 0),
+            (6, 4, 3, 0),
+            (6, 5, 2, 0),
+            (6, 6, 1, 0),
+            (6, 7, 0, 0),
+            (7, 0, 0, 3),
+        ] {
             let exe = build(
                 v,
                 &[Spec {
@@ -1528,21 +1776,30 @@ mod tests {
     #[test]
     fn an_encrypted_file_is_password_protected() {
         let a = payload(100, 1);
-        let exe = build(
+        for v in [
             (6, 4, 0, 1),
-            &[
-                Spec {
-                    flags: ENCRYPTED,
-                    ..spec(&a, Method::Lzma2)
-                },
-                spec(&a, Method::Lzma2),
-            ],
-            false,
-        );
-        let (seen, end) = walked(&exe, Limits::default());
-        end.unwrap();
-        assert!(seen[0].1.is_empty() && seen[0].2.is_some() && seen[0].3);
-        assert_eq!(seen[1].1, a);
+            (6, 4, 3, 0),
+            (6, 5, 2, 0),
+            (6, 6, 1, 0),
+            (6, 7, 0, 0),
+            (7, 0, 0, 3),
+        ] {
+            let exe = build(
+                v,
+                &[
+                    Spec {
+                        flags: ENCRYPTED,
+                        ..spec(&a, Method::Lzma2)
+                    },
+                    spec(&a, Method::Lzma2),
+                ],
+                false,
+            );
+            let (seen, end) = walked(&exe, Limits::default());
+            end.unwrap();
+            assert!(seen[0].1.is_empty() && seen[0].2.is_some() && seen[0].3);
+            assert_eq!(seen[1].1, a);
+        }
     }
 
     /// An installer before 5.1.5 has no loader resource: the header at 0x30
@@ -1583,8 +1840,15 @@ mod tests {
         let mut ext = exe.clone();
         ext[LOADER_AT + 36..LOADER_AT + 40].fill(0);
         assert!(one_report(&ext));
-        // A version before 5.1.5 or past 6.4.0, and no loader table.
-        for v in [(5, 0, 4, 0), (6, 4, 3, 0), (6, 5, 0, 0), (7, 0, 1, 0)] {
+        // A version before 5.1.5, past 7.0.0.3, one between that has no
+        // layout, and no loader table.
+        for v in [
+            (5, 0, 4, 0),
+            (7, 0, 0, 0),
+            (7, 0, 0, 2),
+            (7, 0, 0, 4),
+            (7, 1, 0, 0),
+        ] {
             assert!(
                 one_report(&build(v, &[spec(&a, Method::Zlib)], false)),
                 "{v:?}"
@@ -1642,6 +1906,104 @@ mod tests {
         two[0x260..0x264].copy_from_slice(&(0x1000u32 + (other - 0x200) as u32).to_le_bytes());
         let (seen, _) = walked(&two, Limits::default());
         assert!(seen.len() == 1 && seen[0].2.is_some());
+    }
+
+    #[test]
+    fn a_data_entry_is_two_bytes_smaller_from_6_4_3_and_four_larger_from_6_5_2() {
+        // Sizes of the entries of the released installers.
+        assert_eq!(entry_size((6, 4, 0, 1)), 87);
+        assert_eq!(entry_size((6, 4, 2, 0)), 87);
+        assert_eq!(entry_size((6, 4, 3, 0)), 85);
+        assert_eq!(entry_size((6, 5, 0, 0)), 85);
+        assert_eq!(entry_size((6, 5, 2, 0)), 89);
+    }
+
+    #[test]
+    fn a_chunk_offset_has_64_bits_from_6_5_2() {
+        let a = payload(100, 1);
+        let mut setup = Setup::new((6, 5, 2, 0));
+        setup.chunk_high = 1;
+        let exe = setup.build(&[spec(&a, Method::Zlib)], false);
+        // The chunk is 4 GiB further than the lower half says: not there.
+        let (seen, end) = walked(&exe, Limits::default());
+        end.unwrap();
+        assert!(seen.len() == 1 && seen[0].2.is_some());
+        // Before 6.5.2 the entry has no room for the upper half.
+        let mut setup = Setup::new((6, 5, 0, 0));
+        setup.chunk_high = 1;
+        let exe = setup.build(&[spec(&a, Method::Zlib)], false);
+        let (seen, end) = walked(&exe, Limits::default());
+        end.unwrap();
+        assert_eq!(ok(&seen), vec![a]);
+    }
+
+    #[test]
+    fn the_encryption_header_of_6_5_is_skipped_and_only_encrypted_when_it_says_so() {
+        let a = payload(100, 1);
+        // Files encrypted but the setup headers readable: the files are
+        // listed, none of them reported as encrypted.
+        let mut setup = Setup::new((6, 5, 0, 0));
+        setup.encryption = 1;
+        let exe = setup.build(&[spec(&a, Method::Zlib)], false);
+        let (seen, end) = walked(&exe, Limits::default());
+        end.unwrap();
+        assert_eq!(ok(&seen), vec![a.clone()]);
+        assert!(!seen[0].3);
+        // The setup headers encrypted too: one report, password protected.
+        setup.scrambled = true;
+        let exe = setup.build(&[spec(&a, Method::Zlib)], false);
+        let (seen, end) = walked(&exe, Limits::default());
+        end.unwrap();
+        assert!(seen.len() == 1 && seen[0].2.is_some() && seen[0].3);
+        // The same bytes with the installer not saying it is encrypted are a
+        // header that is not understood, not an encrypted installer: here
+        // the size in the second block is over the limit.
+        setup.encryption = 0;
+        let exe = setup.build(&[spec(&a, Method::Zlib)], false);
+        let (seen, end) = walked(&exe, Limits::default());
+        assert!(seen.is_empty() && end.is_err());
+    }
+
+    #[test]
+    fn a_loader_table_of_revision_2_has_64_bit_offsets() {
+        let a = payload(100, 1);
+        let mut setup = Setup::new((6, 4, 3, 0));
+        setup.table2 = true;
+        let exe = setup.build(&[spec(&a, Method::Zlib)], false);
+        assert_eq!(le32(&exe, LOADER_AT + 12), Some(2));
+        let (seen, end) = walked(&exe, Limits::default());
+        end.unwrap();
+        assert_eq!(ok(&seen), vec![a.clone()]);
+        // The upper half of an offset counts: setup-0 is not at its lower
+        // half, and the installer is reported, not read from there.
+        for at in [LOADER_AT + 40, LOADER_AT + 48] {
+            let mut far = exe.clone();
+            far[at + 4] = 1;
+            let (seen, _) = walked(&far, Limits::default());
+            assert!(seen.len() == 1 && seen[0].2.is_some(), "{at:#x}");
+        }
+    }
+
+    #[test]
+    fn the_stored_size_of_a_block_has_64_bits_from_6_7_0() {
+        let v = (6, 7, 0, 0);
+        let a = payload(100, 1);
+        let exe = build(v, &[spec(&a, Method::Zlib)], false);
+        assert_eq!(block_header(v), 13);
+        let first = le32(&exe, LOADER_AT + 32).unwrap() as usize + VERSION_STRING + 53;
+        let second = first + 13 + le64(&exe, first + 4).unwrap() as usize;
+        // The upper half of the first block's size sends the second block out
+        // of the file: the installer is reported, not read from the lower half.
+        let mut far = exe.clone();
+        far[first + 8] = 1;
+        let (seen, end) = walked(&far, Limits::default());
+        end.unwrap();
+        assert!(seen.len() == 1 && seen[0].2.is_some(), "{seen:?}");
+        // That of the second block is over the buffer limit.
+        let mut big = exe;
+        big[second + 8] = 1;
+        let (seen, end) = walked(&big, Limits::default());
+        assert!(seen.is_empty() && !end.unwrap_err().is_corrupt());
     }
 
     #[test]
@@ -1735,9 +2097,10 @@ mod tests {
         let files: Vec<Spec> = (0..200).map(|_| spec(&a, Method::Stored)).collect();
         let mut exe = build((6, 4, 0, 1), &files, false);
         let first = le32(&exe, LOADER_AT + 32).unwrap() as usize + VERSION_STRING;
-        let second = first + BLOCK_HEADER + le32(&exe, first + 4).unwrap() as usize;
+        let header = block_header((6, 4, 0, 1));
+        let second = first + header + le32(&exe, first + 4).unwrap() as usize;
         // Past the block header, the first piece's CRC and the LZMA header.
-        let at = second + BLOCK_HEADER + 4 + 5 + 40;
+        let at = second + header + 4 + 5 + 40;
         exe[at..at + 60].fill(0xff);
         let (seen, end) = walked(&exe, Limits::default());
         end.unwrap();
@@ -1784,5 +2147,67 @@ mod tests {
             parse_version(b"My Inno Setup Extensions Setup Data (3.0.6.1)"),
             None
         );
+    }
+
+    /// Walks the released installers of `tests/inno/installers.txt`, which
+    /// `make test-inno` fetches into the directory `EXAV_DEBUG_INNO_DIR`:
+    /// every data entry must come out whole, with the SHA-256 the installer
+    /// stores for it.
+    #[test]
+    #[ignore = "needs the installers: make test-inno"]
+    fn released_installers_give_every_file_whole_with_its_checksum() {
+        use sha2::{Digest, Sha256};
+        let dir = std::env::var("EXAV_DEBUG_INNO_DIR")
+            .expect("EXAV_DEBUG_INNO_DIR is not set: run make test-inno");
+        let list = include_str!("../../tests/inno/installers.txt");
+        let rows: Vec<Vec<&str>> = list
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .map(|l| l.split_whitespace().collect())
+            .collect();
+        assert!(!rows.is_empty());
+        for row in rows {
+            let [version, url, _] = row[..] else {
+                panic!("installers.txt: {row:?}");
+            };
+            let path = std::path::Path::new(&dir).join(url.rsplit('/').next().unwrap());
+            let exe = std::fs::read(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+            // The entries as the installer stores them.
+            let (setup0, _) = loader(&exe).expect("loader table");
+            let (v, _) = parse_version(&exe.window(setup0, VERSION_STRING)).expect("version");
+            assert!(is_read(v), "{version}: data version {v:?}");
+            assert_eq!(checksum_size(v), 32, "{version}: SHA-256 expected");
+            let first = setup0 + VERSION_STRING + encryption_header(v);
+            let (stored, _) = block_head(&exe, first, v).expect("block header");
+            let max = Limits::default().max_buffer_bytes;
+            let second = first + block_header(v) + stored as usize;
+            let (data, damaged) = super::block(&exe, second, v, max)
+                .unwrap()
+                .expect("data entries");
+            assert!(!damaged && data.len() % entry_size(v) == 0, "{version}");
+            let (seen, end) = walked(&exe, Limits::default());
+            end.unwrap();
+            let count = data.len() / entry_size(v);
+            assert_eq!(seen.len(), count, "{version}");
+            for (i, e) in data.chunks_exact(entry_size(v)).enumerate() {
+                let want = format!("inno-file-{i}");
+                let (_, bytes, unsupported, _) = seen
+                    .iter()
+                    .find(|m| m.0 == want)
+                    .unwrap_or_else(|| panic!("{version}: no {want}"));
+                assert!(unsupported.is_none(), "{version} {want}: {unsupported:?}");
+                assert_eq!(
+                    bytes.len() as u64,
+                    le64(e, entry_base(v) - 16).unwrap(),
+                    "{version} {want}: short or long"
+                );
+                assert_eq!(
+                    Sha256::digest(bytes)[..],
+                    e[entry_base(v)..entry_base(v) + 32],
+                    "{version} {want}: checksum"
+                );
+            }
+            println!("{version}: {count} files, all whole, checksums verified");
+        }
     }
 }

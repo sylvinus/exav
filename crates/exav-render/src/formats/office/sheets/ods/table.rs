@@ -1,8 +1,9 @@
 //! A table:table to a sheet: columns, rows, cells, merges, notes, links,
 //! validation, conditional formats and drawings.
 
-use super::styles::Props;
+use super::styles::Styles;
 use super::{Doc, cf, draw, paragraphs, parse_date, parse_duration, parse_range_addr, text_of};
+use crate::formats::office::common::odf;
 use crate::formats::office::common::xml::{Child, Node};
 use crate::formats::office::sheets::error::Result;
 use crate::formats::office::sheets::limits::Budget;
@@ -97,19 +98,19 @@ pub(crate) fn read_table(
             last,
             ..Default::default()
         };
-        if let Some(w) = c
-            .attr("table:style-name")
-            .and_then(|sn| doc.st.other("table-column", sn))
-            .and_then(|cs| cs.child("style:table-column-properties"))
-            .and_then(|p| p.attr("style:column-width"))
-            .and_then(super::styles::parse_len_pt)
-        {
+        if let Some(w) = c.attr("table:style-name").and_then(|sn| {
+            doc.st
+                .chain("table-column", Some(sn))
+                .get("table-column/style:column-width")
+                .and_then(odf::pt)
+        }) {
             info.width = Some(width_chars(w.clamp(0.0, 4000.0), digit));
         }
         info.hidden = matches!(c.attr("table:visibility"), Some("collapse" | "filter"));
         let ds = c.attr("table:default-cell-style-name").map(str::to_string);
         if let Some(d) = ds.as_deref().filter(|d| *d != "Default") {
             info.style = Some(doc.sid(wb, Some(d)));
+            budget.alloc(doc.st.take_charge())?;
         }
         col_style.push((first, last, ds));
         sheet.cols.push(info);
@@ -132,19 +133,16 @@ pub(crate) fn read_table(
     // Row heights: the most common one is the default.
     let row_info = |doc: &Doc, row: &Node| -> RowInfo {
         let mut info = RowInfo::default();
-        if let Some(p) = row
-            .attr("table:style-name")
-            .and_then(|sn| doc.st.other("table-row", sn))
-            .and_then(|rs| rs.child("style:table-row-properties"))
-        {
-            if let Some(h) = p
-                .attr("style:row-height")
-                .and_then(super::styles::parse_len_pt)
-            {
+        if let Some(sn) = row.attr("table:style-name") {
+            let p = doc.st.chain("table-row", Some(sn));
+            if let Some(h) = p.get("table-row/style:row-height").and_then(odf::pt) {
                 // Heights are whole twips.
                 info.height = Some(((h * 20.0).round() / 20.0).clamp(0.0, 409.5));
             }
-            info.custom_height = p.attr("style:use-optimal-row-height") != Some("true");
+            if p.iter().any(|(k, _)| k.starts_with("table-row/")) {
+                info.custom_height =
+                    p.get("table-row/style:use-optimal-row-height") != Some("true");
+            }
         }
         info.hidden = matches!(row.attr("table:visibility"), Some("collapse" | "filter"));
         info
@@ -354,6 +352,7 @@ pub(crate) fn read_table(
             if is_cell {
                 first_copy(cell, doc, sheet, (r, c), rep, crep, &mut anchored);
             }
+            budget.alloc(doc.st.take_charge())?;
             c = c.saturating_add(cn);
         }
         r = r.saturating_add(n);
@@ -412,6 +411,7 @@ pub(crate) fn read_table(
     }
     cf::read_table_cfs(t, doc, wb, sheet);
     draw::read_drawings(t, doc, wb, budget, sheet, &anchored, charts_out)?;
+    budget.alloc(doc.st.take_charge())?;
     Ok(())
 }
 
@@ -740,17 +740,14 @@ fn parse_cell(
             cell.attr("office:boolean-value").map(str::trim),
             Some("true" | "1")
         )),
-        Some("string") => {
-            let base = doc.st.resolve(style_name.unwrap_or("Default"));
-            match cell_runs(cell, &base, &doc.text_styles) {
-                Some(runs) => rich(runs, doc),
-                None => Value::text(
-                    cell.attr("office:string-value")
-                        .map(str::to_string)
-                        .unwrap_or_else(|| paragraphs(cell)),
-                ),
-            }
-        }
+        Some("string") => match cell_runs(cell, style_name.unwrap_or("Default"), &doc.st) {
+            Some(runs) => rich(runs),
+            None => Value::text(
+                cell.attr("office:string-value")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| paragraphs(cell)),
+            ),
+        },
         _ if cell.child("text:p").is_some() && formula.is_none() => Value::text(paragraphs(cell)),
         _ => Value::Empty,
     };
@@ -768,18 +765,21 @@ fn parse_cell(
     Ok(Some((value, formula.map(String::into_boxed_str))))
 }
 
+/// Whether a node holds a span.
+fn has_span(n: &Node, depth: u32) -> bool {
+    depth <= 32
+        && n.nodes()
+            .any(|c| c.name == "text:span" || has_span(c, depth + 1))
+}
+
 /// The runs of a cell's text where spans change the font, or `None` when
-/// none does.
-fn cell_runs(
-    cell: &Node,
-    base: &Props,
-    text_styles: &HashMap<String, Props>,
-) -> Option<Vec<(String, Props)>> {
+/// none does. `style` is the cell's style.
+fn cell_runs(cell: &Node, style: &str, st: &Styles) -> Option<Vec<(String, Font)>> {
     fn walk(
         n: &Node,
-        cur: &Props,
-        ts: &HashMap<String, Props>,
-        runs: &mut Vec<(String, Props)>,
+        cur: &Font,
+        st: &Styles,
+        runs: &mut Vec<(String, Font)>,
         any: &mut bool,
         depth: u32,
     ) {
@@ -791,12 +791,17 @@ fn cell_runs(
                 Child::Text(t) => runs.push((t.clone(), cur.clone())),
                 Child::Node(x) => match x.name.as_str() {
                     "text:span" => {
-                        let mut p = cur.clone();
-                        if let Some(sp) = x.attr("text:style-name").and_then(|sn| ts.get(sn)) {
-                            p.overlay(sp);
-                            *any = true;
-                        }
-                        walk(x, &p, ts, runs, any, depth + 1);
+                        let f = match x
+                            .attr("text:style-name")
+                            .and_then(|sn| st.span_font(sn, cur))
+                        {
+                            Some(f) => {
+                                *any = true;
+                                f
+                            }
+                            None => cur.clone(),
+                        };
+                        walk(x, &f, st, runs, any, depth + 1);
                     }
                     "text:s" => {
                         let k = x
@@ -809,12 +814,16 @@ fn cell_runs(
                     "text:tab" => runs.push(("\t".into(), cur.clone())),
                     "text:line-break" => runs.push(("\n".into(), cur.clone())),
                     "office:annotation" => {}
-                    _ => walk(x, cur, ts, runs, any, depth + 1),
+                    _ => walk(x, cur, st, runs, any, depth + 1),
                 },
             }
         }
     }
-    let mut runs: Vec<(String, Props)> = vec![];
+    if !cell.nodes().any(|p| has_span(p, 0)) {
+        return None;
+    }
+    let base = st.font(style);
+    let mut runs: Vec<(String, Font)> = vec![];
     let mut any = false;
     let mut first = true;
     for p in cell.nodes().filter(|p| p.name == "text:p") {
@@ -823,15 +832,14 @@ fn cell_runs(
             runs.push(("\n".into(), last));
         }
         first = false;
-        walk(p, base, text_styles, &mut runs, &mut any, 0);
+        walk(p, &base, st, &mut runs, &mut any, 0);
     }
     any.then_some(runs)
 }
 
-fn rich(runs: Vec<(String, Props)>, doc: &Doc) -> Value {
+fn rich(runs: Vec<(String, Font)>) -> Value {
     let mut out: Vec<Run> = vec![];
-    for (text, p) in runs {
-        let font = doc.st.to_style(&p).font;
+    for (text, font) in runs {
         if let Some(last) = out.last_mut()
             && last.font.as_ref() == Some(&font)
         {

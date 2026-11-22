@@ -220,11 +220,8 @@ pub(crate) struct Parser<'a> {
 }
 
 pub(crate) fn read(input: &[u8], budget: &mut Budget) -> Result<Document> {
-    let head = input.iter().take(64).copied().collect::<Vec<u8>>();
-    let start = head
-        .windows(5)
-        .position(|w| w == b"{\\rtf")
-        .ok_or_else(|| Error::NotFormat("no {\\rtf header".into()))?;
+    let start =
+        exav_unpack::find_rtf(input, 64).ok_or_else(|| Error::NotFormat("no RTF header".into()))?;
     let data = &input[start..];
     let mut p = Parser {
         b: budget,
@@ -332,7 +329,7 @@ impl Parser<'_> {
                 }
                 Tok::Word(w, n) => {
                     if self.stack.is_empty() {
-                        // Before the first group: only {\rtf starts the document.
+                        // Before the first group: only the header's group starts the document.
                         continue;
                     }
                     // The text so far has the formatting the word will change.

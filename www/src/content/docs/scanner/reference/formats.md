@@ -59,7 +59,7 @@ off under `--clamav-compat`.
 A document whose text is not all read is still scanned as bytes, and the scan
 is `PARTIAL`, never `OK`: a text cut short, a drawing past a limit, and with
 `visible-text-office` an office document whose text cannot be taken out
-(encrypted, past a limit, damaged). Another document that does not parse has
+(encrypted, past a limit that follows `--max-object-bytes`, damaged). Another document that does not parse has
 no text view, and its bytes are scanned as any file's. A compound file
 (`.doc`, `.xls`, `.ppt` and their templates) is read as an office document by
 its extension only, so that an installer is not read whole to find out; one
@@ -77,8 +77,8 @@ default), the QR codes in an image are read: every format the viewer's
 decoders read (PNG, JPEG, GIF, BMP, TIFF, WebP, JPEG 2000, JBIG2 and the
 others), an image inside an archive or a document included, and the images
 of a PDF (JPEG, raw pixels, CCITT, JBIG2 with its globals). An image that is
-recognised and does not decode, and a PDF image whose dictionary, color space
-(Lab, Separation, DeviceN) or predictor (TIFF) is not read, is not reported
+recognised and does not decode, and a PDF image whose dictionary or color
+space (Lab, Separation, DeviceN) is not read, is not reported
 clean: the scan is `PARTIAL` (unscannable) with the reason. A file that only
 starts like a BMP, ICO, PNM, DDS, QOI or JPEG XL image, without the rest of
 its header, is not an image. Each
@@ -109,7 +109,7 @@ scanned in turn:
   Excel 2003 flat XML.
 - **Mail:** MIME, TNEF (`winmail.dat`), BinHex, uuencode.
 - **Installers and self-extractors:** NSIS, SFX archives, AutoIt scripts
-  (compiled ones too), Inno Setup 5.1.5 to 6.4 (other versions, encrypted
+  (compiled ones too), Inno Setup 5.1.5 to 7.1.0 (other versions, encrypted
   files and files in a separate `setup-1.bin` reported), InstallShield
   InstallScript cabinets, and InstallShield setup executables of 2009 and
   later (the MSI and the files beside it; the 2015 layout not under
@@ -163,8 +163,8 @@ them in every object:
 
 | State | Packers |
 |---|---|
-| **Unpacked, per format** | UPX, every method, on PE, ELF and Mach-O; the aPLib family (Petite 2.x, FSG 2.0, NsPack); MPRESS, by running ClamAV's own `.cbc` unpacker on exav's bytecode interpreter, so only with `bytecode.cvd` loaded |
-| **Unpacked by running the stub** | ASPack, MEW, Upack, WWPack, PESpin, Yoda's Cryptor, and anything else that looks packed, under a bounded x86 interpreter that captures the image the stub rebuilds ([PE stub emulation](/scanner/concepts/pe-emulation/)) |
+| **Unpacked, per format** | UPX, every method, on PE, ELF and Mach-O; MPRESS, by running ClamAV's own `.cbc` unpacker on exav's bytecode interpreter, so only with `bytecode.cvd` loaded |
+| **Unpacked by running the stub** | ASPack, Petite, FSG, NsPack, MEW, Upack, WWPack, PESpin, Yoda's Cryptor, and anything else that looks packed, under a bounded x86 interpreter that captures the image the stub rebuilds ([PE stub emulation](/scanner/concepts/pe-emulation/)) |
 | **Reported `UNSCANNABLE`** | A file whose packer exav identified but could not unpack. A file sent to the emulator only because of its shape is scanned as it is if nothing comes out |
 | **Reported, never unpacked** | VMProtect, Themida/WinLicense, Enigma: virtualizers, where no original code exists in memory to recover |
 
@@ -236,7 +236,7 @@ that content is reported `PASSWORD-PROTECTED`.
 
 A container or codec exav recognises but does not decode is reported
 `UNSCANNABLE` rather than scanned as opaque bytes: ACE, StuffIt, Inno Setup
-before 5.1.5 and from 6.5 (and an Inno file kept in a separate `setup-1.bin`),
+before 5.1.5 and from 7.1.1 (and an Inno file kept in a separate `setup-1.bin`),
 the files of an InstallScript cabinet set that lie in
 another cabinet than the one scanned, lrzip, and a few codecs inside formats exav otherwise opens (ZIP methods 10,
 94, 96 and 97, RAR 1.5 and 2.x compression, WIM LZMS, and others). The

@@ -1,7 +1,8 @@
 //! What the docs targets check of a conversion that succeeds.
-use std::io::Read;
-
 use exav_render::docs::{Format, Limits, convert};
+
+#[path = "zip_parts.rs"]
+mod zip_parts;
 
 /// Converts `doc` and checks the DOCX.
 pub fn run(doc: &[u8], format: Format) {
@@ -26,24 +27,20 @@ pub fn limits() -> Limits {
 /// character.
 pub fn docx(bytes: &[u8], limits: &Limits) {
     assert!(bytes.len() as u64 <= limits.max_memory);
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a ZIP");
+    let parts = zip_parts::parts(bytes);
     for part in [
         "[Content_Types].xml",
         "_rels/.rels",
         "word/document.xml",
         "word/styles.xml",
     ] {
-        assert!(z.index_for_name(part).is_some(), "{part}");
+        assert!(parts.iter().any(|(name, _)| name == part), "{part}");
     }
-    for i in 0..z.len() {
-        let mut f = z.by_index(i).expect("a part");
-        let name = f.name().map(|n| n.to_string()).unwrap_or_default();
+    for (name, data) in &parts {
         if !(name.ends_with(".xml") || name.ends_with(".rels")) {
             continue;
         }
-        let mut s = String::new();
-        f.read_to_string(&mut s)
-            .unwrap_or_else(|_| panic!("{name}: UTF-8"));
+        let s = std::str::from_utf8(data).unwrap_or_else(|_| panic!("{name}: UTF-8"));
         assert!(s.starts_with("<?xml"), "{name}");
         // No C0 control character but white space: XML 1.0 refuses them.
         assert!(

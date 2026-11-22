@@ -67,6 +67,10 @@ exav-unpack only:
   --max-extracted-bytes SIZE|off
                      stop past SIZE decoded bytes in all (default 64G);
                      --max-size is the older name
+  --max-hole-bytes SIZE|off
+                     stop past SIZE bytes of holes in all, the unwritten
+                     stretches of the sparse files of a disk image, which do
+                     not count in --max-extracted-bytes (default 64G)
   --max-object-bytes SIZE|off
                      largest member or container held in memory whole (1G);
                      --max-memory is the older name. With -r, a member that is
@@ -187,6 +191,10 @@ for a password, 2 for any other (damage, a limit).
   limit as its flags do (the depth has none); `--max-size` and `--max-memory` are the
   older names of the first two and still work. See
   [the safety model](/unpack/#the-safety-model).
+- `--max-hole-bytes`: the holes of the sparse files of a disk image, the
+  stretches the volume never wrote, written out as zeros, 64 GiB of them in
+  all by default. They count here rather than in `--max-extracted-bytes`, so a
+  large sparse file does not end the extraction of the rest of the volume.
 - `--max-compression-ratio`: a member that decodes to more than this many times
   its size in the archive (1000 by default) is left out once it is past
   `--max-object-bytes`, and the other members are still read. The limit is
@@ -224,7 +232,10 @@ On purpose:
   the target being followed through the links already made, and nothing is
   written through a link already there. A member name's `..` and
   root (`/`, a drive letter) are dropped, so every file lands under the
-  extraction directory. Links are made last, once every member is out.
+  extraction directory. Links are made last, once every member is out. A tar
+  hard link is made a hard link to the file its target member was written
+  to, as GNU tar makes it; one whose target is no file in the extraction
+  directory is an error.
 - Every member is `extracting:`, whatever its compression.
 - A split archive is read from any of its parts.
 - A name that could end a line, move the cursor or reorder text (a control

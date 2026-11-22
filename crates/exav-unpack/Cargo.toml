@@ -46,11 +46,6 @@ exav-pe-emu = { version = "0.0.3", path = "../exav-pe-emu", optional = true }
 # --- Per-format optional deps. Each is pulled in only by the feature(s) below
 # that need it; a dep shared by several formats (e.g. `flate2`) is compiled if
 # ANY enabling feature is active. See `[features]`. ---
-# `legacy-zip`: PKZIP 1.x Shrink, Reduce and Implode (methods 1-6), no
-# `unsafe`. These decode a member whole; `formats/zip.rs` checks its sizes
-# against the buffer limit first. Below 9.1, which always brings a random
-# number source (docs/dependencies.toml).
-zip = { version = ">=9.0.5, <9.1", default-features = false, features = ["deflate-flate2", "legacy-zip"], optional = true }
 # For the bzip2 decoder vendored from `bzip2-rs` in `formats/bzip2_rs`.
 tinyvec = { version = "1.13", optional = true }
 lzxd = { version = "0.2", optional = true }
@@ -63,28 +58,23 @@ lznt1 = { version = "0.1", optional = true }
 # `simd-accel`.
 encoding_rs = { version = "0.8.44", default-features = false, features = ["alloc"], optional = true }
 mail-parser = { version = "0.11.9", optional = true }
-delharc = { version = "0.8.0", optional = true }
+# `no-unsafe-assertions` drops the `assert_unchecked` hints (slower decode).
+delharc = { version = "0.8.0", features = ["no-unsafe-assertions"], optional = true }
 # ARJ decompression: bitstream-io for the "fastest" LZ77 codec
 bitstream-io = { version = "4.10.0", optional = true }
 # Pure-Rust crypto for decrypting password-known encrypted archive members
 # (ZIP ZipCrypto + WinZip AES). DECRYPTION needs only a cipher + a KDF, no RNG,
 # so none of these pull `getrandom` (verified) and the hard no-getrandom default
-# build is preserved. We do NOT enable the `zip` crate's `aes-crypto`/encryption
-# features, which would pull `getrandom` for salt/IV generation we never do.
-aes = { version = "0.9", optional = true }
-hmac = { version = "0.13", optional = true }
+# build is preserved.
+aes ={ version = "0.9", optional = true }
 sha1 = { version = "0.11", optional = true }
-pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
-base64 = { version = "0.23", optional = true }
+base64 = { version = "0.23", default-features = false, features = ["std"], optional = true }
 quick-xml = { version = "0.42", optional = true }
 des = { version = "0.9", default-features = false, optional = true }
 cbc = { version = "0.2", optional = true }
 flate2 = { version = "1.1.10", optional = true }
 # ZIP method 9 (Deflate64 / "enhanced deflate"). A leaf dep: zero runtime
-# dependencies, MIT, and `#![forbid(unsafe_code)]` like this crate. It is the
-# same decoder the `zip` crate uses behind its own `deflate64` feature; we depend
-# on it directly so the raw-bytes path (orphan local headers, where we never go
-# through the `zip` crate's reader) decodes method 9 too.
+# dependencies, MIT, and `#![forbid(unsafe_code)]` like this crate.
 deflate64 = { version = "0.1.12", optional = true }
 lzma-rust2 = { version = "0.25", default-features = false, features = ["std"], optional = true }
 # PDF crypto primitives (replacing hand-rolled implementations)
@@ -108,8 +98,8 @@ crc32fast = { version = "1.5.3", optional = true }
 # feature itself, which switches every `flate2` in the build to zlib-rs and
 # adds SIMD to the image decoders: `text-pdf` is therefore not a default.
 html5gum = { version = "=0.8.4", default-features = false, optional = true }
-hayro-interpret = { version = "=0.8.0", default-features = false, features = ["embed-fonts"], optional = true }
-hayro-syntax = { version = "=0.8.0", optional = true }
+hayro-interpret = { version = "=0.9.0", default-features = false, features = ["embed-fonts"], optional = true }
+hayro-syntax = { version = "=0.9.0", optional = true }
 kurbo = { version = "0.13", optional = true }
 
 [features]
@@ -147,7 +137,9 @@ all-formats-no-emu = [
 ]
 
 # Archives / compressors.
-zip = ["dep:zip", "dep:flate2", "dep:deflate64"]
+zip = ["dep:flate2", "dep:deflate64"]
+# The ZIP writer (`zip_write`), for the converters and for test fixtures.
+zip-write = ["dep:flate2"]
 gzip = ["dep:flate2"]
 tar = []
 bzip2 = ["bzip2-decoder"]
@@ -187,8 +179,8 @@ onenote = []
 rtf = []
 machofat = []
 sfx = ["dep:crc32fast"]
-# PE runtime packers: detection plus the aPLib-family static unpack
-# (Petite/FSG2/NsPack). Pure Rust, parses only: nothing is executed.
+# PE runtime packers: detection, and the report for the ones nothing unpacks.
+# Pure Rust, parses only: nothing is executed.
 pepack = []
 # Emulation-based unpacking: run the packer's own stub under `exav-pe-emu` and
 # capture the image it rebuilds. Its own switch, because it is the one thing in
@@ -248,7 +240,7 @@ ishieldcab = ["dep:flate2"]
 # its companions), coded with a key made from the file name and, in most,
 # inflated.
 ishieldmsi = ["dep:flate2"]
-# Inno Setup 5.1.5 to 6.4: chunks stored, or in zlib, bzip2, LZMA1 or LZMA2.
+# Inno Setup 5.1.5 to 7.1.0: chunks stored, or in zlib, bzip2, LZMA1 or LZMA2.
 inno = ["dep:flate2", "dep:lzma-rust2", "bzip2-decoder"]
 # AppleSingle and AppleDouble: the forks, stored as they are.
 applesingle = []
@@ -260,7 +252,8 @@ upx = ["dep:flate2", "dep:lzma-rust2", "dep:base64"]
 # Structured documents.
 ole = ["dep:flate2", "dep:encoding_rs"]
 # Builders and stand-ins for the tests of other crates: compound files
-# (`cfb::build`) and a spill held in memory (`spill::MemSpill`).
+# (`cfb::build`), a spill held in memory (`spill::MemSpill`) and, with
+# `zip-write`, ZipCrypto members from the ZIP writer (`FileOptions::zipcrypto`).
 test-util = []
 pdf = ["dep:flate2"]
 # HTML as tokens and its bytes as text (the public `html` module).
@@ -294,7 +287,7 @@ dmg = [
 # same as when no password is supplied. Effective only combined with a format
 # that has encryptable members. ARJ's ciphers come with `arj`, not this.
 decrypt = [
-    "offcrypto", "dep:aes", "dep:hmac", "dep:pbkdf2", "dep:sha1",
+    "offcrypto", "dep:aes", "dep:sha1",
     "dep:des", "dep:cbc", "dep:md-5", "dep:sha2", "dep:digest", "dep:stringprep",
 ]
 # Excel workbooks saved with a password: RC4, RC4 CryptoAPI and XOR
@@ -340,17 +333,19 @@ name = "cli"
 required-features = ["zip", "cli"]
 
 [dev-dependencies]
+# Turns `zip-write` and `test-util` on for every test target, which build their
+# ZIP fixtures (some encrypted) with them whatever format features the build has.
+exav-unpack = { path = ".", default-features = false, features = ["zip-write", "test-util"] }
 # Used only in tests to compare decoder output against external-oracle digests.
 sha2 = "0.11"
 # Test helpers build ZIP fixtures and gunzip stored disk images; as optional
 # normal dependencies they would be missing from a single-format test build.
 flate2 = "1.1.10"
-zip = { version = ">=9.0.5, <9.1", default-features = false, features = ["deflate-flate2"] }
 # Reference PPMd7 (var.H) and PPMd8 (var.I) encoders, used only to validate the
 # models in `formats/ppmd7` and `formats/ppmd8` (CC0-1.0/MIT-0).
 ppmd-rust = "1"
 # Used only in tests to create 7z archives for roundtrip testing.
-sevenz-rust2 = { version = "0.24.1", default-features = false, features = ["bzip2", "ppmd", "util", "compress"] }
+sevenz-rust2 = { version = "0.25", default-features = false, features = ["bzip2", "ppmd", "util", "compress"] }
 # Used only in tests to build CAB fixtures for roundtrip testing.
 cab = "0.6.0"
 # Its XZ writer, used only in tests to build XZ (method 95) ZIP members.
@@ -360,7 +355,7 @@ lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "e
 bzip2 = "0.6"
 # Used only in tests: an independent writer and strict reader of compound
 # files, to build them and to check exav's lenient reader against.
-cfb = "0.15.0"
+cfb = "0.16"
 # The oracle `formats/lzfse` is checked against, and its encoder builds the
 # streams it reads.
 lzfse_rust = "0.2.1"

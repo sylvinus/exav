@@ -68,6 +68,9 @@ pub(crate) enum Got<'a> {
     Whole(Vec<u8>),
     /// What could be read of a file that breaks part way, and why it does.
     Partial(Vec<u8>, &'static str),
+    /// A file held as [`Got::Whole`] or [`Got::Partial`] are (with why it
+    /// breaks), that many of whose bytes are holes.
+    Sparse(Vec<u8>, u64, Option<&'static str>),
     /// A file too long to hold, of that many bytes, to be read as it goes. It
     /// fails with an error where the volume stops giving its bytes. The cell
     /// counts the bytes of holes it has given.
@@ -86,6 +89,11 @@ impl Got<'_> {
     pub(crate) fn entry(self, path: String) -> Entry {
         match self {
             Got::Whole(d) => Entry::new(path, d),
+            Got::Sparse(d, holes, why) => Entry {
+                unsupported: why,
+                holes,
+                ..Entry::new(path, d)
+            },
             Got::Partial(d, why) => Entry {
                 unsupported: Some(why),
                 ..Entry::new(path, d)
@@ -167,10 +175,15 @@ pub(crate) fn drain<'a>(fill: &mut dyn Fill, v: &mut Vol, size: u64) -> Got<'a> 
             other => break other,
         }
     };
-    match end {
-        Step::End if out.len() as u64 == size => Got::Whole(out),
-        Step::Broken(why) => Got::Partial(out, why),
-        _ => Got::Partial(out, UNREADABLE),
+    let why = match end {
+        Step::End if out.len() as u64 == size => None,
+        Step::Broken(why) => Some(why),
+        _ => Some(UNREADABLE),
+    };
+    match (fill.holes(), why) {
+        (0, None) => Got::Whole(out),
+        (0, Some(why)) => Got::Partial(out, why),
+        (holes, why) => Got::Sparse(out, holes, why),
     }
 }
 

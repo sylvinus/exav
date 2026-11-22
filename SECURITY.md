@@ -28,7 +28,7 @@ exav's own `unsafe` lives in the `exav` binary, almost all of it in
   `setitimer` (the per-job watchdog), `setrlimit` (the kernel-enforced
   per-worker caps), and the `SIGPIPE` disposition in `main.rs`.
 - **SCM_RIGHTS file-descriptor passing** over the local clamd-compatible socket
-  (`recvmsg`/`sendmsg` + `File::from_raw_fd`): the daemon's `FILDES` command and
+  (`recvmsg`/`sendmsg` + `OwnedFd::from_raw_fd`): the daemon's `FILDES` command and
   the client's `--send-as fd`, required for `clamdscan --fdpass` interop. The
   peer is a local-socket client.
 - **Socket creation mode:** `umask` around the daemon's `bind`, so the Unix

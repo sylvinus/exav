@@ -97,10 +97,10 @@ formats in the browser. What is not done:
 
 - **The text-document converter is a prototype.** On the project's test files,
   32% of the pages of DOC files come out close to a reference rendering,
-  against 50% for DOCX drawn natively. Open decisions: falling back to the
-  external converter for what it reports unsupported (Pages '09, Word 1 and
-  2), making it the default even where an external converter is set, keeping
-  tracked changes in DOC, and Pages tables, pictures and headers.
+  against 50% for DOCX drawn natively. What it reports unsupported (Pages '09,
+  Word 1 and 2) goes on to the external converter where one is set. Open
+  decisions: making it the default even where an external converter is set,
+  keeping tracked changes in DOC, and Pages tables, pictures and headers.
 - **Presentations.** PowerPoint 2, 3 and 4 are recognised and reported
   unsupported. PowerPoint 95 pictures, freeforms and arcs are left out. The
   first slide could be drawn while the rest converts. Binary Visio, CorelDRAW,

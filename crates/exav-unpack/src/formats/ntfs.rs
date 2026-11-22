@@ -1512,6 +1512,7 @@ mod tests {
         };
         match read_file(&mut v, Compressed::new(runs, 16, 4, size), size, cap) {
             Got::Whole(d) => (d, 0, false, true),
+            Got::Sparse(d, holes, why) => (d, holes, false, why.is_none()),
             Got::Partial(d, _) => (d, 0, false, false),
             Got::Stream(mut r, _, holes) => {
                 let mut d = Vec::new();
@@ -1624,7 +1625,8 @@ mod tests {
             assert_eq!((n, unit), (size, Some(4)), "cap {cap}");
             let fill = Compressed::new(stream_runs, 16, 4, n);
             let got = match read_file(&mut v, fill, n, u64::MAX) {
-                crate::formats::vol::Got::Whole(d) => d,
+                crate::formats::vol::Got::Whole(d)
+                | crate::formats::vol::Got::Sparse(d, _, None) => d,
                 _ => panic!("cap {cap}: not held"),
             };
             assert!(got == file, "cap {cap}");
@@ -1869,7 +1871,7 @@ mod tests {
                     size,
                     cap,
                 ) {
-                    Got::Partial(_, why) => why.to_string(),
+                    Got::Partial(_, why) | Got::Sparse(_, _, Some(why)) => why.to_string(),
                     Got::Stream(mut r, ..) => r
                         .read_to_end(&mut Vec::new())
                         .err()

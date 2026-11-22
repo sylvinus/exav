@@ -1,8 +1,11 @@
 //! ZIP packages (OpenDocument, OOXML, iWork) read and written within limits.
 
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use exav_unpack::package::{Package, PartError};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 
 /// Why a package part was not read or written.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,84 +33,43 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// What a package is read from: its bytes, or a reader that fetches the
-/// parts asked for.
-pub trait Source: Read + Seek {}
-impl<T: Read + Seek> Source for T {}
+/// Members' names are listed up to this many.
+pub(crate) const MAX_NAMES: usize = 1 << 16;
 
-/// Opens `reader` as a ZIP archive. The directory is first taken where the
-/// end record says, which reads only the end of the file; the crate's own
-/// search for it, which also finds an archive that something precedes,
-/// reads the whole file from its start, and comes second.
-pub(crate) fn open_zip<R: Read + Seek>(
-    mut reader: R,
-) -> zip::result::ZipResult<zip::ZipArchive<R>> {
-    let config = || zip::read::Config {
-        archive_offset: zip::read::ArchiveOffset::Known(0),
-    };
-    if zip::ZipArchive::with_config(config(), &mut reader).is_ok() {
-        return zip::ZipArchive::with_config(config(), reader);
-    }
-    zip::ZipArchive::new(reader)
-}
-
-pub struct Zip<'a> {
-    z: zip::ZipArchive<Box<dyn Source + 'a>>,
-}
+/// A ZIP package read by exav-unpack's package reader.
+pub struct Zip<'a>(Package<'a>);
 
 impl<'a> Zip<'a> {
     pub fn open(bytes: &'a [u8]) -> Result<Zip<'a>, Error> {
-        Zip::from_source(Box::new(Cursor::new(bytes)))
-    }
-
-    pub fn from_source(source: Box<dyn Source + 'a>) -> Result<Zip<'a>, Error> {
-        let z = open_zip(source).map_err(|e| Error::NotZip(e.to_string()))?;
-        Ok(Zip { z })
+        Package::from_bytes(bytes)
+            .map(Zip)
+            .map_err(|e| Error::NotZip(e.to_string()))
     }
 
     /// Member names, at most 65536 of them.
     pub fn names(&self) -> Vec<String> {
-        self.z
-            .file_names()
-            .take(1 << 16)
-            .filter_map(|s| s.ok().map(|s| s.to_string()))
-            .collect()
+        self.0.names(MAX_NAMES)
     }
 
     /// The member's size when inflated, as its directory entry says.
-    pub fn size(&mut self, name: &str) -> Option<u64> {
-        self.z.by_name(name).ok().map(|f| f.size())
+    pub fn size(&self, name: &str) -> Option<u64> {
+        self.0.size(name)
     }
 
     /// A member, `None` when absent or unreadable; past `max` bytes, an
     /// error.
     pub fn read(&mut self, name: &str, max: u64) -> Result<Option<Vec<u8>>, Error> {
-        let f = match self.z.by_name(name) {
-            Ok(f) => f,
-            Err(zip::result::ZipError::UnsupportedArchive(m))
-                if m == zip::result::ZipError::PASSWORD_REQUIRED =>
-            {
-                return Err(Error::Encrypted);
-            }
-            Err(_) => return Ok(None),
-        };
-        let mut v = Vec::new();
-        if f.take(max + 1).read_to_end(&mut v).is_err() {
-            return Ok(None);
-        }
-        if v.len() as u64 > max {
-            return Err(Error::TooLarge);
-        }
-        Ok(Some(v))
+        self.0.read(name, max).map_err(|e| match e {
+            PartError::Encrypted => Error::Encrypted,
+            PartError::TooLarge => Error::TooLarge,
+        })
     }
 }
 
 /// A ZIP archive written to memory, refused past `limit` bytes.
 pub struct PackageWriter {
-    // Declared first: dropped first, so that the limit is lifted before the
-    // writer below is finalized by its own drop.
-    _lift: Lift,
-    z: Option<zip::ZipWriter<Out>>,
+    lift: Lift,
+    z: Option<ZipWriter<Out>>,
 }
 
 /// The output of a ZIP writer, refused past a limit.
@@ -116,11 +78,7 @@ pub(crate) struct Out {
     limit: Arc<AtomicU64>,
 }
 
-/// Lifts its [`Out`]'s limit when dropped. A ZIP writer dropped without being
-/// finished is finalized by the `zip` crate, which says on stderr when it
-/// cannot: and a writer that was refused (past its limit) is the usual one. Its
-/// archive is wanted by no one, so it is let finish its last small write
-/// quietly.
+/// Lifts its [`Out`]'s limit.
 pub(crate) struct Lift(Arc<AtomicU64>);
 
 impl Lift {
@@ -129,12 +87,6 @@ impl Lift {
     /// the limit was about.
     pub(crate) fn lift(&self) {
         self.0.store(u64::MAX, Ordering::Relaxed);
-    }
-}
-
-impl Drop for Lift {
-    fn drop(&mut self) {
-        self.lift();
     }
 }
 
@@ -187,22 +139,21 @@ impl PackageWriter {
     pub fn new(limit: u64) -> PackageWriter {
         let (out, lift) = Out::new(0, limit);
         PackageWriter {
-            _lift: lift,
-            z: Some(zip::ZipWriter::new(out)),
+            lift,
+            z: Some(ZipWriter::new(out)),
         }
     }
 
     /// Adds a member, deflated or stored.
     pub fn put(&mut self, name: &str, data: &[u8], compress: bool) -> Result<(), Error> {
         let method = if compress {
-            zip::CompressionMethod::Deflated
+            Method::Deflated
         } else {
-            zip::CompressionMethod::Stored
+            Method::Stored
         };
-        let opt = zip::write::SimpleFileOptions::default()
-            .compression_method(method)
-            .compression_level(compress.then_some(6))
-            .last_modified_time(zip::DateTime::default());
+        let opt = FileOptions::default()
+            .method(method)
+            .level(compress.then_some(6));
         let Some(z) = self.z.as_mut() else {
             return Err(Error::Write("the package is finished".to_string()));
         };
@@ -215,7 +166,7 @@ impl PackageWriter {
         let Some(z) = self.z.take() else {
             return Err(Error::Write("the package is finished".to_string()));
         };
-        self._lift.lift();
+        self.lift.lift();
         let out = z.finish().map_err(werr)?;
         Ok(out.into_inner())
     }
@@ -250,5 +201,26 @@ mod tests {
         assert_eq!(z.read("a.txt", 100), Err(Error::Encrypted));
         let mut small = PackageWriter::new(100);
         assert_eq!(small.put("x", &[1u8; 5000], false), Err(Error::TooLarge));
+    }
+
+    /// A part is held in what it takes and a quarter more at most, where
+    /// `read_to_end` doubles its buffer to as much again.
+    #[test]
+    fn a_part_is_held_in_little_more_than_its_length() {
+        let mut w = PackageWriter::new(4 << 20);
+        let part = vec![7u8; (1 << 20) + 1];
+        w.put("p.bin", &part, true).unwrap();
+        let bytes = w.finish().unwrap();
+        let v = Zip::open(&bytes)
+            .unwrap()
+            .read("p.bin", 2 << 20)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.len(), part.len());
+        assert!(
+            v.capacity() <= part.len() + part.len() / 4,
+            "{}",
+            v.capacity()
+        );
     }
 }

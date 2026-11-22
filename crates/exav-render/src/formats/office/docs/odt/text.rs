@@ -213,7 +213,11 @@ impl Odt<'_> {
         };
         let mut ppr = super::props::para_props(&ap.props, list.is_some());
         ppr.style = ap.style.clone();
-        let left = ap.props.twips("paragraph/fo:margin-left").unwrap_or(0);
+        let left = ap
+            .props
+            .margin("paragraph", "left")
+            .and_then(crate::formats::office::common::odf::twips)
+            .unwrap_or(0);
         let mut tabs = super::props::tabs(&ap.tabs, if list.is_some() { 0 } else { left });
         if !tabs.is_empty() {
             tabs.sort_by_key(|t| t.pos);

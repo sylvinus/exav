@@ -21,17 +21,17 @@ from the current source:
 <!-- sizes:wasm -->
 | Module | Opens | Size | Brotli | Gzip |
 | --- | --- | --- | --- | --- |
-| `exav_viewer_image` | TIFF, BMP, ICO, PNM, QOI, DDS, farbfeld, HDR, JPEG 2000, JBIG2, JPEG XL, camera RAW | 2,073,734 | 598,898 | 768,083 |
-| `exav_viewer_dwg` | DWG, DXF | 928,993 | 372,242 | 463,779 |
-| `exav_viewer_model` | IFC, STL, OBJ, PLY, glTF | 429,005 | 160,582 | 194,763 |
-| `exav_viewer_text` | Every text file (its encoding, and whether it is text), Markdown, JSON, XML and diffs | 219,621 | 79,748 | 96,917 |
-| `exav_viewer_sheets` | XLS, ODS, FODS, Numbers, SpreadsheetML 2003, HTML tables, SYLK, to XLSX | 1,222,089 | 489,133 | 598,777 |
-| `exav_viewer_slides` | PPT, ODP, FODP, Keynote, ODG, Visio (VSDX), to PPTX | 1,021,841 | 437,345 | 526,948 |
-| `exav_viewer_docs` | DOC, ODT, FODT, RTF, to DOCX | 1,028,254 | 419,879 | 515,186 |
-| `exav_viewer_table` | CSV, TSV, to XLSX | 253,488 | 104,787 | 120,814 |
-| `exav_viewer_sniff` | What a file is, from its first bytes (exav's own detection), a DOCX, XLSX or PPTX's ZIP directory (exav-unpack's ZIP reader), and which Office formats a compound file or a ZIP is | 161,752 | 77,053 | 86,567 |
-| `openjpeg_nowasm_fallback.js` | JPEG 2000 images in PDFs (pdf.js's JPXDecode), the module in base64 | 269,813 | 83,250 | 100,297 |
-| `jbig2_nowasm_fallback.js` | JBIG2 and CCITT fax images in PDFs, the module in base64 | 317,903 | 69,655 | 87,924 |
+| `exav_viewer_image` | TIFF, BMP, ICO, PNM, QOI, DDS, farbfeld, HDR, JPEG 2000, JBIG2, JPEG XL, camera RAW | 2,150,776 | 611,016 | 782,987 |
+| `exav_viewer_dwg` | DWG, DXF | 928,186 | 371,940 | 463,722 |
+| `exav_viewer_model` | IFC, STL, OBJ, PLY, glTF | 428,564 | 160,635 | 194,717 |
+| `exav_viewer_text` | Every text file (its encoding, and whether it is text), Markdown, JSON, XML and diffs | 218,774 | 79,574 | 96,525 |
+| `exav_viewer_sheets` | XLS, ODS, FODS, Numbers, SpreadsheetML 2003, HTML tables, SYLK, to XLSX | 1,230,657 | 492,176 | 601,249 |
+| `exav_viewer_slides` | PPT, ODP, FODP, Keynote, ODG, Visio (VSDX), to PPTX | 1,041,856 | 442,769 | 533,986 |
+| `exav_viewer_docs` | DOC, ODT, FODT, RTF, Pages, to DOCX | 1,046,728 | 424,420 | 521,391 |
+| `exav_viewer_table` | CSV, TSV, to XLSX | 253,207 | 104,742 | 120,834 |
+| `exav_viewer_sniff` | What a file is, from its first bytes (exav's own detection), a DOCX, XLSX or PPTX's ZIP directory (exav-unpack's ZIP reader), and which Office formats a compound file or a ZIP is | 161,393 | 76,921 | 86,572 |
+| `openjpeg_nowasm_fallback.js` | JPEG 2000 images in PDFs (pdf.js's JPXDecode), the module in base64 | 284,897 | 87,683 | 105,639 |
+| `jbig2_nowasm_fallback.js` | JBIG2 and CCITT fax images in PDFs, the module in base64 | 389,303 | 76,532 | 96,586 |
 <!-- /sizes:wasm -->
 
 Sizes are in bytes, of the files in the package's `wasm/`; a server that
@@ -87,9 +87,9 @@ format. The table is written from the build (`npm run sizes`):
 | Peer | Range | Tested with | Needed for | Size | Brotli | Gzip |
 | --- | --- | --- | --- | --- | --- | --- |
 | `pdfjs-dist` | `>=6.4.299 <7` | 6.4.299 | PDF | 3,699,311 | 1,786,847 | 2,083,188 |
-| `@silurus/ooxml` | `>=0.87.0 <1` | 0.89.3 | Word, Excel, PowerPoint, CSV, and the formats converted to them: XLS, ODS, Numbers, PPT, ODP, Keynote, ODG, Visio, DOC, ODT, RTF | 15,566,588 | 3,980,378 | 5,180,287 |
+| `@silurus/ooxml` | `>=0.87.0 <1` | 0.89.3 | Word, Excel, PowerPoint, CSV, and the formats converted to them: XLS, ODS, Numbers, PPT, ODP, Keynote, ODG, Visio, DOC, ODT, RTF, Pages | 15,566,588 | 3,980,378 | 5,180,287 |
 | `three` | `>=0.170.0 <1` | 0.186.1 | IFC, STL, OBJ, PLY, glTF | 754,038 | 157,011 | 193,026 |
-| `@exav/unpack-wasm` | `>=0.0.3` | 0.0.3 | Archives | 2,287,940 | 800,266 | 1,024,226 |
+| `@exav/unpack-wasm` | `>=0.0.3` | 0.0.3 | Archives | 2,299,697 | 806,967 | 1,029,913 |
 | `react`, `react-dom` | `^19.0.0` |  | The React components (`@exav/viewer/react`); the host's own React, not measured |  |  |  |
 <!-- /sizes:peers -->
 
@@ -211,22 +211,22 @@ they share, the Office viewers' common code above all):
 <!-- sizes:frame -->
 | A frame for | `formats` | Size | Brotli | Gzip |
 | --- | --- | --- | --- | --- |
-| The frame itself, in every one |  | 171,161 | 51,124 | 58,676 |
-| PDF | `pdf` | 4,654,436 | 2,078,683 | 2,429,158 |
-| Images: PNG, JPEG, WebP, GIF, SVG and the formats of the image module | `image` | 2,431,001 | 735,697 | 922,905 |
-| DWG, DXF | `dwg` | 3,082,665 | 2,254,960 | 2,363,719 |
-| IFC | `ifc` | 1,568,412 | 462,937 | 552,808 |
-| STL, OBJ, PLY, glTF | `stl` | 1,566,439 | 462,292 | 552,138 |
-| Word | `docx` | 7,685,062 | 1,968,473 | 2,517,067 |
-| Excel, CSV | `xlsx` | 5,995,811 | 1,588,141 | 2,006,626 |
-| PowerPoint | `pptx` | 5,938,278 | 1,501,873 | 1,935,361 |
-| XLS, ODS, Numbers | `xls` | 7,226,629 | 2,080,536 | 2,609,026 |
-| PPT, ODP, Keynote, ODG, Visio | `ppt` | 6,969,037 | 1,942,509 | 2,465,976 |
-| DOC, ODT, RTF | `rtf` | 8,722,155 | 2,391,645 | 3,035,904 |
-| Markdown, text | `text` | 575,506 | 215,546 | 250,625 |
-| Archives | `archive` | 2,664,596 | 941,379 | 1,184,729 |
-| Video, audio | `video` | 340,757 | 130,495 | 147,817 |
-| Every format |  | 32,457,899 | 11,499,936 | 13,943,385 |
+| The frame itself, in every one |  | 174,017 | 52,265 | 59,926 |
+| PDF | `pdf` | 4,743,417 | 2,091,002 | 2,444,419 |
+| Images: PNG, JPEG, WebP, GIF, SVG and the formats of the image module | `image` | 2,510,568 | 748,838 | 939,077 |
+| DWG, DXF | `dwg` | 3,084,355 | 2,255,675 | 2,364,918 |
+| IFC | `ifc` | 1,570,468 | 463,999 | 554,017 |
+| STL, OBJ, PLY, glTF | `stl` | 1,568,495 | 463,354 | 553,347 |
+| Word | `docx` | 7,687,587 | 1,969,508 | 2,518,332 |
+| Excel, CSV | `xlsx` | 5,998,055 | 1,589,131 | 2,007,911 |
+| PowerPoint | `pptx` | 5,940,803 | 1,502,908 | 1,936,626 |
+| XLS, ODS, Numbers | `xls` | 7,237,981 | 2,084,713 | 2,612,953 |
+| PPT, ODP, Keynote, ODG, Visio | `ppt` | 6,992,117 | 1,949,112 | 2,474,449 |
+| DOC, ODT, RTF, Pages | `rtf` | 8,743,694 | 2,397,365 | 3,043,544 |
+| Markdown, text | `text` | 577,140 | 216,370 | 251,465 |
+| Archives | `archive` | 2,678,989 | 949,121 | 1,191,720 |
+| Video, audio | `video` | 343,254 | 131,504 | 149,072 |
+| Every format |  | 32,681,079 | 11,543,827 | 13,994,697 |
 <!-- /sizes:frame -->
 
 The core is the page, its policy and the code that decides which engine
@@ -277,8 +277,8 @@ const sandbox = {
 };
 ```
 
-Video, audio and images on that origin then go by URL; a URL elsewhere, or
-one with `init`, still goes whole. `delivery: { media: "url" }` makes it a
+Video, audio and images on that origin then go by URL; a URL elsewhere, one
+with `init`, or one longer than 2,048 characters, still goes whole. `delivery: { media: "url" }` makes it a
 requirement: any other address is an error. The frame's elements request it
 without CORS and, from an opaque origin, without cookies the browser would
 count on: use public or signed URLs.
@@ -362,18 +362,18 @@ says: a PDF named `.png` is a PDF.
 
 `@exav/viewer/all` imports every plugin, so every peer dependency must be
 installed. It leaves out the converted Office formats, which a host names to
-open them: `rtf()`, `doc()`, `odt()`, `ppt()`, `odp()`, `keynote()`,
-`xls()`, `ods()`, `numbers()`, `odg()` and `visio()` from
+open them: `rtf()`, `doc()`, `odt()`, `pages()`, `ppt()`, `odp()`,
+`keynote()`, `xls()`, `ods()`, `numbers()`, `odg()` and `visio()` from
 `@exav/viewer/office`, with the plugin that shows the result beside them:
 `docx()` for text documents, `xlsx()` for spreadsheets, `pptx()` for
 presentations and drawings.
 
 ```ts
 import {
-  doc, docx, keynote, numbers, odg, odp, ods, odt, ppt, pptx, rtf, visio, xls, xlsx,
+  doc, docx, keynote, numbers, odg, odp, ods, odt, pages, ppt, pptx, rtf, visio, xls, xlsx,
 } from "@exav/viewer/office";
 
-const plugins = [docx(), xlsx(), pptx(), rtf(), doc(), odt(), ppt(), odp(), keynote(), xls(), ods(), numbers(), odg(), visio()];
+const plugins = [docx(), xlsx(), pptx(), rtf(), doc(), odt(), pages(), ppt(), odp(), keynote(), xls(), ods(), numbers(), odg(), visio()];
 ```
 
 The converters are the package's own wasm modules ([above](#two-kinds-of-files)):
@@ -396,18 +396,21 @@ These go to an external converter, a module the host installs and names:
   `xls()`.
 
 With none set, such a file ends in the `needs_converter` error, with the
-format's name. A file one of the package's converters recognises and cannot
-convert (encrypted, too large, damaged) is not handed over: it fails with the
-converter's reason.
+format's name.
 
-`converter` chooses the order. `"exav"`, the default, tries the package's
-converters first for spreadsheets, presentations and drawings, and the
-external one for what they do not read. Text documents (DOC, ODT, RTF) are the
-exception: the external converter takes them first when there is one, since
-the package's `docs` converter is a prototype, and the package's converter
-reads them when there is none. `converter: "exav"` set on a plugin asks for
-the package's converter for text documents even where an external one is
-set. `"external"` sends every format to the external converter alone.
+`converter` chooses the order, and whichever goes first, a file it cannot
+read goes on to the other when both are there. By default the package's
+converters go first for spreadsheets, presentations and drawings, and the
+external converter for text documents (DOC, ODT, RTF, Pages) when there is one,
+since the package's `docs` converter is a prototype; the package's converter
+reads them when there is none. `"exav"` puts the package's converter first,
+`"external"` the external one, for every format, or for each format named:
+`converter: { doc: "exav", odt: "external" }` (a format not named keeps the
+default). A file the package's converter recognises and cannot convert
+(encrypted, too large, damaged, a version it does not read) goes on to the
+external converter; where that one fails too, or there is none, it fails with
+the package's converter's reason. A file the external converter fails on
+goes on to the package's converter for its format.
 
 ### Naming it
 
@@ -445,7 +448,7 @@ The module exports `convert`, and may export `prefetch`:
 
 ```ts
 export function convert(bytes: Uint8Array, options: {
-  hint: string;          // what the viewer took the file for: "rtf", "doc", "odt", "ppt", "odp",
+  hint: string;          // what the viewer took the file for: "rtf", "doc", "odt", "pages", "ppt", "odp",
                          // "keynote", "xls", "ods", "numbers", "odg", "visio", "coreldraw",
                          // "publisher", "pagemaker", "freehand", "quarkxpress", "zonerdraw" or "wpg".
                          // A hint: the bytes decide.
@@ -481,8 +484,8 @@ the contract is `e2e/fixtures/fake-converter.js` in the repository.
 ### In the sandboxed frame
 
 The conversion options are plain data: `sandbox.options.conversion` takes
-`timeoutMs`, `maxMemory`, `converter` and `externalConverter`, and the frame
-checks each. `externalConverter` there is a package name that the frame's
+`timeoutMs`, `maxMemory`, `converter` (one word, or one per format, as for
+the plugins) and `externalConverter`, and the frame checks each. `externalConverter` there is a package name that the frame's
 manifest lists, or a path or an `http(s)` URL; anything else is dropped. The
 module is imported inside the frame, under the frame's policy, which loads
 scripts from the frame's own origin: copy the package beside the frame app
@@ -571,8 +574,9 @@ failed is tried again on the next call.
 In the sandboxed mode, the host page runs no engine: its policy needs
 `frame-src` and `child-src` naming the frame's origin alone, which is also
 what keeps the frame from sending anything elsewhere, and the frame has its
-own ([Security](/viewer/security/#serving-the-frame)). In the
-page, every format needs:
+own ([Security](/viewer/security/#serving-the-frame)). A page whose
+policy refuses the frame fails the session at once, naming the origin to
+add. In the page, every format needs:
 
 ```
 default-src 'self';
@@ -633,7 +637,7 @@ a drawing's layout stops at eight million strokes and fill vertices
 (`maxPrimitives`; lower it for devices with little memory) and a DWG's
 compressed sections at 512 MiB expanded (`maxDecompressedBytes`) and the
 entities read at a million (`maxEntities`), archives
-stop at 512 MiB extracted, 5000 members and a ratio of 200 (the `archive()`
+stop at 512 MiB extracted, 20000 members and a ratio of 200 (the `archive()`
 options), a document's ZIP at 20000 entries (`maxArchiveEntries`), and a
 conversion at 120 seconds (`timeoutMs`) and 1 GiB of memory (`maxMemory`;
 exav-render's converters count it themselves, up to 1.5 GiB). exav's own

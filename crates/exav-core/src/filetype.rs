@@ -370,7 +370,7 @@ fn identify_with(buf: &[u8], detect: impl FnOnce() -> Option<crate::unpack::Form
         Some(crate::unpack::Executable::MachO) => return FileType::MachO,
         None => {}
     }
-    if buf.starts_with(b"{\\rtf") {
+    if crate::unpack::is_rtf(buf) {
         return FileType::Rtf;
     }
     // Uncompressed Flash. `CWS`/`ZWS` (the compressed variants) are containers
@@ -582,6 +582,15 @@ mod tests {
     }
 
     use super::*;
+
+    /// The RTF header is `{\rt` at offset 0: `{\rt0` is an RTF, `{\r` is text.
+    #[test]
+    fn an_rtf_with_a_short_header_is_typed_rtf() {
+        assert_eq!(identify(b"{\\rtf1\\ansi hello}"), FileType::Rtf);
+        assert_eq!(identify(b"{\\rt0\\ansi hello}"), FileType::Rtf);
+        assert_ne!(identify(b"{\\r hello}"), FileType::Rtf);
+        assert_ne!(identify(b" {\\rt0\\ansi hello}"), FileType::Rtf);
+    }
 
     #[test]
     fn ftm_fallback_typing() {

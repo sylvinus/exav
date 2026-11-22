@@ -112,7 +112,7 @@ pull request; the clamd one needs a corpus and runs by hand.
 | harness | what it compares |
 | --- | --- |
 | `scripts/difftest.sh` | exav vs clamd over a corpus, a compliance diff (needs docker and a corpus) |
-| `make test-yara-diff` | exav's YARA engine vs `yara-x` on identical rules and inputs (pulls `yara-x` and its cranelift/wasmtime JIT, which nothing else in exav builds) |
+| `make test-yara-diff` | exav's YARA engine vs `yara-x` on identical rules and inputs, through yara-x's `yr` program (`cargo install yara-x-cli`); fails without `yr` and without a rule corpus in `EXAV_DEBUG_YARA_CORPUS` (`make test-yara-diff-rules` needs only `yr`) |
 
 `cargo test` is fine for the inner loop, but it is a **subset** and a misleading
 one: a test file that opens `#![cfg(feature = "x")]` compiles to **zero tests**

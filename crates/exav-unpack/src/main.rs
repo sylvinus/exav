@@ -61,6 +61,7 @@ use exav_unpack::tree::{
 use exav_unpack::volume::{ByteSpan, Parts, SetKind, SetPlan, join, plan};
 use exav_unpack::{Budget, ByteSource, Limits, Member, MemberMeta, Mtime, walk};
 use std::borrow::Cow;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -93,6 +94,10 @@ exav-unpack only:
   --max-extracted-bytes SIZE|off
                      stop past SIZE decoded bytes in all (default 64G);
                      --max-size is the older name
+  --max-hole-bytes SIZE|off
+                     stop past SIZE bytes of holes in all, the unwritten
+                     stretches of the sparse files of a disk image, which do
+                     not count in --max-extracted-bytes (default 64G)
   --max-object-bytes SIZE|off
                      largest member or container held in memory whole (1G);
                      --max-memory is the older name. With -r, a member that is
@@ -160,7 +165,7 @@ enum Mode {
 
 struct Opts {
     mode: Mode,
-    archive: String,
+    archive: OsString,
     members: Vec<String>,
     excludes: Vec<String>,
     dir: Option<PathBuf>,
@@ -199,6 +204,7 @@ const MAX_SPILL: u64 = 2 << 30;
 /// stands for. They are named as the scanner names them.
 const ENV: &[(&str, &str)] = &[
     ("EXAV_MAX_EXTRACTED_BYTES", "max-extracted-bytes"),
+    ("EXAV_MAX_HOLE_BYTES", "max-hole-bytes"),
     ("EXAV_MAX_OBJECT_BYTES", "max-object-bytes"),
     ("EXAV_MAX_MEMBERS", "max-members"),
     ("EXAV_MAX_COMPRESSION_RATIO", "max-compression-ratio"),
@@ -216,7 +222,7 @@ enum Parsed {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match parse(&args) {
         Ok(Parsed::Usage(code)) => {
             match code {
@@ -269,14 +275,30 @@ const UNSUPPORTED: &[(char, &str)] = &[
     ('A', "DLL help"),
 ];
 
-fn parse(args: &[String]) -> Result<Parsed, String> {
-    parse_with(args, &|name| std::env::var(name).ok())
+fn parse(args: &[OsString]) -> Result<Parsed, String> {
+    parse_with(args, &|name| std::env::var_os(name))
+}
+
+/// `s` without its first `at` bytes, which are ASCII.
+fn tail(s: &OsStr, at: usize) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        OsStr::from_bytes(s.as_bytes().get(at..).unwrap_or_default()).to_os_string()
+    }
+    #[cfg(not(unix))]
+    {
+        s.to_string_lossy().get(at..).unwrap_or_default().into()
+    }
 }
 
 /// [`parse`], reading the environment through `env`. A variable that is set
 /// is read as the option is, an empty one included, as the scanner reads
-/// its own. The command line wins over the environment.
-fn parse_with(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Parsed, String> {
+/// its own. The command line wins over the environment. Options are read as
+/// text; the archive, `-d` and the paths of the long options and of
+/// `EXAV_SPILL_DIR` keep their bytes, the member names and passwords are
+/// text. A variable that is set and is not text is an error.
+fn parse_with(args: &[OsString], env: &dyn Fn(&str) -> Option<OsString>) -> Result<Parsed, String> {
     if args.is_empty() {
         return Ok(Parsed::Usage(status::OK));
     }
@@ -287,11 +309,12 @@ fn parse_with(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<P
     let mut limits = Limits::default();
     limits.max_extracted_bytes = 64 << 30;
     limits.max_scanned_bytes = 64 << 30;
+    limits.max_hole_bytes = 64 << 30;
     limits.max_buffer_bytes = 1 << 30;
     limits.max_members = 1_000_000;
     let mut o = Opts {
         mode: Mode::Extract,
-        archive: String::new(),
+        archive: OsString::new(),
         members: Vec::new(),
         excludes: Vec::new(),
         dir: None,
@@ -310,45 +333,56 @@ fn parse_with(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<P
         max_spill: Some(MAX_SPILL),
     };
     for (var, option) in ENV {
-        if let Some(value) = env(var) {
-            set_limit(&mut o, option, &value, var)?;
+        let Some(value) = env(var) else { continue };
+        if *option == "spill-dir" {
+            o.spill_dir = spill_dir(&value);
+            continue;
         }
+        let Some(text) = value.to_str() else {
+            return Err(format!("{var} is not valid UTF-8"));
+        };
+        set_limit(&mut o, option, text, var)?;
     }
     let (mut modes, mut verbose, mut archive, mut excluding) = (Vec::new(), false, None, false);
     let mut i = 0;
-    let next = |i: &mut usize, what: &str| -> Result<String, String> {
+    let next = |i: &mut usize, what: &str| -> Result<OsString, String> {
         *i += 1;
         args.get(*i)
             .cloned()
             .ok_or_else(|| format!("{what} needs a value"))
     };
     while i < args.len() {
-        let a = &args[i];
+        let raw = &args[i];
+        let lossy = raw.to_string_lossy();
+        let a: &str = &lossy;
         // The long options are exav-unpack's own; unzip has none, so they
         // are read anywhere.
         if let Some(long) = a.strip_prefix("--").filter(|l| !l.is_empty()) {
+            // `inline` is where the value of `--name=VALUE` starts in `raw`.
             let (name, inline) = match long.split_once('=') {
-                Some((n, v)) => (n, Some(v.to_string())),
+                Some((n, _)) => (n, Some(2 + n.len() + 1)),
                 None => (long, None),
             };
-            let value = |i: &mut usize| inline.clone().map_or_else(|| next(i, a), Ok);
+            let value = |i: &mut usize| inline.map_or_else(|| next(i, a), |at| Ok(tail(raw, at)));
+            let text = |i: &mut usize| value(i).map(|v| v.to_string_lossy().into_owned());
             match name {
                 "help" => return Ok(Parsed::Usage(status::OK)),
                 "version" => return Ok(Parsed::Version),
                 "volume" => o.volumes.push(PathBuf::from(value(&mut i)?)),
                 "recursive" => o.recursive = true,
+                "spill-dir" => o.spill_dir = spill_dir(&value(&mut i)?),
                 // The older names are kept.
-                "max-size" => set_limit(&mut o, "max-extracted-bytes", &value(&mut i)?, a)?,
-                "max-memory" => set_limit(&mut o, "max-object-bytes", &value(&mut i)?, a)?,
+                "max-size" => set_limit(&mut o, "max-extracted-bytes", &text(&mut i)?, a)?,
+                "max-memory" => set_limit(&mut o, "max-object-bytes", &text(&mut i)?, a)?,
                 "max-extracted-bytes"
+                | "max-hole-bytes"
                 | "max-object-bytes"
                 | "max-unpack-depth"
                 | "object-cache-bytes"
                 | "object-cache-block-bytes"
                 | "max-members"
                 | "max-compression-ratio"
-                | "spill-dir"
-                | "max-total-spill-bytes" => set_limit(&mut o, name, &value(&mut i)?, a)?,
+                | "max-total-spill-bytes" => set_limit(&mut o, name, &text(&mut i)?, a)?,
                 _ => return Err(format!("unknown option `{a}`")),
             }
             i += 1;
@@ -359,9 +393,9 @@ fn parse_with(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<P
         // a member name, as unzip has it.
         if !option || (archive.is_some() && a != "-x" && !a.starts_with("-d")) {
             match (&archive, excluding) {
-                (None, false) => archive = Some(a.clone()),
-                (_, true) => o.excludes.push(a.clone()),
-                (Some(_), false) => o.members.push(a.clone()),
+                (None, false) => archive = Some(raw.clone()),
+                (_, true) => o.excludes.push(a.to_string()),
+                (Some(_), false) => o.members.push(a.to_string()),
             }
             i += 1;
             continue;
@@ -381,12 +415,14 @@ fn parse_with(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<P
         while k < cluster.len() {
             let c = cluster[k];
             // The rest of the cluster, or the next argument.
-            let mut operand = |i: &mut usize| -> Result<String, String> {
-                let rest: String = cluster[k + 1..].iter().collect();
+            let mut operand = |i: &mut usize| -> Result<OsString, String> {
+                // The dash and the flags up to this one are ASCII.
+                let at = k + 2;
+                let last = k + 1 == cluster.len();
                 k = cluster.len();
-                match rest.is_empty() {
+                match last {
                     true => next(i, &format!("-{c}")),
-                    false => Ok(rest),
+                    false => Ok(tail(raw, at)),
                 }
             };
             match c {
@@ -404,7 +440,9 @@ fn parse_with(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<P
                 'D' => o.no_times = o.no_times.saturating_add(1),
                 'h' => return Ok(Parsed::Usage(status::OK)),
                 'd' => o.dir = Some(PathBuf::from(operand(&mut i)?)),
-                'P' => o.passwords.push(operand(&mut i)?),
+                'P' => o
+                    .passwords
+                    .push(operand(&mut i)?.to_string_lossy().into_owned()),
                 'x' => excluding = true,
                 _ => {
                     return Err(match UNSUPPORTED.iter().find(|u| u.0 == c) {
@@ -477,6 +515,14 @@ fn size_or_off(s: &str) -> Result<u64, String> {
     }
 }
 
+/// The spill directory `--spill-dir` names, `None` for `off`.
+fn spill_dir(value: &OsStr) -> Option<PathBuf> {
+    match value == "off" {
+        true => None,
+        false => Some(PathBuf::from(value)),
+    }
+}
+
 /// Set the option `name` (without its dashes) to `value`, which came from the
 /// flag or the variable `shown`. The one place a limit is read, so that a flag
 /// and its variable take the same values.
@@ -498,6 +544,7 @@ fn set_limit(o: &mut Opts, name: &str, value: &str, shown: &str) -> Result<(), S
             o.limits.max_extracted_bytes = n;
             o.limits.max_scanned_bytes = n;
         }
+        "max-hole-bytes" => o.limits.max_hole_bytes = size_or_off(value).map_err(at)?,
         "max-object-bytes" => o.limits.max_buffer_bytes = size_or_off(value).map_err(at)?,
         // No `off`: every level of nesting costs stack.
         "max-unpack-depth" => {
@@ -510,12 +557,6 @@ fn set_limit(o: &mut Opts, name: &str, value: &str, shown: &str) -> Result<(), S
         "max-compression-ratio" => o.limits.max_compression_ratio = number(" or `off`")?,
         "object-cache-bytes" => o.cache_bytes = cache_size(value).map_err(at)?,
         "object-cache-block-bytes" => o.cache_block = cache_size(value).map_err(at)?,
-        "spill-dir" => {
-            o.spill_dir = match value {
-                "off" => None,
-                dir => Some(PathBuf::from(dir)),
-            }
-        }
         // `off` and 0 are no ceiling, as exav-grep has it.
         "max-total-spill-bytes" => {
             o.max_spill = match size_or_off(value).map_err(at)? {
@@ -548,7 +589,7 @@ fn run(o: &Opts) -> u8 {
     if archives.len() > 1 && !o.volumes.is_empty() {
         eprintln!(
             "exav-unpack:  --volume names the parts of one archive, not of {}",
-            o.archive
+            o.archive.display()
         );
         return status::BAD_OPTIONS;
     }
@@ -596,10 +637,15 @@ fn run(o: &Opts) -> u8 {
 
 /// The archives `spec` names: itself, or failing that with `.zip` or `.ZIP`
 /// added, as unzip tries them; or every file a wildcard matches.
-fn archives(spec: &str) -> Result<Vec<PathBuf>, String> {
-    let missing = || format!("cannot find or open {spec}, {spec}.zip or {spec}.ZIP.");
+fn archives(spec: &OsStr) -> Result<Vec<PathBuf>, String> {
+    let shown = spec.display();
+    let missing = || format!("cannot find or open {shown}, {shown}.zip or {shown}.ZIP.");
     let path = Path::new(spec);
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(spec);
+    let name = path
+        .file_name()
+        .unwrap_or(spec)
+        .to_str()
+        .unwrap_or_default();
     if name.contains(['*', '?', '[']) {
         let dir = path
             .parent()
@@ -627,16 +673,16 @@ fn archives(spec: &str) -> Result<Vec<PathBuf>, String> {
             false => Ok(found),
         };
     }
-    [
-        spec.to_string(),
-        format!("{spec}.zip"),
-        format!("{spec}.ZIP"),
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .find(|p| p.is_file())
-    .map(|p| vec![p])
-    .ok_or_else(missing)
+    let with = |ext: &str| {
+        let mut p = spec.to_os_string();
+        p.push(ext);
+        PathBuf::from(p)
+    };
+    [with(""), with(".zip"), with(".ZIP")]
+        .into_iter()
+        .find(|p| p.is_file())
+        .map(|p| vec![p])
+        .ok_or_else(missing)
 }
 
 /// Whether `name` matches unzip's wildcard `pattern`: `*` any run of
@@ -716,6 +762,15 @@ struct Deferred {
     target: String,
 }
 
+/// A hard link made once every member is out, to the file `source` an earlier
+/// member was written to; `target` is the archive's name for it.
+struct HardLink {
+    path: PathBuf,
+    shown: String,
+    source: PathBuf,
+    target: String,
+}
+
 /// One archive's run.
 struct Archive<'a> {
     o: &'a Opts,
@@ -728,6 +783,7 @@ struct Archive<'a> {
     files: u64,
     bytes: u64,
     links: Vec<Deferred>,
+    hard_links: Vec<HardLink>,
     /// Directories whose times and modes are set last, once their contents
     /// are written.
     dirs: Vec<(PathBuf, Option<Mtime>, Option<u32>)>,
@@ -750,6 +806,7 @@ impl<'a> Archive<'a> {
             files: 0,
             bytes: 0,
             links: Vec::new(),
+            hard_links: Vec::new(),
             dirs: Vec::new(),
             buf: vec![0; 1 << 20],
             tested_bad: false,
@@ -901,6 +958,16 @@ impl<'a> Archive<'a> {
     /// and the patterns nothing matched.
     fn finish(&mut self, root: &Path, messages: bool) {
         let o = self.o;
+        // Before the symbolic links, so none is in a hard link's way.
+        for l in std::mem::take(&mut self.hard_links) {
+            if let Err(e) = make_hard_link(root, &l.path, &l.source) {
+                eprintln!(
+                    "exav-unpack:  cannot hard link {} to {}: {e}",
+                    l.shown, l.target
+                );
+                self.raise(status::ERROR);
+            }
+        }
         if !self.links.is_empty() {
             if messages {
                 println!("finishing deferred symbolic links:");
@@ -1212,6 +1279,39 @@ impl<'a> Archive<'a> {
         let Some(mut path) = target(root, rel) else {
             return self.unsafe_name(name);
         };
+        if let Some(to) = &meta.hard_link {
+            // The archive names the earlier member from its own root: it is
+            // under the same prefix as this member's name, and junked as it is.
+            let to_rel = match o.junk {
+                true => to.rsplit(['/', '\\']).next().unwrap_or(to).to_string(),
+                false => match whole.strip_suffix(meta.name.as_str()) {
+                    Some(prefix) => format!("{prefix}{to}"),
+                    None => to.clone(),
+                },
+            };
+            let Some(source) = target(root, &to_rel) else {
+                return self.unsafe_name(name);
+            };
+            if fs::symlink_metadata(&path).is_ok() {
+                match self.replace(&path) {
+                    Replace::Yes => {}
+                    Replace::No => return Ok(()),
+                    Replace::Rename(p) => path = p,
+                }
+            }
+            let shown = shown(o, &path);
+            if o.quiet == 0 {
+                println!("    linking: {shown:<22}  => {to} ");
+            }
+            self.hard_links.push(HardLink {
+                path,
+                shown,
+                source,
+                target: to.clone(),
+            });
+            self.ok += 1;
+            return Ok(());
+        }
         if link {
             let target = match (&meta.link, content) {
                 (Some(t), _) => t.clone(),
@@ -1553,6 +1653,23 @@ fn make_link(root: &Path, path: &Path, target: &str) -> Result<(), String> {
     // Where links take privileges to make, unzip writes the target as text.
     #[cfg(not(unix))]
     fs::write(path, target).map_err(|e| e.to_string())
+}
+
+/// Make `path` a hard link to `source`, a file under `root`: one this run
+/// wrote, as the archive's hard links name an earlier member.
+fn make_hard_link(root: &Path, path: &Path, source: &Path) -> Result<(), String> {
+    let inside = fs::canonicalize(root)
+        .ok()
+        .zip(fs::canonicalize(source).ok())
+        .is_some_and(|(r, s)| s.starts_with(r));
+    if !inside || !fs::symlink_metadata(source).is_ok_and(|m| m.is_file()) {
+        return Err("it is not a file in the extraction directory".to_string());
+    }
+    directories(root, path, false)?;
+    if fs::symlink_metadata(path).is_ok_and(|m| !m.is_dir()) {
+        fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    fs::hard_link(source, path).map_err(|e| e.to_string())
 }
 
 /// Why a copy stopped: a failed write, or a failed read.
@@ -2029,7 +2146,9 @@ impl Visitor<String> for Nested<'_, '_> {
         self.emit(node)
     }
 
-    /// An archive nothing came out of is one more file.
+    /// An archive nothing came out of is one more file. One whose own bytes
+    /// were decoded only in part is an error, as such a file is, though its
+    /// members came out.
     fn leave(
         &mut self,
         node: &Node<'_>,
@@ -2039,6 +2158,12 @@ impl Visitor<String> for Nested<'_, '_> {
     ) -> Flow<String> {
         match (node.origin == Origin::Root, members) {
             (false, 0) => self.emit(node),
+            (false, _) => {
+                if let End::Cut(e) | End::Damaged(e) = &node.end {
+                    self.archive.fail(&Label::nested(&node.path).shown, e);
+                }
+                Flow::Leaf
+            }
             _ => Flow::Leaf,
         }
     }
@@ -2104,16 +2229,68 @@ mod tests {
 
     /// The options of a run with `vars` in its environment.
     fn parsed_in(vars: &[(&str, &str)], args: &[&str]) -> Result<Box<Opts>, String> {
-        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         let env = |name: &str| {
             vars.iter()
                 .find(|(k, _)| *k == name)
-                .map(|(_, v)| v.to_string())
+                .map(|(_, v)| OsString::from(v))
         };
         match parse_with(&args, &env)? {
             Parsed::Run(o) => Ok(o),
             _ => Err("not a run".to_string()),
         }
+    }
+
+    /// A path given on the command line keeps its bytes, joined to its option
+    /// (after other flags of the cluster, or after `=`) or as the next argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_option_keeps_its_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let os = |b: &[u8]| OsString::from_vec(b.to_vec());
+        let args = [
+            os(b"-rd/o\xe9"),
+            os(b"a\xe9.zip"),
+            os(b"--volume=/v\xe9"),
+            os(b"--volume"),
+            os(b"/w\xe9"),
+            os(b"--spill-dir=/s\xe9"),
+        ];
+        let Ok(Parsed::Run(o)) = parse_with(&args, &|_| None) else {
+            panic!("not a run");
+        };
+        assert_eq!(o.archive, os(b"a\xe9.zip"));
+        assert_eq!(o.dir, Some(PathBuf::from(os(b"/o\xe9"))));
+        assert_eq!(
+            o.volumes,
+            [PathBuf::from(os(b"/v\xe9")), PathBuf::from(os(b"/w\xe9"))]
+        );
+        assert_eq!(o.spill_dir, Some(PathBuf::from(os(b"/s\xe9"))));
+    }
+
+    /// `EXAV_SPILL_DIR` is a path: bytes that are not UTF-8 are kept, not
+    /// dropped for the default.
+    #[cfg(unix)]
+    #[test]
+    fn a_spill_dir_variable_keeps_its_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = OsString::from_vec(b"/s\xe9".to_vec());
+        let env = |name: &str| (name == "EXAV_SPILL_DIR").then(|| dir.clone());
+        let Ok(Parsed::Run(o)) = parse_with(&[OsString::from("a.zip")], &env) else {
+            panic!("not a run");
+        };
+        assert_eq!(o.spill_dir, Some(PathBuf::from(dir)));
+    }
+
+    /// A numeric variable that is set and is not UTF-8 is refused, not
+    /// ignored.
+    #[cfg(unix)]
+    #[test]
+    fn a_variable_that_is_not_text_is_an_error() {
+        use std::os::unix::ffi::OsStringExt;
+        let env = |name: &str| (name == "EXAV_MAX_MEMBERS").then(|| OsString::from_vec(vec![0xe9]));
+        let e = parse_with(&[OsString::from("a.zip")], &env).err();
+        assert!(e.is_some_and(|e| e.contains("EXAV_MAX_MEMBERS")));
     }
 
     /// Every limit has its variable, with the values its option takes and the
@@ -2128,6 +2305,7 @@ mod tests {
             o.limits.max_members,
         );
         assert_eq!((extracted, object, members), (64 << 30, 1 << 30, 1_000_000));
+        assert_eq!(o.limits.max_hole_bytes, 64 << 30);
         assert_eq!(o.limits.max_recursion, Limits::default().max_recursion);
         assert_eq!(
             o.limits.max_compression_ratio,
@@ -2138,6 +2316,10 @@ mod tests {
         assert_eq!(
             (o.limits.max_extracted_bytes, o.limits.max_scanned_bytes),
             (2 << 20, 2 << 20)
+        );
+        assert_eq!(
+            get(&[("EXAV_MAX_HOLE_BYTES", "5G")]).limits.max_hole_bytes,
+            5 << 30
         );
         assert_eq!(
             get(&[("EXAV_MAX_OBJECT_BYTES", "3K")])
@@ -2171,6 +2353,7 @@ mod tests {
         // `off`: no limit, where the scanner's flag takes it.
         let o = get(&[
             ("EXAV_MAX_EXTRACTED_BYTES", "off"),
+            ("EXAV_MAX_HOLE_BYTES", "off"),
             ("EXAV_MAX_OBJECT_BYTES", "OFF"),
             ("EXAV_MAX_MEMBERS", "off"),
             ("EXAV_MAX_COMPRESSION_RATIO", "off"),
@@ -2189,6 +2372,7 @@ mod tests {
             ),
             (u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX)
         );
+        assert_eq!(o.limits.max_hole_bytes, u64::MAX);
         assert_eq!((o.cache_bytes, o.cache_block), (0, 0));
         assert_eq!((o.spill_dir, o.max_spill), (None, None));
         // The depth has none.
@@ -2198,6 +2382,7 @@ mod tests {
         // A bad value names the variable.
         for (var, bad) in [
             ("EXAV_MAX_EXTRACTED_BYTES", "x"),
+            ("EXAV_MAX_HOLE_BYTES", "y"),
             ("EXAV_MAX_OBJECT_BYTES", "1MB"),
             ("EXAV_MAX_MEMBERS", "-1"),
             ("EXAV_MAX_COMPRESSION_RATIO", "-1"),
@@ -2224,6 +2409,7 @@ mod tests {
     fn the_command_line_wins_over_the_environment() {
         let vars = [
             ("EXAV_MAX_EXTRACTED_BYTES", "1K"),
+            ("EXAV_MAX_HOLE_BYTES", "1K"),
             ("EXAV_MAX_OBJECT_BYTES", "1K"),
             ("EXAV_MAX_MEMBERS", "1"),
             ("EXAV_MAX_COMPRESSION_RATIO", "1"),
@@ -2237,6 +2423,8 @@ mod tests {
             &vars,
             &[
                 "--max-extracted-bytes=9M",
+                "--max-hole-bytes",
+                "7G",
                 "--max-object-bytes",
                 "8M",
                 "--max-members",
@@ -2258,6 +2446,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(o.limits.max_extracted_bytes, 9 << 20);
+        assert_eq!(o.limits.max_hole_bytes, 7 << 30);
         assert_eq!(o.limits.max_buffer_bytes, 8 << 20);
         assert_eq!(o.limits.max_members, 70);
         assert_eq!(o.limits.max_compression_ratio, 300);
@@ -2292,6 +2481,8 @@ mod tests {
         let o = parsed(&[
             "--max-extracted-bytes",
             "0",
+            "--max-hole-bytes",
+            "0",
             "--max-object-bytes",
             "0K",
             "--max-members",
@@ -2306,9 +2497,10 @@ mod tests {
             [
                 l.max_extracted_bytes,
                 l.max_scanned_bytes,
+                l.max_hole_bytes,
                 l.max_buffer_bytes
             ],
-            [u64::MAX; 3]
+            [u64::MAX; 4]
         );
         assert_eq!([l.max_members, l.max_compression_ratio], [u64::MAX; 2]);
     }

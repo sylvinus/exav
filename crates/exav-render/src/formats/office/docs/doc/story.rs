@@ -115,9 +115,6 @@ struct TableBuilder {
     cur: Vec<Block>,
 }
 
-/// Deleted and inserted text is drawn in this colour, whoever made the change.
-const REVISION_COLOR: u32 = 0xC00000;
-
 /// The headers or footers `src` has that `dst` has not.
 fn inherit(dst: &mut HeaderFooter, src: HeaderFooter, title_page: bool, facing: bool) {
     dst.default = dst.default.take().or(src.default);
@@ -860,12 +857,7 @@ impl Reader<'_> {
             apply_chp_list(&mut rp, &mut aux, g, &cx);
             // Tracked changes, as an editor shows them.
             if aux.deleted || aux.inserted {
-                rp.color = Some(Color::Rgb(REVISION_COLOR));
-                if aux.deleted {
-                    rp.strike = Some(true);
-                } else {
-                    rp.underline = Some("single");
-                }
+                rp.revision(aux.deleted);
             }
             if let Some(c) = aux.istd {
                 rp.style = self.style_id_for(c);

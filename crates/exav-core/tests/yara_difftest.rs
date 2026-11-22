@@ -19,6 +19,9 @@
 //!
 //! Portions derived from yara-x (BSD-3-Clause), see LICENSE-YARA-X.
 
+mod dotnet_damaged;
+mod elf_image;
+
 use std::collections::BTreeSet;
 
 /// Phase-A rules understood by both engines.
@@ -185,6 +188,52 @@ fn yr_matches(rules: &str, data: &[u8], defines: &[(&str, &str)]) -> BTreeSet<St
         .collect()
 }
 
+/// As [`yr_matches`] for many inputs in one run of the oracle: the matching
+/// rules of each, in the order of `inputs`.
+fn yr_matches_each(rules: &str, inputs: &[&[u8]]) -> Vec<BTreeSet<String>> {
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "exav-yr-many-{}-{}",
+        std::process::id(),
+        CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let targets = dir.join("targets");
+    std::fs::create_dir_all(&targets).expect("create dir");
+    let rule_path = dir.join("rules.yar");
+    std::fs::write(&rule_path, rules).expect("write rules");
+    for (i, data) in inputs.iter().enumerate() {
+        std::fs::write(targets.join(format!("{i}.bin")), data).expect("write target");
+    }
+    let out = std::process::Command::new(yr_bin())
+        .args(["scan", "--recursive"])
+        .arg(&rule_path)
+        .arg(&targets)
+        .output()
+        .expect("run yr scan");
+    let _ = std::fs::remove_dir_all(&dir);
+    if !out.status.success() {
+        panic!(
+            "yr scan failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let mut matched = vec![BTreeSet::new(); inputs.len()];
+    // One line per match: the rule identifier, then the path of the input.
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut words = line.split_whitespace();
+        let (Some(rule), Some(path)) = (words.next(), words.next()) else {
+            continue;
+        };
+        let index: usize = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected yr output: {line}"));
+        matched[index].insert(rule.to_string());
+    }
+    matched
+}
+
 #[test]
 fn differential_matches_agree() {
     agree("phase-a", RULES, INPUTS);
@@ -327,6 +376,385 @@ fn differential_elf_module_agrees() {
     agree("elf", ELF_RULES, ELF_INPUTS);
 }
 
+/// Rules over the fields of the images written by `elf_image`, one family of
+/// fields each. A field one image does not have makes its rules undefined, as
+/// in yara-x; the rule set as a whole must match on both sides alike.
+const ELF_IMAGE_RULES: &str = r#"
+import "elf"
+
+rule osabi_linux { condition: elf.osabi == elf.OSABI_LINUX }
+rule osabi_unknown { condition: elf.osabi == 66 }
+rule header {
+    condition: elf.type == elf.ET_DYN and elf.machine == elf.EM_X86_64
+        and elf.number_of_sections == 6 and elf.number_of_segments == 2
+}
+rule header_without_sections { condition: elf.type == elf.ET_DYN and elf.number_of_sections == 0 }
+rule symbol_counts { condition: elf.dynsym_entries == 4 and elf.symtab_entries == 2 }
+rule symbol_counts_zero { condition: elf.dynsym_entries == 0 and elf.symtab_entries == 0 }
+rule symbol_counts_undefined {
+    condition: not defined elf.dynsym_entries and not defined elf.symtab_entries
+}
+rule dynsym_alpha {
+    condition: elf.dynsym[1].name == "alpha" and elf.dynsym[1].value == 0x1234
+        and elf.dynsym[1].size == 8 and elf.dynsym[1].type == elf.STT_FUNC
+        and elf.dynsym[1].bind == elf.STB_GLOBAL and elf.dynsym[1].shndx == 5
+        and elf.dynsym[1].visibility == elf.STV_INTERNAL
+}
+rule dynsym_beta {
+    condition: elf.dynsym[2].name == "beta" and elf.dynsym[2].type == elf.STT_OBJECT
+        and elf.dynsym[2].bind == elf.STB_WEAK and elf.dynsym[2].shndx == 0xfff1
+        and elf.dynsym[2].visibility == elf.STV_PROTECTED
+}
+rule dynsym_gamma {
+    condition: elf.dynsym[3].name == "gamma" and elf.dynsym[3].visibility == elf.STV_HIDDEN
+}
+rule symtab_main {
+    condition: elf.symtab[1].name == "main" and elf.symtab[1].value == 0x1000
+        and elf.symtab[1].size == 16 and elf.symtab[1].visibility == elf.STV_DEFAULT
+}
+rule dynamic_entries {
+    condition: elf.dynamic_section_entries == 4 and elf.dynamic[0].type == elf.DT_HASH
+        and elf.dynamic[2].val == 18 and elf.dynamic[3].type == elf.DT_SYMTAB
+}
+rule dynamic_end_not_listed {
+    condition: not defined elf.dynamic[4].type
+        and not (for any d in elf.dynamic : (d.type == elf.DT_NULL))
+}
+rule dynamic_two_segments { condition: elf.dynamic_section_entries == 6 }
+rule dynamic_zero { condition: elf.dynamic_section_entries == 0 }
+rule dynamic_high_tag { condition: elf.dynamic[4].type == -2147483648 }
+rule high_types {
+    condition: elf.sections[6].type == -2147483648 and elf.segments[2].type == -2147483647
+}
+rule section_names {
+    condition: elf.sections[1].name == ".dynsym" and elf.sections[5].name == ".shstrtab"
+}
+rule section_name_from_the_header { condition: elf.sections[0].name contains "ELF" }
+rule section_name_undefined {
+    condition: not defined elf.sections[1].name and elf.sections[1].type == elf.SHT_DYNSYM
+}
+rule segment_from_the_header { condition: elf.segments[0].type == 0x464c457f }
+rule segment_from_the_header_be { condition: elf.segments[0].type == 0x7f454c46 }
+rule segments_not_in_the_file {
+    condition: elf.number_of_segments == 200 and not defined elf.segments[0].type
+}
+rule entry_in_dynstr { condition: elf.entry_point == elf.sections[2].offset + 3 }
+rule len_sections { condition: elf.sections.len() == 6 }
+rule len_sections_is_the_number { condition: elf.sections.len() == elf.number_of_sections }
+rule len_sections_zero { condition: elf.sections.len() == 0 }
+rule len_segments { condition: elf.segments.len() == 2 }
+rule len_segments_zero { condition: elf.segments.len() == 0 }
+rule len_dynsym { condition: elf.dynsym.len() == elf.dynsym_entries and elf.dynsym.len() == 4 }
+rule len_dynsym_zero { condition: elf.dynsym.len() == 0 }
+rule len_symtab { condition: elf.symtab.len() == 2 }
+rule len_symtab_zero { condition: elf.symtab.len() == 0 }
+rule len_dynamic { condition: elf.dynamic.len() == elf.dynamic_section_entries and elf.dynamic.len() == 4 }
+rule len_dynamic_zero { condition: elf.dynamic.len() == 0 }
+rule len_in_a_range {
+    condition: for any i in (0..elf.sections.len() - 1) : (elf.sections[i].type == elf.SHT_DYNSYM)
+}
+rule len_of_a_bound_array { condition: with s = elf.symtab : (s.len() == 2) }
+rule entry_undefined { condition: not defined elf.entry_point }
+rule entry_at_zero { condition: elf.entry_point == 0 }
+rule second_symtab { condition: elf.number_of_sections == 7 and elf.symtab_entries == 2 }
+"#;
+
+/// Images that differ in what one point of the module reads: the tables the
+/// header and the section types locate, the identification and the entry point.
+fn elf_images() -> Vec<(String, Vec<u8>)> {
+    use elf_image::{Image, SectionHeaders};
+
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut add = |what: &str, image: &Image| {
+        out.push((
+            format!("{what} (wide {}, big {})", image.wide, image.big),
+            image.bytes(),
+        ));
+    };
+    for (wide, big) in [(true, false), (true, true), (false, false), (false, true)] {
+        add("base", &Image::new(wide, big));
+
+        let mut image = Image::new(wide, big);
+        image.osabi = 3;
+        add("osabi linux", &image);
+        image.osabi = 0x42;
+        add("osabi 66", &image);
+
+        let mut image = Image::new(wide, big);
+        image.dt_symtab = false;
+        add("no DT_SYMTAB", &image);
+        let mut image = Image::new(wide, big);
+        image.machine = 22;
+        image.hash_bucket = 1;
+        add("s390x, hash table of 32-bit words", &image);
+
+        let mut image = Image::new(wide, big);
+        image.section_headers = SectionHeaders::Absent;
+        add("no section headers", &image);
+        image.e_phnum = Some(0);
+        add("no section headers, no segments", &image);
+        image.section_headers = SectionHeaders::PastEnd;
+        add("section headers past the end, no segments", &image);
+        image.section_headers = SectionHeaders::PastEndNoCount;
+        add("no section header, past the end", &image);
+        let mut image = Image::new(wide, big);
+        image.section_headers = SectionHeaders::PastEnd;
+        add("section headers past the end", &image);
+
+        let mut image = Image::new(wide, big);
+        image.e_phoff_zero = true;
+        add("e_phoff 0", &image);
+        image.e_phnum = Some(200);
+        add("e_phoff 0, 200 segments", &image);
+
+        let mut image = Image::new(wide, big);
+        image.second_dynamic = true;
+        add("two PT_DYNAMIC", &image);
+        let mut image = Image::new(wide, big);
+        image.high_types = true;
+        add("types of 2^31 and more", &image);
+        let mut image = Image::new(wide, big);
+        image.second_symtab = true;
+        image.symtab_entsize_zero = true;
+        add("two SHT_SYMTAB, entsize 0", &image);
+
+        let mut image = Image::new(wide, big);
+        image.e_shstrndx = 0;
+        add("e_shstrndx 0", &image);
+        image.e_shstrndx = 99;
+        add("e_shstrndx 99", &image);
+
+        for e_shnum in [0xfeff, 0xff00, 0xffff] {
+            let mut image = Image::new(wide, big);
+            image.entry = image.va(0);
+            image.e_shnum = Some(e_shnum);
+            add(&format!("entry, e_shnum {e_shnum:#x}"), &image);
+        }
+        let mut image = Image::new(wide, big);
+        image.nobits = true;
+        image.e_type = 1;
+        image.entry = image.va(0x40) + 4;
+        add("entry in a SHT_NOBITS section", &image);
+
+        // The sections are 0x100000 above the segment that holds the file.
+        let dynstr = Image::new(wide, big).build().1.dynstr;
+        for base in [0x1000, 0] {
+            let mut image = Image::new(wide, big);
+            image.base = base;
+            image.section_shift = 0x10_0000;
+            for e_type in [0, 1, 2, 3, 4, 127] {
+                let in_dynstr = image.va(dynstr) + 3;
+                for entry in [0, image.va(0), in_dynstr, in_dynstr + 0x10_0000] {
+                    image.e_type = e_type;
+                    image.entry = entry;
+                    add(
+                        &format!("type {e_type}, entry {entry:#x}, base {base:#x}"),
+                        &image,
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn differential_elf_module_on_written_images() {
+    if !have_yr() {
+        eprintln!("[elf images] skipped: `yr` (yara-x CLI) not on PATH");
+        return;
+    }
+    let exav = exav_core::yara::compile(ELF_IMAGE_RULES).expect("exav compile failed");
+    let images = elf_images();
+    let inputs: Vec<&[u8]> = images.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let mut seen = BTreeSet::new();
+    for ((what, bytes), b) in images.iter().zip(yr_matches_each(ELF_IMAGE_RULES, &inputs)) {
+        let a = exav_matches(&exav, bytes);
+        assert_eq!(
+            a, b,
+            "\n\n[elf images] {what}:\n  exav: {a:?}\n  yara-x: {b:?}"
+        );
+        seen.extend(b);
+    }
+    // A rule that no image matches would agree without checking anything.
+    let never: Vec<_> = ELF_IMAGE_RULES
+        .lines()
+        .filter_map(|l| l.strip_prefix("rule ")?.split_whitespace().next())
+        .filter(|id| !seen.contains(*id))
+        .collect();
+    assert!(never.is_empty(), "no image matches: {never:?}");
+}
+
+/// Every constant, with its value, compiles in yara-x and means the same.
+#[test]
+fn differential_elf_constants() {
+    let mut rules = String::from("import \"elf\"\n");
+    for (name, value) in elf_image::CONSTANTS {
+        rules.push_str(&format!(
+            "rule {name} {{ condition: elf.{name} == {value} }}\n"
+        ));
+    }
+    let exav = exav_core::yara::compile(&rules).expect("exav compile failed");
+    let ours = exav_matches(&exav, b"");
+    assert_eq!(ours.len(), elf_image::CONSTANTS.len());
+    if !have_yr() {
+        eprintln!("[elf constants] skipped: `yr` (yara-x CLI) not on PATH");
+        return;
+    }
+    assert_eq!(ours, yr_matches(&rules, b"", &[]));
+}
+
+/// What `yr` gives for `elf.import_md5()` and `elf.telfhash()` on each input
+/// (`None` for a value that is undefined), from its console.
+fn yr_elf_hashes(inputs: &[&[u8]]) -> Vec<(Option<String>, Option<String>)> {
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "exav-yr-hashes-{}-{}",
+        std::process::id(),
+        CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let targets = dir.join("targets");
+    std::fs::create_dir_all(&targets).expect("create dir");
+    let rule_path = dir.join("rules.yar");
+    std::fs::write(
+        &rule_path,
+        "import \"elf\"\nimport \"console\"\n\
+         rule i { condition: console.log(\"I=\", elf.import_md5()) }\n\
+         rule t { condition: console.log(\"T=\", elf.telfhash()) }\n",
+    )
+    .expect("write rules");
+    for (i, data) in inputs.iter().enumerate() {
+        std::fs::write(targets.join(format!("{i}.bin")), data).expect("write target");
+    }
+    let out = std::process::Command::new(yr_bin())
+        .args(["scan", "--recursive"])
+        .arg(&rule_path)
+        .arg(&targets)
+        .output()
+        .expect("run yr scan");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "yr scan failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let mut values = vec![(None, None); inputs.len()];
+    for line in String::from_utf8_lossy(&out.stderr).lines() {
+        let Some((path, rest)) = line.split_once(": ") else {
+            continue;
+        };
+        let index: usize = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected yr output: {line}"));
+        if let Some(md5) = rest.strip_prefix("I=") {
+            values[index].0 = Some(md5.to_string());
+        } else if let Some(hash) = rest.strip_prefix("T=") {
+            values[index].1 = Some(hash.to_string());
+        }
+    }
+    values
+}
+
+/// A pseudo-random sequence, the same on every run.
+struct Xorshift(u64);
+
+impl Xorshift {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// ELF files whose symbols vary in name, kind, binding, visibility, whether the
+/// file defines them and which table holds them.
+fn symbol_images() -> Vec<Vec<u8>> {
+    use elf_image::{Sym, symbol_elf};
+    const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+    const PREFIXES: &[&str] = &["", "", "", "_", ".", "str", "mem", "Str"];
+    const SUFFIXES: &[&str] = &["", "", "", "", "64", "_ex"];
+    const FIXED: &[&str] = &["main", "puts", "abort", "atol", "__libc_start_main"];
+    let mut rng = Xorshift(0x2545_f491_4f6c_dd1d);
+    let mut images = Vec::new();
+    for _ in 0..400 {
+        let count = 1 + rng.below(45) as usize;
+        let symbols: Vec<Sym> = (0..count)
+            .map(|_| {
+                let mut name = String::from(PREFIXES[rng.below(PREFIXES.len() as u64) as usize]);
+                for _ in 0..3 + rng.below(18) {
+                    name.push(LETTERS[rng.below(LETTERS.len() as u64) as usize] as char);
+                }
+                name.push_str(SUFFIXES[rng.below(SUFFIXES.len() as u64) as usize]);
+                if rng.below(40) == 0 {
+                    name = FIXED[rng.below(FIXED.len() as u64) as usize].to_string();
+                }
+                // Mostly global functions; the rest vary one attribute.
+                let (kind, bind, other, shndx) = match rng.below(12) {
+                    0 => (1, 1, 0, 0),
+                    1 => (0, 1, 0, 0),
+                    2 => (2, 2, 0, 0),
+                    3 => (2, 0, 0, 0),
+                    4 => (2, 1, 2, 0),
+                    5 => (2, 1, 0, 1),
+                    _ => (2, 1, 0, 0),
+                };
+                Sym::new(name.as_bytes(), bind << 4 | kind, other, shndx)
+            })
+            .collect();
+        images.push(match rng.below(4) {
+            0 => symbol_elf(None, Some(&symbols)),
+            1 => symbol_elf(Some(&symbols), None),
+            2 => symbol_elf(Some(&symbols[count / 2..]), Some(&symbols[..count / 2])),
+            _ => symbol_elf(Some(&[]), Some(&symbols)),
+        });
+    }
+    images
+}
+
+#[test]
+fn differential_elf_import_md5_and_telfhash() {
+    if !have_yr() {
+        eprintln!("[elf hashes] skipped: `yr` (yara-x CLI) not on PATH");
+        return;
+    }
+    let images = symbol_images();
+    let inputs: Vec<&[u8]> = images.iter().map(Vec::as_slice).collect();
+    let theirs = yr_elf_hashes(&inputs);
+    let mut telfhashes = 0;
+    for (i, (image, (md5, telfhash))) in images.iter().zip(&theirs).enumerate() {
+        let md5 = md5.as_deref().expect("yr has an import_md5");
+        let telfhash = match telfhash {
+            Some(h) => {
+                telfhashes += 1;
+                format!("elf.telfhash() == \"{h}\"")
+            }
+            None => "not defined elf.telfhash()".to_string(),
+        };
+        let rules = exav_core::yara::compile(&format!(
+            "import \"elf\" rule r {{ condition: elf.import_md5() == \"{md5}\" and {telfhash} }}"
+        ))
+        .expect("exav compile failed");
+        assert_eq!(
+            exav_matches(&rules, image).len(),
+            1,
+            "[elf hashes] image {i}: yara-x gives import_md5 {md5}, {telfhash}"
+        );
+    }
+    // The comparison has to see both a hash and no hash.
+    assert!(
+        telfhashes > 100 && telfhashes < images.len(),
+        "{telfhashes} of {} images have a telfhash",
+        images.len()
+    );
+}
+
 /// A hand-crafted minimal ELF64 executable (see tests/testdata/tiny_elf64).
 const TINY_ELF: &[u8] = include_bytes!("testdata/tiny_elf64");
 
@@ -442,6 +870,88 @@ fn differential_string() {
     agree("string", STRING_RULES, &pe_inputs());
 }
 
+// --- dotnet module ---------------------------------------------------------
+
+const DOTNET_RULES: &str = r#"
+import "dotnet"
+rule field_offset { condition: dotnet.field_offsets[0] == 9312 }
+rule field_offsets_none { condition: dotnet.is_dotnet and dotnet.number_of_field_offsets == 0 }
+rule field_offsets_len { condition: dotnet.field_offsets.len() == 1 }
+rule resource_offset { condition: dotnet.resources[0].offset == 8852 }
+rule resource_offset_edge { condition: dotnet.resources[0].offset == 8848 + 340 + 4 }
+rule resource_offset_undefined {
+    condition: dotnet.number_of_resources == 1 and not defined dotnet.resources[0].offset
+}
+rule resources_len { condition: dotnet.resources.len() == 1 and dotnet.streams.len() == 5 }
+rule not_dotnet { condition: not dotnet.is_dotnet and dotnet.streams.len() == 0 }
+"#;
+
+/// The assemblies of `tests/fixtures/dotnet`, and copies with the fields that
+/// the offsets of the module depend on changed (see `suites/yara_dotnet.rs`).
+#[test]
+fn differential_dotnet_offsets() {
+    let sha3: &[u8] = include_bytes!("fixtures/dotnet/sha3_field_rva.dll");
+    let buffers: &[u8] = include_bytes!("fixtures/dotnet/system_buffers_resource.dll");
+    let reference: &[u8] = include_bytes!("fixtures/dotnet/system_buffers.dll");
+    let mut inputs = vec![
+        sha3.to_vec(),
+        buffers.to_vec(),
+        reference.to_vec(),
+        b"MZ".to_vec(),
+    ];
+    let mut cut = sha3.to_vec();
+    for at in [376 + 8, 376 + 16] {
+        cut[at..at + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+    }
+    inputs.push(cut);
+    for (at, value) in [(4756, 340u32), (4756, 341), (520 + 24, 0x9000_0000)] {
+        let mut data = buffers.to_vec();
+        data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        inputs.push(data);
+    }
+    let mut other_file = buffers.to_vec();
+    other_file[4756 + 10] = 1;
+    inputs.push(other_file);
+    let inputs: Vec<&[u8]> = inputs.iter().map(Vec::as_slice).collect();
+    agree("dotnet", DOTNET_RULES, &inputs);
+}
+
+/// Assemblies with a header, a table or a heap damaged (`dotnet_damaged`):
+/// every condition that was recorded from `yr` holds in `yr` and in exav.
+#[test]
+fn differential_dotnet_damaged() {
+    if !have_yr() {
+        eprintln!("[dotnet damaged] skipped: `yr` (yara-x CLI) not on PATH");
+        return;
+    }
+    for case in dotnet_damaged::cases() {
+        let rules: String = std::iter::once("import \"dotnet\"\n".to_string())
+            .chain(
+                case.holds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, cond)| format!("rule c{i} {{ condition: {cond} }}\n")),
+            )
+            .collect();
+        let all: BTreeSet<String> = (0..case.holds.len()).map(|i| format!("c{i}")).collect();
+        let exav = exav_core::yara::compile(&rules).expect("exav compile failed");
+        assert_eq!(
+            exav_matches(&exav, &case.data),
+            all,
+            "[{}] exav: some of {:?} does not hold",
+            case.name,
+            case.holds
+        );
+        assert_eq!(
+            yr_matches(&rules, &case.data, &[]),
+            all,
+            "[{}] yara-x: some of {:?} does not hold",
+            case.name,
+            case.holds
+        );
+    }
+}
+
 // --- pe module -------------------------------------------------------------
 
 const PE_RULES: &str = r#"
@@ -461,6 +971,9 @@ rule num_imports    { condition: pe.number_of_imports == 1 }
 rule imports_k32    { condition: pe.imports("kernel32.dll") == 1 }
 rule imports_fn     { condition: pe.imports("KERNEL32.dll", "ExitProcess") }
 rule imphash        { condition: pe.imphash() == "f9ade0aa18f660a34a4fa23392e21838" }
+rule len_sections   { condition: pe.sections.len() == 1 and pe.sections.len() == pe.number_of_sections }
+rule len_no_sections { condition: pe.sections.len() == 0 }
+rule len_of_a_bound_array { condition: with s = pe.sections : (s.len() > 0) }
 "#;
 
 #[test]

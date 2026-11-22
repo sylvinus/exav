@@ -6,6 +6,7 @@
 use exav_core::bytecode::runtime::BytecodeRuntime;
 use exav_core::filetype::FileType;
 use exav_core::{ScanOptions, Verdict, analyze, analyze_all};
+use exav_unpack::zip_write::{FileOptions, ZipWriter};
 
 const HEADER_MAGIC: u64 = 0x53e5_493e_9f3d_1c30;
 
@@ -170,9 +171,8 @@ fn a_trigger_with_a_container_condition_fires_in_that_container() {
     loader.add_named_bytes("t.cbc", cbc.as_bytes(), true);
     let db = loader.build().unwrap();
     let member = b"..prefix..MALWARE..suffix..";
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    zip.start_file("m.txt", zip::write::SimpleFileOptions::default())
-        .unwrap();
+    let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file("m.txt", FileOptions::default()).unwrap();
     zip.write_all(member).unwrap();
     let zip = zip.finish().unwrap().into_inner();
     let found = |data: &[u8]| match analyze(&db, data, &ScanOptions::default()).verdict {

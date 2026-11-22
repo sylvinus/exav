@@ -34,7 +34,7 @@ file you open in it stays in your browser.
   run in a worker. So are the converters of the formats the Office engines do
   not read: spreadsheets (XLS, ODS, Numbers) to XLSX, presentations and
   drawings (PPT, ODP, Keynote, ODG, Visio) to PPTX, and text documents (DOC,
-  ODT, RTF) to DOCX. The modules import nothing but wasm-bindgen's plumbing:
+  ODT, RTF, Pages) to DOCX. The modules import nothing but wasm-bindgen's plumbing:
   no network, no global object, no clock. A crafted file can fail to open,
   or be stopped after a time limit or at its module's memory cap; what the
   decoder does stays in its worker.
@@ -64,7 +64,7 @@ file you open in it stays in your browser.
 | CSV, TSV | `csv()` | the separator and encoding read off the bytes | `@silurus/ooxml` |
 | XLS (.xls, .xlt; Excel 2.1 to 2003); ODS (.ods, .ots, .fods); Numbers (.numbers); an XML Spreadsheet 2003, HTML table or SYLK file saved as .xls | `xls()`, `ods()`, `numbers()`, `@exav/viewer/office`, with `xlsx()` | exav-render's `sheets`, in a worker: converted to XLSX, shown by `xlsx()` | `@silurus/ooxml` |
 | PPT (.ppt, .pps, .pot; PowerPoint 95 and 97 to 2003); ODP (.odp, .otp, .fodp); Keynote (.key, every version); ODG (.odg, .otg, .fodg); Visio 2013 and later (.vsdx, .vsdm, .vstx, .vstm) | `ppt()`, `odp()`, `keynote()`, `odg()`, `visio()`, `@exav/viewer/office`, with `pptx()` | exav-render's `slides`, in a worker: converted to PPTX, shown by `pptx()`; a page of a drawing is a slide | `@silurus/ooxml` |
-| RTF (.rtf); DOC (.doc, .dot; Word 6 to 2003); ODT (.odt, .ott, .fodt) | `rtf()`, `doc()`, `odt()`, `@exav/viewer/office`, with `docx()` | exav-render's `docs` (a prototype), in a worker: converted to DOCX, shown by `docx()` | `@silurus/ooxml` |
+| RTF (.rtf); DOC (.doc, .dot; Word 6 to 2003); ODT (.odt, .ott, .fodt); Pages (.pages; Pages 5 and later) | `rtf()`, `doc()`, `odt()`, `pages()`, `@exav/viewer/office`, with `docx()` | exav-render's `docs` (a prototype), in a worker: converted to DOCX, shown by `docx()` | `@silurus/ooxml` |
 | What none of those converters reads: binary Visio (.vsd, .vst), Visio 2003 XML (.vdx, .vtx), CorelDRAW (.cdr, .cmx), Publisher (.pub), PageMaker (6 to 7), FreeHand (3 to 11), QuarkXPress (3.1 to 4.1), Zoner Draw (4, 5), WordPerfect Graphics (.wpg); a CSV or DIF saved as .xls | `visio()`, `coreldraw()`, `publisher()`, `pagemaker()`, `freehand()`, `quarkxpress()`, `zonerdraw()`, `wpg()`, `@exav/viewer/office`, with `pdf()` and `xlsx()` | an [external converter](/viewer/integration/#the-external-converter) the host names; without one the file ends in the `needs_converter` error | the converter's package |
 | Text: .txt, .text, .log; Markdown (.md, .markdown); JSON (.json, .geojson); XML (.xml, .xsd, .xsl, .xslt, .rss, .atom, .kml, .gpx, .rdf, .wsdl, .plist); HTML as source (.html, .htm, .xhtml); YAML, TOML, INI and conf files, .jsonl, .srt and .vtt subtitles, diffs (.diff, .patch); source code and scripts (.js, .ts, .py, .sh, .css, .c, .h, .rs, .go, .java and the like) | `text()`, `@exav/viewer/text` | written for the viewer, in TypeScript; no dependency | |
 | IFC (IFC2X3, IFC4, IFC4X3) | `ifc()`, `@exav/viewer/ifc` | exav-render, in a worker; drawn with three.js | `three` |
@@ -91,7 +91,7 @@ engine of the Open XML format it became:
 - **Presentations and drawings** (PPT, ODP, Keynote, ODG, Visio 2013 and
   later) become PPTX. A page of a drawing is a slide, in the size of the
   largest page.
-- **Text documents** (DOC, ODT, RTF) become DOCX. This converter is a
+- **Text documents** (DOC, ODT, RTF, Pages) become DOCX. This converter is a
   prototype: on the project's test files, 32% of the pages of DOC files come
   out close to a reference rendering, against 50% for DOCX files drawn
   natively.
@@ -137,19 +137,20 @@ archive, by their names.
   text in brackets: nothing is loaded. A
   link to an absolute `http:`, `https:` or `mailto:` address (without
   credentials) is drawn as its label with the address written beside it, and
-  an `http:` or `https:` one opens on a click or Enter as a PDF's links do: in
-  the sandboxed frame the host asks first, in the page it opens a new tab
-  with no opener. A `mailto:` link is text, and any other target
+  opens on a click or Enter as a PDF's links do: in the sandboxed frame the
+  host asks first (`confirmLink`), in the page it opens a new tab with no
+  opener, or the mail program for a `mailto:` one. Any other target
   (`javascript:`, `data:`, `file:`, a relative path) leaves the label alone.
   A link is not an anchor, so the document itself never navigates.
 - **What the bytes say.** A byte-order mark picks UTF-8 or UTF-16;
   otherwise UTF-8 if the bytes are valid in it, else windows-1252. A file
   with a NUL byte in its first 64 KiB, or mostly control characters, is
   not text, and the viewer says so instead of drawing noise. Control
-  characters show as their Control Pictures glyph, and bidirectional
-  embeddings, overrides and isolates (CVE-2021-42574) and the line and
+  characters show as their Control Pictures glyph, and the bidirectional
+  marks, embeddings, overrides and isolates (CVE-2021-42574) and the line and
   paragraph separators show as `<U+202E>` and the like, so a file cannot
-  reorder or hide what it says.
+  reorder or hide what it says. They are the characters the scanner and the
+  extractor hide in a name.
 - **Limits.** The first 2 MiB and 50,000 lines are read, a line is cut at
   10,000 characters, a Markdown document is cut at 100,000 nodes and
   nests quotes and lists ten deep, JSON nests a hundred deep. A warning

@@ -2,8 +2,8 @@
 //!
 //! Vendored and adapted from the `unarc-rs` crate (MIT OR Apache-2.0) — see
 //! `NOTICE` — exactly as `formats/arj_parse/` was, and for the same reason:
-//! depending on that crate directly drags in a second `zip` with its *default*
-//! features, and Cargo's feature unification then turns on the `zip` crate's own
+//! depending on that crate directly drags in the `zip` crate with its *default*
+//! features, and Cargo's feature unification then turns on its own
 //! LZMA/bzip2/deflate64 decoders inside exav. Those bypass exav's per-member
 //! budget, and the ZIP-codec suite caught it immediately.
 //!

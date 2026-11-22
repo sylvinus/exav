@@ -5,6 +5,8 @@ use exav_render::formats::office::test_util::build_cfb as build;
 use exav_render::slides::{
     Error, Format, Limits, convert, convert_first, convert_first_from, convert_keynote_package,
 };
+use exav_unpack::package::Package;
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::io::Read;
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -17,10 +19,12 @@ fn fixture(name: &str) -> Vec<u8> {
 
 /// A part of a PPTX, as text.
 fn part(pptx: &[u8], name: &str) -> String {
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(pptx)).unwrap();
-    let mut s = String::new();
-    z.by_name(name).unwrap().read_to_string(&mut s).unwrap();
-    s
+    let part = Package::from_bytes(pptx)
+        .unwrap()
+        .read(name, u64::MAX)
+        .unwrap()
+        .unwrap();
+    String::from_utf8(part).unwrap()
 }
 
 /// An ODP of one slide holding a bar chart object, written per ODF 1.3,
@@ -47,8 +51,8 @@ fn chart_odp(table: &str) -> Vec<u8> {
         row("Q1", "10"),
         row("Q2", "20")
     );
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts = zip::write::SimpleFileOptions::default();
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = FileOptions::default();
     for (name, data) in [
         (
             "mimetype",
@@ -83,10 +87,7 @@ fn chart_objects_become_charts() {
 }
 
 fn names(pptx: &[u8]) -> Vec<String> {
-    let z = zip::ZipArchive::new(std::io::Cursor::new(pptx)).unwrap();
-    z.file_names()
-        .filter_map(|n| n.ok().map(|n| n.to_string()))
-        .collect()
+    Package::from_bytes(pptx).unwrap().names(usize::MAX)
 }
 
 /// The PPTX's own structure: a presentation naming its slides, which name
@@ -186,16 +187,15 @@ fn keynote() {
     assert!(s1.contains("Example Presentation"));
     assert!(s1.contains("This is a subtitle."));
     // The same document as a package directory, given file by file.
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(fixture("sample.key"))).unwrap();
+    let key = fixture("sample.key");
+    let mut z = Package::from_bytes(&key).unwrap();
     let mut files = vec![];
-    for i in 0..z.len() {
-        let mut f = z.by_index(i).unwrap();
-        if f.is_dir() {
+    for name in z.names(usize::MAX) {
+        if name.ends_with('/') {
             continue;
         }
-        let mut v = vec![];
-        f.read_to_end(&mut v).unwrap();
-        files.push((f.name().map(|n| n.to_string()).unwrap_or_default(), v));
+        let v = z.read(&name, u64::MAX).unwrap().unwrap();
+        files.push((name, v));
     }
     let refs: Vec<(&str, &[u8])> = files
         .iter()
@@ -243,10 +243,9 @@ fn odp_with_picture(size: usize) -> Vec<u8> {
     );
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     png.resize(size, 7);
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     // Stored, as pictures are: the package is as large as they are.
-    let opts =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let opts = FileOptions::default().method(Method::Stored);
     for (name, data) in [
         (
             "mimetype",

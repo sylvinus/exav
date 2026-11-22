@@ -122,6 +122,8 @@ mod pdf_empty_password;
 mod pdf_parse;
 #[cfg(feature = "pdf")]
 mod pdf_readers_agree;
+#[cfg(feature = "text-pdf")]
+mod pdf_readers_diff;
 #[cfg(feature = "pepack")]
 mod pe_emulation;
 #[cfg(feature = "pepack")]
@@ -197,6 +199,8 @@ mod zip_disguised_members;
 mod zip_local_vs_directory;
 #[cfg(feature = "zip")]
 mod zip_overlap;
+#[cfg(feature = "zip")]
+mod zip_write;
 #[cfg(feature = "zoo")]
 mod zoo;
 
@@ -253,6 +257,7 @@ pub(crate) fn extract_each<R>(
             mode: meta.mode,
             raster: meta.raster.clone(),
             object_stream: meta.object_stream,
+            holes: 0,
         };
         visit(entry, budget)
     })

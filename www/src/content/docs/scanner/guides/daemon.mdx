@@ -41,7 +41,9 @@ clamdscan --fdpass file.bin                        # fd-passing also works
 address from its `clamd.conf` (`LocalSocket`, or `TCPSocket` and `TCPAddr`).
 
 By default the client sends paths, which the daemon opens itself, so the daemon
-has to be able to see them. `--send-as contents` sends the bytes (`INSTREAM`) and
+has to be able to see them. On Unix a path is sent as its bytes and the reply
+printed as its bytes, so a file whose name is not UTF-8 is reported under its
+own name (`--json` writes it as UTF-8 text, as JSON requires). `--send-as contents` sends the bytes (`INSTREAM`) and
 `--send-as fd` sends an open descriptor (`FILDES`, Unix socket only); either way
 the daemon needs no access to the path, which suits a container, a remote scanner
 or a daemon running as another user. `-` (stdin) is always sent as contents.
@@ -76,6 +78,17 @@ bind a TCP listener to the interface that should reach it and firewall the rest.
 The other address options are listed in
 [what belongs to one listener](/scanner/reference/cli/#what-belongs-to-one-listener).
 
+A daemon can listen on a socket and a port at once, as `clamd.conf` does with
+`LocalSocket` and `TCPSocket`; name each address, with its own options:
+
+```sh
+exav --listen 'clamd:///run/exav.sock?mode=660' \
+     --listen 'clamd://127.0.0.1:3310?max-connections=64' -d /var/lib/exav
+```
+
+Under the worker pool each worker waits on both; `max-connections` is then not
+read, and the worker count bounds the connections over both addresses.
+
 <Aside type="note" title="Put the socket somewhere only its owner can write">
 The path is a name another process can replace between `bind` and `chmod`.
 `$XDG_RUNTIME_DIR` (usually mode 0700 and user-owned) or `/var/run` are safe;
@@ -94,7 +107,9 @@ the exav extensions
 [scanning over HTTP](/scanner/guides/scanning/#scanning-over-http)) and is honoured, and
 listed in `VERSIONCOMMANDS`, only in a build with `http-scan`
 (`--features http`) and with `--allow-http-scan`. Commands may be `z`- or
-`n`-framed.
+`n`-framed. `FILDES` takes one descriptor; a message that passes more, or a
+descriptor sent with another command, is refused as clamd refuses it, and the
+connection closes.
 
 `EXINSTREAM` takes `INSTREAM`'s framing and answers one line of JSON with the
 [verdict fields](/scanner/reference/verdicts/), for instance
@@ -126,14 +141,21 @@ a time reports three clean files and never looks at what the archive holds. (The
 first part of a 7z set is `PARTIAL` on its own: the header that says how to
 decode it is in the last part.)
 
-`CONTSCAN` and `MULTISCAN` rejoin such sets per directory and scan the archive
-they make. The reply is still one line per file, and every part carries the
-archive's verdict, a `FOUND` replacing a part's own `PARTIAL`:
+`CONTSCAN`, `MULTISCAN`, `ALLMATCHSCAN` and `SCAN` of a directory write each
+file's line as the file is scanned, so a job stopped by `--max-scan-secs` has
+already answered for the files before it.
+
+`CONTSCAN`, `MULTISCAN` and `ALLMATCHSCAN` rejoin such sets per directory and
+scan the archive they make. The reply is still one line per file, and every
+part carries the archive's verdict, a `FOUND` replacing a part's own `PARTIAL`:
 
 ```text
 /data/big.zip.001: Eicar-Signature FOUND (in big.zip)
 /data/big.zip.002: Eicar-Signature FOUND (in big.zip)
 ```
+
+`ALLMATCHSCAN` answers each part with one line for every signature the archive
+matches.
 
 A part of an infected archive is the file you have to act on. A set with a gap in
 its numbering comes back `UNSCANNABLE`: those bytes belong to an archive nothing
@@ -165,8 +187,11 @@ join and not by concatenation (which would produce garbage that still looks like
 an archive): a RAR set (`x.part1.rar`, `x.part2.rar`, ..., or `x.rar`, `x.r00`,
 ...), a ZIP set (`x.z01`, ..., and the `x.zip` that ends it) and a set of
 cabinets, found from the names their headers give one another. A set with a
-volume missing, or whose volumes do not fit together, is `PARTIAL`, never
-clean. The client sends a directory as one request when it holds a byte-split,
+volume missing at its start or in the middle, or whose volumes do not fit
+together, is `PARTIAL`, never clean. A RAR set whose last volume is cut short
+is read as far as its volumes go, as a single cut archive is; one that ends
+where a member goes on in a volume not given is scanned too, and that member
+is reported as continuing (`PARTIAL`). The client sends a directory as one request when it holds a byte-split,
 RAR or ZIP part by name, with its `.zip` and `.cab` files; a directory of
 cabinets alone is rejoined when the daemon scans it by path (`CONTSCAN`).
 
@@ -183,8 +208,20 @@ answered `LIMITS-EXCEEDED`. See
 When the daemon has its answer before the stream ends, it reads and discards up
 to 64 MiB of the rest before replying, so the reply is not lost to a reset
 connection; the [ICAP guide](/scanner/guides/icap/#draining-an-over-limit-body) explains
-why. Past that it replies and closes the connection, an `IDSESSION` too. ICAP
-bodies are buffered the same way.
+why. Past that it replies and closes the connection, an `IDSESSION` too, and
+the size in a `LIMITS-EXCEEDED` reason is then a floor (`file size at least
+N`). ICAP bodies are buffered the same way.
+
+A path that is a FIFO, a socket or a device answers `Not supported file type
+ERROR`, as in clamd; inside a directory, they and symbolic links get no line.
+On Unix the path of `SCAN`, `CONTSCAN`, `MULTISCAN` and `ALLMATCHSCAN` is bytes,
+as in clamd: a file whose name is not UTF-8 is scanned, and every reply names a
+file by its bytes, the lines of a directory walk and the `--log` file included,
+so a client finds the name it sent or the one on disk. Where a path is text
+(Windows), a command that is not UTF-8 is answered `command is not valid UTF-8
+ERROR`. A command longer than 64 KiB is answered `command line exceeds limit
+ERROR` and the connection closes. That bound has no setting: a path on Linux is
+at most 4,096 bytes, so a longer command names no file.
 
 These bounds keep a slow client from holding the daemon, in the thread model and
 in the pool. They go on the listener's address; the first two are always on,

@@ -80,28 +80,6 @@ struct Cli {
     #[arg(long = "passwords", value_name = "PASSWORD")]
     passwords: Vec<String>,
 
-    /// Max members to visit inside each input file; `off` or `0` sets no limit. The
-    /// budget is per file, not a total across the tree: a directory of N
-    /// archives may yield N times this many members.
-    #[arg(
-        long = "max-members",
-        env = "EXAV_MAX_MEMBERS",
-        value_name = "N|off",
-        value_parser = count_or_off
-    )]
-    max_members: Option<u64>,
-
-    /// Leave out a member that decodes to more than N times its size, once it
-    /// is past --max-object-bytes; the other members are still searched and the
-    /// file is reported as not fully read. `off` or `0` sets no limit.
-    #[arg(
-        long = "max-compression-ratio",
-        env = "EXAV_MAX_COMPRESSION_RATIO",
-        value_name = "N|off",
-        value_parser = count_or_off
-    )]
-    max_compression_ratio: Option<u64>,
-
     /// Don't report members that could not be read. Off by default, because
     /// hiding them turns "I couldn't look" into an indistinguishable "no match".
     #[arg(long)]
@@ -124,18 +102,6 @@ struct Cli {
 
     #[command(flatten)]
     qr_limits: cli::QrArgs,
-}
-
-/// A count given as a number or `off`; `off` and `0` are no limit, as in exav.
-fn count_or_off(v: &str) -> Result<u64, String> {
-    match v.trim() {
-        n if n.eq_ignore_ascii_case("off") => Ok(u64::MAX),
-        n => match n.parse() {
-            Ok(0) => Ok(u64::MAX),
-            Ok(n) => Ok(n),
-            Err(_) => Err(format!("expected a number or `off`, got `{n}`")),
-        },
-    }
 }
 
 fn main() -> ExitCode {
@@ -163,12 +129,6 @@ fn main() -> ExitCode {
     if let Err(e) = cli.qr_limits.apply(&mut opts) {
         eprintln!("exav-grep: {e}");
         return ExitCode::from(2);
-    }
-    if let Some(n) = cli.max_members {
-        opts.limits.max_members = n;
-    }
-    if let Some(n) = cli.max_compression_ratio {
-        opts.limits.max_compression_ratio = n;
     }
     let ctx = cli.context.unwrap_or(0);
     opts.passwords = cli.passwords.clone();

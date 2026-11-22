@@ -54,8 +54,8 @@ cannot add a line or a terminal escape sequence to the output.
 `3` is the one a script has to handle. What could not be read is said on
 stderr, one line each, and is never taken for "no code":
 
-- an image that does not decode, or a PDF image whose dictionary, color space
-  (Lab, Separation, DeviceN) or predictor (TIFF) is not read;
+- an image that does not decode, or a PDF image whose dictionary or color
+  space (Lab, Separation, DeviceN) is not read;
 - an image that a limit stopped: past `--max-qr-pixels`, `--max-qr-millis`,
   `--max-qr-codes`, `--max-qr-finders`, `--max-qr-grids`, or past
   `--max-object-bytes`;
@@ -75,6 +75,13 @@ unless said, and a flag wins over its variable.
 | `-r`, `--recursive` | Read the files of the directories named. Without it a directory is an error |
 | `--max-object-bytes <SIZE\|off>` | The most held in memory at once for one file or member (default 256 MiB); K/M/G/T suffixes. An image over it is reported unread. Environment: `EXAV_MAX_OBJECT_BYTES` |
 | `--max-extracted-bytes <SIZE\|off>` | The most bytes of members that a format decodes into memory itself (PDF streams, OLE streams, RTF objects and the like), summed over one file (default 1 GiB). The bytes a PDF is read again to follow its objects count too. A file that reaches it is reported unread. Environment: `EXAV_MAX_EXTRACTED_BYTES` |
+| `--max-matcher-bytes <SIZE\|off>` | The most bytes read for one file named on the command line, its members summed (default 10 GiB): a CPU and time bound. A file that reaches it is reported unread. Environment: `EXAV_MAX_MATCHER_BYTES` |
+| `--max-hole-bytes <SIZE\|off>` | The most bytes of holes of sparse files in a filesystem image read as zeros for one file named on the command line (default 10 GiB), counted apart from `--max-matcher-bytes`. Environment: `EXAV_MAX_HOLE_BYTES` |
+| `--max-members <N\|off>` | Cap on members visited inside each input file (default 100000). Environment: `EXAV_MAX_MEMBERS` |
+| `--max-compression-ratio <N\|off>` | A member past `--max-object-bytes` that decodes to more than N times its size (default 1000) is left out and reported unread. Environment: `EXAV_MAX_COMPRESSION_RATIO` |
+| `--max-pe-emulation-steps <N\|off>` | Most x86 instructions the emulator that unpacks packed executables may run for one file named on the command line (default 1000000000). Environment: `EXAV_MAX_PE_EMULATION_STEPS` |
+| `--max-pe-stub-steps <N\|off>` | Most x86 instructions that emulator may run for one packed executable (default 500000000). Environment: `EXAV_MAX_PE_STUB_STEPS` |
+| `--max-pe-idle-steps <N\|off>` | Most instructions a packed executable's stub may run in that emulator without writing a page it has not written before (default 64000000). Environment: `EXAV_MAX_PE_IDLE_STEPS` |
 | `--max-unpack-depth <N>` | Cap on archive-within-archive nesting; `0` opens no archive, and each file is read as it stands. There is no `off`. Environment: `EXAV_MAX_UNPACK_DEPTH` |
 | `--spill-dir <DIR\|off>` | Where a container inside a member over `--max-object-bytes` is written to be opened (default: the system temporary directory); `off` writes nothing. Environment: `EXAV_SPILL_DIR` |
 | `--max-total-spill-bytes <SIZE\|off>` | The most the spill files open at once may hold (default 2 GiB). Environment: `EXAV_MAX_TOTAL_SPILL_BYTES` |

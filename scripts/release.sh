@@ -221,12 +221,24 @@ exav-qr = { path = "exav-qr-$VERSION" }
 exav-grep = { path = "exav-grep-$VERSION" }
 $PROFILES
 EOF
-( cd "$tb" && $CARGO build --release ) \
+# The unpacked tarballs are this build's checkout: mapped like the real one.
+( cd "$tb" && RUSTFLAGS="$("$REPO/scripts/build-flags.sh" "$tb")" $CARGO build --release ) \
   || fail "the packaged crates do not build on their own: a published file is missing (check the \`exclude\` keys)"
 [ -x "$tb/target/release/exav" ] || fail "the packaged build produced no exav binary"
+python3 -I scripts/check-build-paths.py --also "$tb" "$tb/target/release/exav" \
+  || fail "the binary built from the tarballs holds a path of this machine"
 # It has to answer, not just link: a binary that cannot start is not installable.
 "$tb/target/release/exav" --version >/dev/null || fail "the packaged exav binary does not run"
 echo "  built and ran exav $VERSION from the tarballs alone"
+
+step "No path of this machine in any published tarball"
+# Source archives: their tests and docs name /home/x and C:\Users\x as
+# examples, so only this machine's own paths (the checkout, the cargo and
+# rustup homes, the home directory) are looked for.
+crate_files=()
+for c in "${CRATES[@]}"; do crate_files+=("target/package/$c-$VERSION.crate"); done
+python3 -I scripts/check-build-paths.py --source "${crate_files[@]}" \
+  || fail "a crate tarball holds a path of this machine"
 
 step "No EICAR literal in any published tarball"
 # The self-scan test covers the source tree; this covers the artifacts, which is

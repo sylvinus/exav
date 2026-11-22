@@ -84,6 +84,10 @@ mod inflate;
 pub mod html;
 #[allow(dead_code)]
 mod kdf;
+// `pbkdf2` and `ct_eq` are each used by only some of the formats.
+#[cfg(feature = "decrypt")]
+#[allow(dead_code)]
+mod hmac;
 #[cfg(all(test, any(feature = "dmg", feature = "ishieldz")))]
 mod oracle;
 /// The headers of a PE executable and the file offset of an address in
@@ -98,7 +102,18 @@ pub mod span;
 pub mod spill;
 mod stream;
 mod text_kind;
+#[cfg(feature = "zip")]
+mod zip_dir;
 mod zip_end;
+#[cfg(any(
+    all(feature = "zip", feature = "decrypt"),
+    all(feature = "zip-write", feature = "test-util")
+))]
+mod zip_keys;
+/// A ZIP writer: Stored and Deflated members, ZIP64 when needed. Feature
+/// `zip-write`.
+#[cfg(feature = "zip-write")]
+pub mod zip_write;
 pub use text_kind::{TextKind, field_name_len, is_message, looks_like_html, text_keeps, text_kind};
 /// The text a reader sees in HTML, Office and OpenDocument XML parts, and
 /// PDF. Feature `text`.
@@ -146,6 +161,10 @@ pub use formats::office_package::{
 /// PowerPoint 2 to 4, whose files have no compound structure. Feature `ole`.
 #[cfg(feature = "ole")]
 pub use formats::old_ppt;
+/// The parts of a ZIP package (Office, OpenDocument, iWork) read by name.
+/// Feature `zip`.
+#[cfg(feature = "zip")]
+pub use formats::package;
 /// RTF's tokenizer, which the scanner's extractor of embedded objects and
 /// exav-render's converter both read with. Feature `rtf`.
 #[cfg(feature = "rtf")]
@@ -318,7 +337,8 @@ pub struct Limits {
     /// file. They are charged here instead of to [`Self::max_scanned_bytes`],
     /// so that a large sparse file does not use that up and end the walk
     /// before the rest of the volume. A CPU/time bound: the zeros are still
-    /// matched. Default 64 GiB.
+    /// matched. Default 10 GiB, as [`Self::max_scanned_bytes`]: a hole costs
+    /// the matcher what the same bytes of data cost.
     pub max_hole_bytes: u64,
     /// What one run of a bytecode signature may hold in all: its `malloc`s
     /// (a program frees nothing), the frames of its calls in progress, and the
@@ -328,10 +348,22 @@ pub struct Limits {
     /// Cap on the instructions the PE stub emulator may run across the whole
     /// recursive analysis of one top-level file.
     ///
-    /// Each emulation already has its own instruction budget; this bounds their
-    /// sum, which otherwise grows with the number of packed executables an
-    /// archive carries. A run cut short by it is `LimitsExceeded`.
+    /// Each emulation has its own budgets ([`Limits::max_pe_stub_steps`],
+    /// [`Limits::max_pe_idle_steps`]); this bounds their sum, which otherwise
+    /// grows with the number of packed executables an archive carries. A run
+    /// cut short by it is `LimitsExceeded`.
     pub max_pe_emulation_steps: u64,
+    /// Instructions the PE stub emulator may run for one packed executable.
+    /// A run that reaches it is cut short: what the stub rebuilt by then is
+    /// still scanned, as a `-emulated-partial` member, and the scan ends
+    /// `LimitsExceeded` unless something is found. `u64::MAX` is no limit (the
+    /// scan-wide `max_pe_emulation_steps` still applies). Default 500 million.
+    pub max_pe_stub_steps: u64,
+    /// Instructions a stub may run without writing a page it has not written
+    /// before. A run that goes that long is looping on nothing and stops, with
+    /// what it rebuilt scanned as for any other stop; this is not a limit hit.
+    /// `u64::MAX` disables it. Default 64 million.
+    pub max_pe_idle_steps: u64,
     /// Most PE, ELF or Mach-O images carving takes from one object, of each
     /// kind. A further one that validates is left out and the object is not
     /// fully scanned. Default 16. Read by exav-core, which carves.
@@ -392,11 +424,13 @@ impl Default for Limits {
             // and runaway scan time, and lets a multi-gigabyte member be fully
             // scanned.
             max_scanned_bytes: 10 * 1024 * 1024 * 1024,
-            max_hole_bytes: 64 * 1024 * 1024 * 1024,
+            max_hole_bytes: 10 * 1024 * 1024 * 1024,
             max_bytecode_memory_bytes: 256 * 1024 * 1024,
             // A few seconds to tens of seconds of emulation per top-level file,
-            // against the per-stub budget of `formats::pepack`.
+            // against the per-stub budget below.
             max_pe_emulation_steps: 1_000_000_000,
+            max_pe_stub_steps: 500_000_000,
+            max_pe_idle_steps: 64_000_000,
             max_carved_executables: 16,
             max_carved_archives: 32,
             max_base64_payloads: 8,
@@ -435,15 +469,15 @@ pub struct Budget {
     pub(crate) pe_emulation_steps: u64,
     /// PBKDF2 iterations spent so far on RAR5 and disk image passwords, across
     /// every archive of the scan. Atomic because the readers hold the budget by `&`.
-    #[cfg_attr(not(feature = "decrypt"), allow(dead_code))]
+    #[cfg(all(feature = "decrypt", any(feature = "rar", feature = "dmg")))]
     pub(crate) kdf_rounds: std::sync::atomic::AtomicU64,
     /// What the scan has spent on 7z key derivations, and the keys it made
     /// ([`kdf`]). A handle, so that a reader can hold it while the budget is
     /// borrowed for something else.
-    #[cfg_attr(not(feature = "decrypt"), allow(dead_code))]
+    #[cfg(feature = "sevenz")]
     pub(crate) kdf: std::sync::Arc<kdf::Kdf>,
     /// RAR3 key derivations made so far, across every archive of the scan.
-    #[cfg_attr(not(feature = "decrypt"), allow(dead_code))]
+    #[cfg(all(feature = "decrypt", feature = "rar"))]
     pub(crate) rar3_derivations: std::sync::atomic::AtomicUsize,
     /// Candidate passwords tried, in order, when decrypting an encrypted ZIP,
     /// 7z, RAR, ARJ, PDF, DMG or Office member, before the built-in ones a
@@ -488,8 +522,11 @@ impl Budget {
             holes: 0,
             skipped: None,
             pe_emulation_steps: 0,
+            #[cfg(all(feature = "decrypt", any(feature = "rar", feature = "dmg")))]
             kdf_rounds: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "sevenz")]
             kdf: std::sync::Arc::default(),
+            #[cfg(all(feature = "decrypt", feature = "rar"))]
             rar3_derivations: std::sync::atomic::AtomicUsize::new(0),
             passwords: Vec::new(),
             verify_checksums: false,
@@ -586,7 +623,13 @@ impl Budget {
     /// so a huge directory-only archive still trips the cap.
     pub fn count_entry(&mut self) -> Result<(), LimitHit> {
         self.files += 1;
-        if self.files > self.limits.max_members {
+        self.entries_fit(0)
+    }
+
+    /// Whether `n` more entries fit in the member limit, as [`Self::count_entry`]
+    /// would say once they are counted. Nothing is counted.
+    pub(crate) fn entries_fit(&self, n: u64) -> Result<(), LimitHit> {
+        if self.files.saturating_add(n) > self.limits.max_members {
             return Err(LimitHit::of_kind(
                 LimitKind::MaxFiles,
                 format!("file count > {}", self.limits.max_members),
@@ -716,6 +759,17 @@ impl Budget {
             format!(
                 "PE emulation steps > {} (--max-pe-emulation-steps)",
                 self.limits.max_pe_emulation_steps
+            ),
+        )
+    }
+
+    #[cfg_attr(not(feature = "pe-emu"), allow(dead_code))]
+    pub(crate) fn pe_stub_exhausted(&self) -> LimitHit {
+        LimitHit::of_kind(
+            LimitKind::MaxScanTime,
+            format!(
+                "PE stub emulation steps > {} (--max-pe-stub-steps)",
+                self.limits.max_pe_stub_steps
             ),
         )
     }
@@ -855,6 +909,10 @@ pub struct Entry {
     /// Whether the member is a PDF object stream, decoded: the text of the
     /// objects it holds (see [`MemberMeta::object_stream`]).
     pub object_stream: bool,
+    /// The bytes of `data` that are holes of a sparse file in a filesystem,
+    /// zeros the volume never wrote: charged to [`Limits::max_hole_bytes`]
+    /// instead of the scan budget, as those of a file read as it goes are.
+    pub holes: u64,
 }
 
 impl Entry {
@@ -989,7 +1047,7 @@ pub enum Format {
     AppleSingle,
     /// FAT12/16/32 filesystem, walked, so fragmented files come back whole.
     Fat,
-    /// Inno Setup installer (5.1.5 to 6.4.0): the files it holds, as they
+    /// Inno Setup installer (5.1.5 to 7.1.0): the files it holds, as they
     /// are read from its chunks.
     Inno,
     /// NTFS filesystem, walked through the master file table.
@@ -1032,8 +1090,9 @@ pub enum Format {
     OneNote,
     /// RTF document: extract hex-encoded embedded objects (`\objdata`).
     Rtf,
-    /// PE packed by a runtime packer (Petite/FSG/NsPack aPLib families are
-    /// decompressed; other packers are detected only). See `formats/pepack.rs`.
+    /// PE packed by a runtime packer: its stub is run to recover the image
+    /// (with the `pe-emu` feature), the virtualizing protectors are reported.
+    /// See `formats/pepack.rs`.
     PePacked,
     /// Java `.class`: surface constant-pool strings and class/name references.
     JavaClass,
@@ -1404,6 +1463,29 @@ pub fn executable_kind(head: &[u8]) -> Option<Executable> {
     } else {
         None
     }
+}
+
+/// Whether `head` starts as an RTF document: `{\rt`, so `{\rtf1` and also a
+/// header such as `{\rt0`.
+pub fn is_rtf(head: &[u8]) -> bool {
+    head.starts_with(b"{\\rt")
+}
+
+/// Whether `head` is an RTF document after an optional UTF-8 byte order mark
+/// and up to 16 bytes of white space.
+pub fn is_rtf_after_space(head: &[u8]) -> bool {
+    let h = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    let at = h
+        .iter()
+        .take(16)
+        .take_while(|b| b.is_ascii_whitespace())
+        .count();
+    is_rtf(&h[at..])
+}
+
+/// Where an RTF header starts in the first `within` bytes of `head`.
+pub fn find_rtf(head: &[u8], within: usize) -> Option<usize> {
+    (0..head.len().min(within)).find(|&at| is_rtf(&head[at..]))
 }
 
 /// Whether `d` starts with a stand-alone executable / OLE magic (PE `MZ`, ELF,
@@ -1867,29 +1949,43 @@ pub(crate) const DETECT_HEAD: usize = 4 * 1024 * 1024 + 1024;
 /// Reads the object's start (its first 4 MiB), its end, and the places past
 /// its start that its structure names: never all of it, held in memory or not.
 pub fn detect(src: &dyn ByteSource) -> Option<Format> {
+    detect_read(src, false).0
+}
+
+/// [`detect`], and whether the start of the object holds a UPX pack header
+/// ([`is_upx_source`]), from the one read of the start. The second answer is
+/// `None` where detection settled on the first bytes alone and did not read
+/// the start: [`is_upx_source`] reads it.
+pub fn detect_with_upx(src: &dyn ByteSource) -> (Option<Format>, Option<bool>) {
+    detect_read(src, true)
+}
+
+/// [`detect`], with `upx` asking for the UPX answer of [`detect_with_upx`].
+fn detect_read(src: &dyn ByteSource, upx: bool) -> (Option<Format>, Option<bool>) {
     if let Some(data) = src.as_slice() {
-        return detect_probe(&Probe::whole(data));
+        return (detect_probe(&Probe::whole(data)), upx.then(|| is_upx(data)));
     }
     // The first checks need a few bytes, so an archive typed by them is not
     // read `DETECT_HEAD` deep: over a network or browser reader that is most
     // of a small archive. Only those `detect_probe` makes first: a later one,
     // such as RAR's, could be overruled by an earlier check that needs more.
     if let Some(fmt) = archive_magic(&src.window(0, 32)) {
-        return Some(udif_or(fmt, src.len(), |off| {
-            src.window(off, 12).into_owned()
-        }));
+        let fmt = udif_or(fmt, src.len(), |off| src.window(off, 12).into_owned());
+        return (Some(fmt), None);
     }
     let head = src.window(0, DETECT_HEAD);
+    let upx = upx.then(|| is_upx_start(&head, src.len()));
     if head.len() == src.len() {
-        return detect_probe(&Probe::whole(&head));
+        return (detect_probe(&Probe::whole(&head)), upx);
     }
-    detect_probe(&Probe {
+    let probe = Probe {
         head: &head,
         len: src.len(),
         rest: Some(Rest::Source(src)),
         partial: false,
         reached: std::cell::Cell::new(false),
-    })
+    };
+    (detect_probe(&probe), upx)
 }
 
 /// [`detect`] for the start of an object that cannot be read any further, a
@@ -1945,6 +2041,21 @@ pub fn string_is_header(format: Format, head: &[u8]) -> bool {
             let _ = head;
             false
         }
+    }
+}
+
+/// The length of the stub of the self-extractor `src` (typed [`Format::Sfx`]):
+/// where the payload its walk hands over starts. `None` when there is no
+/// payload, or without the `sfx` feature.
+pub fn sfx_stub_len(src: &dyn ByteSource) -> Option<usize> {
+    #[cfg(feature = "sfx")]
+    {
+        formats::sfx::stub_len(src)
+    }
+    #[cfg(not(feature = "sfx"))]
+    {
+        let _ = src;
+        None
     }
 }
 
@@ -2296,7 +2407,7 @@ fn detect_probe(p: &Probe) -> Option<Format> {
         return Some(Format::OneNote);
     }
     #[cfg(feature = "rtf")]
-    if data.starts_with(b"{\\rtf") {
+    if is_rtf(data) {
         return Some(Format::Rtf);
     }
     // DXF: the binary sentinel, or a `0`/`SECTION` pair after comments.
@@ -2440,6 +2551,23 @@ mod detect_source_tests {
         ] {
             assert_eq!(executable_kind(head), None, "{head:x?}");
         }
+    }
+
+    #[test]
+    fn an_rtf_header_is_rt_at_the_start_or_after_a_mark_and_white_space() {
+        for head in [&b"{\\rtf1\\ansi"[..], b"{\\rt0\\ansi", b"{\\rt"] {
+            assert!(is_rtf(head), "{head:?}");
+            assert!(is_rtf_after_space(head), "{head:?}");
+        }
+        for head in [&b"{\\r hello}"[..], b"{\\RT0", b"{\\rT", b" {\\rt0", b""] {
+            assert!(!is_rtf(head), "{head:?}");
+        }
+        assert!(is_rtf_after_space(b"\xEF\xBB\xBF\r\n {\\rt0"));
+        assert!(!is_rtf_after_space(b"  {\\r hello}"));
+        assert!(!is_rtf_after_space(b"x {\\rt0"));
+        assert_eq!(find_rtf(b"junk {\\rt0", 64), Some(5));
+        assert_eq!(find_rtf(b"junk {\\rt0", 5), None);
+        assert_eq!(find_rtf(b"junk {\\r0", 64), None);
     }
 
     /// The marker of a compiled AutoIt script after the script GUID.
@@ -2602,6 +2730,49 @@ mod detect_source_tests {
             let read = noted.bytes_read();
             assert!(read <= MOST, "object {i}: {read} bytes read of {LEN}");
         }
+    }
+
+    /// `detect_with_upx` says what `detect` and `is_upx_source` say, from the
+    /// read `detect` makes: held, read through a source, and typed by the
+    /// first bytes alone (no answer).
+    #[test]
+    fn detection_says_whether_the_start_holds_a_upx_header() {
+        let mut data = vec![b'.'; DETECT_HEAD + 5000];
+        data[..2].copy_from_slice(b"MZ");
+        let at = 4096;
+        data[at + 4..at + 8].copy_from_slice(b"UPX!");
+        data[at + 10] = 2;
+        data[at + 20..at + 24].copy_from_slice(&100u32.to_le_bytes());
+        data[at + 24..at + 28].copy_from_slice(&100u32.to_le_bytes());
+        let noted = |data: &Vec<u8>| Noted {
+            data: data.clone(),
+            read: Default::default(),
+        };
+        let slice: &[u8] = &data;
+        let held = detect_with_upx(&slice);
+        assert_eq!(held, (detect(&slice), Some(is_upx(&data))));
+        assert_eq!(held.1, Some(cfg!(feature = "upx")));
+        let (alone, with) = (noted(&data), noted(&data));
+        let got = detect_with_upx(&with);
+        assert_eq!(got, (detect(&alone), Some(is_upx_source(&alone))));
+        assert_eq!(got.1, held.1);
+        assert_eq!(with.bytes_read(), {
+            let only = noted(&data);
+            detect(&only);
+            only.bytes_read()
+        });
+        // Past the start, a header is not one.
+        let mut far = data.clone();
+        far.copy_within(at..at + 28, DETECT_HEAD + 100);
+        far[at..at + 28].fill(b'.');
+        assert_eq!(detect_with_upx(&noted(&far)).1, Some(false));
+        // An archive typed by its magic: the start is not read.
+        let mut zip = data.clone();
+        zip[..4].copy_from_slice(b"PK\x03\x04");
+        let zip = noted(&zip);
+        let (format, upx) = detect_with_upx(&zip);
+        assert_eq!((format, upx), (detect(&zip), None));
+        assert!(zip.bytes_read() < DETECT_HEAD, "{}", zip.bytes_read());
     }
 
     #[test]
@@ -2974,6 +3145,8 @@ pub fn read_entry(
         mode: meta.mode,
         raster: meta.raster.clone(),
         object_stream: meta.object_stream,
+        // The walk that handed the member over has charged them.
+        holes: 0,
     };
     if let Some(content) = content {
         let (data, partial) = content.into_bytes(meta, budget)?;

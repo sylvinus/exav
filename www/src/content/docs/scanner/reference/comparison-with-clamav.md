@@ -135,7 +135,7 @@ each axis. (For the catalogue see [Supported formats](/scanner/reference/formats
 | **Archive codecs** | none | ZIP members compressed with LZMA, zstd, XZ, PPMd, Shrink or Reduce are decoded (ClamAV reads stored, Deflate, Deflate64, bzip2 and Implode). Members whose sizes are deferred to a trailing data descriptor are carved and scanned. |
 | **Container formats** | none | Virtual disks ClamAV does not open: VHD, VHDX, QCOW2 (compressed clusters included) and VMDK (sparse and streamOptimized, as inside an OVA), reconstructed to the guest disk and rescanned, with the filesystems inside them (NTFS, FAT, exFAT, ext2/3/4, HFS+, APFS). Also SquashFS, cramfs, romfs, EROFS, UDF, WIM, KWAJ, LZ4, ARC and Unix `compress` (`.Z`). |
 | **Decryption** | none | ZIP, 7z and RAR3/RAR5 (encrypted headers included), encrypted DMG, PDF and Office are decrypted with the password pool and the built-in passwords ([details](/scanner/reference/formats/#encryption-and-passwords)). What stays encrypted, PKWARE Strong Encryption included, is reported `PASSWORD-PROTECTED`; ClamAV returns `OK` for an encrypted archive unless `--alert-encrypted-archive` is passed. |
-| **PE unpacking** | none | UPX and the aPLib family are unpacked by decoders, and the result is rebuilt in ClamAV's layout so ClamAV hash signatures over its rebuilt image match. Everything else that looks packed has its stub run under a bounded x86 interpreter ([how](/scanner/concepts/pe-emulation/)); ClamAV ships a hand-written unpacker per family. |
+| **PE unpacking** | none | UPX is unpacked by a decoder, and the result is rebuilt in ClamAV's layout so ClamAV hash signatures over its rebuilt image match. Everything else that looks packed has its stub run under a bounded x86 interpreter ([how](/scanner/concepts/pe-emulation/)); ClamAV ships a hand-written unpacker per family. |
 | **PE trust** | Authenticode is parsed and matched against a block list; the certificate chain is not verified. | none |
 | **Heuristics** | A few of ClamAV's default-on heuristics are missing, all per-family detection content written as engine code ([details](#heuristic-alerts)). Deep PDF-JavaScript analysis and VBA-stomping detection are partial; the static scorer is a hand-weighted baseline, not a trained classifier. | Opt-in heuristics of exav's own: TLSH fuzzy hashing, the static scorer, packer names and suspicious import sets (`--detect exav-heuristics`, `--detect packed`). |
 | **Updating** | No `.cdiff` patching, no DNS `TXT` version probing, no database signature (`dsig`) verification: full downloads only. `freshclam` or `cvdupdate` fetch the official database; `--auto-update` fetches from a mirror you run ([details](/scanner/guides/signatures/)). | A prebuilt [`.exavdb`](/scanner/guides/prebuilt-database/) compiles a large set once and loads quickly everywhere, hot-reloading in the daemon. |
@@ -294,8 +294,8 @@ reached, and the scan can come back clean.
 [Evidence for what ClamAV does not open](#evidence-for-what-clamav-does-not-open)
 has the disk image measurements.
 
-ClamAV natively unpacks 10 PE packer families. exav unpacks four of them with
-decoders (UPX, Petite, FSG, NsPack) and the other six by
+ClamAV natively unpacks 10 PE packer families. exav unpacks one of them with a
+decoder (UPX) and the other nine by
 [running the stub](/scanner/concepts/pe-emulation/), which also reaches packers nobody
 has written a decoder for, MPRESS among them. ClamAV unpacks MPRESS only
 through a bytecode program in its signature database, which exav runs too.

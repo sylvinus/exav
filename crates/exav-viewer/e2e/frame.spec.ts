@@ -263,6 +263,61 @@ test.describe("the host", () => {
     violations(page).splice(0);
   });
 
+  // A page whose policy does not name the frame's origin: the browser refuses
+  // the frame, and the host says so at once, with what to add.
+  // The demo's policy sets every fetch directive but these three, so
+  // `default-src 'none'` is what refuses the frame in the third case.
+  for (const [directive, policy] of [
+    ["frame-src", "default-src 'self'; frame-src 'none';"],
+    ["child-src", "default-src 'self'; child-src 'none';"],
+    ["default-src", "default-src 'none';"],
+  ] as const) {
+    test(`a page whose ${directive} refuses the frame fails the session at once, naming the origin to add`, async ({ page }) => {
+      await page.route(/\/(\?.*)?$/, async (route) => {
+        const response = await route.fetch();
+        const html = (await response.text()).replace("default-src 'self';", policy);
+        await route.fulfill({ response, body: html });
+      });
+      const warned = page.waitForEvent("console", (m) => m.type() === "warning" && m.text().includes("the sandboxed frame failed"));
+      await openSample(page, "report.pdf");
+      // Well before the 20 seconds the frame has to start.
+      await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "error", { timeout: 5000 });
+      const cause = await (await warned).args()[1]!.evaluate((e) => (e as Error).message);
+      expect(cause).toBe(`the page's Content-Security-Policy blocks the frame: add ${new URL(page.url()).origin} to its frame-src (to its child-src or default-src when it has no frame-src)`);
+      violations(page).splice(0);
+    });
+  }
+
+  test("a frame that answers the host's pings stays", async ({ page }) => {
+    await page.goto("./?lang=en&frameTimeoutMs=600");
+    await pick(page, "report.pdf");
+    await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+    // A ping goes every 200 ms: one left unanswered for 600 ms would end the session.
+    await page.waitForTimeout(1500);
+    await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+  });
+
+  // A frame that hangs cannot be played here: the demo's frame shares the
+  // page's process, and a loop in it would stop the page's timers as well.
+  test("a frame that stops answering is dropped once a ping stays unanswered for frameTimeoutMs", async ({ page }) => {
+    await page.addInitScript(() => {
+      if (window === window.top) return;
+      const post = MessagePort.prototype.postMessage as (this: MessagePort, ...a: unknown[]) => void;
+      (MessagePort.prototype as unknown as { postMessage: unknown }).postMessage = function (this: MessagePort, ...args: unknown[]) {
+        const m = args[0] as { type?: string } | null;
+        if (m?.type === "pong" && (window as unknown as { muted?: boolean }).muted) return;
+        post.apply(this, args);
+      };
+    });
+    await page.goto("./?lang=en&frameTimeoutMs=600");
+    await pick(page, "report.pdf");
+    await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+    const frame = await inside(page);
+    await frame.evaluate(() => ((window as unknown as { muted: boolean }).muted = true));
+    await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "error", { timeout: 5000 });
+    await expect(page.locator(".demo-frame iframe")).toHaveCount(0);
+  });
+
   test("one frame per file: the next file gets a new one, the last is gone", async ({ page }) => {
     await open(page, "report.pdf");
     const first = await inside(page);

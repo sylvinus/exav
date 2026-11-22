@@ -12,6 +12,7 @@ import {
   odp,
   ods,
   odt,
+  pages,
   pagemaker,
   ppt,
   publisher,
@@ -161,6 +162,8 @@ const SANDBOX = {
   formats: BUILTIN_ORDER,
   // `?sniffBytes=0`: files are told by their name and type alone (the browser tests).
   ...(QUERY.get("sniffBytes") ? { sniffBytes: Number(QUERY.get("sniffBytes")) } : {}),
+  // `?frameTimeoutMs=600`: how long the frame may go without answering a ping (the browser tests).
+  ...(QUERY.get("frameTimeoutMs") ? { frameTimeoutMs: Number(QUERY.get("frameTimeoutMs")) } : {}),
 };
 
 /** `?url=<address>`: a file by its address, opened first. */
@@ -227,7 +230,7 @@ export function App() {
   const plugins = useMemo(
     () => [
       ...allPlugins({ cad: CAD, ifc: MODEL, model: MODEL }),
-      ...[rtf(CONVERTER), doc(CONVERTER), odt(CONVERTER), ppt(CONVERTER), odp(CONVERTER), keynote(CONVERTER), xls(CONVERTER), ods(CONVERTER), numbers(CONVERTER)],
+      ...[rtf(CONVERTER), doc(CONVERTER), odt(CONVERTER), pages(CONVERTER), ppt(CONVERTER), odp(CONVERTER), keynote(CONVERTER), xls(CONVERTER), ods(CONVERTER), numbers(CONVERTER)],
       ...[odg(CONVERTER), visio(CONVERTER), coreldraw(CONVERTER), publisher(CONVERTER), pagemaker(CONVERTER), freehand(CONVERTER), quarkxpress(CONVERTER), zonerdraw(CONVERTER), wpg(CONVERTER)],
     ],
     [],

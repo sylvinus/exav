@@ -7,6 +7,7 @@
 use std::io::Write;
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()
@@ -114,12 +115,9 @@ fn a_compressed_file_cut_short_is_scanned_as_far_as_it_goes() {
 /// (the embedded copy's central directory records offsets relative to the whole
 /// document, so they point outside the carved slice).
 fn zip_with_an_unreadable_first_member() -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    z.start_file(
-        "payload.bin",
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
-    )
-    .unwrap();
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    z.start_file("payload.bin", FileOptions::default().method(Method::Stored))
+        .unwrap();
     z.write_all(&[b'P'; 2048]).unwrap();
     let mut blob = z.finish().unwrap().into_inner();
     // Point the member's directory entry at a local header that is not there.
@@ -137,13 +135,9 @@ fn zip_with_an_unreadable_first_member() -> Vec<u8> {
 /// nowhere verbatim and only extraction can reach them.
 fn carrier_with_an_eicar_zip(prefix: Vec<u8>) -> Vec<u8> {
     let mut blob = prefix;
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    z.start_file(
-        "eicar.txt",
-        zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated),
-    )
-    .unwrap();
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    z.start_file("eicar.txt", FileOptions::default().method(Method::Deflated))
+        .unwrap();
     z.write_all(eicar()).unwrap();
     blob.extend_from_slice(&z.finish().unwrap().into_inner());
     blob
@@ -166,18 +160,14 @@ fn one_unreadable_member_does_not_take_the_rest_of_the_archive_with_it() {
     // Deflated, so the payload appears nowhere verbatim: the container's raw scan
     // cannot find it, and only actually reaching the third member can.
     let db = Scanner::builtin();
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for (name, body) in [
         ("first.bin", &b"aaaaaaaaaaaaaaaaaaaaaaaa"[..]),
         ("second.bin", &b"bbbbbbbbbbbbbbbbbbbbbbbb"[..]),
         ("third.bin", eicar()),
     ] {
-        z.start_file(
-            name,
-            zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated),
-        )
-        .unwrap();
+        z.start_file(name, FileOptions::default().method(Method::Deflated))
+            .unwrap();
         z.write_all(body).unwrap();
     }
     let mut blob = z.finish().unwrap().into_inner();
@@ -326,13 +316,9 @@ mod damaged {
     }
 
     fn zip_one(name: &str, body: &[u8]) -> Vec<u8> {
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        z.start_file(
-            name,
-            zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated),
-        )
-        .unwrap();
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        z.start_file(name, FileOptions::default().method(Method::Deflated))
+            .unwrap();
         z.write_all(body).unwrap();
         z.finish().unwrap().into_inner()
     }
@@ -344,13 +330,9 @@ mod damaged {
 
     /// A ZIP whose deflated member breaks right after `prefix`.
     fn zip_broken_after(prefix: &[u8]) -> Vec<u8> {
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        z.start_file(
-            "m.bin",
-            zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored),
-        )
-        .unwrap();
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        z.start_file("m.bin", FileOptions::default().method(Method::Stored))
+            .unwrap();
         z.write_all(&deflate_broken_after(prefix, UNREACHED))
             .unwrap();
         let mut blob = z.finish().unwrap().into_inner();
@@ -372,13 +354,9 @@ mod damaged {
     }
 
     fn in_zip(name: &str, data: &[u8]) -> Vec<u8> {
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        z.start_file(
-            name,
-            zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored),
-        )
-        .unwrap();
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        z.start_file(name, FileOptions::default().method(Method::Stored))
+            .unwrap();
         z.write_all(data).unwrap();
         z.finish().unwrap().into_inner()
     }

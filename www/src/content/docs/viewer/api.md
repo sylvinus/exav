@@ -121,8 +121,9 @@ frame. The differences:
   name and type alone: the page holds no detection module (the frame tells
   the files it is given).
 - `confirmLink(url, file)` decides on a link the user followed in a
-  document: absolute `http:` and `https:` URLs only reach it, and it is
-  opened with `noopener,noreferrer` when it resolves `true`. A link the user
+  document: absolute `http:` and `https:` URLs and `mailto:` addresses only
+  reach it, and it is opened with `noopener,noreferrer` (a `mailto:` one in
+  the mail program) when it resolves `true`. A link the user
   did not just click or press a key for is dropped without a question, as
   is one that comes while a question is open.
 - `linkQuietMs` (default 2,000, `0` for none): after each answer, the frame's
@@ -130,6 +131,11 @@ frame. The differences:
   again at once.
 - `startTimeoutMs` (default 20,000): a frame that has not answered by then
   is reported as an error.
+- `frameTimeoutMs` (default 30,000, `0` for none): once the frame is ready,
+  the page pings it every third of this value, and the session fails when a
+  ping stays unanswered this long (the frame crashed, navigated away, or its
+  main thread hangs). A tick the browser delays, in a hidden or frozen tab,
+  restarts the wait rather than counting against the frame.
 - `sniffTimeoutMs` (default 30,000, `0` for none) and `sniffBytes` (default
   65,536, `0` for none): as for `createViewer`. The frame tells what a file is
   from its first bytes, so a PDF named `.png` is shown as a PDF there too
@@ -500,12 +506,12 @@ included.
 | `image()` | `wasmDecoders` (default false: the plugin then claims only the formats every browser draws, PNG, JPEG, WebP, GIF and SVG; true adds what exav-render decodes in WebAssembly, TIFF, BMP, ICO, PNM, QOI, DDS, Farbfeld, Radiance HDR, JPEG 2000, JBIG2 and JPEG XL, and camera RAW files, shown by the largest preview they embed that fits `maxDecodeBytes`, in a file of its own and as the members an archive opens), `maxDecodeBytes` (default 256 MiB), `overlay(file)` and `detail(file)` (below), `onTap(file, point, context)`, `minScale`, `maxScale`, `wheelStep`, `wheel` (what a plain wheel or two-finger scroll does: `"zoom"` about the pointer, the default, or `"pan"` the sheet, as a document reader scrolls; Ctrl or ⌘ with the wheel, a trackpad pinch, zooms in both, a mouse notch by a step of about 35%), `tapSlop`, `crossOrigin` (the `<img>`'s, default `"anonymous"` so that pixels can be read back; `null` shows an image from a server without CORS, unreadable) |
 | `dwg()`, `dxf()` | `ground`, `colors` (`{ light, dark }`), `lineweights` (`"drawing"`, the default, as the drawing's `$LWDISPLAY` says; `"always"`; `"never"`, every line a pixel), `monochrome` (everything in ink, as monochrome.ctb plots; default false), `fontsUrl` (a directory serving the bundled fonts, for a host that publishes them itself), `timeoutMs` (default 120,000: past it the engine is stopped and the file reported unreadable), `maxPrimitives` (default 8,000,000 strokes and fill vertices per layout, up to 256 MB of buffers: past it the rest of the drawing is left out, with a warning), `maxDecompressedBytes` (default 512 MiB: what the compressed sections of a 2004 or later DWG may expand to; past it the file is reported unreadable), `maxEntities` (default 1,000,000, about 512 MiB of the module's memory: past it the rest of the drawing is left out, with a warning). While a drawing parses, the thumbnail it was saved with (PNG or BMP), if any, stands in for it |
 | `docx()`, `xlsx()`, `pptx()`, `csv()` | `useGoogleFonts` (default false), `mode` (`"main"`, the default: parse in a worker made from an inline module and paint on the page; `"worker"`: both in a worker started from a file, what the sandboxed frame uses), `maxArchiveEntries` (the most entries a document's ZIP may list, default 20000) |
-| `rtf()`, `doc()`, `odt()`, `ppt()`, `odp()`, `keynote()`, `xls()`, `ods()`, `numbers()`, `odg()`, `visio()`, `coreldraw()`, `publisher()`, `pagemaker()`, `freehand()`, `quarkxpress()`, `zonerdraw()`, `wpg()` | `converter` (`"exav"`, the default: the package's converters, then the external one for what they do not read, and for text documents the external one first when there is one; `"external"`: the external converter alone, for every format), `externalConverter` (a package name that `@exav/viewer/vite` or `exav-viewer-assets` copied, or the URL of an ES module; default none, see [Integration](/viewer/integration/#the-external-converter)), `timeoutMs` (default 120,000: past it the conversion's worker, or the wait for the external converter, is stopped and the file reported unreadable), `maxMemory` (bytes a conversion may take. The package's converters count their own: 1 GiB by default, at most 1.5 GiB; past it the file is reported unreadable rather than shown with pictures missing. The external converter gets the number as set, and none when it is not). What the bytes are decides within each kind: an RTF saved as .doc is read as RTF, an XLSX named .xls is shown as it is |
+| `rtf()`, `doc()`, `odt()`, `pages()`, `ppt()`, `odp()`, `keynote()`, `xls()`, `ods()`, `numbers()`, `odg()`, `visio()`, `coreldraw()`, `publisher()`, `pagemaker()`, `freehand()`, `quarkxpress()`, `zonerdraw()`, `wpg()` | `converter` (which goes first, the other taking what it cannot read: by default the package's converters, and for text documents the external one when there is one; `"exav"` or `"external"` for every format, or one per format, `{ doc: "exav", odt: "external" }`), `externalConverter` (a package name that `@exav/viewer/vite` or `exav-viewer-assets` copied, or the URL of an ES module; default none, see [Integration](/viewer/integration/#the-external-converter)), `timeoutMs` (default 120,000: past it the conversion's worker, or the wait for the external converter, is stopped and the file reported unreadable), `maxMemory` (bytes a conversion may take. The package's converters count their own: 1 GiB by default, at most 1.5 GiB; past it the file is reported unreadable rather than shown with pictures missing. The external converter gets the number as set, and none when it is not). What the bytes are decides within each kind: an RTF saved as .doc is read as RTF, an XLSX named .xls is shown as it is |
 | `video()`, `audio()` | `controls` (`"native"`, the default: the browser's player; `"none"`: no controls in the surface, for a host drawing its own from the `media` controller; a click on a video plays or pauses it). FLAC is claimed with the rest of what browsers play |
 | `text()` | none: it reads at most 2 MiB and 50,000 lines of a file, and cuts a line at 10,000 characters |
 | `ifc()` | `ground`, `colors`, `highlight`, `timeoutMs` (default 120,000), `maxTriangles` (default 6,000,000, about 330 MB of buffers: past it the remaining elements are left out, with a warning) |
 | `stl()` | `surface` (a colour), `zUp` (default true), `timeoutMs` (default 120,000), `maxTriangles` (default 6,000,000) |
-| `archive()` | `maxExtractedBytes` (512 MiB), `maxMembers` (5000) |
+| `archive()` | `maxExtractedBytes` (512 MiB), `maxMembers` (20000), the defaults of the viewer's limits on a ZIP's directory, so that a ZIP the detection lets through is listed; both below the scanner's (1 GiB, 100000), as a browser tab has less memory than a server |
 
 ### Drawing over an image
 

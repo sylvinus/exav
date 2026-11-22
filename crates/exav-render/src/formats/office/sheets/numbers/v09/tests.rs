@@ -322,16 +322,16 @@ fn gridline_runs_override_the_table_style() {
 
 #[test]
 fn packages() {
+    use exav_unpack::zip_write::{FileOptions, ZipWriter};
     use std::io::Write;
     let xml = budget_doc();
     let mut gz = flate2::write::GzEncoder::new(vec![], flate2::Compression::fast());
     gz.write_all(xml.as_bytes()).unwrap();
     let gz = gz.finish().unwrap();
     let zip = |files: &[(&str, &[u8])]| {
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(vec![]));
+        let mut z = ZipWriter::new(std::io::Cursor::new(vec![]));
         for (n, d) in files {
-            z.start_file(*n, zip::write::SimpleFileOptions::default())
-                .unwrap();
+            z.start_file(n, FileOptions::default()).unwrap();
             z.write_all(d).unwrap();
         }
         z.finish().unwrap().into_inner()

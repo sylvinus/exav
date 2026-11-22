@@ -12,6 +12,7 @@
 //! containing file clean on that basis is exactly the silent-clean bug.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze};
+use exav_unpack::zip_write::{FileOptions, ZipWriter};
 
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()
@@ -278,9 +279,8 @@ fn streamed(name: &str, method: u16, flags: u16, packed: &[u8], size: usize) -> 
 /// it out.
 fn hidden_before_a_zip(member: &[u8]) -> Vec<u8> {
     use std::io::Write;
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    z.start_file("readme.txt", zip::write::SimpleFileOptions::default())
-        .unwrap();
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    z.start_file("readme.txt", FileOptions::default()).unwrap();
     z.write_all(b"nothing to see here").unwrap();
     [member, &z.finish().unwrap().into_inner()].concat()
 }

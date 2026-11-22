@@ -127,6 +127,7 @@ pub(crate) fn walk(
             mtime: mtime.map(Mtime::Unix),
             mode: kind.and_then(|k| Some(k | (set(&h[100..108])? as u32 & 0o7777))),
             link: (typeflag == b'2').then(|| String::from_utf8_lossy(&link).into_owned()),
+            hard_link: (typeflag == b'1').then(|| String::from_utf8_lossy(&link).into_owned()),
             ..MemberMeta::default()
         };
 

@@ -215,6 +215,63 @@ fn hitting_the_directory_walk_cap_is_reported() {
     assert!(walk(u64::MAX).is_ok());
 }
 
+/// The files found before the member limit stops the directory walk are
+/// visited, and the walk then ends with the limit.
+#[test]
+fn the_files_found_before_the_member_limit_are_visited() {
+    let mut img = vec![0u8; SECTOR * 60];
+    let pvd = 16 * SECTOR;
+    img[pvd] = 1;
+    img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+    let rd = pvd + 156;
+    img[rd] = 34;
+    img[rd + 2..rd + 6].copy_from_slice(&18u32.to_le_bytes());
+    img[rd + 10..rd + 14].copy_from_slice(&(40 * 2048u32).to_le_bytes());
+    img[rd + 25] = 0x02;
+    img[rd + 32] = 1;
+    let term = 17 * SECTOR;
+    img[term] = 0xff;
+    img[term + 1..term + 6].copy_from_slice(b"CD001");
+    // A file at sector 59, then directories past the end of the image.
+    img[59 * SECTOR..59 * SECTOR + 5].copy_from_slice(b"hello");
+    let mut p = 18 * SECTOR;
+    let mut record = |p: &mut usize, name: &str, lba: u32, len: u32, flags: u8| {
+        let rec_len = 33 + name.len();
+        if (*p % SECTOR) + rec_len > SECTOR {
+            *p = (*p / SECTOR + 1) * SECTOR;
+        }
+        img[*p] = rec_len as u8;
+        img[*p + 2..*p + 6].copy_from_slice(&lba.to_le_bytes());
+        img[*p + 10..*p + 14].copy_from_slice(&len.to_le_bytes());
+        img[*p + 25] = flags;
+        img[*p + 32] = name.len() as u8;
+        img[*p + 33..*p + 33 + name.len()].copy_from_slice(name.as_bytes());
+        *p += rec_len;
+    };
+    record(&mut p, "A.TXT", 59, 5, 0);
+    for i in 0..1100u32 {
+        record(&mut p, &format!("D{i}"), 1000 + i, 2048, 0x02);
+    }
+    let mut limits = Limits::default();
+    limits.max_members = 100;
+    let mut seen = Vec::new();
+    let end = exav_unpack::walk(
+        Format::Iso,
+        &img,
+        &mut Budget::new(limits),
+        &mut |m: &exav_unpack::MemberMeta, _: Option<exav_unpack::Member<'_>>, _: &mut Budget| {
+            seen.push(m.name.clone());
+            None::<()>
+        },
+    );
+    assert_eq!(seen, ["A.TXT"]);
+    let err = end.expect_err("1100 directories are past a limit of 100");
+    assert!(
+        matches!(err.kind, exav_unpack::LimitKind::MaxFiles),
+        "{err:?}"
+    );
+}
+
 /// The bytes of the directories read are charged to the scan budget: a
 /// hundred directories that overlap, each declared 80 sectors long, are 16 MB
 /// of reads in an image of 400 KB, and a count of directories does not say so.

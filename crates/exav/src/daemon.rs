@@ -206,18 +206,28 @@ fn ctime_from_btime(btime: &str) -> String {
 /// `SCM_RIGHTS` ancillary data (the `FILDES` command). Non-fd transports
 /// (TCP) just return `None`.
 pub(crate) trait FdSource {
-    fn take_fd(&mut self) -> Option<File>;
+    fn take_fd(&mut self) -> Passed;
+}
+
+/// What a client passed for a `FILDES`.
+pub(crate) enum Passed {
+    /// No descriptor.
+    Nothing,
+    /// Exactly one.
+    One(File),
+    /// More than one, or more than the control buffer holds. All are closed.
+    Several,
 }
 
 impl<R: Read + FdSource> FdSource for BufReader<R> {
-    fn take_fd(&mut self) -> Option<File> {
+    fn take_fd(&mut self) -> Passed {
         self.get_mut().take_fd()
     }
 }
 
 impl FdSource for &TcpListenerStream {
-    fn take_fd(&mut self) -> Option<File> {
-        None
+    fn take_fd(&mut self) -> Passed {
+        Passed::Nothing
     }
 }
 
@@ -238,16 +248,25 @@ impl Write for &TcpListenerStream {
     }
 }
 
-/// A `UnixStream` reader that captures any `SCM_RIGHTS` file descriptors
+/// The reason for a descriptor that came with anything but a `FILDES`: clamd's
+/// words. The reply reads `<reason> ERROR`.
+const WITHOUT_FILDES: &str = "PROTOCOL ERROR: ancillary data sent without FILDES.";
+
+/// A `UnixStream` reader that captures the `SCM_RIGHTS` file descriptors
 /// arriving alongside the data (used by the `FILDES` command). Every read is a
 /// `recvmsg` so an fd is captured whether it accompanies the command bytes or a
 /// follow-up packet.
+///
+/// It holds the descriptors of one message at most, until `take_fd`. More than
+/// one in a message are closed on arrival, and a read made while a message's
+/// descriptors are still held (the command it came with did not take them)
+/// closes them and fails with a [`CommandRefused`], so a client cannot make the
+/// daemon hold descriptors, or have one scanned in place of the one it sent
+/// with the command.
 #[cfg(unix)]
 struct AncillaryReader<'a> {
     stream: &'a std::os::unix::net::UnixStream,
-    // Safety invariant: each is an open descriptor this reader alone owns,
-    // listed once.
-    fds: Vec<std::os::fd::RawFd>,
+    passed: Passed,
 }
 
 #[cfg(unix)]
@@ -255,16 +274,22 @@ impl<'a> AncillaryReader<'a> {
     fn new(stream: &'a std::os::unix::net::UnixStream) -> Self {
         Self {
             stream,
-            fds: Vec::new(),
+            passed: Passed::Nothing,
         }
     }
 
-    /// One `recvmsg` into `buf`, draining any passed fds into `self.fds`.
+    /// One `recvmsg` into `buf`, keeping what the message passed in
+    /// `self.passed`.
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        use std::os::fd::{AsRawFd, RawFd};
-        // Control buffer sized for a handful of fds. `u64` rather than `u8` for
-        // the alignment `cmsghdr` needs, as in `send_fd_command`.
-        let mut cmsg = [0u64; 32];
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+        // Room for one fd (`msg_controllen` below): the kernel installs no
+        // more, closes the rest of a message that passes more and sets
+        // `MSG_CTRUNC`. The array is `u64` rather than `u8` for the alignment
+        // `cmsghdr` needs, as in `send_fd_command`, and holds `CMSG_SPACE` of
+        // one fd on any target.
+        let mut cmsg = [0u64; 3];
+        let mut count = 0usize;
+        let mut first: Option<OwnedFd> = None;
         let mut iov = libc::iovec {
             iov_base: buf.as_mut_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
@@ -280,16 +305,18 @@ impl<'a> AncillaryReader<'a> {
         //   those bytes, so `*c` reads a `cmsghdr` the kernel wrote.
         // - For `SCM_RIGHTS` the kernel sets `cmsg_len` to `CMSG_LEN` of the
         //   descriptors it installed, within the buffer: `data.add(i * 4)` for
-        //   `i < count` stays in it, and `copy_nonoverlapping` copies 4 bytes
+        //   `i < n_fds` stays in it, and `copy_nonoverlapping` copies 4 bytes
         //   into the local `fd`, with no alignment needed.
-        // - The descriptors are new to this process and owned by nothing
-        //   else: pushed once each, they keep the invariant of `fds`.
-        let n = unsafe {
+        // - Each descriptor is new to this process and owned by nothing else,
+        //   and is wrapped in an `OwnedFd` once, so each is closed once, when
+        //   that value is dropped. The ones the kernel did not fit in the buffer
+        //   it closed itself (`MSG_CTRUNC`).
+        let (n, truncated) = unsafe {
             let mut msg: libc::msghdr = std::mem::zeroed();
             msg.msg_iov = &mut iov;
             msg.msg_iovlen = 1;
             msg.msg_control = cmsg.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = std::mem::size_of_val(&cmsg) as _;
+            msg.msg_controllen = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
             let n = libc::recvmsg(self.stream.as_raw_fd(), &mut msg, 0);
             if n < 0 {
                 return Err(io::Error::last_os_error());
@@ -300,8 +327,8 @@ impl<'a> AncillaryReader<'a> {
                 if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
                     let data = libc::CMSG_DATA(c);
                     let payload = (*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                    let count = payload / std::mem::size_of::<RawFd>();
-                    for i in 0..count {
+                    let n_fds = payload / std::mem::size_of::<RawFd>();
+                    for i in 0..n_fds {
                         let mut fd: RawFd = -1;
                         std::ptr::copy_nonoverlapping(
                             data.add(i * std::mem::size_of::<RawFd>()),
@@ -309,13 +336,23 @@ impl<'a> AncillaryReader<'a> {
                             std::mem::size_of::<RawFd>(),
                         );
                         if fd >= 0 {
-                            self.fds.push(fd);
+                            count += 1;
+                            let fd = OwnedFd::from_raw_fd(fd);
+                            if first.is_none() {
+                                first = Some(fd);
+                            }
                         }
                     }
                 }
                 c = libc::CMSG_NXTHDR(&msg, c);
             }
-            n
+            (n, msg.msg_flags & libc::MSG_CTRUNC != 0)
+        };
+        self.passed = match (first, count, truncated) {
+            (None, _, false) => return Ok(n as usize),
+            (Some(fd), 1, false) => Passed::One(File::from(fd)),
+            // Dropping `first` here closes it with the others.
+            _ => Passed::Several,
         };
         Ok(n as usize)
     }
@@ -324,23 +361,25 @@ impl<'a> AncillaryReader<'a> {
 #[cfg(unix)]
 impl Read for AncillaryReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !matches!(self.passed, Passed::Nothing) {
+            // Still held: the command they came with did not take them, or
+            // no complete command came with them.
+            self.passed = Passed::Nothing;
+            return Err(CommandRefused::error(WITHOUT_FILDES, Delim::Null));
+        }
         self.recv(buf)
     }
 }
 
 #[cfg(unix)]
 impl FdSource for AncillaryReader<'_> {
-    fn take_fd(&mut self) -> Option<File> {
-        use std::os::fd::FromRawFd;
-        if self.fds.is_empty() {
-            // The fd may be in a follow-up packet (≥1 data byte + ancillary).
+    fn take_fd(&mut self) -> Passed {
+        if matches!(self.passed, Passed::Nothing) {
+            // The descriptor comes in a message of its own after the command.
             let mut scratch = [0u8; 64];
             let _ = self.recv(&mut scratch);
         }
-        // SAFETY: `File::from_raw_fd` needs an open descriptor the caller owns.
-        // By the invariant of `fds`, `fd` is one this reader alone owns, and
-        // `pop` removes it, so the `File` is its only owner.
-        self.fds.pop().map(|fd| unsafe { File::from_raw_fd(fd) })
+        std::mem::replace(&mut self.passed, Passed::Nothing)
     }
 }
 
@@ -351,54 +390,63 @@ impl SetReadTimeout for AncillaryReader<'_> {
     }
 }
 
-/// Send `cmd` on `stream` with `fd` attached as `SCM_RIGHTS` ancillary data:
-/// the client half of `FILDES`, and the one thing a plain `write` cannot do.
+/// Send `cmd` on `stream` with `fds` (one for a `FILDES`) attached as
+/// `SCM_RIGHTS` ancillary data: the client half of `FILDES`, and the one thing
+/// a plain `write` cannot do.
 ///
-/// The descriptor the daemon receives is its own, pointing at the same open
+/// A descriptor the daemon receives is its own, pointing at the same open
 /// file: it reads the bytes this client already has access to, without needing
 /// permission on the path or a view of this filesystem.
 #[cfg(unix)]
 pub(crate) fn send_fd_command(
     stream: &std::os::unix::net::UnixStream,
     cmd: &[u8],
-    fd: std::os::fd::BorrowedFd<'_>,
+    fds: &[std::os::fd::BorrowedFd<'_>],
 ) -> io::Result<()> {
     use std::os::fd::{AsRawFd, RawFd};
     const FD_SIZE: usize = std::mem::size_of::<RawFd>();
-    let fd = fd.as_raw_fd();
+    let raw: Vec<RawFd> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
+    let payload = (raw.len() * FD_SIZE) as u32;
     let mut iov = libc::iovec {
         iov_base: cmd.as_ptr() as *mut libc::c_void,
         iov_len: cmd.len(),
     };
     // `usize` rather than `u8`: a control buffer has to be aligned for
-    // `cmsghdr`, and a byte array carries no such guarantee.
-    let mut control = [0usize; 8];
+    // `cmsghdr`, and a byte array carries no such guarantee. Two words more
+    // than a header and the descriptors cover the padding `CMSG_SPACE` adds.
+    let words = (std::mem::size_of::<libc::cmsghdr>() + payload as usize)
+        .div_ceil(std::mem::size_of::<usize>())
+        + 2;
+    let mut control = vec![0usize; words];
     // SAFETY:
     // - `mem::zeroed::<msghdr>`: its fields are integers and raw pointers,
     //   for which all-zero bytes are valid values.
-    // - `CMSG_FIRSTHDR` returns `control`'s start, non-null since
-    //   `msg_controllen` (`CMSG_SPACE` of one descriptor, 24 bytes at most)
-    //   holds a `cmsghdr`; `control` is 64 bytes, aligned for `cmsghdr`
-    //   (`usize`), so the three field writes through `c` are in bounds and
-    //   aligned, and `CMSG_DATA(c)` has room for `FD_SIZE` bytes after them.
-    // - `copy_nonoverlapping` copies `FD_SIZE` bytes from the local `fd`.
+    // - `CMSG_SPACE` of the descriptors is a header, the descriptors and
+    //   padding of less than a word at each end, so `control` holds it:
+    //   `CMSG_FIRSTHDR` returns `control`'s start, non-null, aligned for
+    //   `cmsghdr` (`usize`), so the three field writes through `c` are in
+    //   bounds and aligned, and `CMSG_DATA(c)` has room for `payload` bytes
+    //   after them.
+    // - `copy_nonoverlapping` copies `payload` bytes from `raw`, which holds
+    //   that many.
     // - `sendmsg` (POSIX) only reads: `iov` names `cmd`, readable for
     //   `cmd.len()` bytes, and `msg_control` the header just written; all
-    //   outlive the call. `fd` is open for it: it comes from a `BorrowedFd`.
+    //   outlive the call. The descriptors are open for it: they come from
+    //   `BorrowedFd`s.
     let sent = unsafe {
         let mut msg: libc::msghdr = std::mem::zeroed();
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = libc::CMSG_SPACE(FD_SIZE as u32) as _;
+        msg.msg_controllen = libc::CMSG_SPACE(payload) as _;
         let c = libc::CMSG_FIRSTHDR(&msg);
         (*c).cmsg_level = libc::SOL_SOCKET;
         (*c).cmsg_type = libc::SCM_RIGHTS;
-        (*c).cmsg_len = libc::CMSG_LEN(FD_SIZE as u32) as _;
+        (*c).cmsg_len = libc::CMSG_LEN(payload) as _;
         std::ptr::copy_nonoverlapping(
-            &fd as *const RawFd as *const u8,
+            raw.as_ptr() as *const u8,
             libc::CMSG_DATA(c),
-            FD_SIZE,
+            payload as usize,
         );
         libc::sendmsg(stream.as_raw_fd(), &msg, 0)
     };
@@ -411,24 +459,6 @@ pub(crate) fn send_fd_command(
         return Err(io::Error::other("short send passing the file descriptor"));
     }
     Ok(())
-}
-
-#[cfg(unix)]
-impl Drop for AncillaryReader<'_> {
-    fn drop(&mut self) {
-        // Close any descriptors that arrived over the socket but were never
-        // consumed by `take_fd`, so a client passing extra or unsolicited
-        // `SCM_RIGHTS` fds cannot leak them across connections and exhaust
-        // `RLIMIT_NOFILE`.
-        for fd in self.fds.drain(..) {
-            // SAFETY: `close` ends a descriptor this process owns. By the
-            // invariant of `fds`, this reader alone owns `fd`, and `drain`
-            // takes each out once.
-            unsafe {
-                libc::close(fd);
-            }
-        }
-    }
 }
 
 /// Where the daemon listens.
@@ -551,6 +581,12 @@ fn transient_accept_error(e: &io::Error) -> bool {
                 | libc::ENETUNREACH
         );
     }
+    // Winsock's: out of sockets (WSAEMFILE) or of buffers (WSAENOBUFS), which
+    // closing connections gives back, and the network down (WSAENETDOWN).
+    #[cfg(windows)]
+    if let Some(code) = e.raw_os_error() {
+        return matches!(code, 10024 | 10055 | 10050);
+    }
     false
 }
 
@@ -576,6 +612,26 @@ impl AcceptBackoff {
     pub(crate) fn reset(&mut self) {
         self.0 = None;
     }
+
+    /// After an accept that failed with `e`: whether to accept again, after a
+    /// pause when the failure is transient ([`transient_accept_error`]), or
+    /// not, when waiting does not mend it. `lost_race` errors (another worker
+    /// took the connection) go on at once.
+    pub(crate) fn again_after(&mut self, e: &io::Error, lost_race: bool) -> bool {
+        if lost_race {
+            return true;
+        }
+        if !transient_accept_error(e) {
+            return false;
+        }
+        let pause = self.pause();
+        eprintln!(
+            "exav: accept failed, trying again in {} ms: {e}",
+            pause.as_millis()
+        );
+        std::thread::sleep(pause);
+        true
+    }
 }
 
 /// Hands each connection `accept` returns to `serve`, until an accept fails in a
@@ -592,14 +648,7 @@ fn accept_loop<S>(
                 backoff.reset();
                 serve(conn);
             }
-            Err(e) if transient_accept_error(&e) => {
-                let pause = backoff.pause();
-                eprintln!(
-                    "exav: accept failed, trying again in {} ms: {e}",
-                    pause.as_millis()
-                );
-                std::thread::sleep(pause);
-            }
+            Err(e) if backoff.again_after(&e, false) => {}
             Err(e) => return Err(e),
         }
     }
@@ -992,7 +1041,7 @@ impl<R: Read + SetReadTimeout> Read for Clocked<'_, R> {
 }
 
 impl<R: FdSource> FdSource for Clocked<'_, R> {
-    fn take_fd(&mut self) -> Option<File> {
+    fn take_fd(&mut self) -> Passed {
         self.inner.take_fd()
     }
 }
@@ -1091,32 +1140,40 @@ pub fn supervise(
     }
 }
 
-/// Run the daemon until the listener errors (e.g. the process is killed).
+/// One clamd address to serve, with the settings of its own address.
+pub struct ClamdListener {
+    pub addr: ListenAddr,
+    /// Concurrent connections accepted here (`?max-connections=`). Only the
+    /// thread model counts them: the pool is bounded by its worker count.
+    pub max_connections: usize,
+    pub reads: Reads,
+}
+
+/// Run the daemon until a listener errors (e.g. the process is killed).
 /// `allow_shutdown` controls whether the `SHUTDOWN` command stops the daemon
 /// (here it exits the process; the thread model has no supervisor to unwind).
 /// `allow_http_scan` controls whether the exav-only `SCANURL` command fetches,
 /// off by default, since it lets any client that can reach the socket make the
-/// daemon fetch a URL. `reads` bound how long a client takes to send and to
-/// take its replies ([`Reads`]).
+/// daemon fetch a URL.
+///
+/// Each of `listeners` is served on a thread of its own, with its own
+/// connection count and its own [`Reads`]; the first runs on the calling thread.
+/// One that fails ends the process, as the only one does: the daemon is the
+/// whole set of addresses.
 ///
 /// Each connection is served with the database current when it opened; a
 /// reload ([`supervise`]) swaps it for the connections after. An accept that
 /// fails for a transient reason (out of descriptors, a connection lost before
 /// it was accepted) is logged and retried after a pause; any other accept error
 /// ends the listener and is returned.
-#[allow(clippy::too_many_arguments)]
 pub fn run(
     db: Arc<SharedDb>,
-    addr: ListenAddr,
+    listeners: Vec<ClamdListener>,
     opts: Arc<ScanOptions>,
     allow_shutdown: bool,
     allow_http_scan: bool,
-    max_connections: usize,
-    reads: Reads,
 ) -> io::Result<()> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    SHUTDOWN_ALLOWED.store(allow_shutdown, Ordering::Relaxed);
-    let conns = Arc::new(AtomicUsize::new(0));
+    SHUTDOWN_ALLOWED.store(allow_shutdown, std::sync::atomic::Ordering::Relaxed);
     // A client that disconnects right after reading a reply delivers SIGPIPE on
     // the next write. `main` set the default disposition, which kills the
     // process, so that a one-shot scan piped into `head` ends quietly; a
@@ -1128,6 +1185,37 @@ pub fn run(
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
+    let mut listeners = listeners.into_iter();
+    let Some(first) = listeners.next() else {
+        return Err(io::Error::other("no clamd address to serve"));
+    };
+    for l in listeners {
+        let (db, opts) = (Arc::clone(&db), Arc::clone(&opts));
+        std::thread::spawn(move || {
+            if let Err(e) = serve_listener(db, l, opts, allow_shutdown, allow_http_scan) {
+                eprintln!("exav: daemon error: {e}");
+            }
+            std::process::exit(2);
+        });
+    }
+    serve_listener(db, first, opts, allow_shutdown, allow_http_scan)
+}
+
+/// [`run`] for one address.
+fn serve_listener(
+    db: Arc<SharedDb>,
+    listener: ClamdListener,
+    opts: Arc<ScanOptions>,
+    allow_shutdown: bool,
+    allow_http_scan: bool,
+) -> io::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let ClamdListener {
+        addr,
+        max_connections,
+        reads,
+    } = listener;
+    let conns = Arc::new(AtomicUsize::new(0));
 
     match addr {
         #[cfg(unix)]
@@ -1275,14 +1363,21 @@ pub struct PoolConfig {
     /// the same reason: it lets any client that can reach the socket make the
     /// daemon fetch a URL.
     pub allow_http_scan: bool,
-    /// How long a client may take to send and to take its replies ([`Reads`]).
-    /// The job's own timer starts after the command line has been read, so
-    /// these also cover the line; it also covers the writes, unless
-    /// `max_scan_time` is off.
-    pub reads: Reads,
+    /// Between the supervisor's scan-totals lines (zero: none).
+    pub metrics_interval: std::time::Duration,
 }
 
-/// A bound listening socket the workers share across `fork()`.
+/// A bound listening socket the workers share across `fork()`, with how long
+/// the clients of its address may take to send and to take their replies
+/// ([`Reads`]). The job's own timer starts after the command line has been
+/// read, so these also cover the line; it also covers the writes, unless
+/// `max_scan_time` is off.
+#[cfg(unix)]
+struct PoolListener {
+    socket: BoundListener,
+    reads: Reads,
+}
+
 #[cfg(unix)]
 enum BoundListener {
     Unix(std::os::unix::net::UnixListener),
@@ -1546,7 +1641,7 @@ pub(crate) const SUPERVISOR_TICK: std::time::Duration = std::time::Duration::fro
 #[cfg(unix)]
 struct Retiring {
     /// The name of the side listener this child served, `None` for a worker.
-    name: Option<&'static str>,
+    name: Option<String>,
     since: std::time::Instant,
     /// Sent SIGTERM for outliving its grace.
     stopped: bool,
@@ -1554,7 +1649,7 @@ struct Retiring {
 
 #[cfg(unix)]
 impl Retiring {
-    fn new(name: Option<&'static str>, since: std::time::Instant) -> Self {
+    fn new(name: Option<String>, since: std::time::Instant) -> Self {
         Self {
             name,
             since,
@@ -2228,7 +2323,7 @@ fn set_timer(d: std::time::Duration) {
 #[cfg(unix)]
 pub struct SideListener {
     /// Named in the supervisor's log when the child exits.
-    pub name: &'static str,
+    pub name: String,
     /// Serves the listener it captured, in the forked child. The descriptor is
     /// the child's generation (see [`await_connection`]): once it is retired,
     /// the child finishes what it is serving and exits 0.
@@ -2299,33 +2394,48 @@ pub(crate) fn lost_accept_race(e: &io::Error) -> bool {
 /// generation `retire` belongs to has been retired (`false`).
 #[cfg(unix)]
 pub(crate) fn await_connection(listener: std::os::fd::RawFd, retire: std::os::fd::RawFd) -> bool {
-    let mut fds = [
-        libc::pollfd {
-            fd: retire,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: listener,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
+    await_any(&[listener], 0, retire).is_some()
+}
+
+/// Block until one of `listeners` has a connection to accept, and return its
+/// index, or until the generation `retire` belongs to has been retired
+/// (`None`). Of the ones ready, the first from index `first` on, wrapping: a
+/// caller that moves `first` on each turn does not leave a listener behind
+/// another that always has a connection waiting. `listeners` is not empty.
+#[cfg(unix)]
+pub(crate) fn await_any(
+    listeners: &[std::os::fd::RawFd],
+    first: usize,
+    retire: std::os::fd::RawFd,
+) -> Option<usize> {
+    let poll_in = |fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut fds: Vec<libc::pollfd> = std::iter::once(retire)
+        .chain(listeners.iter().copied())
+        .map(poll_in)
+        .collect();
     loop {
-        // SAFETY: `fds` is two valid `pollfd` for the duration of the call.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        // SAFETY: `fds` is `fds.len()` valid `pollfd` for the duration of the
+        // call.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
         if n < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             // Let the accept that follows report the failure.
-            return true;
+            return Some(first % listeners.len());
         }
         if fds[0].revents != 0 {
-            return false;
+            return None;
         }
-        if fds[1].revents != 0 {
-            return true;
+        let ready = (0..listeners.len())
+            .map(|i| (first + i) % listeners.len())
+            .find(|&i| fds[1 + i].revents != 0);
+        if ready.is_some() {
+            return ready;
         }
     }
 }
@@ -2344,7 +2454,7 @@ pub(crate) fn await_connection(listener: std::os::fd::RawFd, retire: std::os::fd
 #[allow(clippy::too_many_arguments)]
 pub fn run_prefork(
     db: Arc<Scanner>,
-    addr: ListenAddr,
+    listeners: Vec<ClamdListener>,
     opts: Arc<ScanOptions>,
     mut cfg: PoolConfig,
     mut datadir: Option<Watch>,
@@ -2360,10 +2470,26 @@ pub fn run_prefork(
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    let listener = bind_listener(&addr)?;
-    // Workers wait in `await_connection`, not in `accept`: several may wake for
-    // one connection, and the ones that lose the race must not block in accept.
-    listener.set_nonblocking()?;
+    if listeners.is_empty() {
+        return Err(io::Error::other("no clamd address to serve"));
+    }
+    // Every address is bound here, before any fork, and every worker waits on
+    // all of them. `max_connections` is not read: a worker serves one
+    // connection at a time, so the worker count bounds them across addresses.
+    //
+    // Workers wait in `await_any`, not in `accept`: several may wake for one
+    // connection, and the ones that lose the race must not block in accept.
+    let listeners = listeners
+        .iter()
+        .map(|l| {
+            let socket = bind_listener(&l.addr)?;
+            socket.set_nonblocking()?;
+            Ok(PoolListener {
+                socket,
+                reads: l.reads,
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
 
     // Warm every lazily-initialised structure BEFORE forking, so all workers
     // share them read-only via COW rather than each building its own copy on
@@ -2442,10 +2568,13 @@ pub fn run_prefork(
     if let Err(e) = crate::metrics::share_across_fork() {
         eprintln!("exav: the counters stay per process, so STATS shows one process's: {e}");
     }
+    // The pool's one totals line, written by this loop: a thread here would be
+    // running whenever a child is forked.
+    let mut reporter = crate::metrics::Reporter::new(cfg.metrics_interval);
     let mut r#gen = Generation::new()?;
     let mut children = std::collections::HashSet::new();
     for _ in 0..cfg.workers {
-        children.insert(spawn_worker(&listener, &db, &opts, &cfg, &r#gen)?);
+        children.insert(spawn_worker(&listeners, &db, &opts, &cfg, &r#gen)?);
     }
     let mut side_pids: Vec<Option<libc::pid_t>> = Vec::with_capacity(side.len());
     for s in side {
@@ -2481,7 +2610,7 @@ pub fn run_prefork(
             // flight with it.
             crate::metrics::release(pid);
             if let Some(r) = retiring.remove(&pid) {
-                log_child_exit(pid, status, r.name.unwrap_or("worker"), true);
+                log_child_exit(pid, status, r.name.as_deref().unwrap_or("worker"), true);
                 continue;
             }
             let which = side_pids.iter().position(|p| *p == Some(pid));
@@ -2491,12 +2620,17 @@ pub fn run_prefork(
                     children.remove(&pid);
                 }
             }
-            log_child_exit(pid, status, which.map_or("worker", |i| side[i].name), false);
+            log_child_exit(
+                pid,
+                status,
+                which.map_or("worker", |i| side[i].name.as_str()),
+                false,
+            );
             if !SHUTDOWN.load(Ordering::Relaxed) {
                 match which {
                     Some(i) => side_pids[i] = Some(spawn_side(&side[i], &db, &opts, &r#gen)?),
                     None => {
-                        children.insert(spawn_worker(&listener, &db, &opts, &cfg, &r#gen)?);
+                        children.insert(spawn_worker(&listeners, &db, &opts, &cfg, &r#gen)?);
                     }
                 }
             }
@@ -2546,11 +2680,11 @@ pub fn run_prefork(
                     for (slot, s) in side_pids.iter_mut().zip(side) {
                         retiring.extend(
                             slot.take()
-                                .map(|pid| (pid, Retiring::new(Some(s.name), since))),
+                                .map(|pid| (pid, Retiring::new(Some(s.name.clone()), since))),
                         );
                     }
                     for _ in 0..cfg.workers {
-                        children.insert(spawn_worker(&listener, &db, &opts, &cfg, &r#gen)?);
+                        children.insert(spawn_worker(&listeners, &db, &opts, &cfg, &r#gen)?);
                     }
                     for (slot, s) in side_pids.iter_mut().zip(side) {
                         *slot = Some(spawn_side(s, &db, &opts, &r#gen)?);
@@ -2570,13 +2704,16 @@ pub fn run_prefork(
         if let Some(wait) = updater.as_mut().and_then(|u| u.due(&r#gen)) {
             tick = tick.min(wait);
         }
+        if let Some(r) = reporter.as_mut() {
+            tick = tick.min(r.poll());
+        }
         for (&pid, r) in retiring.iter_mut().filter(|(_, r)| !r.stopped) {
             // A grace too long to add to the clock is one that never ends.
             let Some(due) = r.since.checked_add(grace) else {
                 continue;
             };
             if now >= due {
-                let what = r.name.unwrap_or("worker");
+                let what = r.name.as_deref().unwrap_or("worker");
                 eprintln!(
                     "exav: {what} {pid} of a retired generation is still busy after {}s; stopping it",
                     grace.as_secs()
@@ -2835,7 +2972,7 @@ impl Drop for Updater {
 
 #[cfg(unix)]
 fn spawn_worker(
-    listener: &BoundListener,
+    listeners: &[PoolListener],
     db: &Arc<Scanner>,
     opts: &Arc<ScanOptions>,
     cfg: &PoolConfig,
@@ -2854,7 +2991,7 @@ fn spawn_worker(
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(io::Error::last_os_error()),
-        0 => worker_main(listener, db, opts, cfg, supervisor, r#gen.enter()), // never returns
+        0 => worker_main(listeners, db, opts, cfg, supervisor, r#gen.enter()), // never returns
         n => Ok(n),
     }
 }
@@ -2865,7 +3002,7 @@ fn spawn_worker(
 /// the first case only). Never returns.
 #[cfg(unix)]
 fn worker_main(
-    listener: &BoundListener,
+    listeners: &[PoolListener],
     db: &Scanner,
     opts: &ScanOptions,
     cfg: &PoolConfig,
@@ -2929,7 +3066,6 @@ fn worker_main(
     let allow_shutdown = cfg.allow_shutdown;
     SHUTDOWN_ALLOWED.store(allow_shutdown, Ordering::Relaxed);
     let allow_http_scan = cfg.allow_http_scan;
-    let reads = cfg.reads;
     let shutdown = move || -> bool {
         if allow_shutdown {
             let parent = std::os::unix::process::parent_id() as libc::pid_t;
@@ -2942,17 +3078,28 @@ fn worker_main(
     };
 
     let mut jobs = 0u64;
+    let fds: Vec<std::os::fd::RawFd> = listeners.iter().map(|l| l.socket.as_raw_fd()).collect();
+    // Where the next wait starts looking, moved on after each wake so that no
+    // address is left behind another that always has a connection waiting.
+    let mut turn = 0usize;
+    // Out of descriptors or memory, which the connections closing give back:
+    // the worker waits and accepts again, as the in-process listener does,
+    // rather than exit and cost a fork.
+    let mut backoff = AcceptBackoff::default();
     loop {
-        if !await_connection(listener.as_raw_fd(), retire) {
+        let Some(ready) = await_any(&fds, turn, retire) else {
             // SAFETY: `_exit` has no memory precondition; it ends this child
             // without running the destructors of the frames it inherited.
             unsafe { libc::_exit(0) }
-        }
+        };
+        turn = ready + 1;
+        let reads = listeners[ready].reads;
         // The listener is non-blocking, and on some systems an accepted socket
         // inherits that; a job's reads are written for a blocking one.
-        let outcome: io::Result<()> = match listener {
+        let outcome: io::Result<()> = match &listeners[ready].socket {
             BoundListener::Unix(l) => match l.accept() {
                 Ok((stream, _)) => {
+                    backoff.reset();
                     let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(reads.idle));
                     let _ = stream.set_write_timeout(Some(reads.idle));
@@ -2979,8 +3126,9 @@ fn worker_main(
                     disarm(); // ensure the timer is off between connections
                     r
                 }
-                // Another worker took the connection this one woke for.
-                Err(e) if lost_accept_race(&e) => continue,
+                // Another worker took the connection this one woke for, or a
+                // transient failure.
+                Err(e) if backoff.again_after(&e, lost_accept_race(&e)) => continue,
                 Err(e) => {
                     eprintln!("exav: worker accept error: {e}");
                     // SAFETY: as at the top of the loop.
@@ -2989,6 +3137,7 @@ fn worker_main(
             },
             BoundListener::Tcp(l) => match l.accept() {
                 Ok((stream, _)) => {
+                    backoff.reset();
                     let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(reads.idle));
                     let _ = stream.set_write_timeout(Some(reads.idle));
@@ -3018,7 +3167,7 @@ fn worker_main(
                     disarm();
                     r
                 }
-                Err(e) if lost_accept_race(&e) => continue,
+                Err(e) if backoff.again_after(&e, lost_accept_race(&e)) => continue,
                 Err(e) => {
                     eprintln!("exav: worker accept error: {e}");
                     // SAFETY: as at the top of the loop.
@@ -3071,7 +3220,7 @@ fn log_child_exit(pid: libc::pid_t, status: libc::c_int, what: &str, retired: bo
 }
 
 /// Command terminator, mirrored from the request onto the reply.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Delim {
     Newline,
     Null,
@@ -3089,7 +3238,11 @@ impl Delim {
 /// Read one command. Returns `None` at clean end-of-connection. The leading
 /// `z`/`n` prefix (if any) selects the terminator; a bare command is treated as
 /// legacy newline-terminated.
-pub(crate) fn read_command<R: Read>(r: &mut BufReader<R>) -> io::Result<Option<(String, Delim)>> {
+///
+/// The line is bytes: on Unix a path is bytes and a client names one that is not
+/// UTF-8 as it is on disk. Elsewhere a path is text, and a line that is not
+/// UTF-8 is refused.
+pub(crate) fn read_command<R: Read>(r: &mut BufReader<R>) -> io::Result<Option<(Vec<u8>, Delim)>> {
     let mut first = [0u8; 1];
     if read_full(r, &mut first)? == 0 {
         return Ok(None);
@@ -3100,7 +3253,7 @@ pub(crate) fn read_command<R: Read>(r: &mut BufReader<R>) -> io::Result<Option<(
         // Legacy: the byte is part of the command itself.
         other => (Delim::Newline, vec![other]),
     };
-    read_until(r, delim.byte(), &mut buf)?;
+    read_until(r, delim, &mut buf)?;
     // Strip the terminator and any trailing CR.
     if buf.last() == Some(&delim.byte()) {
         buf.pop();
@@ -3108,25 +3261,102 @@ pub(crate) fn read_command<R: Read>(r: &mut BufReader<R>) -> io::Result<Option<(
     if buf.last() == Some(&b'\r') {
         buf.pop();
     }
-    // A path on Unix is bytes, not text, and a filename that is not valid UTF-8
-    // is perfectly legal, so `from_utf8_lossy` can replace bytes and produce a
-    // path that names a different file, or none. The command pipeline is `str`
-    // throughout, so the lossy conversion stands for now; what must not stand is
-    // the misleading answer. Without this the client is told "No such file or
-    // directory" about a file that exists, which sends an operator looking in
-    // the wrong place. Naming the real cause keeps the failure honest.
-    let cmd = match std::str::from_utf8(&buf) {
-        Ok(s) => s.to_string(),
-        Err(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "command is not valid UTF-8 (a path with non-UTF-8 bytes cannot \
-                 be sent over this protocol; scan it by descriptor with FILDES)",
-            ));
-        }
-    };
-    Ok(Some((cmd, delim)))
+    #[cfg(not(unix))]
+    if std::str::from_utf8(&buf).is_err() {
+        return Err(CommandRefused::error("command is not valid UTF-8", delim));
+    }
+    Ok(Some((buf, delim)))
 }
+
+/// A command line split into its verb and its argument.
+pub(crate) struct Command<'a> {
+    /// The verb. It is ASCII; a line whose verb is not reads as an unknown one.
+    pub word: std::borrow::Cow<'a, str>,
+    /// What follows the verb, without the blanks around it. The path of a scan
+    /// verb, as bytes.
+    pub arg: &'a [u8],
+}
+
+impl<'a> Command<'a> {
+    pub(crate) fn parse(line: &'a [u8]) -> Self {
+        let line = line.trim_ascii();
+        let end = line
+            .iter()
+            .position(u8::is_ascii_whitespace)
+            .unwrap_or(line.len());
+        Self {
+            word: String::from_utf8_lossy(&line[..end]),
+            arg: line[end..].trim_ascii(),
+        }
+    }
+
+    /// The argument as text: what a verb that takes no path reads, and shows.
+    fn text(&self) -> std::borrow::Cow<'a, str> {
+        String::from_utf8_lossy(self.arg)
+    }
+}
+
+/// The path a scan verb names.
+#[cfg(unix)]
+fn path_of(arg: &[u8]) -> &Path {
+    use std::os::unix::ffi::OsStrExt;
+    Path::new(std::ffi::OsStr::from_bytes(arg))
+}
+
+/// The path a scan verb names. [`read_command`] has checked it is UTF-8.
+#[cfg(not(unix))]
+fn path_of(arg: &[u8]) -> &Path {
+    Path::new(std::str::from_utf8(arg).unwrap_or_default())
+}
+
+/// A path as the bytes a reply carries.
+#[cfg(unix)]
+pub(crate) fn path_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    std::borrow::Cow::Borrowed(path.as_os_str().as_bytes())
+}
+
+/// A path as the bytes a reply carries.
+#[cfg(not(unix))]
+pub(crate) fn path_bytes(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    std::borrow::Cow::Owned(path.display().to_string().into_bytes())
+}
+
+/// A reply about `path`: the path as bytes, then `rest`, which starts at the
+/// colon (`: OK`).
+fn named(path: &Path, rest: &str) -> Vec<u8> {
+    let mut line = path_bytes(path).into_owned();
+    line.extend_from_slice(rest.as_bytes());
+    line
+}
+
+/// What reading a command fails with when the command itself is what the
+/// listener will not take: the client is told why, in the reply's own framing,
+/// before the connection ends.
+#[derive(Debug)]
+pub(crate) struct CommandRefused {
+    reason: &'static str,
+    delim: Delim,
+}
+
+impl CommandRefused {
+    fn error(reason: &'static str, delim: Delim) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, Self { reason, delim })
+    }
+
+    /// The refusal inside `e`, if that is what it is.
+    fn of(e: &io::Error) -> Option<&Self> {
+        e.get_ref().and_then(|inner| inner.downcast_ref::<Self>())
+    }
+}
+
+impl std::fmt::Display for CommandRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason)
+    }
+}
+
+impl std::error::Error for CommandRefused {}
 
 /// Read exactly `buf.len()` bytes, or fewer only at EOF. Returns bytes read.
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
@@ -3143,14 +3373,21 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
 /// Append bytes up to and including `delim` (or EOF) to `buf`, bounded to
 /// [`MAX_COMMAND`] bytes so a client that never sends a terminator can't make
 /// the daemon buffer unbounded memory (the standard `read_until` is unbounded).
-fn read_until<R: Read>(r: &mut BufReader<R>, delim: u8, buf: &mut Vec<u8>) -> io::Result<()> {
+///
+/// The bound is on the line without its terminator, wherever the terminator
+/// falls in a read: `MAX_COMMAND` bytes and a terminator are accepted, one more
+/// byte is refused.
+fn read_until<R: Read>(r: &mut BufReader<R>, delim: Delim, buf: &mut Vec<u8>) -> io::Result<()> {
     use std::io::BufRead;
     loop {
         let available = r.fill_buf()?;
         if available.is_empty() {
             return Ok(()); // EOF
         }
-        if let Some(pos) = available.iter().position(|&b| b == delim) {
+        if let Some(pos) = available.iter().position(|&b| b == delim.byte()) {
+            if buf.len() + pos > MAX_COMMAND {
+                return Err(CommandRefused::error("command line exceeds limit", delim));
+            }
             buf.extend_from_slice(&available[..=pos]);
             r.consume(pos + 1);
             return Ok(());
@@ -3159,10 +3396,7 @@ fn read_until<R: Read>(r: &mut BufReader<R>, delim: u8, buf: &mut Vec<u8>) -> io
         let n = available.len();
         r.consume(n);
         if buf.len() > MAX_COMMAND {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "command line exceeds limit",
-            ));
+            return Err(CommandRefused::error("command line exceeds limit", delim));
         }
     }
 }
@@ -3233,6 +3467,28 @@ where
     }
 }
 
+/// Tell the client why its command was refused ([`CommandRefused`]), as the
+/// reply to the command it would have been, and hand `e` back for the caller to
+/// end the connection with. Any other error is returned as it came.
+fn answer_refusal<W: Write + SetWriteTimeout>(
+    writer: &mut Replies<W>,
+    id: Option<u64>,
+    e: io::Error,
+) -> io::Error {
+    writer.start_reply();
+    write_refusal(writer, id, &e);
+    e
+}
+
+/// The line for a command that [`read_command`] refused ([`CommandRefused`]),
+/// written to `w` as the reply to it. Nothing is written for any other error.
+pub(crate) fn write_refusal<W: Write>(w: &mut W, id: Option<u64>, e: &io::Error) {
+    if let Some(refusal) = CommandRefused::of(e) {
+        let reply = format!("{} ERROR", refusal.reason);
+        let _ = write_reply(w, id, reply.as_bytes(), refusal.delim);
+    }
+}
+
 /// The commands of one connection, under `clock`.
 #[allow(clippy::too_many_arguments)]
 fn converse<R, W>(
@@ -3251,20 +3507,20 @@ where
     R: Read + FdSource + SetReadTimeout,
     W: Write + SetWriteTimeout,
 {
-    let (cmd, delim) = match read_command(reader)? {
-        Some(c) => c,
-        None => return Ok(()),
+    let (line, delim) = match read_command(reader) {
+        Ok(Some(c)) => c,
+        Ok(None) => return Ok(()),
+        Err(e) => return Err(answer_refusal(writer, None, e)),
     };
-    let cmd = cmd.trim().to_string();
-    let word = cmd.split_whitespace().next().unwrap_or("").to_string();
+    let cmd = Command::parse(&line);
 
     // IDSESSION/SESSION keep the connection open for many commands until END.
     // IDSESSION tags each reply with a sequence id (the modern, client-preferred
     // form); the legacy SESSION does not. Every other command is handled once and
     // the connection is then closed: clamd's single-command-per-connection
     // semantics, which clients rely on to know the reply is complete.
-    let idsession = word.eq_ignore_ascii_case("IDSESSION");
-    if idsession || word.eq_ignore_ascii_case("SESSION") {
+    let idsession = cmd.word.eq_ignore_ascii_case("IDSESSION");
+    if idsession || cmd.word.eq_ignore_ascii_case("SESSION") {
         let mut id = 0u64;
         loop {
             // Past the connection's lifetime no command is read, buffered or not.
@@ -3275,24 +3531,23 @@ where
             // first byte: the wait for that byte is the socket's timeout, or
             // what is left of the connection's lifetime.
             clock.restart(!reader.buffer().is_empty());
-            let (cmd, delim) = match read_command(reader)? {
-                Some(c) => c,
-                None => return Ok(()),
+            let (line, delim) = match read_command(reader) {
+                Ok(Some(c)) => c,
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(answer_refusal(writer, idsession.then_some(id + 1), e)),
             };
-            let cmd = cmd.trim();
-            let word = cmd.split_whitespace().next().unwrap_or("");
-            if word.eq_ignore_ascii_case("END") {
+            let cmd = Command::parse(&line);
+            if cmd.word.eq_ignore_ascii_case("END") {
                 return Ok(());
             }
-            if cmd.is_empty() {
+            if cmd.word.is_empty() {
                 continue;
             }
             id += 1;
             writer.start_reply();
             arm();
             let r = run_command(
-                cmd,
-                word,
+                &cmd,
                 reader,
                 writer,
                 delim,
@@ -3312,14 +3567,13 @@ where
         }
     }
 
-    if cmd.is_empty() || word.eq_ignore_ascii_case("END") {
+    if cmd.word.is_empty() || cmd.word.eq_ignore_ascii_case("END") {
         return Ok(());
     }
     writer.start_reply();
     arm();
     let r = run_command(
         &cmd,
-        &word,
         reader,
         writer,
         delim,
@@ -3339,8 +3593,7 @@ where
 /// everything else goes to `dispatch`.
 #[allow(clippy::too_many_arguments)]
 fn run_command<R, W>(
-    cmd: &str,
-    word: &str,
+    cmd: &Command<'_>,
     reader: &mut BufReader<R>,
     writer: &mut W,
     delim: Delim,
@@ -3355,8 +3608,21 @@ where
     R: Read + FdSource,
     W: Write,
 {
+    // Mirror scan results into `--log`. A daemon's results go to whoever asked
+    // for them and nowhere else, so this file is the operator's only record of
+    // what was scanned and what came back; logging before the write means a
+    // client that hangs up mid-reply still leaves the verdict on disk.
+    let word = &*cmd.word;
+    let logged = is_scan_verb(word);
+    let mut emit = |reply: Vec<u8>| -> io::Result<()> {
+        if logged {
+            crate::log_line(&reply);
+        }
+        write_reply(writer, id, &reply, delim)
+    };
     let (replies, rest) = if word.eq_ignore_ascii_case("FILDES") {
-        (vec![fildes(reader, db, opts)], Rest::Read)
+        let (reply, rest) = fildes(reader, db, opts);
+        (vec![reply], rest)
     } else if word.eq_ignore_ascii_case("RELOAD") {
         // Ask the supervisor to re-read the data dir and re-fork the pool. The
         // reply is clamd's `RELOADING` either way; the reload happens out of band
@@ -3378,19 +3644,10 @@ where
         };
         (replies, Rest::Read)
     } else {
-        dispatch(cmd, word, reader, delim, db, opts, allow_http_scan)?
+        dispatch(cmd, reader, delim, db, opts, allow_http_scan, &mut emit)?
     };
-    // Mirror scan results into `--log`. A daemon's results go to whoever asked
-    // for them and nowhere else, so this file is the operator's only record of
-    // what was scanned and what came back; logging before the write means a
-    // client that hangs up mid-reply still leaves the verdict on disk.
-    if is_scan_verb(word) {
-        for reply in &replies {
-            crate::log_line(reply);
-        }
-    }
     for reply in replies {
-        write_reply(writer, id, &reply, delim)?;
+        emit(reply.into_bytes())?;
     }
     Ok(rest)
 }
@@ -3412,43 +3669,53 @@ fn is_scan_verb(word: &str) -> bool {
     SCAN_VERBS.iter().any(|v| word.eq_ignore_ascii_case(v))
 }
 
-/// FILDES: scan a file descriptor passed over the socket via SCM_RIGHTS.
+/// FILDES: scan the one file descriptor passed over the socket via SCM_RIGHTS.
+/// With none, or more than one, the reply is clamd's and the connection closes
+/// (what was passed is already closed).
 fn fildes<R: Read + FdSource>(
     reader: &mut BufReader<R>,
     db: &Scanner,
     opts: &ScanOptions,
-) -> String {
+) -> (String, Rest) {
     match reader.take_fd() {
-        Some(file) => {
-            let size = file.metadata().map(|m| m.len()).unwrap_or(0);
-            // Isolate a panic on a malicious fd so it becomes an ERROR reply for
-            // this target instead of tearing down the connection (matches the
-            // per-file containment of SCAN/scan_one_path).
-            let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                exav_core::scan_seekable(db, file, size, opts)
-            }));
-            match scanned {
-                Ok(Ok(report)) => verdict_line("fd", &report),
-                Ok(Err(e)) => format!("fd: {e} ERROR"),
-                Err(_) => "fd: internal error while scanning ERROR".to_string(),
+        Passed::One(file) => {
+            // clamd's client sends the command and then the one-byte message
+            // that carries the descriptor. The kernel can hand both over in one
+            // read, and that byte is then still here: it is no command.
+            if reader.buffer().len() == 1 {
+                std::io::BufRead::consume(reader, 1);
             }
+            let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let line = match contained(|| exav_core::scan_seekable(db, file, size, opts)) {
+                Ok(report) => verdict_line("fd", &report),
+                Err(e) => format!("fd: {e} ERROR"),
+            };
+            (line, Rest::Read)
         }
-        None => "FILDES: no file descriptor received ERROR".to_string(),
+        Passed::Nothing | Passed::Several => (
+            "No file descriptor received. ERROR".to_string(),
+            Rest::Unread,
+        ),
     }
 }
 
 /// Run a single command, returning the reply line(s) and what it left of its
 /// request. For INSTREAM the chunk stream is consumed from `reader`.
+///
+/// The verbs that walk a directory write each file's line through `emit` as the
+/// file is done, and return none: a walk that is stopped (the job's time ran
+/// out) has already answered for the files it got through.
+#[allow(clippy::too_many_arguments)]
 fn dispatch<R: Read>(
-    cmd: &str,
-    word: &str,
+    cmd: &Command<'_>,
     reader: &mut BufReader<R>,
     _delim: Delim,
     db: &Scanner,
     opts: &ScanOptions,
     allow_http_scan: bool,
+    emit: Emit<'_>,
 ) -> io::Result<(Vec<String>, Rest)> {
-    let arg = cmd[word.len()..].trim();
+    let word = &*cmd.word;
     // The fuzz target feeds this arbitrary bytes, and a path in them would be
     // opened on the machine fuzzing.
     #[cfg(feature = "fuzzing")]
@@ -3501,12 +3768,24 @@ fn dispatch<R: Read>(
         // a client that works against clamd and not against exav, which is the
         // whole claim of speaking this protocol. `scan_tree` also rejoins split
         // sets, so a directory answered here matches what CONTSCAN would say.
-        "SCAN" if Path::new(arg).is_dir() => scan_tree(db, opts, arg),
-        "SCAN" => vec![scan_one_path(db, opts, arg)],
-        "CONTSCAN" | "MULTISCAN" => scan_tree(db, opts, arg),
+        "SCAN" if path_of(cmd.arg).is_dir() => {
+            scan_tree(db, opts, path_of(cmd.arg), emit)?;
+            Vec::new()
+        }
+        "SCAN" => {
+            emit(scan_one_path(db, opts, path_of(cmd.arg)))?;
+            Vec::new()
+        }
+        "CONTSCAN" | "MULTISCAN" => {
+            scan_tree(db, opts, path_of(cmd.arg), emit)?;
+            Vec::new()
+        }
         // All-match: report every matching signature per file (not just the
         // first), one reply line each: clamd's ALLMATCHSCAN semantics.
-        "ALLMATCHSCAN" => scan_tree_allmatch(db, opts, arg),
+        "ALLMATCHSCAN" => {
+            scan_tree_allmatch(db, opts, path_of(cmd.arg), emit)?;
+            Vec::new()
+        }
         "INSTREAM" => return streamed(instream(db, opts, reader)?),
         // Extended INSTREAM: same chunk framing, structured JSON reply with the
         // nested match location. Older/newer clients that don't know it fall to
@@ -3514,23 +3793,25 @@ fn dispatch<R: Read>(
         // `EXINSTREAM MULTI` sends several files in one request so a
         // multi-volume archive split across them can be rejoined; bare
         // `EXINSTREAM` is the single-file form and is unchanged.
-        "EXINSTREAM" if arg.eq_ignore_ascii_case("MULTI") => {
+        "EXINSTREAM" if cmd.arg.eq_ignore_ascii_case(b"MULTI") => {
             return streamed(exinstream_multi(db, opts, reader)?);
         }
         "EXINSTREAM" => return streamed(exinstream(db, opts, reader)?),
         #[cfg(feature = "http-scan")]
         "SCANURL" => {
-            vec![if allow_http_scan {
-                scan_url(db, opts, arg)
-            } else {
-                format!(
+            let arg = cmd.text();
+            vec![match std::str::from_utf8(cmd.arg) {
+                Ok(url) if allow_http_scan => scan_url(db, opts, url),
+                Ok(_) => format!(
                     "{arg}: SCANURL disabled (the daemon was not started with --allow-http-scan) ERROR"
-                )
+                ),
+                Err(_) => format!("{arg}: SCANURL requires an http(s) URL ERROR"),
             }]
         }
         #[cfg(not(feature = "http-scan"))]
         "SCANURL" => vec![format!(
-            "{arg}: SCANURL needs a build with `--features http-scan` ERROR"
+            "{}: SCANURL needs a build with `--features http-scan` ERROR",
+            cmd.text()
         )],
         _ => vec![format!("UNKNOWN COMMAND {word} ERROR")],
     };
@@ -3540,7 +3821,7 @@ fn dispatch<R: Read>(
 pub(crate) fn write_reply<W: Write>(
     w: &mut W,
     id: Option<u64>,
-    reply: &str,
+    reply: &[u8],
     delim: Delim,
 ) -> io::Result<()> {
     // In session (IDSESSION) mode each reply MESSAGE is tagged with its command
@@ -3549,13 +3830,82 @@ pub(crate) fn write_reply<W: Write>(
     // breaks clamd-session clients like clamdtop, which then see
     // `2: STATE:`/`2: THREADS:` instead of the bare field lines and can't parse
     // the body. Each CONTSCAN file result is a separate reply message (its own
-    // call here), so it still gets its own id; only intra-message lines change.
+    // call here), so it is tagged with the command's id; only intra-message
+    // lines change.
     if let Some(n) = id {
         write!(w, "{n}: ")?;
     }
-    w.write_all(reply.as_bytes())?;
+    w.write_all(reply)?;
     w.write_all(&[delim.byte()])?;
     w.flush()
+}
+
+/// What a scan that panicked is reported as, on every surface.
+pub(crate) const SCAN_PANICKED: &str = "scan failed (internal error)";
+
+/// The error [`contained`] turns a panic into.
+#[derive(Debug)]
+struct ScanPanicked;
+
+impl std::fmt::Display for ScanPanicked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(SCAN_PANICKED)
+    }
+}
+
+impl std::error::Error for ScanPanicked {}
+
+/// Whether `e` is what [`contained`] makes of a panic, for a surface that
+/// words an ordinary failure with a prefix of its own.
+pub(crate) fn scan_panicked(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<ScanPanicked>())
+}
+
+/// Run `scan`, one scan of one object, and turn a panic in it into an error for
+/// that object, so the connection, the walk it is part of and the worker go on.
+/// Every scan of every surface (the clamd verbs, ICAP, the command line) goes
+/// through here.
+pub(crate) fn contained<T>(scan: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        before_scan::run();
+        scan()
+    }))
+    .unwrap_or_else(|_| Err(io::Error::other(ScanPanicked)))
+}
+
+/// A hook the tests of this thread run at the start of every [`contained`]
+/// scan, inside its guard: to panic there (no input makes the engine panic) or
+/// to hold a scan until the test has seen what came before it.
+#[cfg(test)]
+pub(crate) mod before_scan {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut()>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(hook: impl FnMut() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Runs the hook, which stays set, a panic in it included.
+    pub(super) fn run() {
+        struct Back(Option<Hook>);
+        impl Drop for Back {
+            fn drop(&mut self) {
+                if let Some(hook) = self.0.take() {
+                    HOOK.with(|h| *h.borrow_mut() = Some(hook));
+                }
+            }
+        }
+        let mut hook = Back(HOOK.with(|h| h.borrow_mut().take()));
+        if let Some(f) = hook.0.as_mut() {
+            f();
+        }
+    }
 }
 
 /// Format a scan verdict into a clamd-style reply line, from the shared
@@ -3602,27 +3952,35 @@ fn verdict_line(target: &str, report: &ScanReport) -> String {
     }
 }
 
-fn scan_one_path(db: &Scanner, opts: &ScanOptions, path: &str) -> String {
-    if path.is_empty() {
-        return "SCAN: missing path ERROR".to_string();
+/// The reply to a path that is neither a regular file nor a directory (a FIFO,
+/// a socket, a device), which has no file to scan. clamd's words for the same
+/// path. It is checked before the path is opened, since opening a FIFO waits
+/// for a writer.
+fn unsupported_type(path: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(path).ok()?;
+    (!meta.is_file() && !meta.is_dir()).then(|| named(path, ": Not supported file type ERROR"))
+}
+
+/// The path scanned by `SCAN` and, for each file of a walk, by `CONTSCAN`. It is
+/// opened as it is named, and named in the reply by its bytes.
+fn scan_one_path(db: &Scanner, opts: &ScanOptions, path: &Path) -> Vec<u8> {
+    if path.as_os_str().is_empty() {
+        return b"SCAN: missing path ERROR".to_vec();
     }
-    // Isolate a panic on a malicious file: report ERROR for this target rather
-    // than letting it tear down the connection (or, with the per-file recursion
-    // in scan_tree, the rest of the walk).
+    if let Some(reply) = unsupported_type(path) {
+        return reply;
+    }
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let timer = crate::metrics::ScanTimer::start();
-    let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        scan_path(db, Path::new(path), opts)
-    }));
+    let scanned = contained(|| scan_path(db, path, opts));
     let category = match &scanned {
-        Ok(Ok(report)) => report.verdict.category().into(),
-        _ => crate::metrics::Category::Partial,
+        Ok(report) => report.verdict.category().into(),
+        Err(_) => crate::metrics::Category::Partial,
     };
-    timer.finish(path, size, category);
+    timer.finish(&path.display().to_string(), size, category);
     match scanned {
-        Ok(Ok(report)) => verdict_line(path, &report),
-        Ok(Err(e)) => format!("{path}: {e} ERROR"),
-        Err(_) => format!("{path}: scan failed (internal error) ERROR"),
+        Ok(report) => named(path, &verdict_line("", &report)),
+        Err(e) => named(path, &format!(": {e} ERROR")),
     }
 }
 
@@ -3634,27 +3992,77 @@ fn scan_one_path(db: &Scanner, opts: &ScanOptions, path: &str) -> String {
 /// its own, so every part reports `OK` and the archive is never opened. Sets are
 /// therefore rejoined per directory and scanned as the archives they are. See
 /// [`volume_set_lines`] for how the result is attributed back to files.
-fn scan_tree(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String> {
-    if path.is_empty() {
-        return vec!["CONTSCAN: missing path ERROR".to_string()];
+fn scan_tree(db: &Scanner, opts: &ScanOptions, path: &Path, emit: Emit<'_>) -> io::Result<()> {
+    walk_and_scan(
+        db,
+        opts,
+        path,
+        "CONTSCAN",
+        false,
+        |file| vec![scan_one_path(db, opts, file)],
+        emit,
+    )
+}
+
+/// Where a walk puts the reply lines: each is written (and logged) as it is
+/// handed over, as the bytes it is written with.
+type Emit<'a> = &'a mut dyn FnMut(Vec<u8>) -> io::Result<()>;
+
+/// The walk `CONTSCAN` and `ALLMATCHSCAN` share: `scan_file` gives the reply
+/// lines of one path, and the sets split across the files of a directory are
+/// rejoined over them. The path named is a file, a special file or a directory.
+/// With `all`, a set's parts are answered with every signature the set matched.
+///
+/// A file's lines go to `emit` once the file is scanned, so a walk that is
+/// stopped has answered for the files it got through. The sets are scanned
+/// first, and their parts' lines come out with their files'.
+///
+/// Inside a directory a symbolic link is passed over, which is the documented
+/// policy, and so is a FIFO, a socket or a device. clamd answers for none of
+/// them in a walk either, and a special file has nothing to scan.
+fn walk_and_scan(
+    db: &Scanner,
+    opts: &ScanOptions,
+    p: &Path,
+    verb: &str,
+    all: bool,
+    scan_file: impl Fn(&Path) -> Vec<Vec<u8>>,
+    emit: Emit<'_>,
+) -> io::Result<()> {
+    if p.as_os_str().is_empty() {
+        return emit(format!("{verb}: missing path ERROR").into_bytes());
     }
-    let p = Path::new(path);
-    if p.is_file() {
-        return vec![scan_one_path(db, opts, path)];
+    // A FIFO, a socket or a device named as the root is answered for, not
+    // walked: a walk of it yields nothing, and nothing reads as `OK`.
+    if p.is_file() || (p.exists() && !p.is_dir()) {
+        return scan_file(p).into_iter().try_for_each(emit);
     }
     if !p.exists() {
-        return vec![format!("{path}: No such file or directory ERROR")];
+        return emit(named(p, ": No such file or directory ERROR"));
     }
+    let mut lines = 0usize;
+    let mut put = |line: Vec<u8>| {
+        lines += 1;
+        emit(line)
+    };
     // A path the walk could not reach gets its own ERROR reply rather than being
     // dropped: a reply list that omits it tells the client the tree was scanned
     // when part of it was never opened.
     let walk = crate::walk_tree(p, None, crate::Descent::Recursive);
     let files = walk.files;
-    let sets = volume_set_lines(db, opts, &files);
-    let mut out = walk.errors;
+    for e in walk.errors {
+        put(named(&e.path, &format!(": {} ERROR", e.reason)))?;
+    }
+    let sets = match contained(|| Ok(volume_set_lines(db, opts, &files, all))) {
+        Ok(sets) => sets,
+        // The parts' own `OK` would stand for sets nobody rejoined.
+        Err(e) => {
+            put(named(p, &format!(": {e} ERROR")))?;
+            Default::default()
+        }
+    };
     for f in &files {
-        let name = f.to_string_lossy();
-        let line = scan_one_path(db, opts, &name);
+        let own = scan_file(f);
         // The archive's verdict replaces a part's own `OK`: on its own the part
         // is a fragment, so that `OK` says only "this fragment is not itself
         // malware". A detection in the archive also replaces a part's own
@@ -3662,26 +4070,30 @@ fn scan_tree(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String> {
         // whole. Any other verdict the part earned by itself stands.
         match sets.get(f) {
             Some((found, status))
-                if line.ends_with(": OK") || (*found && !line.ends_with(" FOUND")) =>
+                if own.iter().all(|l| l.ends_with(b": OK"))
+                    || (*found && !own.iter().any(|l| l.ends_with(b" FOUND"))) =>
             {
-                out.push(format!("{name}: {status}"))
+                for s in status {
+                    put(named(f, &format!(": {s}")))?;
+                }
             }
-            _ => out.push(line),
+            _ => own.into_iter().try_for_each(&mut put)?,
         }
     }
-    if out.is_empty() {
-        out.push(format!("{path}: OK"));
+    if lines == 0 {
+        emit(named(p, ": OK"))?;
     }
-    out
+    Ok(())
 }
 
 /// Rejoin the multi-volume sets among `files` and scan each as one archive.
 ///
-/// Returns whether the set was found infected and the status text to report,
+/// Returns whether the set was found infected and the status texts to report,
 /// for each part of a set that resolved to something other than clean, keyed
-/// by the part's own path, so the caller still emits exactly one reply line
-/// per file. A piece of an infected archive is not a clean file, and it is the
-/// piece the operator has to act on.
+/// by the part's own path. A piece of an infected archive is not a clean file,
+/// and it is the piece the operator has to act on. One status text for a part,
+/// or with `all` one for each signature the set matched, as a file of its own
+/// is answered by `ALLMATCHSCAN`.
 ///
 /// Grouped per directory: `a/big.7z.001` and `b/big.7z.002` are two unrelated
 /// files that happen to share a name, and splicing them would concatenate bytes
@@ -3690,7 +4102,8 @@ fn volume_set_lines(
     db: &Scanner,
     opts: &ScanOptions,
     files: &[std::path::PathBuf],
-) -> std::collections::HashMap<std::path::PathBuf, (bool, String)> {
+    all: bool,
+) -> std::collections::HashMap<std::path::PathBuf, (bool, Vec<String>)> {
     use std::collections::HashMap;
     let mut by_dir: HashMap<&Path, Vec<&std::path::PathBuf>> = HashMap::new();
     for f in files {
@@ -3701,119 +4114,216 @@ fn volume_set_lines(
     }
     let mut out = HashMap::new();
     for (dir, group) in by_dir {
-        let names: Vec<String> = group
-            .iter()
-            .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .collect();
+        // The sets are found among names as text. Each name stands for the
+        // files it was made from, and those are what is opened and keyed: two
+        // names that differ in bytes that are not UTF-8 can read the same, and
+        // the set is then ambiguous for both.
+        let mut real: HashMap<String, Vec<&std::ffi::OsStr>> = HashMap::new();
+        let mut names: Vec<String> = Vec::new();
+        for f in &group {
+            if let Some(n) = f.file_name() {
+                let text = n.to_string_lossy().into_owned();
+                real.entry(text.clone()).or_default().push(n);
+                names.push(text);
+            }
+        }
+        let path_of = |name: &str| {
+            real.get(name)
+                .and_then(|r| r.first())
+                .map(|n| dir.join(n))
+                .ok_or_else(|| io::Error::other("no such file in the directory"))
+        };
         // `fetch` only ever runs for a name that parses as a part, so a
         // directory of large ordinary files is not read here at all.
-        let mut verdicts = exav_core::analyze_volume_sets(db, &names, opts, |name| {
+        let read_part = |name: &str| {
             let mut data = Vec::new();
             exav_core::unpack::source::read_capped(
-                &mut File::open(dir.join(name))?,
+                &mut File::open(path_of(name)?)?,
                 &mut data,
                 opts.limits.max_buffer_bytes.saturating_add(1),
             )?;
             Ok(data)
-        });
+        };
         // The sets whose volumes carry their own headers (RAR, ZIP, CAB), read
         // where they lie. A `.cab` is read by its head to see whether it names
         // a neighbour, and no name is turned into a path: only names in this
         // directory's list.
-        verdicts.extend(exav_core::analyze_split_sets_seekable(
-            db,
-            &names,
-            opts,
-            |name| File::open(dir.join(name)),
-        ));
-        for v in verdicts {
-            // Named for the archive, not the fragment: `big.7z FOUND …` tells an
-            // operator what was actually found, which `big.7z.002` does not.
-            //
-            // Built by `verdict_line` so a part's reply and a whole file's reply
-            // share one grammar, including `--partial-as`, which `verdict_line`
-            // applies. The empty target leaves a bare `": "` in front for the
-            // caller to fill in with the part's path.
-            let line = verdict_line("", &v.report);
-            let status = line.trim_start_matches(": ");
+        let open_part = |name: &str| File::open(path_of(name)?);
+        let sets: Vec<SetResult> = if all {
+            exav_core::analyze_volume_sets_all(db, &names, opts, read_part)
+                .into_iter()
+                .map(SetResult::from)
+                .chain(
+                    exav_core::analyze_split_sets_seekable_all(db, &names, opts, open_part)
+                        .into_iter()
+                        .map(SetResult::from),
+                )
+                .collect()
+        } else {
+            exav_core::analyze_volume_sets(db, &names, opts, read_part)
+                .into_iter()
+                .map(SetResult::from)
+                .chain(
+                    exav_core::analyze_split_sets_seekable(db, &names, opts, open_part)
+                        .into_iter()
+                        .map(SetResult::from),
+                )
+                .collect()
+        };
+        for set_result in sets {
+            // Per part: the archive it belongs to, whether it was found
+            // infected, and the reply texts that follow the part's path.
+            let (name, set, found, status) = set_result.into_status();
             // Checked on the rendered line, not on the raw verdict: under
             // `--partial-as ok` a part exav could not fully examine has become
             // clean by this point, and a clean part earns no reply at all.
-            if status == "OK" {
+            if status.iter().all(|s| s == "OK") {
                 continue;
             }
-            let found = v.report.verdict.category() == VerdictCategory::Infected;
-            out.insert(
-                dir.join(&v.name),
-                (found, format!("{status} (in {})", v.set)),
-            );
+            // Named for the archive, not the fragment: `big.7z FOUND …` tells an
+            // operator what was actually found, which `big.7z.002` does not.
+            let status: Vec<String> = status
+                .into_iter()
+                .map(|s| format!("{s} (in {set})"))
+                .collect();
+            for n in real.get(name.as_str()).into_iter().flatten() {
+                out.insert(dir.join(n), (found, status.clone()));
+            }
         }
     }
     out
 }
 
+/// The scan of a multi-volume set, reported against one of its parts: the first
+/// match or every match. One shape for the daemon and the CLI to report.
+pub(crate) struct SetResult {
+    /// The part the result is attributed to.
+    pub(crate) name: String,
+    /// The name of the archive the part belongs to.
+    pub(crate) set: String,
+    pub(crate) scan: SetScan,
+}
+
+pub(crate) enum SetScan {
+    First(ScanReport),
+    All(Vec<(String, exav_core::Method)>, AllMatchOutcome),
+}
+
+impl From<exav_core::VolumeSetVerdict> for SetResult {
+    fn from(v: exav_core::VolumeSetVerdict) -> Self {
+        Self {
+            name: v.name,
+            set: v.set,
+            scan: SetScan::First(v.report),
+        }
+    }
+}
+
+impl From<exav_core::VolumeSetMatches> for SetResult {
+    fn from(m: exav_core::VolumeSetMatches) -> Self {
+        Self {
+            name: m.name,
+            set: m.set,
+            scan: SetScan::All(m.found, m.outcome),
+        }
+    }
+}
+
+impl SetResult {
+    /// Whether the set is clean and complete: nothing to report.
+    pub(crate) fn is_clean(&self) -> bool {
+        match &self.scan {
+            SetScan::First(report) => report.verdict.category() == VerdictCategory::Clean,
+            SetScan::All(found, outcome) => {
+                found.is_empty() && *outcome == AllMatchOutcome::Complete
+            }
+        }
+    }
+
+    /// The part, its archive, whether the set was found infected, and the reply
+    /// texts that follow the part's path. A part's reply and a whole file's
+    /// reply share one grammar, `--partial-as` included: the texts are the
+    /// lines of a file of its own, with the bare `": "` in front cut off.
+    fn into_status(self) -> (String, String, bool, Vec<String>) {
+        let (found, lines) = match self.scan {
+            SetScan::First(report) => (
+                report.verdict.category() == VerdictCategory::Infected,
+                vec![verdict_line("", &report)],
+            ),
+            SetScan::All(found, outcome) => (!found.is_empty(), allmatch_lines((found, outcome))),
+        };
+        let status = lines
+            .iter()
+            .map(|l| l.trim_start_matches(": ").to_string())
+            .collect();
+        (self.name, self.set, found, status)
+    }
+}
+
 /// ALLMATCHSCAN: like [`scan_tree`] but every matching signature is reported per
-/// file (one reply line each), not just the first.
-fn scan_tree_allmatch(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String> {
-    if path.is_empty() {
-        return vec!["ALLMATCHSCAN: missing path ERROR".to_string()];
-    }
-    let p = Path::new(path);
-    if p.is_file() {
-        return scan_one_allmatch(db, opts, path);
-    }
-    if !p.exists() {
-        return vec![format!("{path}: No such file or directory ERROR")];
-    }
-    // As in `scan_tree`: an unreachable path is reported, never omitted.
-    let walk = crate::walk_tree(p, None, crate::Descent::Recursive);
-    let mut out = walk.errors;
-    for f in &walk.files {
-        out.extend(scan_one_allmatch(db, opts, &f.to_string_lossy()));
-    }
-    if out.is_empty() {
-        out.push(format!("{path}: OK"));
-    }
-    out
+/// file (one reply line each), not just the first. The walk and the rejoining
+/// of split sets are `scan_tree`'s: a part's reply is the set's one line.
+fn scan_tree_allmatch(
+    db: &Scanner,
+    opts: &ScanOptions,
+    path: &Path,
+    emit: Emit<'_>,
+) -> io::Result<()> {
+    walk_and_scan(
+        db,
+        opts,
+        path,
+        "ALLMATCHSCAN",
+        true,
+        |file| scan_one_allmatch(db, opts, file),
+        emit,
+    )
 }
 
 /// All-match scan of a single file: report every matching signature, at any
 /// size; past `--max-input-bytes`, what its first bytes hold. With no
 /// detection, an incomplete scan is reported as such. Unlike the CLI's
 /// `--all-matches`, a reply with detections carries no line for the limit.
-fn scan_one_allmatch(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String> {
-    if path.is_empty() {
-        return vec!["ALLMATCHSCAN: missing path ERROR".to_string()];
+/// Named as [`scan_one_path`] names a path.
+fn scan_one_allmatch(db: &Scanner, opts: &ScanOptions, path: &Path) -> Vec<Vec<u8>> {
+    if path.as_os_str().is_empty() {
+        return vec![b"ALLMATCHSCAN: missing path ERROR".to_vec()];
     }
-    // Isolate a panic on a crafted file into an ERROR for this target.
-    let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        analyze_all_path(db, Path::new(path), opts)
-    }));
-    let found = match found {
-        Ok(Ok(found)) => Ok(found),
-        Ok(Err(e)) => return vec![format!("{path}: {e} ERROR")],
-        Err(panic) => Err(panic),
+    if let Some(reply) = unsupported_type(path) {
+        return vec![reply];
+    }
+    let found = match contained(|| analyze_all_path(db, path, opts)) {
+        Ok(found) => found,
+        Err(e) => return vec![named(path, &format!(": {e} ERROR"))],
     };
+    allmatch_lines(found)
+        .iter()
+        .map(|line| named(path, line))
+        .collect()
+}
+
+/// The reply lines of an all-match scan, each without its target (`: sig FOUND`):
+/// one for each detection, or with none the line a single-match scan gives.
+fn allmatch_lines(found: (Vec<(String, exav_core::Method)>, AllMatchOutcome)) -> Vec<String> {
     match found {
-        Ok((dets, _)) if !dets.is_empty() => dets
+        (dets, _) if !dets.is_empty() => dets
             .into_iter()
-            .map(|(sig, _method)| format!("{path}: {sig} FOUND"))
+            .map(|(sig, _method)| format!(": {sig} FOUND"))
             .collect(),
         // No detections, but the walk may not have covered the file. Reporting OK
         // here regardless is a silent clean, and it lands in the mode a
         // differential harness drives every file through, so the measurements
         // steering development inherited it too.
         // The same line a single-match scan gives, `--partial-as` included.
-        Ok((_, outcome)) => {
+        (_, outcome) => {
             let verdict = match outcome {
                 AllMatchOutcome::Complete => Verdict::Clean,
                 AllMatchOutcome::LimitsExceeded(reason) => Verdict::LimitsExceeded { reason },
                 AllMatchOutcome::Unscannable(reason) => Verdict::Unscannable { reason },
                 AllMatchOutcome::PasswordProtected(reason) => Verdict::PasswordProtected { reason },
             };
-            vec![verdict_line(path, &ScanReport::new(verdict, Vec::new()))]
+            vec![verdict_line("", &ScanReport::new(verdict, Vec::new()))]
         }
-        Err(_) => vec![format!("{path}: scan failed (internal error) ERROR")],
     }
 }
 
@@ -3826,13 +4336,9 @@ fn scan_url(db: &Scanner, opts: &ScanOptions, url: &str) -> String {
         Ok(r) => r,
         Err(e) => return format!("{url}: {e} ERROR"),
     };
-    let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        exav_core::scan_seekable(db, reader, size, opts)
-    }));
-    match scanned {
-        Ok(Ok(report)) => verdict_line(url, &report),
-        Ok(Err(e)) => format!("{url}: {e} ERROR"),
-        Err(_) => format!("{url}: scan failed (internal error) ERROR"),
+    match contained(|| exav_core::scan_seekable(db, reader, size, opts)) {
+        Ok(report) => verdict_line(url, &report),
+        Err(e) => format!("{url}: {e} ERROR"),
     }
 }
 
@@ -3848,7 +4354,7 @@ pub(crate) const MAX_DRAIN_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What a command leaves of its request on the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Rest {
+pub(crate) enum Rest {
     /// Nothing: the next byte is the next command's.
     Read,
     /// Bytes that were not read and are not a command: the connection is
@@ -3953,7 +4459,7 @@ pub(crate) fn buffer_to_seekable<R: Read>(reader: &mut R) -> io::Result<Held> {
                 short: Some(why),
             });
         }
-        Err(SpillError::Io(e)) => return Err(e),
+        Err(SpillError::Io(e)) => return Err(spill_failed(e)),
     };
     let mut short = None;
     for chunk in [&buf[..], &block[..got]] {
@@ -3963,7 +4469,7 @@ pub(crate) fn buffer_to_seekable<R: Read>(reader: &mut R) -> io::Result<Held> {
                 short = Some(why);
                 break;
             }
-            Err(SpillError::Io(e)) => return Err(e),
+            Err(SpillError::Io(e)) => return Err(spill_failed(e)),
         }
     }
     while short.is_none() {
@@ -3974,14 +4480,26 @@ pub(crate) fn buffer_to_seekable<R: Read>(reader: &mut R) -> io::Result<Held> {
         match tmp.write_all(&block[..n]) {
             Ok(()) => {}
             Err(SpillError::Budget(why)) => short = Some(why),
-            Err(SpillError::Io(e)) => return Err(e),
+            Err(SpillError::Io(e)) => return Err(spill_failed(e)),
         }
     }
-    let len = tmp.len()?;
+    let len = tmp.len().map_err(spill_failed)?;
     Ok(Held {
         payload: StreamPayload::Disk(tmp, len),
         short,
     })
+}
+
+/// `e`, a failure of the temp file, marked as one: a failed read of the stream
+/// is the client's, this one is the server's and is answered.
+fn spill_failed(e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), crate::spill::SpillError::Io(e))
+}
+
+/// Whether `e` came from [`spill_failed`].
+fn is_spill_failure(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<crate::spill::SpillError>())
 }
 
 /// Scan what was held of a stream of `size` bytes. A payload that stops short
@@ -4046,7 +4564,7 @@ fn scan_payload_timed(
     target: &str,
 ) -> io::Result<(ScanReport, Option<String>)> {
     let timer = crate::metrics::ScanTimer::start();
-    let result = scan_held(db, opts, held, size);
+    let result = contained(|| scan_held(db, opts, held, size));
     let category = match &result {
         Ok((report, _)) => report.verdict.category().into(),
         // A scan that failed is a scan that did not finish, which is the
@@ -4069,7 +4587,17 @@ fn instream<R: Read>(
     reader: &mut BufReader<R>,
 ) -> io::Result<(String, Rest)> {
     let mut stream = Instream::new(reader, opts.max_scan_size);
-    let held = buffer_to_seekable(&mut stream)?;
+    let held = match buffer_to_seekable(&mut stream) {
+        Ok(h) => h,
+        // The temp file failed, not the client: the stream was not scanned and
+        // the client is told so. A read of the client's that failed ends the
+        // connection as before.
+        Err(e) if is_spill_failure(&e) => {
+            let rest = stream.drain().unwrap_or(Rest::Unread);
+            return Ok((format!("stream: {e} ERROR"), rest));
+        }
+        Err(e) => return Err(e),
+    };
     // Counts what was not held, so the size is the stream's.
     let rest = stream.drain()?;
     // Answering a prefix would answer a question the client never finished
@@ -4078,8 +4606,37 @@ fn instream<R: Read>(
     if stream.truncated() {
         return Ok((format!("stream: {STREAM_CUT} ERROR"), rest));
     }
-    let (report, _loc) = scan_payload_timed(db, opts, &held, stream.total(), "stream")?;
+    let report = match scan_payload_timed(db, opts, &held, stream.total(), "stream") {
+        Ok((report, _loc)) => size_counted(report, stream.total(), rest),
+        Err(e) => return Ok((format!("stream: {e} ERROR"), rest)),
+    };
     Ok((verdict_line("stream", &report), rest))
+}
+
+/// `report` of a stream whose size was `size` bytes as far as the drain got.
+///
+/// Past [`MAX_DRAIN_BYTES`] the rest of the stream is left unread, so `size` is
+/// what was read and the stream is longer: a reason that gives it as the
+/// stream's size says "at least" instead.
+pub(crate) fn size_counted(mut report: ScanReport, size: u64, rest: Rest) -> ScanReport {
+    if let Verdict::LimitsExceeded { reason } = &mut report.verdict {
+        size_floor(reason, size, rest);
+    }
+    report
+}
+
+/// [`size_counted`] for the reason of a limit.
+pub(crate) fn size_floor(reason: &mut String, size: u64, rest: Rest) {
+    if rest == Rest::Read {
+        return;
+    }
+    let said = format!("file size {size} ");
+    let counted = reason
+        .strip_prefix(&said)
+        .map(|tail| format!("file size at least {size} {tail}"));
+    if let Some(counted) = counted {
+        *reason = counted;
+    }
 }
 
 /// `EXINSTREAM`: scan a file sent over the exact INSTREAM chunk framing and reply
@@ -4113,7 +4670,7 @@ fn exinstream<R: Read>(
         return Ok((json_error(STREAM_CUT), rest));
     }
     let reply = match scan_payload_timed(db, opts, &held, stream.total(), "stream") {
-        Ok((report, loc)) => verdict_json(&report, loc),
+        Ok((report, loc)) => verdict_json(&size_counted(report, stream.total(), rest), loc),
         Err(e) => json_error(&format!("scan error: {e}")),
     };
     Ok((reply, rest))
@@ -4220,12 +4777,15 @@ fn exinstream_multi<R: Read>(
         };
         // Past a drain that stopped at its cap, or at end of input, the next
         // file's framing is not where the loop would look for it.
-        let cut = stream.drain()? == Rest::Unread || stream.truncated();
+        let drained = stream.drain()?;
+        let cut = drained == Rest::Unread || stream.truncated();
         let fields = if stream.truncated() {
             json!({"status": "ERROR", "reason": STREAM_CUT})
         } else {
             match scan_payload_timed(db, opts, &held, stream.total(), &name) {
-                Ok((report, loc)) => verdict_fields(&report, loc),
+                Ok((report, loc)) => {
+                    verdict_fields(&size_counted(report, stream.total(), drained), loc)
+                }
                 Err(e) => json!({"status": "ERROR", "reason": format!("scan error: {e}")}),
             }
         };
@@ -4270,21 +4830,36 @@ fn exinstream_multi<R: Read>(
             .bytes_capped(opts.limits.max_buffer_bytes)?
             .ok_or_else(|| io::Error::other("stream too large to rejoin"))
     };
-    let mut verdicts = exav_core::analyze_volume_sets(db, &names, opts, held_bytes);
-    // And the sets whose volumes carry their own headers (RAR, ZIP, CAB), the
-    // heads of `.cab` streams being read to see whether they name a neighbour.
-    verdicts.extend(exav_core::analyze_split_sets(
-        db,
-        &names,
-        opts,
-        |name, head| {
-            let mut data = held_bytes(name)?;
-            if let Some(n) = head {
-                data.truncate(n);
-            }
-            Ok(data)
-        },
-    ));
+    let rest = if request_truncated {
+        Rest::Unread
+    } else {
+        Rest::Read
+    };
+    // A part's own `clean` stands only if this pass ran, so a panic in it fails
+    // the request.
+    let verdicts = contained(|| {
+        let mut verdicts = exav_core::analyze_volume_sets(db, &names, opts, held_bytes);
+        // And the sets whose volumes carry their own headers (RAR, ZIP, CAB),
+        // the heads of `.cab` streams being read to see whether they name a
+        // neighbour.
+        verdicts.extend(exav_core::analyze_split_sets(
+            db,
+            &names,
+            opts,
+            |name, head| {
+                let mut data = held_bytes(name)?;
+                if let Some(n) = head {
+                    data.truncate(n);
+                }
+                Ok(data)
+            },
+        ));
+        Ok(verdicts)
+    });
+    let verdicts = match verdicts {
+        Ok(verdicts) => verdicts,
+        Err(e) => return Ok((json_error(&format!("scan error: {e}")), rest)),
+    };
     for v in verdicts {
         let Some(i) = names.iter().position(|n| *n == v.name) else {
             continue;
@@ -4309,11 +4884,6 @@ fn exinstream_multi<R: Read>(
         // clean" would be wrong about a batch it never fully sent.
         out["truncated"] = json!(true);
     }
-    let rest = if request_truncated {
-        Rest::Unread
-    } else {
-        Rest::Read
-    };
     Ok((out.to_string(), rest))
 }
 
@@ -4544,6 +5114,28 @@ impl<R: Read> Read for Instream<'_, R> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    /// A worker waits on every address: it gets the one that is ready, takes
+    /// them in turn when several are, and stops when its generation is retired.
+    #[test]
+    fn a_wait_on_several_listeners_names_the_ready_one_in_turn() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let (mut peer_a, a) = UnixStream::pair().unwrap();
+        let (mut peer_b, b) = UnixStream::pair().unwrap();
+        let (peer_retire, retire) = UnixStream::pair().unwrap();
+        let fds = [a.as_raw_fd(), b.as_raw_fd()];
+        let wait = |first| super::await_any(&fds, first, retire.as_raw_fd());
+
+        peer_b.write_all(b"x").unwrap();
+        assert_eq!(wait(0), Some(1), "only the second is ready");
+        peer_a.write_all(b"x").unwrap();
+        assert_eq!(wait(0), Some(0), "both ready: from the first");
+        assert_eq!(wait(1), Some(1), "both ready: from the second");
+        drop(peer_retire);
+        assert_eq!(wait(0), None, "a retired generation outranks a connection");
+    }
+
     /// `--max-scan-secs` is an operator's number, and a database's build time is
     /// text from a file: neither may panic the supervisor or a connection.
     #[test]
@@ -4584,6 +5176,28 @@ mod tests {
 
     fn eicar() -> &'static [u8] {
         exav_core::unpack::eicar()
+    }
+
+    /// The lines of a `CONTSCAN` of `path`, collected.
+    fn scan_tree(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        super::scan_tree(db, opts, Path::new(path), &mut |l| {
+            out.push(String::from_utf8_lossy(&l).into_owned());
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    /// The lines of an `ALLMATCHSCAN` of `path`, collected.
+    fn scan_tree_allmatch(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        super::scan_tree_allmatch(db, opts, Path::new(path), &mut |l| {
+            out.push(String::from_utf8_lossy(&l).into_owned());
+            Ok(())
+        })
+        .unwrap();
+        out
     }
 
     /// The in-core extraction budget must fit inside the memory a job is
@@ -4883,6 +5497,11 @@ mod tests {
     /// One command on a fresh connection as [`one`], with `SCANURL` honoured
     /// or refused.
     fn one_allow_http_scan(send: &[u8], delim: u8, allow_http_scan: bool) -> String {
+        String::from_utf8_lossy(&one_raw(send, delim, allow_http_scan)).into_owned()
+    }
+
+    /// The bytes of the reply [`one`] reads, without its terminator.
+    fn one_raw(send: &[u8], delim: u8, allow_http_scan: bool) -> Vec<u8> {
         let mut w = serve_allow_http_scan(allow_http_scan);
         let mut r = BufReader::new(w.try_clone().unwrap());
         w.write_all(send).unwrap();
@@ -4892,7 +5511,7 @@ mod tests {
         if buf.last() == Some(&delim) {
             buf.pop();
         }
-        String::from_utf8_lossy(&buf).into_owned()
+        buf
     }
 
     fn instream_msg(data: &[u8]) -> Vec<u8> {
@@ -5497,12 +6116,8 @@ mod tests {
             std::fs::write(dir.path().join(&name), &part).unwrap();
         }
         let first = dir.path().join("mixed.zip.001");
-        let solo = scan_one_path(
-            &Scanner::builtin(),
-            &ScanOptions::default(),
-            &first.to_string_lossy(),
-        );
-        assert!(solo.ends_with(" ERROR"), "the first part alone: {solo}");
+        let solo = scan_one_path(&Scanner::builtin(), &ScanOptions::default(), &first);
+        assert!(solo.ends_with(b" ERROR"), "the first part alone: {solo:?}");
         let lines = scan_tree(
             &Scanner::builtin(),
             &ScanOptions::default(),
@@ -5573,6 +6188,518 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(lines.iter().filter(|l| l.ends_with(": OK")).count(), 1);
         assert_eq!(lines.iter().filter(|l| l.contains("FOUND")).count(), 1);
+    }
+
+    /// `ALLMATCHSCAN` of a directory joins a split archive as `CONTSCAN` does:
+    /// a part scanned alone reads `OK`.
+    #[test]
+    fn allmatchscan_rejoins_a_split_archive_in_a_directory() {
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        for (name, part) in split_set("payload", ZIP_EICAR_INSIDE, 3) {
+            std::fs::write(dir.path().join(&name), &part).unwrap();
+        }
+        let (db, opts) = (Scanner::builtin(), ScanOptions::default());
+        let path = dir.path().to_string_lossy();
+        let mut lines = scan_tree_allmatch(&db, &opts, &path);
+        assert_eq!(lines.len(), 3, "one line per file: {lines:?}");
+        for l in &lines {
+            assert!(
+                l.contains("FOUND") && l.contains("(in payload.zip)"),
+                "every part carries the archive's verdict: {lines:?}"
+            );
+        }
+        let mut cont = scan_tree(&db, &opts, &path);
+        lines.sort();
+        cont.sort();
+        assert_eq!(lines, cont, "the two verbs answer a directory alike");
+    }
+
+    /// The signatures [`two_signatures`] matches in the text of the split
+    /// fixtures.
+    const THREE: [&str; 3] = ["Eicar-Test-Signature", "Test.First", "Test.Second"];
+
+    /// A database of two signatures, `EICAR-STANDARD` and
+    /// `R-STANDARD-ANTIVIRUS`, beside the built-in EICAR one: the text of the
+    /// split fixtures matches all three.
+    fn two_signatures() -> Scanner {
+        let mut b = exav_core::loader::Builder::new();
+        b.add_named_bytes(
+            "two.ndb",
+            b"Test.First:0:*:4341522d5354414e44415244\n\
+              Test.Second:0:*:522d5354414e444152442d414e54495649525553\n",
+            false,
+        );
+        b.build().unwrap()
+    }
+
+    /// The lines of `CONTSCAN` and of `ALLMATCHSCAN` of a directory holding
+    /// `parts`, for a database of [`two_signatures`].
+    fn contscan_and_allmatchscan(parts: &[(String, Vec<u8>)]) -> (Vec<String>, Vec<String>) {
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        for (name, part) in parts {
+            std::fs::write(dir.path().join(name), part).unwrap();
+        }
+        let (db, opts) = (two_signatures(), ScanOptions::default());
+        let path = dir.path().to_string_lossy();
+        let mut all = scan_tree_allmatch(&db, &opts, &path);
+        let mut cont = scan_tree(&db, &opts, &path);
+        all.sort();
+        cont.sort();
+        (cont, all)
+    }
+
+    /// `ALLMATCHSCAN` answers each part of a set with every signature the
+    /// archive matches, as it answers a file, where `CONTSCAN` gives the first.
+    #[test]
+    fn allmatchscan_lists_every_match_of_a_split_archive() {
+        let parts = split_set("payload", ZIP_EICAR_INSIDE, 3);
+        let (cont, all) = contscan_and_allmatchscan(&parts);
+        assert_eq!(cont.len(), 3, "{cont:?}");
+        assert!(cont.iter().all(|l| l.contains("FOUND (in payload.zip)")));
+        let path = cont[0].split_once("/payload.zip.").unwrap().0;
+        let want: Vec<String> = parts
+            .iter()
+            .flat_map(|(name, _)| {
+                THREE.map(|sig| format!("{path}/{name}: {sig} FOUND (in payload.zip)"))
+            })
+            .collect();
+        assert_eq!(all, want);
+    }
+
+    /// The same for a set whose volumes carry their own headers.
+    #[test]
+    fn allmatchscan_lists_every_match_of_a_zip_split_in_volumes() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/split/");
+        let parts: Vec<(String, Vec<u8>)> = ["e.z01", "e.zip"]
+            .map(|n| {
+                (
+                    n.to_string(),
+                    exav_core::unpack::read_fixture(&format!("{dir}{n}")).unwrap(),
+                )
+            })
+            .into();
+        let (cont, all) = contscan_and_allmatchscan(&parts);
+        assert_eq!(cont.len(), 2, "{cont:?}");
+        assert!(cont.iter().all(|l| l.contains("FOUND (in e.zip)")));
+        assert_eq!(all.len(), 6, "{all:?}");
+        for sig in THREE {
+            assert_eq!(
+                all.iter()
+                    .filter(|l| l.ends_with(&format!(": {sig} FOUND (in e.zip)")))
+                    .count(),
+                2,
+                "{all:?}"
+            );
+        }
+    }
+
+    /// A file of a walk is opened by its name as it is on disk, not by the text
+    /// of it. This helper reads the lines as text, with U+FFFD for each byte
+    /// that is not UTF-8.
+    #[test]
+    fn a_walked_file_with_a_name_that_is_not_utf8_is_scanned() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let bad = std::ffi::OsStr::from_bytes(b"bad\xff.bin");
+        let good = std::ffi::OsStr::from_bytes(b"fine\xfe.txt");
+        std::fs::write(dir.path().join(bad), eicar()).unwrap();
+        std::fs::write(dir.path().join(good), b"hello").unwrap();
+        let (db, opts) = (Scanner::builtin(), ScanOptions::default());
+        let path = dir.path().to_string_lossy();
+        let shown = |name: &str| format!("{path}/{name}");
+        for (verb, mut lines) in [
+            ("CONTSCAN", scan_tree(&db, &opts, &path)),
+            ("ALLMATCHSCAN", scan_tree_allmatch(&db, &opts, &path)),
+        ] {
+            lines.sort();
+            assert_eq!(lines.len(), 2, "{verb}: {lines:?}");
+            assert!(
+                lines[0].starts_with(&shown("bad\u{fffd}.bin: ")) && lines[0].ends_with("FOUND"),
+                "{verb}: {lines:?}"
+            );
+            assert_eq!(
+                lines[1],
+                format!("{}: OK", shown("fine\u{fffd}.txt")),
+                "{verb}"
+            );
+        }
+    }
+
+    /// The parts of a split set are found by the names they have on disk, and
+    /// the set's verdict is put on each of them.
+    #[test]
+    fn a_split_set_whose_name_is_not_utf8_is_rejoined() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        for (name, part) in split_set("payXload", ZIP_EICAR_INSIDE, 3) {
+            let raw: Vec<u8> = name
+                .bytes()
+                .map(|b| if b == b'X' { 0xff } else { b })
+                .collect();
+            std::fs::write(dir.path().join(std::ffi::OsStr::from_bytes(&raw)), &part).unwrap();
+        }
+        let (db, opts) = (Scanner::builtin(), ScanOptions::default());
+        let path = dir.path().to_string_lossy();
+        for (verb, lines) in [
+            ("CONTSCAN", scan_tree(&db, &opts, &path)),
+            ("ALLMATCHSCAN", scan_tree_allmatch(&db, &opts, &path)),
+        ] {
+            assert_eq!(lines.len(), 3, "{verb}: {lines:?}");
+            for l in &lines {
+                assert!(
+                    l.contains("FOUND") && l.contains("(in pay\u{fffd}load.zip)"),
+                    "{verb}: {lines:?}"
+                );
+            }
+        }
+    }
+
+    /// A path named to a scan that is neither a file nor a directory has
+    /// nothing to scan, and is an error: its walk yields no file, and an empty
+    /// walk reads as a clean tree.
+    #[test]
+    fn a_fifo_or_a_socket_named_to_a_scan_is_an_error_never_ok() {
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let fifo = dir.path().join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // With a writer held, a scan that opens the FIFO is not left waiting for
+        // one, and answers instead of hanging the test.
+        let _writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        let sock = dir.path().join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        // A scan that opens the FIFO and reads it never ends: it is waited for
+        // on a thread, so that the failure is a failed test.
+        let answered = |verb: &'static str, name: String| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let (db, opts) = (Scanner::builtin(), ScanOptions::default());
+                let lines = match verb {
+                    "SCAN" => vec![one(format!("zSCAN {name}\0").as_bytes(), 0)],
+                    "CONTSCAN" => scan_tree(&db, &opts, &name),
+                    _ => scan_tree_allmatch(&db, &opts, &name),
+                };
+                let _ = tx.send(lines);
+            });
+            rx.recv_timeout(Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("{verb}: no answer, it opened the path"))
+        };
+        for target in [&fifo, &sock, &link] {
+            let name = target.to_str().unwrap();
+            let want = vec![format!("{name}: Not supported file type ERROR")];
+            for verb in ["SCAN", "CONTSCAN", "ALLMATCHSCAN"] {
+                assert_eq!(answered(verb, name.to_string()), want, "{verb} {name}");
+            }
+        }
+    }
+
+    fn os(bytes: &[u8]) -> &std::ffi::OsStr {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(bytes)
+    }
+
+    /// `dir`, a slash and `name`, as the bytes a client sends for a path.
+    fn path_with(dir: &Path, name: &[u8]) -> Vec<u8> {
+        let mut p = dir.as_os_str().as_encoded_bytes().to_vec();
+        p.push(b'/');
+        p.extend_from_slice(name);
+        p
+    }
+
+    /// A command line: the framing byte (`z` or `n`), `verb`, a blank, `path`
+    /// and the terminator the framing ends with.
+    fn command(framing: u8, verb: &str, path: &[u8]) -> Vec<u8> {
+        let end = if framing == b'z' { b"\0" } else { b"\n" };
+        [&[framing][..], verb.as_bytes(), b" ", path, end].concat()
+    }
+
+    /// A path is bytes: `SCAN` opens the file the client names, whatever its
+    /// bytes, and answers with that name.
+    #[test]
+    fn scan_takes_a_path_that_is_not_utf8_and_names_it_by_its_bytes() {
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let path = path_with(dir.path(), b"caf\xe9.txt");
+        std::fs::write(os(&path), eicar()).unwrap();
+        let reply = one_raw(&command(b'z', "SCAN", &path), 0, false);
+        assert!(
+            reply.starts_with(&[&path[..], b": "].concat()) && reply.ends_with(b" FOUND"),
+            "{reply:?}"
+        );
+    }
+
+    /// The lines of a directory walk name each file by its bytes.
+    #[test]
+    fn contscan_names_a_walked_file_by_its_bytes() {
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let path = path_with(dir.path(), b"caf\xe9.txt");
+        std::fs::write(os(&path), eicar()).unwrap();
+        let root = dir.path().as_os_str().as_encoded_bytes();
+        let reply = one_raw(&command(b'z', "CONTSCAN", root), 0, false);
+        assert!(
+            reply.starts_with(&[&path[..], b": "].concat()) && reply.ends_with(b" FOUND"),
+            "{reply:?}"
+        );
+    }
+
+    /// A path the walk could not open is named by its bytes too.
+    #[test]
+    fn contscan_names_an_unreachable_path_by_its_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let secret = path_with(dir.path(), b"secret\xff");
+        let secret_dir = os(&secret);
+        std::fs::create_dir(secret_dir).unwrap();
+        std::fs::set_permissions(secret_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root defeats mode 0: there is nothing to show then.
+        if std::fs::read_dir(secret_dir).is_ok() {
+            std::fs::set_permissions(secret_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let root = dir.path().as_os_str().as_encoded_bytes();
+        let reply = one_raw(&command(b'z', "CONTSCAN", root), 0, false);
+        std::fs::set_permissions(secret_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            reply.starts_with(&[&secret[..], b": "].concat()) && reply.ends_with(b" ERROR"),
+            "{reply:?}"
+        );
+    }
+
+    /// A path that is not UTF-8 and is not there is answered with the bytes the
+    /// client sent.
+    #[test]
+    fn a_missing_path_that_is_not_utf8_is_answered_by_its_bytes() {
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let path = path_with(dir.path(), b"nope\xe9.txt");
+        for verb in ["SCAN", "CONTSCAN"] {
+            let reply = one_raw(&command(b'n', verb, &path), b'\n', false);
+            assert!(
+                reply.starts_with(&[&path[..], b": "].concat())
+                    && reply.windows(15).any(|w| w == b"No such file or")
+                    && reply.ends_with(b" ERROR"),
+                "{verb}: {reply:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_line_past_the_limit_is_answered() {
+        let mut send = b"zSCAN /".to_vec();
+        send.resize(send.len() + MAX_COMMAND, b'a');
+        assert_eq!(one(&send, 0), "command line exceeds limit ERROR");
+    }
+
+    /// A `SCAN` line of `len` bytes after the `z`, sent with its terminator in one
+    /// write.
+    fn scan_line_of(len: usize) -> Vec<u8> {
+        let mut line = b"SCAN /".to_vec();
+        line.resize(len, b'a');
+        [b"z", &line[..], b"\0"].concat()
+    }
+
+    /// The bound is on the line, not on the read it ends in: one byte past it is
+    /// refused even when its terminator arrives with it.
+    #[test]
+    fn a_terminated_line_one_byte_past_the_limit_is_refused() {
+        let reply = one(&scan_line_of(MAX_COMMAND + 1), 0);
+        assert_eq!(reply, "command line exceeds limit ERROR");
+    }
+
+    /// A line of exactly the limit is taken (the verb then fails on the path).
+    #[test]
+    fn a_terminated_line_of_the_limit_is_taken() {
+        let reply = one(&scan_line_of(MAX_COMMAND), 0);
+        assert!(
+            reply.ends_with(" ERROR") && !reply.contains("command line exceeds limit"),
+            "{}",
+            &reply[reply.len().saturating_sub(120)..]
+        );
+    }
+
+    /// Spawn a handler as [`serve`], after `setup` has run on its thread.
+    fn serve_after(setup: impl FnOnce() + Send + 'static) -> UnixStream {
+        let (client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        std::thread::spawn(move || {
+            setup();
+            let db = Scanner::builtin();
+            let opts = ScanOptions::default();
+            let reader = AncillaryReader::new(&server);
+            let _ = handle_conn(
+                reader,
+                &server,
+                &db,
+                &opts,
+                &|| {},
+                &|| {},
+                &|| {},
+                &|| false,
+                false,
+                Reads::with_command(None),
+            );
+        });
+        client
+    }
+
+    /// The next reply, up to its NUL.
+    fn next_reply(r: &mut BufReader<UnixStream>) -> String {
+        let mut b = Vec::new();
+        r.read_until(0, &mut b).unwrap();
+        String::from_utf8_lossy(&b).into_owned()
+    }
+
+    /// A scan that panics is that file's error, whichever verb scanned it, and
+    /// the session carries on with its next command. No input makes the
+    /// engine panic, so the panic is raised in the scan by a hook.
+    #[test]
+    fn a_scan_that_panics_is_answered_for_its_file_and_the_session_goes_on() {
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, b"abc").unwrap();
+        let mut w = serve_after(|| before_scan::set(|| panic!("a scan that panics")));
+        let mut r = BufReader::new(w.try_clone().unwrap());
+        let mut sent = b"zIDSESSION\0".to_vec();
+        sent.extend(instream_msg(b"abc"));
+        sent.extend(exinstream_msg(b"abc"));
+        sent.extend(exinstream_multi_msg(&[("a", b"abc")]));
+        for verb in ["SCAN", "CONTSCAN", "ALLMATCHSCAN"] {
+            let path = if verb == "CONTSCAN" {
+                dir.path()
+            } else {
+                &file
+            };
+            sent.extend(format!("z{verb} {}\0", path.display()).into_bytes());
+        }
+        sent.extend(b"zPING\0");
+        w.write_all(&sent).unwrap();
+        w.flush().unwrap();
+
+        let panicked = "scan failed (internal error)";
+        let shown = file.display();
+        assert_eq!(
+            next_reply(&mut r),
+            format!("1: stream: {panicked} ERROR\0"),
+            "INSTREAM"
+        );
+        for (id, verb) in [(2, "EXINSTREAM"), (3, "EXINSTREAM MULTI")] {
+            let reply = next_reply(&mut r);
+            assert!(
+                reply.starts_with(&format!("{id}: {{"))
+                    && reply.contains("\"status\":\"ERROR\"")
+                    && reply.contains(panicked),
+                "{verb}: {reply:?}"
+            );
+            // The pass over split sets panicked too in the multi request: no
+            // part's own verdict stands without it, so the request is the error.
+            assert!(!reply.contains("\"files\""), "{verb}: {reply:?}");
+        }
+        assert_eq!(
+            next_reply(&mut r),
+            format!("4: {shown}: {panicked} ERROR\0"),
+            "SCAN"
+        );
+        // The directory: the pass over split sets, then its file.
+        assert_eq!(
+            next_reply(&mut r),
+            format!("5: {}: {panicked} ERROR\0", dir.path().display()),
+            "CONTSCAN sets"
+        );
+        assert_eq!(
+            next_reply(&mut r),
+            format!("5: {shown}: {panicked} ERROR\0"),
+            "CONTSCAN file"
+        );
+        assert_eq!(
+            next_reply(&mut r),
+            format!("6: {shown}: {panicked} ERROR\0"),
+            "ALLMATCHSCAN"
+        );
+        assert_eq!(next_reply(&mut r), "7: PONG\0", "the session goes on");
+    }
+
+    /// A walk answers for each file as it is done: the first file's line is on
+    /// the connection while the second is still being scanned, so a walk that
+    /// is stopped there (the job's time ran out) has lost no line.
+    #[test]
+    fn a_walk_writes_a_files_line_before_the_next_file_is_scanned() {
+        const CLEAN: &str = "clean.txt: OK\0";
+        const INFECTED: &str = "eicar.com: Exav.Test.EICAR FOUND\0";
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("clean.txt"), b"nothing here").unwrap();
+        std::fs::write(dir.path().join("eicar.com"), eicar()).unwrap();
+        for verb in ["CONTSCAN", "MULTISCAN", "ALLMATCHSCAN", "SCAN"] {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let mut w = serve_after(move || {
+                let mut scans = 0;
+                before_scan::set(move || {
+                    scans += 1;
+                    // The first is the pass over split sets, the second the
+                    // walk's first file, the third its second.
+                    if scans == 3 {
+                        let _ = held.recv_timeout(Duration::from_secs(30));
+                    }
+                });
+            });
+            w.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut r = BufReader::new(w.try_clone().unwrap());
+            w.write_all(format!("z{verb} {}\0", dir.path().display()).as_bytes())
+                .unwrap();
+            w.flush().unwrap();
+
+            let mut line = Vec::new();
+            let got = r.read_until(0, &mut line);
+            assert!(
+                got.is_ok(),
+                "{verb}: the first file's line was not written before the second was scanned: {got:?}"
+            );
+            let first = String::from_utf8_lossy(&line).into_owned();
+            assert!(
+                first.ends_with(CLEAN) || first.ends_with(INFECTED),
+                "{verb}: {first:?}"
+            );
+            release.send(()).unwrap();
+            let mut both = [first, next_reply(&mut r)];
+            both.sort();
+            assert!(
+                both[0].ends_with(CLEAN) && both[1].ends_with(INFECTED),
+                "{verb}: {both:?}"
+            );
+        }
+    }
+
+    /// In a session the refusal is the reply to the command that would have come
+    /// next, under its id.
+    #[test]
+    fn a_refused_command_in_a_session_is_answered_under_its_id() {
+        let mut w = serve();
+        let mut r = BufReader::new(w.try_clone().unwrap());
+        let mut send = b"zIDSESSION\0zPING\0zSCAN /".to_vec();
+        send.resize(send.len() + MAX_COMMAND + 1, b'a');
+        w.write_all(&send).unwrap();
+        w.flush().unwrap();
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            let mut b = Vec::new();
+            r.read_until(0, &mut b).unwrap();
+            replies.push(String::from_utf8_lossy(&b).into_owned());
+        }
+        assert_eq!(replies[0], "1: PONG\0");
+        assert!(
+            replies[1].starts_with("2: command line exceeds limit"),
+            "{replies:?}"
+        );
     }
 
     #[test]
@@ -5691,9 +6818,9 @@ mod tests {
         );
     }
 
-    /// Send `data` plus one file descriptor as SCM_RIGHTS over the socket.
-    fn send_with_fd(stream: &UnixStream, data: &[u8], fd: std::os::fd::BorrowedFd<'_>) {
-        super::send_fd_command(stream, data, fd).unwrap();
+    /// Send `data` plus file descriptors as SCM_RIGHTS over the socket.
+    fn send_with_fd(stream: &UnixStream, data: &[u8], fds: &[std::os::fd::BorrowedFd<'_>]) {
+        super::send_fd_command(stream, data, fds).unwrap();
     }
 
     #[test]
@@ -5706,12 +6833,165 @@ mod tests {
 
         let mut w = serve();
         let mut r = BufReader::new(w.try_clone().unwrap());
-        send_with_fd(&w, b"zFILDES\0", f.as_fd());
+        send_with_fd(&w, b"zFILDES\0", &[f.as_fd()]);
         let mut buf = Vec::new();
         r.read_until(0, &mut buf).unwrap();
         let reply = String::from_utf8_lossy(&buf);
         assert!(reply.contains("FOUND"), "got {reply}");
         let _ = w.write(b""); // keep w alive until reply read
+    }
+
+    /// The write end of a pipe to hand to the daemon, and its read end: the read
+    /// end reaches end of file once no process holds a write end.
+    fn probe() -> (std::io::PipeReader, std::io::PipeWriter) {
+        std::io::pipe().unwrap()
+    }
+
+    /// Whether the daemon let go of every write end of `probe` (the caller has
+    /// dropped its own).
+    fn released(mut probe: std::io::PipeReader) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut b = [0u8; 1];
+            let _ = tx.send(matches!(probe.read(&mut b), Ok(0)));
+        });
+        rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
+    }
+
+    /// Everything the daemon sends until it closes the connection.
+    fn until_closed(mut w: UnixStream) -> Vec<u8> {
+        w.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut out = Vec::new();
+        w.read_to_end(&mut out)
+            .expect("the connection was not closed");
+        out
+    }
+
+    /// More than one descriptor in the message that carries a `FILDES` is refused
+    /// as clamd does, none is scanned, the connection closes, and every one the
+    /// daemon was passed is closed (clamd keeps them open).
+    #[test]
+    fn fildes_with_several_descriptors_is_refused_and_all_are_closed() {
+        use std::os::fd::AsFd;
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let bad = dir.path().join("bad");
+        std::fs::write(&bad, eicar()).unwrap();
+        let f = std::fs::File::open(&bad).unwrap();
+        let (first, hold_first) = probe();
+        let (last, hold_last) = probe();
+
+        let w = serve();
+        (&w).write_all(b"zFILDES\0").unwrap();
+        // The form of clamd's client: the descriptors on a message of one byte.
+        send_with_fd(
+            &w,
+            b"\0",
+            &[hold_first.as_fd(), f.as_fd(), hold_last.as_fd()],
+        );
+        drop((hold_first, hold_last, f));
+        let said = until_closed(w);
+        assert_eq!(
+            String::from_utf8_lossy(&said),
+            "No file descriptor received. ERROR\0"
+        );
+        assert!(released(first), "the first descriptor passed was kept");
+        assert!(released(last), "the last descriptor passed was kept");
+    }
+
+    /// A descriptor sent ahead of the command, with no command or with another
+    /// one, is refused as clamd does (the reply is the next command's), the
+    /// connection closes, and the descriptor is closed.
+    #[test]
+    fn a_descriptor_sent_ahead_of_the_command_is_refused_and_closed() {
+        use std::os::fd::AsFd;
+        let refused = "PROTOCOL ERROR: ancillary data sent without FILDES. ERROR\0";
+        for (ahead, replies) in [
+            (&b"z"[..], format!("1: {refused}")),
+            (&b"zPING\0"[..], format!("1: PONG\x002: {refused}")),
+        ] {
+            let (probe, hold) = probe();
+            let w = serve();
+            (&w).write_all(b"zIDSESSION\0").unwrap();
+            send_with_fd(&w, ahead, &[hold.as_fd()]);
+            drop(hold);
+            let said = until_closed(w);
+            assert_eq!(String::from_utf8_lossy(&said), replies, "after {ahead:?}");
+            assert!(
+                released(probe),
+                "the descriptor sent after {ahead:?} was kept"
+            );
+        }
+    }
+
+    /// One descriptor for a `FILDES` is scanned and closed, on a message of its
+    /// own after the command (clamd's form) or on the command's, and a session
+    /// takes one after the other.
+    #[test]
+    fn fildes_scans_one_descriptor_each_time() {
+        use std::os::fd::AsFd;
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let bad = dir.path().join("bad");
+        std::fs::write(&bad, eicar()).unwrap();
+        let ok = dir.path().join("ok");
+        std::fs::write(&ok, b"clean\n").unwrap();
+        let bad = std::fs::File::open(&bad).unwrap();
+        let ok = std::fs::File::open(&ok).unwrap();
+
+        let w = serve();
+        (&w).write_all(b"zFILDES\0").unwrap();
+        send_with_fd(&w, b"\0", &[bad.as_fd()]);
+        let said = until_closed(w);
+        assert_eq!(
+            String::from_utf8_lossy(&said),
+            "fd: Exav.Test.EICAR FOUND\0"
+        );
+
+        let w = serve();
+        let mut r = BufReader::new(w.try_clone().unwrap());
+        let mut reply = || {
+            let mut buf = Vec::new();
+            r.read_until(0, &mut buf).unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        (&w).write_all(b"zIDSESSION\0").unwrap();
+        send_with_fd(&w, b"zFILDES\0", &[bad.as_fd()]);
+        assert_eq!(reply(), "1: fd: Exav.Test.EICAR FOUND\0");
+        send_with_fd(&w, b"zFILDES\0", &[ok.as_fd()]);
+        assert_eq!(reply(), "2: fd: OK\0");
+        (&w).write_all(b"zPING\0").unwrap();
+        assert_eq!(reply(), "3: PONG\0");
+    }
+
+    /// clamd's client sends `FILDES` and the message that carries the descriptor
+    /// back to back, and the daemon can read both at once: the byte of that
+    /// message is not the start of the session's next command.
+    #[test]
+    fn fildes_and_its_descriptor_read_together_leave_the_next_command_intact() {
+        use std::os::fd::AsFd;
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let bad = dir.path().join("bad");
+        std::fs::write(&bad, eicar()).unwrap();
+        let bad = std::fs::File::open(&bad).unwrap();
+
+        // Everything is queued before the daemon reads, so its first read gets
+        // the command and the descriptor's byte together.
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let w = serve_after(move || {
+            let _ = wait.recv();
+        });
+        let mut r = BufReader::new(w.try_clone().unwrap());
+        (&w).write_all(b"zIDSESSION\0zFILDES\0").unwrap();
+        send_with_fd(&w, b"\0", &[bad.as_fd()]);
+        (&w).write_all(b"zPING\0").unwrap();
+        go.send(()).unwrap();
+        let mut said = Vec::new();
+        for _ in 0..2 {
+            r.read_until(0, &mut said).unwrap();
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&said),
+            "1: fd: Exav.Test.EICAR FOUND\x002: PONG\0"
+        );
     }
 
     /// A verb is listed when it works and not when it is refused, so a client
@@ -5813,15 +7093,14 @@ mod tests {
         let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
         gz.extend_from_slice(&[0xff; 64]);
         std::fs::write(&damaged, gz).unwrap();
-        let path = damaged.to_string_lossy();
         let db = Scanner::builtin();
-        let lines = scan_one_allmatch(&db, &ScanOptions::default(), &path);
+        let lines = scan_one_allmatch(&db, &ScanOptions::default(), &damaged);
         assert_eq!(
             lines,
-            [scan_one_path(&db, &ScanOptions::default(), &path)],
+            [scan_one_path(&db, &ScanOptions::default(), &damaged)],
             "ALLMATCHSCAN and SCAN disagree"
         );
-        assert!(lines[0].ends_with(" UNSCANNABLE ERROR"), "{lines:?}");
+        assert!(lines[0].ends_with(b" UNSCANNABLE ERROR"), "{lines:?}");
     }
 
     #[test]
@@ -6157,8 +7436,8 @@ mod tests {
     }
 
     impl FdSource for Scripted {
-        fn take_fd(&mut self) -> Option<std::fs::File> {
-            None
+        fn take_fd(&mut self) -> Passed {
+            Passed::Nothing
         }
     }
 
@@ -6183,8 +7462,8 @@ mod tests {
     }
 
     impl<R> FdSource for Sent<R> {
-        fn take_fd(&mut self) -> Option<std::fs::File> {
-            None
+        fn take_fd(&mut self) -> Passed {
+            Passed::Nothing
         }
     }
 
@@ -6238,6 +7517,55 @@ mod tests {
                 "{verb}: {shown:?}"
             );
             assert!(read.get() < all, "{verb}: the request was read to its end");
+        }
+    }
+
+    /// The size a reply gives for a stream past `--max-input-bytes` is the
+    /// stream's when the drain read it to its end, and a floor when the drain
+    /// stopped at its cap and left the rest unread.
+    #[test]
+    fn a_stream_the_drain_gave_up_on_has_its_size_given_as_a_floor() {
+        let hold = 1024u64;
+        let mut opts = ScanOptions::default();
+        opts.max_scan_size = Some(hold);
+        let answer = |verb: &[u8], len: u64| {
+            let mut head = [b"z", verb, b"\0"].concat();
+            head.extend_from_slice(&u32::try_from(len).unwrap().to_be_bytes());
+            let sent = Sent {
+                inner: io::Cursor::new(head)
+                    .chain(io::repeat(0).take(len))
+                    .chain(io::Cursor::new(vec![0; 4])),
+                read: std::rc::Rc::new(std::cell::Cell::new(0)),
+            };
+            let mut out = Vec::new();
+            handle_conn(
+                sent,
+                &mut out,
+                &Scanner::builtin(),
+                &opts,
+                &|| {},
+                &|| {},
+                &|| {},
+                &|| false,
+                false,
+                Reads::with_command(None),
+            )
+            .unwrap();
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        for verb in [&b"INSTREAM"[..], b"EXINSTREAM"] {
+            let verb_name = String::from_utf8_lossy(verb);
+            let whole = hold + 4096;
+            let r = answer(verb, whole);
+            assert!(
+                r.contains(&format!("file size {whole} exceeds")),
+                "{verb_name}: a stream read to its end: {r}"
+            );
+            let r = answer(verb, hold + MAX_DRAIN_BYTES + 1024 * 1024);
+            assert!(
+                r.contains("file size at least ") && r.contains(" exceeds max-input-bytes"),
+                "{verb_name}: a stream left unread: {r}"
+            );
         }
     }
 
@@ -6795,6 +8123,20 @@ mod tests {
         );
         b.reset();
         assert_eq!(b.pause(), Duration::from_millis(5));
+    }
+
+    /// After an accept that failed (what a pool worker asks): a lost race goes
+    /// on at once, a transient failure after a pause, anything else ends it.
+    #[test]
+    fn after_a_failed_accept_a_transient_failure_is_tried_again() {
+        let mut b = AcceptBackoff::default();
+        let gone = io::Error::from_raw_os_error(libc::EAGAIN);
+        assert!(b.again_after(&gone, true));
+        // The race took no pause: the first one is still the shortest.
+        assert_eq!(b.0, None);
+        assert!(b.again_after(&io::Error::from_raw_os_error(libc::EMFILE), false));
+        assert_eq!(b.0, Some(Duration::from_millis(10)));
+        assert!(!b.again_after(&io::Error::from_raw_os_error(libc::EBADF), false));
     }
 
     /// Transient failures are retried, connections after them are served, and

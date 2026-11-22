@@ -50,6 +50,7 @@ async function headOfUrl(http: Fetcher, length: number, signal: AbortSignal): Pr
   const a = await requestRange(http, { from: 0, to: length - 1 }, signal);
   if (a.kind === "empty") return { bytes: new Uint8Array(), size: 0 };
   if (a.kind === "refused") throw new Error(a.why);
+  if (a.kind === "encoded") throw new Error("the server compresses its answers to range requests");
   const total = a.kind === "part" ? a.total : null;
   return { bytes: a.bytes, size: total ?? (a.bytes.length < length ? a.bytes.length : UNKNOWN_SIZE) };
 }
@@ -84,9 +85,10 @@ export interface OwnedSourceReader extends SourceReader {
 /**
  * Reads a source at most once: `url`, `blob` and `bytes` share one download,
  * aborted with `signal`. An object URL made for a blob or bytes belongs to the
- * reader and is revoked by `dispose`.
+ * reader and is revoked by `dispose`. A download stops past `maxBytes`, and
+ * fails with a `RangeError`.
  */
-export function createSourceReader(source: FileSource, signal: AbortSignal): OwnedSourceReader {
+export function createSourceReader(source: FileSource, signal: AbortSignal, maxBytes = Infinity): OwnedSourceReader {
   const progress = writable<{ loaded: number; total: number | null } | null>(null);
   const urls: string[] = [];
   let resolved: Promise<Resolved> | null = null;
@@ -112,8 +114,15 @@ export function createSourceReader(source: FileSource, signal: AbortSignal): Own
       const response = await http(address).get(null, signal);
       if (!response.ok) throw new Error(`HTTP ${response.status} for the file`);
       const total = declaredLength(response);
+      const over = () => new RangeError(`the file is larger than ${maxBytes} bytes`);
+      if (total !== null && total > maxBytes) {
+        void response.body?.cancel();
+        throw over();
+      }
       progress.set({ loaded: 0, total });
-      return joinChunks(await bodyChunks(response, undefined, (loaded) => progress.set({ loaded, total })));
+      const body = await bodyChunks(response, maxBytes + 1, (loaded) => progress.set({ loaded, total }));
+      if (body.size > maxBytes) throw over();
+      return joinChunks(body);
     })();
     return downloaded;
   };

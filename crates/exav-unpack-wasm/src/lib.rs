@@ -198,8 +198,8 @@ fn browser_limits() -> Limits {
     l
 }
 
-/// Read a `{ maxExtractedBytes, maxBufferBytes, maxScannedBytes, maxMembers,
-/// maxRecursion }` object from JS. Absent keys keep the browser default; a
+/// Read a `{ maxExtractedBytes, maxBufferBytes, maxScannedBytes, maxHoleBytes,
+/// maxMembers, maxRecursion }` object from JS. Absent keys keep the browser default; a
 /// caller sets only what it cares about. The compression ratio is not one: it
 /// acts only on a member past `maxBufferBytes`, which is not held.
 fn limits_from_js(v: &JsValue) -> Limits {
@@ -221,6 +221,9 @@ fn limits_from_js(v: &JsValue) -> Limits {
     }
     if let Some(n) = num("maxScannedBytes") {
         l.max_scanned_bytes = n as u64;
+    }
+    if let Some(n) = num("maxHoleBytes") {
+        l.max_hole_bytes = n as u64;
     }
     if let Some(n) = num("maxMembers") {
         l.max_members = n as u64;

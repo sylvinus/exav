@@ -354,8 +354,18 @@ entities, inserted comments and whitespace. The scanner has to reproduce that
 rendering byte for byte: HTML entity decoding, lowercasing and whitespace
 collapsing; quote-aware comment stripping; and, for scripts, a JavaScript
 normaliser that decodes string escapes, folds `"ab"+"cd"`, evaluates
-`String.fromCharCode(<literals>)` and `unescape("…%XX…")`, and re-parses the
-argument of `eval("…")`, up to 32 nested layers. Nothing is executed. A single
+`unescape("…%XX…")` of a literal, and re-parses the argument of `eval("…")`,
+up to 32 nested layers. It renames the names a script declares (`var` names,
+function names and parameters) `n000`, `n001`... in each `script` element, as
+clamscan does, and leaves every other name as written. It writes a number and
+the letters after it apart (`50em` is `50 em`), an integer wrapped to 32 bits
+and a number with a `.` as C's `%g` does. This is the rendering of the
+`script` elements of a page, which clamscan matches. exav also runs the whole
+page (not under `--clamav-compat`) and a script file through the same
+normaliser in a decoding mode, which also evaluates
+`String.fromCharCode(<literals>)`, `decodeURI`, `decodeURIComponent` and an
+`unescape` nested in another (clamscan leaves the first three as written and
+folds `unescape` one level). Nothing is executed. A single
 textual buffer can be scanned up to five times: raw, HTML- or text-normalised,
 through the light and heavy JavaScript normalisation and, for a page, its
 `script` elements alone, normalised as script.

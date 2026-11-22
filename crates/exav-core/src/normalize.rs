@@ -72,17 +72,26 @@ impl Out for Vec<u8> {
     }
 }
 
-/// The contents of the `<script>` elements of the HTML view written into it,
+/// The contents of the `<script>` elements of the page written into it,
 /// whatever their language, each to its `</script>` or to the end, one after
-/// the other with a newline between them: what clamscan 1.4.3 normalises as a
+/// the other with a NUL between them: what clamscan 1.4.3 normalises as a
 /// page's script. Not event handlers, nor a script's `src`.
+///
+/// It takes the bytes of the page as they are: the tags are told whatever
+/// their case, a character reference is not decoded (`&lt;script&gt;` is text),
+/// and a script is written as it is, with its newlines and its case, but for its
+/// NUL bytes, which clamscan drops. After a `<!` in a script, `</script` is not
+/// an end tag until the next `>`.
 pub(crate) struct Scripts<O> {
     inner: O,
     /// The last byte of the view, for the normaliser writing it.
     last: Option<u8>,
     state: ScriptState,
-    /// How much of `<script` or `</script` the bytes just read are.
+    /// The bytes just read that start `</script` in a script, and how many.
+    held: [u8; CLOSE.len()],
     matched: usize,
+    /// In a script, after a `<!` and before the next `>`.
+    decl: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -108,29 +117,48 @@ impl<O: Out> Scripts<O> {
             inner,
             last: None,
             state: ScriptState::Out,
+            held: [0; CLOSE.len()],
             matched: 0,
+            decl: false,
         }
     }
 
-    /// What was written, with the start of an end tag that the view ended in
+    /// What was written, with the start of an end tag that the page ended in
     /// given back to the script it is part of.
     pub(crate) fn into_inner(mut self) -> O {
         if self.state == ScriptState::In {
-            for &held in &CLOSE[..self.matched] {
-                self.inner.push(held);
+            for k in 0..self.matched {
+                self.put(self.held[k]);
             }
         }
         self.inner
+    }
+
+    /// A byte of a script. NUL is the end of a script in what is written.
+    fn put(&mut self, b: u8) {
+        if b != 0 {
+            self.inner.push(b);
+        }
+    }
+
+    /// The start of a script: a NUL after the one before it.
+    fn begin(&mut self) {
+        self.state = ScriptState::In;
+        self.decl = false;
+        if self.inner.last().is_some() {
+            self.inner.push(0);
+        }
     }
 }
 
 impl<O: Out> Out for Scripts<O> {
     fn push(&mut self, b: u8) {
         self.last = Some(b);
+        let lower = b.to_ascii_lowercase();
         match self.state {
             ScriptState::Out => {
                 self.matched = match b {
-                    _ if b == OPEN[self.matched] => self.matched + 1,
+                    _ if lower == OPEN[self.matched] => self.matched + 1,
                     b'<' => 1,
                     _ => 0,
                 };
@@ -139,30 +167,25 @@ impl<O: Out> Out for Scripts<O> {
                     self.state = ScriptState::Name;
                 }
             }
-            ScriptState::Name => {
-                self.state = match b {
-                    b'>' => ScriptState::In,
-                    b'/' => ScriptState::Tag,
-                    _ if b.is_ascii_whitespace() => ScriptState::Tag,
-                    b'<' => {
-                        self.matched = 1;
-                        ScriptState::Out
-                    }
-                    _ => ScriptState::Out,
-                };
-                if self.state == ScriptState::In && self.inner.last().is_some() {
-                    self.inner.push(b'\n');
+            ScriptState::Name => match b {
+                b'>' => self.begin(),
+                b'/' => self.state = ScriptState::Tag,
+                _ if b.is_ascii_whitespace() => self.state = ScriptState::Tag,
+                b'<' => {
+                    self.matched = 1;
+                    self.state = ScriptState::Out;
                 }
-            }
-            ScriptState::Tag if b == b'>' => {
-                self.state = ScriptState::In;
-                if self.inner.last().is_some() {
-                    self.inner.push(b'\n');
-                }
-            }
+                _ => self.state = ScriptState::Out,
+            },
+            ScriptState::Tag if b == b'>' => self.begin(),
             ScriptState::Tag => {}
+            ScriptState::In if self.decl => {
+                self.decl = b != b'>';
+                self.put(b);
+            }
             ScriptState::In => {
-                if b == CLOSE[self.matched] {
+                if lower == CLOSE[self.matched] {
+                    self.held[self.matched] = b;
                     self.matched += 1;
                     if self.matched == CLOSE.len() {
                         self.matched = 0;
@@ -170,15 +193,17 @@ impl<O: Out> Out for Scripts<O> {
                     }
                     return;
                 }
+                self.decl = self.matched == 1 && b == b'!';
                 // What looked like the end tag is the script's.
-                for &held in &CLOSE[..self.matched] {
-                    self.inner.push(held);
+                for k in 0..self.matched {
+                    self.put(self.held[k]);
                 }
                 self.matched = 0;
                 if b == b'<' {
+                    self.held[0] = b;
                     self.matched = 1;
                 } else {
-                    self.inner.push(b);
+                    self.put(b);
                 }
             }
             ScriptState::End if b == b'>' => self.state = ScriptState::Out,
@@ -205,11 +230,18 @@ fn push_collapsed<O: Out>(out: &mut O, b: u8, prev_ws: &mut bool) {
     }
 }
 
-/// The [`Scripts`] of the [`html`] view of `data`.
+/// The [`Scripts`] of the page `data`.
 pub(crate) fn scripts(data: &[u8]) -> Vec<u8> {
     let mut s = Scripts::new(Vec::new());
-    html_into(&mut Indexed(data), &mut s);
+    scripts_into(&mut Indexed(data), &mut s);
     s.into_inner()
+}
+
+/// [`scripts`] from any object into any [`Scripts`].
+pub(crate) fn scripts_into<B: Bytes, O: Out>(data: &mut B, out: &mut Scripts<O>) {
+    for i in 0..data.len() {
+        out.push(data.at(i));
+    }
 }
 
 /// Normalise HTML: decode entities, lowercase, collapse whitespace. Tags are
@@ -605,22 +637,58 @@ mod tests {
 
     /// The scripts of a page are the contents of its `<script>` elements, as
     /// clamscan 1.4.3 normalises them: each to its end tag or to the end of
-    /// the file, whatever its language, lowercased, and nothing else of it.
+    /// the file, whatever its language, as they are, and nothing else of it.
     #[test]
     fn the_scripts_of_a_page_are_its_script_elements() {
         let s = |page: &str| String::from_utf8(scripts(page.as_bytes())).unwrap();
-        assert_eq!(s("<p>x</p><SCRIPT>var A=1;</SCRIPT><p>y</p>"), "var a=1;");
+        assert_eq!(s("<p>x</p><SCRIPT>var A=1;</SCRIPT><p>y</p>"), "var A=1;");
         assert_eq!(
             s("<script>a()</script><p>mid</p><script type=\"text/template\">b</script>"),
-            "a()\nb"
+            "a()\0b"
         );
-        assert_eq!(s("<script language=vbscript>x = \"Z\"</script>"), "x = \"z\"");
+        assert_eq!(
+            s("<script language=vbscript>x = \"Z\"</script>"),
+            "x = \"Z\""
+        );
         assert_eq!(s("<body><script>var x=1;</scr ipt> and on"), "var x=1;</scr ipt> and on");
         assert_eq!(s("<script>if (a<b) c()</script>"), "if (a<b) c()");
         assert_eq!(s("<script>ends at the end </scri"), "ends at the end </scri");
         assert_eq!(s("<script src=\"http://x/a.js\"></script>"), "");
         assert_eq!(s("<a onclick=\"evil()\">x</a><scripts>no</scripts>"), "");
         assert_eq!(s("<<script>a</script>"), "a");
+    }
+
+    /// What is text in a page is not read as a tag, and what is in a script is
+    /// not changed: as clamscan 1.4.3 normalises it.
+    #[test]
+    fn a_script_is_taken_from_the_page_as_it_is() {
+        let s = |page: &str| String::from_utf8(scripts(page.as_bytes())).unwrap();
+        assert_eq!(
+            s("<p>&lt;script&gt;var a=1;&lt;/script&gt;</p><script>var b=2;</script>"),
+            "var b=2;"
+        );
+        assert_eq!(s("<scr&#105;pt>var q=1;</script>"), "");
+        assert_eq!(
+            s("<SCRIPT>var A=1; alert(A);</SCRIPT><Script>VAR B=2</Script>"),
+            "var A=1; alert(A);\0VAR B=2"
+        );
+        assert_eq!(
+            s("<script>var a=\"&lt;b&gt; &amp; &#65;\";\r\n// c d\r\n</script>"),
+            "var a=\"&lt;b&gt; &amp; &#65;\";\r\n// c d\r\n"
+        );
+        // NUL is dropped, as it ends a script in what is written.
+        assert_eq!(s("<script>a\0b</script>"), "ab");
+    }
+
+    /// After a `<!` in a script, `</script` is text until the next `>`.
+    #[test]
+    fn a_declaration_in_a_script_hides_its_end_tag_until_it_closes() {
+        let s = |page: &str| String::from_utf8(scripts(page.as_bytes())).unwrap();
+        assert_eq!(s("<script>a;<!x;</script>d;"), "a;<!x;</script>d;");
+        assert_eq!(s("<script>a;<!--b;--></script>d;"), "a;<!--b;-->");
+        assert_eq!(s("<script>a;<!--b;>c;</script>d;"), "a;<!--b;>c;");
+        assert_eq!(s("<script>a;<!</script>d;"), "a;<!</script>d;");
+        assert_eq!(s("<script>a;<b;</script>d;"), "a;<b;");
     }
 
     #[test]

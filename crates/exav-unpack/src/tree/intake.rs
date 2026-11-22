@@ -144,13 +144,7 @@ pub fn intake<'a, 's>(
     let body = match (content, range) {
         (None, _) => Body::None,
         (Some(Member::Bytes(data)), _) => Body::Mem(data),
-        (Some(Member::Stream(_)), Some(sub)) => {
-            // Charged here: the walk counts only what is read of the stream.
-            if budget.charge_scan(sub.len() as u64).is_err() {
-                return Err(Declined::Stopped);
-            }
-            Body::Range(sub)
-        }
+        (Some(Member::Stream(_)), Some(sub)) => Body::Range(sub),
         (Some(Member::Stream(rdr)), None) => match hold.large {
             Large::Source => read_member(hold, rdr, verify, &mut reasons, &mut end)?,
             Large::StreamLeaves => {
@@ -170,6 +164,13 @@ pub fn intake<'a, 's>(
     // member, so the comparison is rarely made.
     if is_fixed_point(&body, container) {
         return Err(Declined::Same);
+    }
+    // A range read in place is charged here, once taken: the walk counts only
+    // what is read of the stream.
+    if let Body::Range(sub) = &body
+        && budget.charge_scan(sub.len() as u64).is_err()
+    {
+        return Err(Declined::Stopped);
     }
     // A range that runs past the end of the container is cut there, held or
     // read in place: the rest is absent, not hidden.
@@ -1009,6 +1010,8 @@ mod tests {
             let got = same(&stored("m", off, len), Member::Stream(&mut rdr), &h);
             assert_eq!(got, expected, "range {off}+{len}");
         }
+        // A copy not taken is not charged; only the two ranges taken are.
+        assert_eq!(b.scanned, 299 + 299);
     }
 
     #[test]

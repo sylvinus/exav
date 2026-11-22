@@ -23,17 +23,20 @@
 #![forbid(unsafe_code)]
 
 use exav_core::{ScanOptions, Scanner, VerdictCategory, analyze};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<OsString> = std::env::args_os().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <db-dir-or-exavdb> <file1> [file2] ...", args[0]);
+        let prog = args
+            .first()
+            .map_or_else(String::new, |a| a.display().to_string());
+        eprintln!("Usage: {prog} <db-dir-or-exavdb> <file1> [file2] ...");
         eprintln!();
         eprintln!("Example:");
         eprintln!(
-            "  wasmtime --dir ./sigs::/db --dir ./files::/files {0} /db /files/malware.exe",
-            args[0]
+            "  wasmtime --dir ./sigs::/db --dir ./files::/files {prog} /db /files/malware.exe"
         );
         std::process::exit(2);
     }

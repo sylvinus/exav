@@ -229,7 +229,6 @@ pub(crate) fn read(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
 mod tests {
     use super::*;
     use crate::formats::office::sheets::{Limits, convert_csv};
-    use std::io::Read;
 
     /// The cells of the sheet `bytes` is read into, row by row.
     fn rows(bytes: &[u8]) -> Vec<Vec<String>> {
@@ -382,12 +381,9 @@ mod tests {
         let xlsx = convert_csv(doc.as_bytes(), &Limits::default())
             .unwrap()
             .xlsx;
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(xlsx)).unwrap();
-        let mut part = |name: &str| {
-            let mut out = String::new();
-            zip.by_name(name).unwrap().read_to_string(&mut out).unwrap();
-            out
-        };
+        let mut zip = crate::formats::office::common::package::Zip::open(&xlsx).unwrap();
+        let mut part =
+            |name: &str| String::from_utf8(zip.read(name, 1 << 20).unwrap().unwrap()).unwrap();
         let sheet = part("xl/worksheets/sheet1.xml");
         for cell in ["A1", "B1", "A5", "B4"] {
             assert!(sheet.contains(&format!("r=\"{cell}\"")), "{cell}");

@@ -17,7 +17,7 @@ import { bodyChunks, createFetcher, declaredLength, requestRange, type Fetcher }
 import { readWhole } from "../core/source.js";
 import type { BuiltinFormat, ByteRanges, FileSource, ViewerFile } from "../core/types.js";
 import { isOrigin, type FrameOrigins } from "./policy.js";
-import { READS } from "./protocol.js";
+import { MAX_URL, READS } from "./protocol.js";
 
 export interface Delivery {
   /** Video and audio. */
@@ -79,6 +79,8 @@ export function urlRefusal(url: string, init: RequestInit | undefined, allowed: 
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return `only http(s) URLs are given to the frame, not ${parsed.protocol}`;
   if (parsed.username || parsed.password) return "a URL with credentials in it is not given to the frame";
+  // The frame refuses a longer one; read on this page, the file is shown.
+  if (parsed.href.length > MAX_URL) return `a URL of more than ${MAX_URL} characters is not given to the frame`;
   if (init && Object.keys(init).length) return "the source has `init` (headers, credentials), which the frame's request would not carry";
   if (!allowed.includes(parsed.origin)) return `${parsed.origin} is not one of the origins the frame allows (${allowed.join(" ") || "none"})`;
   return null;
@@ -226,6 +228,10 @@ async function openUrlRanges(http: Fetcher, o: PrepareOptions): Promise<HostRang
   if (probe.kind === "whole") {
     console.warn("exav viewer: the server does not answer range requests: the whole file is downloaded");
     return probe.response;
+  }
+  if (probe.kind === "encoded") {
+    console.warn("exav viewer: the server compresses its answers to range requests: the whole file is downloaded");
+    return WHOLE;
   }
   if (probe.kind !== "part" || probe.total === null) {
     console.warn("exav viewer: the server's answer to a range request is not the bytes asked for, or has no readable Content-Range (cross-origin, it must be exposed): the whole file is downloaded");

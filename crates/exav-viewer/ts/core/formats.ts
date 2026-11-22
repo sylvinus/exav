@@ -118,6 +118,7 @@ export const MATCHERS: Record<BuiltinFormat, FormatMatcher> = {
   /** Also what Windows types an .rtf as, with Word installed: the bytes then say RTF. */
   doc: matcher("doc", { extensionOverrides: ["container"] }),
   odt: matcher("odt", { extensionOverrides: ["container"] }),
+  pages: matcher("pages", { extensionOverrides: ["container"] }),
   ppt: matcher("ppt", { extensionOverrides: ["container"] }),
   odp: matcher("odp", { extensionOverrides: ["container"] }),
   keynote: matcher("keynote", { extensionOverrides: ["container"] }),
@@ -202,6 +203,7 @@ export const CONVERTED_FORMATS: readonly BuiltinFormat[] = [
   "rtf",
   "doc",
   "odt",
+  "pages",
   "ppt",
   "odp",
   "keynote",
@@ -242,6 +244,7 @@ export const BUILTIN_ORDER: readonly BuiltinFormat[] = [
   "rtf",
   "doc",
   "odt",
+  "pages",
   "ppt",
   "odp",
   "keynote",

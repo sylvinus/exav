@@ -5,6 +5,8 @@
 # - [[patch]]    a `[patch]` entry.
 # - [[vendored]] source copied or ported into the tree: where from, which
 #                version, and what lets it go back to a dependency (or be dropped).
+# - [[switch]]   a default Cargo feature left off (or an optional one turned on)
+#                to remove `unsafe` code; scripts/deps-review.py does not read it.
 #
 # `track` says where the script looks for upstream's newest release: "crates",
 # "github" (owner/repo), "pypi", or "none" (a port of a file with no releases).
@@ -47,11 +49,6 @@ why = "libclamav's version, for CCITT strips of a TIFF (decoder parity, see imag
 until = "as image."
 
 [[pin]]
-crate = "zip"
-why = "Below 9.1: from 9.1.0 it depends on `getrandom` whatever its features (salts for the AES archives it writes; exav writes none), and from 9.4.2 on `zeroize` and `constant_time_eq`."
-until = "exav-unpack's PKZIP 1.x methods and the converters' package reading and writing move to exav's own ZIP code (next cycle), or zip makes those crates optional."
-
-[[pin]]
 crate = "weezl"
 why = "0.1.12 where libclamav has 0.1.10: only a debug assertion that a TIFF LZW strip without a clear code tripped is corrected; it decodes the same."
 until = "as image."
@@ -73,7 +70,7 @@ until = "as hayro-jpeg2000."
 
 [[pin]]
 crate = "hayro-ccitt"
-why = "hayro-jbig2's own MMR decoder, at the version it builds with."
+why = "CCITT fax (a PDF's CCITTFaxDecode, and the TIFF fax that the TIFF decoder does not read), and hayro-jbig2's own MMR decoder, at the version it builds with."
 until = "as hayro-jpeg2000."
 
 [[pin]]
@@ -110,6 +107,52 @@ until = "dct.rs is ported from a newer rustdct, or the oracle is dropped."
 crate = "wasm-bindgen"
 why = "Must equal the version of the wasm-bindgen CLI that generates the glue."
 until = "never pinned apart from the CLI: bump both together."
+
+# ---------------------------------------------------------------- switches
+#
+# `unsafe` counts below are keywords in the macro-expanded source of the locked
+# version, for the features that are compiled (scripts/deps-review.py counts
+# the text of src/, so its figure for these crates does not change).
+
+[[switch]]
+crate = "base64"
+version = "0.23.1"
+manifests = ["crates/exav-core/Cargo.toml", "crates/exav-unpack/Cargo.toml"]
+setting = "default-features = false, features = [\"std\"]: `simd-unsafe` off"
+why = "`simd-unsafe` (a default feature) is the only source of `unsafe` in the crate: 8 keywords with it, 0 without (the crate is then `forbid(unsafe_code)`). exav only uses the `GeneralPurpose` engine, never the `Simd` one. ureq and ureq-proto already ask for it off. Holds in the root, fuzz and unpack-wasm locks."
+until = "never: nothing in exav needs the SIMD engines."
+
+[[switch]]
+crate = "delharc"
+version = "0.8.0"
+manifests = ["crates/exav-unpack/Cargo.toml"]
+setting = "features = [\"no-unsafe-assertions\"]"
+why = "Removes the 30 `assert_unchecked` hints (release builds only). 62 `unsafe` keywords before, 32 after in the expanded crate (both counts include 3 macro bodies and a nightly expansion artefact); what is left is bytemuck's derived `unsafe impl`s, a few `from_utf8_unchecked`, `assume_init_mut` and `set_len`. LHA decoding is about 5 to 15 percent slower in a release build (120 MB text as lh5 and as lh7, measured 2026-11-21)."
+until = "LHA on exav's own reader (the delharc, chrono and iana-time-zone item in docs/BACKLOG.md)."
+
+[[switch]]
+crate = "regex-automata"
+version = "0.4.18"
+manifests = ["crates/exav-core/Cargo.toml"]
+setting = "default-features = false, with every default feature but `dfa` (so `dfa-build`, `dfa-search` and `dfa-onepass` are not asked for)"
+why = "All of the crate's `dfa` module `unsafe` is behind `dfa-search`: 53 `unsafe` keywords with it, 26 without (expanded, with meta, hybrid and the NFAs). `regex` turns on only `dfa-onepass`, which has none. Still on in every build that has exav-core's yara feature: bstr's default `unicode` feature enables `dfa-search`, and yara-x-parser takes bstr with its defaults, so the switch does not lower the count until bstr is gone. A build-time copy with `dfa` on also exists for logos-codegen (a proc macro, not linked). No speed change measured on YARA regexps, PCRE subsignatures and wildcard hex signatures over 250 MB (2026-11-21)."
+until = "the yara-x-parser vendoring without bstr (docs/BACKLOG.md): then `dfa-search` goes off and the 27 keywords with it."
+
+[[switch]]
+crate = "goblin"
+version = "0.10.7"
+manifests = ["crates/exav-core/Cargo.toml"]
+setting = "features = [\"std\", \"pe32\", \"pe64\"]: `elf32` and `elf64` off"
+why = "The ELF half of goblin held 90 of its 92 `unsafe` keywords (expanded: 92 with `elf32` and `elf64`, 2 without; the 2 are `Strtab::from_raw`, used by no one). Nothing else in the workspace reads goblin's ELF or Mach-O parts: YARA's `elf` module is the only ELF user and reads through the `elf` crate (next entry)."
+until = "PE on exav's own reader (docs/BACKLOG.md): goblin, scroll and plain leave the tree."
+
+[[switch]]
+crate = "elf"
+version = "0.8.0"
+manifests = ["crates/exav-core/Cargo.toml"]
+setting = "default-features = false, optional, behind exav-core's `yara` feature: `std`, `alloc` and `to_str` off"
+why = "Replaces goblin's ELF half for YARA's `elf` module: the records (header, program and section headers, symbols, dynamic entries, relocations) are decoded by the crate, which is `forbid(unsafe_code)`, has no dependencies, and is MIT or Apache-2.0 (released 2025-05-14). The tables are located by exav's own code (src/yara/modules/elf.rs), as goblin located them: the output is the same on every file goblin parsed, except where goblin gave up on what the module does not expose (names that are not UTF-8, relocation sections, an unreadable hash table) or read a table from offset 0 that the file does not locate. `std` is not needed (only the `ElfStream` reader and error traits), `to_str` only names constants."
+until = "never for the YARA module: it reads an in-memory image. exav's own header readers over a ByteSource (`elf_layout`, `elf_image_end` in crates/exav-core/src/pe.rs) stay beside it."
 
 # ---------------------------------------------------------------- patches
 
@@ -201,7 +244,7 @@ version = "1.5.0"
 reviewed = "1.5.2"
 kind = "port"
 why = "PPMd var.I rev.1 (ZIP method 98) with the sub-allocator rewritten over a bounds-checked byte arena."
-return_when = "the next early pass: ppmd-rust 1.5.2 is forbid(unsafe_code), which was the reason for the arena rewrite, and its Ppmd8Decoder agrees with this copy on the corpus and on mutated streams; a late pass does not un-vendor. The wrapper must keep reporting a stream cut short (Ppmd8Decoder reads the end of its input as the end of the data)."
+return_when = "ppmd-rust allocates its model as cheaply as this copy: 1.5.2 writes the whole model when it allocates it (`resize`), 38 ms for a member that declares 256 MiB, where this copy's `vec![0; n]` is zeroed lazily (measured 2026-11-19). Otherwise 1.5.2 qualifies: forbid(unsafe_code), and its Ppmd8Decoder delivers the same bytes as this copy on the repository's method-98 streams, cut at many points, and on 16,000 mutated ones. The wrapper must keep reporting a stream cut short (Ppmd8Decoder reads the end of its input as the end of the data), and read it a byte at a time (a failing read drops what it decoded)."
 
 [[vendored]]
 path = "crates/exav-unpack/src/formats/udif.rs"
@@ -232,7 +275,7 @@ track = "crates"
 # the release when the copy was taken.
 version = "0.6.1"
 kind = "adapted copy"
-why = "ARJ reader. Depending on unarc-rs brings a second `zip` with default features, which unifies in codecs that bypass the per-member budget."
+why = "ARJ reader. Depending on unarc-rs brings in `zip` with default features, which unifies in codecs that bypass the per-member budget."
 return_when = "unarc-rs no longer depends on zip's default codecs."
 
 [[vendored]]
@@ -354,7 +397,7 @@ track = "github"
 # its main branch.
 version = "1.9"
 kind = "port"
-why = "Inno Setup installers, from the C++ tool: loader table, setup header and data entries by version, setup-1 chunks and the x86 filters. Changed from upstream: members streamed within exav's bounds; LZMA through lzma-rust2."
+why = "Inno Setup installers, from the C++ tool: loader table, setup header and data entries by version, setup-1 chunks and the x86 filters. Inno Setup 6.4.2 to 7.0.2 and the loader table revision 2 are from pull request 210 (open), commits 67d95c40e742 (loader), 9f3cee2dd8e1 (versions, header), cc1444754d1a (data entry flags, only the 6.4.3 part; its encryption header and signing keys count), 6c584226b9ad (6.5.0 header fields), 5cb290709b28 (6.5.2 chunk offset of 64 bits) and 65c61e140738 (6.5.2 and 6.6.x header colours and image opacity; the rest of it and 1f1c5ce97d4b only change lists exav skips), b7388dfd161f (the 8-byte stored size of a block from 6.7.0; its other hunks are 64-bit widening exav already has) and 0254c3f11e34 (6.7.0 header: five more strings, two more colours, two more bytes; the rest of it and 0e92dbc4b09 only change lists and flag sets exav skips), b152f283d (7.0.0.1: only the version; its run entry string is in a list exav skips) and e48636159 (7.0.0.3: the 4-byte compiled script version in the setup header; the file, registry and run entry bitness bytes are in lists exav skips); the pull request's head is 376a13e7c41c; its files carry innoextract's header, so they come under the same zlib licence. Changed from upstream: members streamed within exav's bounds; LZMA through lzma-rust2."
 return_when = "never: a port from C++."
 
 [[vendored]]

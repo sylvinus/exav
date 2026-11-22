@@ -17,8 +17,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use hayro_interpret::font::{Glyph, GlyphRun};
 use hayro_interpret::hayro_cmap::BfString;
 use hayro_interpret::{
-    BlendMode, CacheKey, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
-    InterpreterCache, InterpreterSettings, SoftMask, interpret_page,
+    BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
+    InterpreterCache, InterpreterSettings, RenderContent, SoftMask, interpret_page,
 };
 use hayro_syntax::Pdf;
 use kurbo::{Affine, BezPath, Point, Rect, Shape};
@@ -70,7 +70,7 @@ fn pages(data: &[u8], out: &mut Out) {
             return;
         }
         let settings = InterpreterSettings {
-            render_annotations: false,
+            render_content: RenderContent::PAGE,
             ..InterpreterSettings::default()
         };
         let mut context = Context::new(

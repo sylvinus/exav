@@ -8,7 +8,7 @@
 
 use std::borrow::Cow;
 
-use exav_unpack::{Predictor, Raster, RasterCodec, RasterSpace};
+use exav_unpack::{Raster, RasterCodec, RasterSpace};
 
 use super::{Channels, Error, Pixels, Samples, cmyk_pixel, within};
 
@@ -16,7 +16,7 @@ use super::{Channels, Error, Pixels, Samples, cmyk_pixel, within};
 /// the stream with its filters undone, a predictor aside. At most `max_alloc`
 /// bytes (and [`super::DECODE_MAX`]) are allocated; an image that needs more is
 /// [`Error::TooLarge`], before it is allocated. [`Error::Unsupported`] for a
-/// codec not built in, a color space or a TIFF predictor not read here, a
+/// codec not built in, a color space or a predictor not read here, a
 /// dictionary that gave no size, and JBIG2 globals that could not be read;
 /// [`Error::Undecodable`] for samples that do not reach the image's size and a
 /// codec stream that does not decode. For a CCITT or JBIG2 image `data` is the
@@ -69,13 +69,22 @@ fn grey(raster: &Raster, data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
             Cow::Borrowed(data)
         }
         Some(p) => {
-            let png = Png::new(p)?;
-            let rows = need.div_ceil(png.rowlen);
-            if (data.len() as u64) / (png.rowlen + 1) < rows {
-                return Err(Error::Undecodable);
-            }
-            within(pixels.saturating_add(rows * png.rowlen), max_alloc)?;
-            Cow::Owned(png.undo(data, rows as usize))
+            let Some((rowlen, tagged)) = p.row() else {
+                return Err(if matches!(p.kind, 2 | 10..=15) {
+                    Error::Undecodable
+                } else {
+                    Error::Unsupported
+                });
+            };
+            let rows = need.div_ceil(rowlen);
+            let len = rows
+                .checked_mul(rowlen + u64::from(tagged))
+                .filter(|&n| n <= data.len() as u64)
+                .ok_or(Error::Undecodable)?;
+            within(pixels.saturating_add(len), max_alloc)?;
+            let mut samples = data[..len as usize].to_vec();
+            p.undo(&mut samples);
+            Cow::Owned(samples)
         }
     };
     let (w, stride) = (w as usize, stride as usize);
@@ -156,7 +165,7 @@ fn decode_codec(
             ..
         } => return Err(Error::Unsupported),
         #[cfg(feature = "jbig2")]
-        RasterCodec::Jbig2 { globals, .. } => Some(crate::pdf_image::decode_jbig2(
+        RasterCodec::Jbig2 { globals, .. } => Some(crate::pdf_image::decode_jbig2_strict(
             data,
             raster.width,
             raster.height,
@@ -269,82 +278,10 @@ fn mapping(raster: &Raster) -> Result<Mapping, Error> {
     }
 }
 
-/// A PNG predictor: every row starts with the byte of the filter it was
-/// written with.
-struct Png {
-    /// Bytes in a row, without that byte.
-    rowlen: u64,
-    /// Bytes in a pixel, at least 1.
-    bpp: usize,
-}
-
-impl Png {
-    fn new(p: &Predictor) -> Result<Png, Error> {
-        if !(10..=15).contains(&p.kind) {
-            return Err(Error::Unsupported);
-        }
-        if p.colors == 0 || p.colors > 32 || p.columns == 0 || !matches!(p.bits, 1 | 2 | 4 | 8 | 16)
-        {
-            return Err(Error::Undecodable);
-        }
-        let pixel_bits = u64::from(p.colors) * u64::from(p.bits);
-        Ok(Png {
-            rowlen: (pixel_bits * u64::from(p.columns)).div_ceil(8),
-            bpp: pixel_bits.div_ceil(8) as usize,
-        })
-    }
-
-    /// The first `rows` rows of `data`, unfiltered. A filter byte past 4 is
-    /// none.
-    fn undo(&self, data: &[u8], rows: usize) -> Vec<u8> {
-        let rowlen = self.rowlen as usize;
-        let mut out = vec![0u8; rows * rowlen];
-        for (y, line) in data.chunks_exact(rowlen + 1).take(rows).enumerate() {
-            let (before, rest) = out.split_at_mut(y * rowlen);
-            let prev: &[u8] = if y == 0 {
-                &[]
-            } else {
-                &before[(y - 1) * rowlen..]
-            };
-            let cur = &mut rest[..rowlen];
-            for i in 0..rowlen {
-                let a = if i >= self.bpp { cur[i - self.bpp] } else { 0 };
-                let b = prev.get(i).copied().unwrap_or(0);
-                let c = if i >= self.bpp {
-                    prev.get(i - self.bpp).copied().unwrap_or(0)
-                } else {
-                    0
-                };
-                let predicted = match line[0] {
-                    1 => a,
-                    2 => b,
-                    3 => ((u16::from(a) + u16::from(b)) / 2) as u8,
-                    4 => paeth(a, b, c),
-                    _ => 0,
-                };
-                cur[i] = line[i + 1].wrapping_add(predicted);
-            }
-        }
-        out
-    }
-}
-
-fn paeth(a: u8, b: u8, c: u8) -> u8 {
-    let (a, b, c) = (i32::from(a), i32::from(b), i32::from(c));
-    let p = a + b - c;
-    let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs());
-    if pa <= pb && pa <= pc {
-        a as u8
-    } else if pb <= pc {
-        b as u8
-    } else {
-        c as u8
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use exav_unpack::Predictor;
 
     fn raster(width: u32, height: u32, bits: u8, space: RasterSpace) -> Raster {
         Raster {
@@ -478,18 +415,38 @@ mod tests {
         assert_eq!(from_raster(&gray, &[0; 16], 15), Err(Error::TooLarge));
         let lab = raster(1, 1, 8, RasterSpace::Other("Lab".into()));
         assert_eq!(from_raster(&lab, &[0; 3], 1 << 20), Err(Error::Unsupported));
+        let predicted = |kind| Raster {
+            predictor: Some(Predictor {
+                kind,
+                colors: 1,
+                bits: 8,
+                columns: 4,
+            }),
+            ..gray.clone()
+        };
+        assert_eq!(
+            from_raster(&predicted(5), &[0; 16], 1 << 20),
+            Err(Error::Unsupported)
+        );
+        // A PNG predictor's rows are a byte longer each.
+        assert_eq!(
+            from_raster(&predicted(12), &[0; 16], 1 << 20),
+            Err(Error::Undecodable)
+        );
+    }
+
+    /// The TIFF predictor: a sample is the difference to the one before it.
+    #[test]
+    fn a_tiff_predictor_is_undone() {
         let tiff = Raster {
             predictor: Some(Predictor {
                 kind: 2,
                 colors: 1,
                 bits: 8,
-                columns: 4,
+                columns: 2,
             }),
-            ..gray
+            ..raster(2, 2, 8, RasterSpace::Gray)
         };
-        assert_eq!(
-            from_raster(&tiff, &[0; 16], 1 << 20),
-            Err(Error::Unsupported)
-        );
+        assert_eq!(grey_of(&tiff, &[10, 5, 200, 50]), [10, 15, 200, 250]);
     }
 }

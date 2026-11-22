@@ -10,7 +10,7 @@ import { MATCHERS } from "../core/formats.js";
 import type { FormatPlugin } from "../core/types.js";
 
 export interface ArchiveOptions {
-  /** Defaults: 512 MiB extracted, 5000 members. */
+  /** Defaults: 512 MiB extracted, 20,000 members, as the viewer's limits on a ZIP's directory (`maxExtractedBytes`, `maxMembers`). */
   maxExtractedBytes?: number;
   maxMembers?: number;
 }

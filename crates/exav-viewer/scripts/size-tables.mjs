@@ -32,7 +32,7 @@ const MODULES = [
   ["exav_viewer_text_bg.wasm", "Every text file (its encoding, and whether it is text), Markdown, JSON, XML and diffs"],
   ["exav_viewer_sheets_bg.wasm", "XLS, ODS, FODS, Numbers, SpreadsheetML 2003, HTML tables, SYLK, to XLSX"],
   ["exav_viewer_slides_bg.wasm", "PPT, ODP, FODP, Keynote, ODG, Visio (VSDX), to PPTX"],
-  ["exav_viewer_docs_bg.wasm", "DOC, ODT, FODT, RTF, to DOCX"],
+  ["exav_viewer_docs_bg.wasm", "DOC, ODT, FODT, RTF, Pages, to DOCX"],
   ["exav_viewer_table_bg.wasm", "CSV, TSV, to XLSX"],
   ["exav_viewer_sniff_bg.wasm", "What a file is, from its first bytes (exav's own detection), a DOCX, XLSX or PPTX's ZIP directory (exav-unpack's ZIP reader), and which Office formats a compound file or a ZIP is"],
   ["openjpeg_nowasm_fallback.js", "JPEG 2000 images in PDFs (pdf.js's JPXDecode), the module in base64"],
@@ -51,7 +51,7 @@ const FRAMES = [
   ["PowerPoint", ["pptx"]],
   ["XLS, ODS, Numbers", ["xls"]],
   ["PPT, ODP, Keynote, ODG, Visio", ["ppt"]],
-  ["DOC, ODT, RTF", ["rtf"]],
+  ["DOC, ODT, RTF, Pages", ["rtf"]],
   ["Markdown, text", ["text"]],
   ["Archives", ["archive"]],
   ["Video, audio", ["video"]],
@@ -109,7 +109,7 @@ function frameTable() {
 /** The peer dependencies, and the formats each is needed for. Every key of package.json's `peerDependencies` must be here. */
 const PEERS = [
   [["pdfjs-dist"], "PDF"],
-  [["@silurus/ooxml"], "Word, Excel, PowerPoint, CSV, and the formats converted to them: XLS, ODS, Numbers, PPT, ODP, Keynote, ODG, Visio, DOC, ODT, RTF"],
+  [["@silurus/ooxml"], "Word, Excel, PowerPoint, CSV, and the formats converted to them: XLS, ODS, Numbers, PPT, ODP, Keynote, ODG, Visio, DOC, ODT, RTF, Pages"],
   [["three"], "IFC, STL, OBJ, PLY, glTF"],
   [["@exav/unpack-wasm"], "Archives"],
   [["react", "react-dom"], "The React components (`@exav/viewer/react`); the host's own React, not measured"],

@@ -15,6 +15,7 @@
 //! different alert.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
+use exav_unpack::zip_write::{FileOptions, ZipWriter};
 use std::io::Write;
 
 fn scanner() -> Scanner {
@@ -25,13 +26,10 @@ fn scanner() -> Scanner {
 
 /// A ZIP holding more members than the file-count budget allows.
 fn zip_with_members(n: usize) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for i in 0..n {
-        z.start_file(
-            format!("m{i}.txt"),
-            zip::write::SimpleFileOptions::default(),
-        )
-        .unwrap();
+        z.start_file(&format!("m{i}.txt"), FileOptions::default())
+            .unwrap();
         z.write_all(b"padding padding padding\n").unwrap();
     }
     z.finish().unwrap().into_inner()
@@ -100,12 +98,9 @@ fn the_recursion_budget_reports_its_own_name() {
     // Nested ZIPs deeper than the recursion budget.
     let mut blob = b"payload payload payload\n".to_vec();
     for i in 0..8 {
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        z.start_file(
-            format!("n{i}.zip"),
-            zip::write::SimpleFileOptions::default(),
-        )
-        .unwrap();
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        z.start_file(&format!("n{i}.zip"), FileOptions::default())
+            .unwrap();
         z.write_all(&blob).unwrap();
         blob = z.finish().unwrap().into_inner();
     }
@@ -221,16 +216,12 @@ fn a_real_detection_still_beats_the_limit_alert() {
     l.add_named_bytes("t.ndb", format!("Test.Real:0:*:{hex}\n").as_bytes(), true);
     let db = l.build().expect("db");
 
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    z.start_file("hit.txt", zip::write::SimpleFileOptions::default())
-        .unwrap();
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    z.start_file("hit.txt", FileOptions::default()).unwrap();
     z.write_all(b"exav-limit-precedence-marker").unwrap();
     for i in 0..40 {
-        z.start_file(
-            format!("f{i}.txt"),
-            zip::write::SimpleFileOptions::default(),
-        )
-        .unwrap();
+        z.start_file(&format!("f{i}.txt"), FileOptions::default())
+            .unwrap();
         z.write_all(b"padding\n").unwrap();
     }
     let blob = z.finish().unwrap().into_inner();

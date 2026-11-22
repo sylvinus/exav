@@ -72,6 +72,23 @@ const TRAP_STRIDE: u32 = 0x10;
 /// the trap range, still inside the module image.
 const RETURN_OFFSET: u32 = 0x0003_f000;
 
+/// `GetModuleHandleEx` flag: the argument is an address inside the module.
+const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 4;
+/// What the package APIs return for a process that is not packaged.
+const APPMODEL_ERROR_NO_PACKAGE: u32 = 15700;
+
+/// `VirtualAlloc` granularity.
+const ALLOC_GRANULARITY: u32 = 0x1_0000;
+
+/// What `EncodePointer` XORs into a pointer. Windows picks a random cookie per
+/// process; a fixed one keeps a dump reproducible, and decoding is the same
+/// operation.
+const POINTER_COOKIE: u32 = 0x4b1d_9a37;
+
+/// How many functions a synthetic DLL without a carried name list advertises,
+/// so that imports by ordinal below it resolve.
+const ANON_ORDINALS: u32 = 0x400;
+
 /// Largest export directory, in bytes, a synthetic module may build below its
 /// trap range. Bounds the per-module name set so the directory cannot grow into
 /// the traps.
@@ -137,12 +154,21 @@ enum Api {
     GetModuleHandle {
         wide: bool,
     },
+    GetModuleHandleEx {
+        wide: bool,
+    },
     GetModuleFileName {
         wide: bool,
     },
-    VirtualAlloc,
+    VirtualAlloc {
+        /// `VirtualAllocEx` takes the process handle first.
+        ex: bool,
+    },
     VirtualFree,
-    VirtualProtect,
+    VirtualProtect {
+        /// `VirtualProtectEx` takes the process handle first.
+        ex: bool,
+    },
     VirtualQuery,
     HeapCreate,
     HeapAlloc,
@@ -190,6 +216,10 @@ enum Api {
     GetStdHandle,
     SetUnhandledExceptionFilter,
     InterlockedExchange,
+    InterlockedCompareExchange,
+    /// `EncodePointer` / `DecodePointer`: a per-process reversible scramble of
+    /// a pointer, which the C runtime applies to the handlers it keeps.
+    EncodePointer,
     LstrLen {
         wide: bool,
     },
@@ -253,6 +283,22 @@ const APIS: &[ApiSpec] = &[
     k("GetModuleHandleA", 1, Api::GetModuleHandle { wide: false }),
     k("GetModuleHandleW", 1, Api::GetModuleHandle { wide: true }),
     k(
+        "GetModuleHandleExA",
+        3,
+        Api::GetModuleHandleEx { wide: false },
+    ),
+    k(
+        "GetModuleHandleExW",
+        3,
+        Api::GetModuleHandleEx { wide: true },
+    ),
+    // Win 8 and later: this process has no package identity.
+    k(
+        "GetCurrentPackageId",
+        2,
+        Api::Const(APPMODEL_ERROR_NO_PACKAGE),
+    ),
+    k(
         "GetModuleFileNameA",
         3,
         Api::GetModuleFileName { wide: false },
@@ -262,11 +308,11 @@ const APIS: &[ApiSpec] = &[
         3,
         Api::GetModuleFileName { wide: true },
     ),
-    k("VirtualAlloc", 4, Api::VirtualAlloc),
-    k("VirtualAllocEx", 5, Api::VirtualAlloc),
+    k("VirtualAlloc", 4, Api::VirtualAlloc { ex: false }),
+    k("VirtualAllocEx", 5, Api::VirtualAlloc { ex: true }),
     k("VirtualFree", 3, Api::VirtualFree),
-    k("VirtualProtect", 4, Api::VirtualProtect),
-    k("VirtualProtectEx", 5, Api::VirtualProtect),
+    k("VirtualProtect", 4, Api::VirtualProtect { ex: false }),
+    k("VirtualProtectEx", 5, Api::VirtualProtect { ex: true }),
     k("VirtualQuery", 3, Api::VirtualQuery),
     k("HeapCreate", 3, Api::HeapCreate),
     k("HeapDestroy", 1, Api::Const(1)),
@@ -305,6 +351,13 @@ const APIS: &[ApiSpec] = &[
     k("TlsSetValue", 2, Api::TlsSetValue),
     k("TlsGetValue", 1, Api::TlsGetValue),
     k("TlsFree", 1, Api::TlsFree),
+    // Fiber local storage, which the C runtime uses where it once used TLS. The
+    // slots are the same table: a program asks for an index and gets its value
+    // back, and the callback `FlsAlloc` takes never runs here.
+    k("FlsAlloc", 1, Api::TlsAlloc),
+    k("FlsSetValue", 2, Api::TlsSetValue),
+    k("FlsGetValue", 1, Api::TlsGetValue),
+    k("FlsFree", 1, Api::TlsFree),
     k("Sleep", 1, Api::Sleep),
     k("CloseHandle", 1, Api::CloseHandle),
     k("CreateFileA", 7, Api::CreateFile { wide: false }),
@@ -318,6 +371,13 @@ const APIS: &[ApiSpec] = &[
         Api::SetUnhandledExceptionFilter,
     ),
     k("InterlockedExchange", 2, Api::InterlockedExchange),
+    k(
+        "InterlockedCompareExchange",
+        3,
+        Api::InterlockedCompareExchange,
+    ),
+    k("EncodePointer", 1, Api::EncodePointer),
+    k("DecodePointer", 1, Api::EncodePointer),
     k("lstrlenA", 1, Api::LstrLen { wide: false }),
     k("lstrlenW", 1, Api::LstrLen { wide: true }),
     k("lstrcpyA", 2, Api::LstrCpy { wide: false }),
@@ -461,6 +521,7 @@ const APIS: &[ApiSpec] = &[
     c("__crtGetShowWindowMode", Api::Const(0)),
     c("_controlfp", Api::Const(0x9001f)),
     c("_initterm", Api::Const(0)),
+    c("_initterm_e", Api::Const(0)),
     c("_except_handler3", Api::Const(1)),
     c("_XcptFilter", Api::Const(0)),
     c("exit", Api::ExitProcess),
@@ -479,6 +540,7 @@ const APIS: &[ApiSpec] = &[
     // --- kernel32: the rest of what a program touches on the way up ----
     k("InitializeCriticalSection", 1, Api::Const(0)),
     k("InitializeCriticalSectionAndSpinCount", 2, Api::Const(1)),
+    k("InitializeCriticalSectionEx", 3, Api::Const(1)),
     k("DeleteCriticalSection", 1, Api::Const(0)),
     k("EnterCriticalSection", 1, Api::Const(0)),
     k("LeaveCriticalSection", 1, Api::Const(0)),
@@ -765,6 +827,7 @@ pub struct Env<'a> {
     /// Base address of the emulated program image (what `GetModuleHandle(NULL)`
     /// returns).
     pub image_base: u32,
+    image_size: u32,
     heap_next: u32,
     /// Live allocations, base to size. Regions handed out by `VirtualAlloc` are
     /// where a packer that does not unpack in place puts the payload, so the
@@ -811,6 +874,7 @@ impl<'a> Env<'a> {
             crt_cell: ENV_BASE + 0x100,
             traps: FxHashMap::default(),
             image_base,
+            image_size,
             heap_next: HEAP_BASE,
             allocations: Vec::new(),
             last_error: 0,
@@ -879,6 +943,13 @@ impl<'a> Env<'a> {
         self.kernel32_base() + RETURN_OFFSET + 0x10
     }
 
+    /// Handler of the registration record `ntdll` links in front of the chain
+    /// while a handler runs. An exception raised inside a handler reaches it
+    /// first; the driver answers `ExceptionContinueSearch` for it.
+    pub fn seh_nested(&self) -> u32 {
+        self.kernel32_base() + RETURN_OFFSET + 0x30
+    }
+
     /// Return address a TLS callback returns to, so the driver runs the next
     /// one. A distinct sentinel from `process_return` because a callback
     /// returning is not the stub returning to the loader.
@@ -926,6 +997,34 @@ impl<'a> Env<'a> {
 
     fn find_module(&self, base: u32) -> Option<&Module> {
         self.modules.iter().find(|m| m.base == base)
+    }
+
+    /// `GetModuleHandle`: the program for a null name, otherwise the module
+    /// of that name, which is loaded on the spot when it is a system DLL.
+    fn module_handle(&mut self, mem: &mut Mem, name_ptr: u32, wide: bool) -> Result<u32, Stop> {
+        if name_ptr == 0 {
+            return Ok(self.image_base);
+        }
+        let name = read_str(mem, name_ptr, wide)?;
+        Ok(match self.find_module_by_name(&name).map(|m| m.base) {
+            Some(b) => b,
+            // A system DLL a real process has loaded (or would have
+            // loaded by now) reports as present, because a stub that
+            // asks for one and is told "not loaded" concludes it is
+            // running somewhere broken and gives up; `mscoree.dll`
+            // is how every packed .NET binary stopped. Anything
+            // *not* on this list still reports absent: naming an
+            // unknown DLL is how a stub probes for a sandbox, and
+            // the honest answer there is that it is not there.
+            None if is_system_dll(&name) => {
+                let base = self.next_module_base(mem);
+                match self.create_module(mem, &name, base) {
+                    Ok(()) => base,
+                    Err(_) => 0,
+                }
+            }
+            None => 0,
+        })
     }
 
     fn find_module_by_name(&self, name: &str) -> Option<&Module> {
@@ -999,8 +1098,19 @@ impl<'a> Env<'a> {
         // Export directory at RVA 0x1000, arrays and strings after it.
         let ed_rva = 0x1000u32;
         let n = exports.len() as u32;
+        // A DLL whose name list the emulator does not carry still has to
+        // answer an import by ordinal, which a stub resolves by indexing the
+        // export table itself: past `NumberOfFunctions` it takes a fallback
+        // that does not exist on Windows. Such a module gets nameless slots
+        // after its named exports, up to `ANON_ORDINALS` functions.
+        let anon = if EXTRA_EXPORTS.iter().any(|(m, _)| *m == name) {
+            0
+        } else {
+            ANON_ORDINALS.saturating_sub(n)
+        };
+        let total = n + anon;
         let funcs_rva = ed_rva + 40;
-        let names_rva = funcs_rva + n * 4;
+        let names_rva = funcs_rva + total * 4;
         let ords_rva = names_rva + n * 4;
         let strings_rva = ords_rva + n * 2;
 
@@ -1010,7 +1120,7 @@ impl<'a> Env<'a> {
         ed.extend_from_slice(&0u32.to_le_bytes()); // Major/Minor version
         ed.extend_from_slice(&0u32.to_le_bytes()); // Name, patched below
         ed.extend_from_slice(&1u32.to_le_bytes()); // Base ordinal
-        ed.extend_from_slice(&n.to_le_bytes()); // NumberOfFunctions
+        ed.extend_from_slice(&total.to_le_bytes()); // NumberOfFunctions
         ed.extend_from_slice(&n.to_le_bytes()); // NumberOfNames
         ed.extend_from_slice(&funcs_rva.to_le_bytes());
         ed.extend_from_slice(&names_rva.to_le_bytes());
@@ -1035,6 +1145,20 @@ impl<'a> Env<'a> {
                     argc: *argc,
                     module: name.clone(),
                     name: ename.to_string(),
+                },
+            );
+            trap += TRAP_STRIDE;
+        }
+        for i in n..total {
+            mem.write_u32(base + funcs_rva + i * 4, trap - base)
+                .map_err(Stop::Fault)?;
+            self.traps.insert(
+                trap,
+                Trap {
+                    api: None,
+                    argc: 0,
+                    module: name.clone(),
+                    name: format!("#{}", i + 1),
                 },
             );
             trap += TRAP_STRIDE;
@@ -1238,9 +1362,22 @@ impl<'a> Env<'a> {
         let base = if addr != 0 {
             addr & !(PAGE_SIZE as u32 - 1)
         } else {
-            let b = self.heap_next;
-            if b.saturating_add(rounded) >= HEAP_LIMIT {
-                return 0;
+            // An image may be based inside the allocator's range (0x01000000
+            // is a common base); Windows never hands out memory that is
+            // already mapped, so step over it. Each page looked at is charged
+            // like a page copied: a stub that maps pages in the way would
+            // otherwise make every call search the whole range for free.
+            let mut b = self.heap_next;
+            loop {
+                if b.saturating_add(rounded) >= HEAP_LIMIT {
+                    return 0;
+                }
+                let Some(hit) = mem.first_mapped(b, rounded) else {
+                    self.bulk_bytes += u64::from(rounded);
+                    break;
+                };
+                self.bulk_bytes += u64::from(hit.saturating_sub(b)) + PAGE_SIZE as u64;
+                b = (hit + PAGE_SIZE as u32).next_multiple_of(ALLOC_GRANULARITY);
             }
             self.heap_next = b + rounded + PAGE_SIZE as u32; // guard page
             b
@@ -1315,30 +1452,28 @@ impl<'a> Env<'a> {
             }
             Api::GetModuleHandle { wide } => {
                 let p = arg(cpu, mem, 0)?;
-                if p == 0 {
-                    self.image_base
+                self.module_handle(mem, p, wide)?
+            }
+            Api::GetModuleHandleEx { wide } => {
+                let flags = arg(cpu, mem, 0)?;
+                let p = arg(cpu, mem, 1)?;
+                let out = arg(cpu, mem, 2)?;
+                let h = if flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS != 0 {
+                    // `p` is an address inside the module.
+                    self.modules
+                        .iter()
+                        .find(|m| p >= m.base && p - m.base < m.size)
+                        .map(|m| m.base)
+                        .or_else(|| {
+                            (p >= self.image_base && p - self.image_base < self.image_size)
+                                .then_some(self.image_base)
+                        })
+                        .unwrap_or(0)
                 } else {
-                    let name = read_str(mem, p, wide)?;
-                    match self.find_module_by_name(&name).map(|m| m.base) {
-                        Some(b) => b,
-                        // A system DLL a real process has loaded (or would have
-                        // loaded by now) reports as present, because a stub that
-                        // asks for one and is told "not loaded" concludes it is
-                        // running somewhere broken and gives up; `mscoree.dll`
-                        // is how every packed .NET binary stopped. Anything
-                        // *not* on this list still reports absent: naming an
-                        // unknown DLL is how a stub probes for a sandbox, and
-                        // the honest answer there is that it is not there.
-                        None if is_system_dll(&name) => {
-                            let base = self.next_module_base(mem);
-                            match self.create_module(mem, &name, base) {
-                                Ok(()) => base,
-                                Err(_) => 0,
-                            }
-                        }
-                        None => 0,
-                    }
-                }
+                    self.module_handle(mem, p, wide)?
+                };
+                mem.write_u32(out, h).map_err(Stop::Fault)?;
+                u32::from(h != 0)
             }
             Api::GetModuleFileName { wide } => {
                 let buf = arg(cpu, mem, 1)?;
@@ -1346,19 +1481,29 @@ impl<'a> Env<'a> {
                 let path = "C:\\sample.exe";
                 write_str(mem, buf, path, wide, cap)?
             }
-            Api::VirtualAlloc => {
-                let addr = arg(cpu, mem, 0)?;
-                let size = arg(cpu, mem, 1)?;
+            Api::VirtualAlloc { ex } => {
+                let first = u32::from(ex);
+                let addr = arg(cpu, mem, first)?;
+                let size = arg(cpu, mem, first + 1)?;
                 self.alloc(mem, addr, size)
             }
             Api::VirtualFree => 1,
-            Api::VirtualProtect => {
-                // Report the previous protection as "everything", which is what
-                // a stub that saves and restores it will put back.
-                let old = arg(cpu, mem, 3)?;
+            Api::VirtualProtect { ex } => {
+                let first = u32::from(ex);
+                let addr = arg(cpu, mem, first)?;
+                let size = arg(cpu, mem, first + 1)?;
+                let new = arg(cpu, mem, first + 2)?;
+                let old = arg(cpu, mem, first + 3)?;
+                // Only write protection is modelled. The previous protection
+                // is "everything", except on a read-only page, so that a stub
+                // that saves and restores it puts back what it found.
+                let was = if mem.is_read_only(addr) { 0x02 } else { 0x40 };
                 if old != 0 {
-                    mem.write_u32(old, 0x40).map_err(Stop::Fault)?;
+                    mem.write_u32(old, was).map_err(Stop::Fault)?;
                 }
+                // PAGE_READWRITE, WRITECOPY, EXECUTE_READWRITE, EXECUTE_WRITECOPY.
+                let writable = new & 0xcc != 0;
+                mem.set_read_only(addr, size, !writable);
                 1
             }
             Api::VirtualQuery => {
@@ -1724,6 +1869,17 @@ impl<'a> Env<'a> {
                 mem.write_u32(p, v).map_err(Stop::Fault)?;
                 old
             }
+            Api::InterlockedCompareExchange => {
+                let p = arg(cpu, mem, 0)?;
+                let exchange = arg(cpu, mem, 1)?;
+                let comparand = arg(cpu, mem, 2)?;
+                let old = mem.read_u32(p).map_err(Stop::Fault)?;
+                if old == comparand {
+                    mem.write_u32(p, exchange).map_err(Stop::Fault)?;
+                }
+                old
+            }
+            Api::EncodePointer => arg(cpu, mem, 0)? ^ POINTER_COOKIE,
             Api::LstrLen { wide } => {
                 let p = arg(cpu, mem, 0)?;
                 read_str(mem, p, wide)?.chars().count() as u32
@@ -2674,6 +2830,184 @@ mod tests {
             call_k32(&mut env, &mut mem, "TlsAlloc", &[]),
             TLS_OUT_OF_INDEXES
         );
+    }
+
+    /// The C runtime's start-up asks for these before `main`; any of them
+    /// unimplemented returns zero and sends it down its failure path.
+    #[test]
+    fn the_c_runtime_start_up_calls_answer_as_kernel32_does() {
+        let (mut mem, mut env) = env();
+        let p = 0x1234_5678;
+        let enc = call_k32(&mut env, &mut mem, "EncodePointer", &[p]);
+        assert_ne!(enc, p, "an encoded pointer is not the pointer");
+        assert_eq!(call_k32(&mut env, &mut mem, "DecodePointer", &[enc]), p);
+
+        let cell = 0x0040_0100;
+        mem.write_u32(cell, 7).unwrap();
+        // Swaps only when the comparand matches, and returns the old value.
+        assert_eq!(
+            call_k32(
+                &mut env,
+                &mut mem,
+                "InterlockedCompareExchange",
+                &[cell, 9, 8]
+            ),
+            7
+        );
+        assert_eq!(mem.read_u32(cell).unwrap(), 7);
+        assert_eq!(
+            call_k32(
+                &mut env,
+                &mut mem,
+                "InterlockedCompareExchange",
+                &[cell, 9, 7]
+            ),
+            7
+        );
+        assert_eq!(mem.read_u32(cell).unwrap(), 9);
+
+        assert_eq!(
+            call_k32(
+                &mut env,
+                &mut mem,
+                "InitializeCriticalSectionEx",
+                &[cell, 4000, 0]
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn fiber_local_storage_keeps_a_value_per_index() {
+        let (mut mem, mut env) = env();
+        let a = call_k32(&mut env, &mut mem, "FlsAlloc", &[0]);
+        let b = call_k32(&mut env, &mut mem, "FlsAlloc", &[0]);
+        assert_ne!(a, b);
+        assert_ne!(a, TLS_OUT_OF_INDEXES);
+        assert_eq!(call_k32(&mut env, &mut mem, "FlsSetValue", &[a, 11]), 1);
+        assert_eq!(call_k32(&mut env, &mut mem, "FlsSetValue", &[b, 22]), 1);
+        assert_eq!(call_k32(&mut env, &mut mem, "FlsGetValue", &[a]), 11);
+        assert_eq!(call_k32(&mut env, &mut mem, "FlsGetValue", &[b]), 22);
+        assert_eq!(call_k32(&mut env, &mut mem, "FlsFree", &[a]), 1);
+    }
+
+    #[test]
+    fn the_module_handle_ex_calls_find_the_program_by_name_or_by_address() {
+        let (mut mem, mut env) = env();
+        let out = 0x0040_0200;
+        // A null name is the program itself.
+        assert_eq!(
+            call_k32(&mut env, &mut mem, "GetModuleHandleExW", &[0, 0, out]),
+            1
+        );
+        assert_eq!(mem.read_u32(out).unwrap(), 0x0040_0000);
+        // An address inside the program, or inside a loaded module.
+        let call = |env: &mut Env, mem: &mut Mem, addr| {
+            call_k32(
+                env,
+                mem,
+                "GetModuleHandleExW",
+                &[GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, addr, out],
+            )
+        };
+        assert_eq!(call(&mut env, &mut mem, 0x0040_0800), 1);
+        assert_eq!(mem.read_u32(out).unwrap(), 0x0040_0000);
+        let k32 = env.find_module_by_name("kernel32.dll").unwrap().base;
+        assert_eq!(call(&mut env, &mut mem, k32 + 0x2000), 1);
+        assert_eq!(mem.read_u32(out).unwrap(), k32);
+        // An address in no module fails and says so.
+        assert_eq!(call(&mut env, &mut mem, 0x0900_0000), 0);
+        assert_eq!(mem.read_u32(out).unwrap(), 0);
+    }
+
+    /// An image based where the allocator starts (0x01000000 is a common
+    /// base) must not be handed out as free memory: a stub that "allocates" it
+    /// writes over its own headers.
+    #[test]
+    fn the_search_for_free_space_steps_past_what_is_mapped_and_is_charged() {
+        // Pages mapped at the top of each window a 512 MiB request tries: the
+        // search jumps past each one instead of sliding over it a granule at
+        // a time, and pays for every page it looks at.
+        let (mut mem, mut env) = env();
+        let size = 512 << 20;
+        for top in [HEAP_BASE + size, HEAP_BASE + 2 * size] {
+            mem.map(top - 0x1000, 0x1000).unwrap();
+        }
+        env.take_bulk_bytes();
+        // Past the second one, no window of that size is left below the
+        // allocator's limit.
+        assert_eq!(
+            call_k32(&mut env, &mut mem, "VirtualAlloc", &[0, size, 0x1000, 4]),
+            0
+        );
+        let charged = env.take_bulk_bytes();
+        assert!(charged >= u64::from(2 * size), "charged {charged:#x}");
+        assert!(charged <= u64::from(4 * size), "charged {charged:#x}");
+        // A failed search does not move where the next allocation goes.
+        assert_eq!(
+            call_k32(&mut env, &mut mem, "VirtualAlloc", &[0, 0x1000, 0x1000, 4]),
+            HEAP_BASE
+        );
+    }
+
+    #[test]
+    fn virtual_alloc_ex_takes_the_process_handle_first() {
+        let (mut mem, mut env) = env();
+        let got = call_k32(
+            &mut env,
+            &mut mem,
+            "VirtualAllocEx",
+            &[0xffff_ffff, 0, 0x1000, 0x1000, 4],
+        );
+        assert_ne!(got, 0);
+        assert!(mem.is_mapped(got, 0x1000));
+    }
+
+    #[test]
+    fn an_allocation_is_not_placed_on_the_mapped_image() {
+        let (mut mem, mut env) = env();
+        mem.map(HEAP_BASE, 0x2000).unwrap();
+        let got = call_k32(&mut env, &mut mem, "VirtualAlloc", &[0, 0x1000, 0x1000, 4]);
+        assert_ne!(got, 0);
+        assert!(
+            got >= HEAP_BASE + 0x2000 || got + 0x1000 <= HEAP_BASE,
+            "allocated {got:#x} over the image"
+        );
+    }
+
+    /// A page `VirtualProtect` made read-only faults on a write and reports
+    /// itself as read-only to the next call; making it writable lifts that.
+    #[test]
+    fn virtual_protect_makes_pages_read_only_and_writable_again() {
+        let (mut mem, mut env) = env();
+        let (page, old) = (0x0040_0000, 0x0050_0000);
+        mem.map(old, 0x1000).unwrap();
+        assert_eq!(
+            call_k32(
+                &mut env,
+                &mut mem,
+                "VirtualProtect",
+                &[page, 0x1000, 0x02, old]
+            ),
+            1
+        );
+        assert_eq!(mem.read_u32(old).unwrap(), 0x40, "the default was writable");
+        assert!(mem.write_u8(page, 1).is_err());
+        assert_eq!(
+            call_k32(
+                &mut env,
+                &mut mem,
+                "VirtualProtect",
+                &[page, 0x1000, 0x04, old]
+            ),
+            1
+        );
+        assert_eq!(
+            mem.read_u32(old).unwrap(),
+            0x02,
+            "the previous protection comes back"
+        );
+        assert!(mem.write_u8(page, 1).is_ok());
     }
 
     fn trap_for(env: &Env, module: &str, name: &str) -> u32 {

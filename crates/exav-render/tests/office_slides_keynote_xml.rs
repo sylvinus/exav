@@ -1,20 +1,24 @@
 //! Keynote 1 to 5 documents (XML), over documents written here.
 
 use exav_render::slides::{Error, Format, Limits, convert, convert_keynote_package};
-use std::io::{Read, Write};
+use exav_unpack::package::Package;
+use exav_unpack::zip_write::{FileOptions, ZipWriter};
+use std::io::Write;
 
 fn part(pptx: &[u8], name: &str) -> String {
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(pptx)).unwrap();
-    let mut s = String::new();
-    z.by_name(name).unwrap().read_to_string(&mut s).unwrap();
-    s
+    let part = Package::from_bytes(pptx)
+        .unwrap()
+        .read(name, u64::MAX)
+        .unwrap()
+        .unwrap();
+    String::from_utf8(part).unwrap()
 }
 
 fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts = zip::write::SimpleFileOptions::default();
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = FileOptions::default();
     for (name, data) in files {
-        z.start_file(*name, opts).unwrap();
+        z.start_file(name, opts).unwrap();
         z.write_all(data).unwrap();
     }
     z.finish().unwrap().into_inner()

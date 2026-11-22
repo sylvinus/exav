@@ -784,3 +784,224 @@ fn object_streams_the_budget_cannot_hold_report_a_limit() {
     let (_, end) = walked(&pdf, Limits::default(), false);
     end.unwrap();
 }
+
+/// A Catalog-less file made of `objects`.
+fn pdf_of(objects: &[Vec<u8>]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    for object in objects {
+        pdf.extend_from_slice(object);
+    }
+    pdf.extend_from_slice(b"trailer\n<< /Root 1 0 R >>\n%%EOF\n");
+    pdf
+}
+
+/// The members of a document made of `objects`, in a Catalog-less file.
+fn members_of(objects: &[Vec<u8>]) -> Vec<exav_unpack::Entry> {
+    let mut budget = Budget::new(Limits::default());
+    extract(Format::Pdf, &pdf_of(objects), &mut budget).unwrap()
+}
+
+/// A value nested past the depth the parser reads is passed over as a null:
+/// the entries after it in the dictionary are read, and the stream is a member.
+/// The scan ends unscannable, naming the first object that had one.
+#[test]
+fn a_dictionary_nested_past_the_parser_depth_still_gives_its_stream() {
+    let deep = format!("/X {}{}", "[".repeat(100), "]".repeat(100));
+    let dict = format!("{deep} /Filter /FlateDecode");
+    let pdf = pdf_of(&[
+        stream_object(4, &dict, &flate(b"PLAIN-CONTENT")),
+        stream_object(5, &dict, &flate(b"OTHER-CONTENT")),
+    ]);
+    let (content, end) = walked_member(&pdf, Limits::default(), "pdf-obj-4-0");
+    assert_eq!(content.unwrap(), b"PLAIN-CONTENT");
+    let hit = end.unwrap_err();
+    assert!(hit.is_corrupt(), "{hit}");
+    assert_eq!(
+        hit.reason,
+        "PDF object 4: a value nested past 64 levels is not read"
+    );
+}
+
+/// The same for an object inside an object stream.
+#[test]
+fn a_value_nested_past_the_parser_depth_in_an_object_stream_is_reported() {
+    let deep = format!("<< /X {}{} >>", "[".repeat(100), "]".repeat(100));
+    let pdf = pdf_of(&[object_stream(1, &[(10, "<< /A 1 >>"), (11, &deep)])]);
+    let (_, end) = walked(&pdf, Limits::default(), false);
+    let hit = end.unwrap_err();
+    assert!(hit.is_corrupt(), "{hit}");
+    assert_eq!(
+        hit.reason,
+        "PDF object 11: a value nested past 64 levels is not read"
+    );
+}
+
+/// The harvest of scripts and links looks as deep as the parser reads: a
+/// script at the deepest level parsed is found, and one a level deeper is
+/// reported as not read by the parser.
+#[test]
+fn the_harvest_looks_as_deep_as_the_parser_reads() {
+    let nested = |levels: usize| {
+        format!(
+            "{}<< /S /JavaScript /JS (app.alert\\(1\\)) >>{}",
+            "[".repeat(levels),
+            "]".repeat(levels)
+        )
+    };
+    let object = |text: &str| format!("7 0 obj\n<< /A {text} >>\nendobj\n").into_bytes();
+    let walk = |levels| {
+        walked_member(
+            &pdf_of(&[object(&nested(levels))]),
+            Limits::default(),
+            "pdf-javascript",
+        )
+    };
+    let deepest = (1..100)
+        .take_while(|&levels| walk(levels).1.is_ok())
+        .last()
+        .unwrap();
+    assert!(deepest > 32, "{deepest}");
+    let (found, _) = walk(deepest);
+    assert_eq!(found.unwrap(), b"app.alert(1)\n");
+    let (none, end) = walk(deepest + 1);
+    assert_eq!(none, None);
+    let hit = end.unwrap_err();
+    assert!(hit.is_corrupt(), "{hit}");
+    assert_eq!(
+        hit.reason,
+        "PDF object 7: a value nested past 64 levels is not read"
+    );
+}
+
+/// A bare keyword inside an array or as the value of a key of a dictionary is
+/// read as a null, and the dictionary goes on after it.
+#[test]
+fn a_keyword_inside_a_dictionary_is_read_as_a_null() {
+    let dict = "/X [ stream endobj endstream ] /Y endobj /Filter /FlateDecode";
+    let entries = members_of(&[stream_object(4, dict, &flate(b"PLAIN-CONTENT"))]);
+    let content = member(&entries, "pdf-obj-4-0").unwrap();
+    assert_eq!(content.data, b"PLAIN-CONTENT");
+    assert!(content.unsupported.is_none(), "{:?}", content.unsupported);
+}
+
+/// The text of a stream that holds the `endstream` keyword.
+const WITH_KEYWORD: &[u8] = b"first part\nendstream\nsecond part";
+
+/// A stream whose `/Length` ends at an `endstream` keyword is that long, even
+/// when the keyword is also in its data.
+#[test]
+fn a_stream_is_as_long_as_its_length_says() {
+    let entries = members_of(&[stream_object(4, "", WITH_KEYWORD)]);
+    assert_eq!(member(&entries, "pdf-obj-4-0").unwrap().data, WITH_KEYWORD);
+}
+
+/// The same for a `/Length` that is a reference, to an object anywhere in the
+/// file.
+#[test]
+fn a_stream_is_as_long_as_the_object_its_length_names_says() {
+    let mut stream = b"4 0 obj\n<< /Length 9 0 R >>\nstream\n".to_vec();
+    stream.extend_from_slice(WITH_KEYWORD);
+    stream.extend_from_slice(b"\nendstream\nendobj\n");
+    let length = format!("9 0 obj\n{}\nendobj\n", WITH_KEYWORD.len()).into_bytes();
+    let entries = members_of(&[stream, length]);
+    assert_eq!(member(&entries, "pdf-obj-4-0").unwrap().data, WITH_KEYWORD);
+}
+
+/// A `/Length` that does not end at an `endstream` keyword is not used: the
+/// stream ends at the first one, as for a stream without a length.
+#[test]
+fn a_length_that_ends_elsewhere_is_not_used() {
+    let mut stream = b"4 0 obj\n<< /Length 12 >>\nstream\n".to_vec();
+    stream.extend_from_slice(WITH_KEYWORD);
+    stream.extend_from_slice(b"\nendstream\nendobj\n");
+    let entries = members_of(&[stream]);
+    assert_eq!(member(&entries, "pdf-obj-4-0").unwrap().data, b"first part");
+}
+
+/// Up to 256 bytes of PDF white space may stand between the bytes a `/Length`
+/// covers and `endstream`; with more, the stream ends at the first keyword.
+#[test]
+fn white_space_between_a_length_and_its_endstream_is_skipped_up_to_a_bound() {
+    let stream = |white: &[u8]| {
+        let mut out =
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", WITH_KEYWORD.len()).into_bytes();
+        out.extend_from_slice(WITH_KEYWORD);
+        out.extend_from_slice(white);
+        out.extend_from_slice(b"endstream\nendobj\n");
+        out
+    };
+    // Space, tab, CR, LF, FF and NUL.
+    let mixed: Vec<u8> = b" \t\r\n\x0c\x00"
+        .iter()
+        .copied()
+        .cycle()
+        .take(256)
+        .collect();
+    let entries = members_of(&[stream(&mixed)]);
+    assert_eq!(member(&entries, "pdf-obj-4-0").unwrap().data, WITH_KEYWORD);
+    let entries = members_of(&[stream(&[b' '; 257])]);
+    assert_eq!(member(&entries, "pdf-obj-4-0").unwrap().data, b"first part");
+}
+
+/// The scan goes on after the first `endstream` keyword, so an object defined
+/// in bytes that a `/Length` covers is read as well.
+#[test]
+fn an_object_in_the_bytes_a_length_covers_is_still_read() {
+    let mut data = b"first part\nendstream\n".to_vec();
+    data.extend_from_slice(b"7 0 obj\n<< /S /JavaScript /JS (app.alert\\(1\\)) >>\nendobj\n");
+    let entries = members_of(&[stream_object(4, "", &data)]);
+    assert_eq!(member(&entries, "pdf-obj-4-0").unwrap().data, data);
+    assert_eq!(
+        member(&entries, "pdf-javascript").unwrap().data,
+        b"app.alert(1)\n"
+    );
+}
+
+/// `data` as a PNG predictor writes rows of `row` bytes: every row is the
+/// difference to the one above it (tag 2).
+fn png_up(data: &[u8], row: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (y, line) in data.chunks(row).enumerate() {
+        out.push(2);
+        for (i, b) in line.iter().enumerate() {
+            let up = if y == 0 { 0 } else { data[(y - 1) * row + i] };
+            out.push(b.wrapping_sub(up));
+        }
+    }
+    out
+}
+
+const PREDICTED: &str = "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 4 >>";
+
+/// The data of a stream that is not an image has its predictor undone after
+/// the filter.
+#[test]
+fn the_predictor_of_a_stream_is_undone() {
+    let plain = b"ABCDEFGHIJKL";
+    let entries = members_of(&[stream_object(4, PREDICTED, &flate(&png_up(plain, 4)))]);
+    let content = member(&entries, "pdf-obj-4-0").unwrap();
+    assert_eq!(content.data, plain);
+    assert!(content.unsupported.is_none(), "{:?}", content.unsupported);
+}
+
+/// The samples of an image are left predicted: its decoder undoes the
+/// predictor.
+#[test]
+fn the_predictor_of_an_image_is_left_for_its_decoder() {
+    let predicted = png_up(b"ABCDEFGHIJKL", 4);
+    let dict = format!("/Subtype /Image /Width 4 /Height 3 /BitsPerComponent 8 {PREDICTED}");
+    let entries = members_of(&[stream_object(4, &dict, &flate(&predicted))]);
+    assert_eq!(member(&entries, "pdf-obj-4-0").unwrap().data, predicted);
+}
+
+/// A predictor with parameters that cannot be read leaves the bytes as the
+/// filter gave them and the member says so.
+#[test]
+fn a_predictor_that_cannot_be_read_is_reported() {
+    let dict = "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 0 >>";
+    let predicted = png_up(b"ABCDEFGHIJKL", 4);
+    let entries = members_of(&[stream_object(4, dict, &flate(&predicted))]);
+    let content = member(&entries, "pdf-obj-4-0").unwrap();
+    assert_eq!(content.data, predicted);
+    assert!(content.unsupported.is_some());
+}

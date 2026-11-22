@@ -219,6 +219,10 @@ describe("what the viewer can show", () => {
     expect(kind({ type: "application/zip", path: "x/talk.key" })).toBe("keynote");
     expect(kind({ type: "application/x-iwork-numbers-sffnumbers" })).toBe("numbers");
     expect(kind({ path: "x/budget.numbers" })).toBe("numbers");
+    expect(kind({ type: "application/vnd.apple.pages" })).toBe("pages");
+    expect(kind({ type: "application/x-iwork-pages-sffpages" })).toBe("pages");
+    expect(kind({ type: "application/zip", path: "x/notes.pages" })).toBe("pages");
+    expect(kind({ path: "x/notes.pages" })).toBe("pages");
   });
 
   it("claims the drawing and page layout formats, which are converted", () => {
@@ -260,7 +264,6 @@ describe("what the viewer can show", () => {
   it("leaves everything else to the browser", () => {
     expect(kind({ type: "application/vnd.ms-excel" })).toBeNull();
     expect(kind({ type: "application/vnd.ms-project" })).toBeNull();
-    expect(kind({ type: "application/x-iwork-pages-sffpages" })).toBeNull();
   });
 
   it("follows a link rather than drawing it", () => {
@@ -274,7 +277,7 @@ describe("what the viewer can show", () => {
     expect(kind({ path: "documents/plan.mpp" })).toBeNull();
     expect(kind({ type: "application/octet-stream", path: "documents/photo.jpg" })).toBe("image");
     expect(kind({ type: "application/octet-stream", path: "documents/notes.rtf" })).toBe("rtf");
-    expect(kind({ type: "application/octet-stream", path: "documents/notes.pages" })).toBeNull();
+    expect(kind({ type: "application/octet-stream", path: "documents/notes.pages" })).toBe("pages");
     // RTF is text, and typed so by some systems.
     expect(kind({ type: "text/plain", path: "documents/notes.rtf" })).toBe("rtf");
     // A picture named plan.pdf is a picture: the type is believed.
@@ -722,6 +725,9 @@ describe("a ZIP told by its members", () => {
     expect(await as("x.pdf", docx)).toBe("archive");
     // No way to read the end of the file: the name and the type decide.
     expect(await office.detectFile({ name: "x.zip", type: "" }, docx, docx.length)).toBe("archive");
+    // An archive's member is held whole: its end is there.
+    expect(await office.detectBytes("x.zip", docx, docx.length)).toBe("docx");
+    expect(await office.detectBytes("x.zip", docx.subarray(0, 100), docx.length)).toBe("archive");
     // And with no engine for the members.
     expect(await as("x.zip", docx, "", rust)).toBe("archive");
   });

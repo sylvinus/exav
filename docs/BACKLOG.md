@@ -24,8 +24,7 @@ is on exav.org.
 - **QR codes in PDF images, what is left**: the PDF reader describes every
   image (`Entry::raster`), and the raw, CCITT and JBIG2 ones (with their
   globals) are read. Said, not read (the scan is `PARTIAL`): the Lab,
-  Separation, DeviceN and other color spaces, the TIFF predictor, an Indexed
-  image over 8 bits, an image whose dictionary lacks `/Width`, `/Height`,
+  Separation, DeviceN and other color spaces, an Indexed image over 8 bits, an image whose dictionary lacks `/Width`, `/Height`,
   `/BitsPerComponent` or `/ColorSpace`. Not said: inline images (`BI ... EI`,
   not members), and a CCITT or JBIG2 stream the decoder reads leniently
   (garbage or a missing page information is a white image, a truncated stream
@@ -80,13 +79,23 @@ is on exav.org.
   encoded script past a page's first 4 MiB (the page reader could decode it,
   as clamscan's HTML normaliser does). The self-extractor check takes
   `PK\x03\x04` and `Rar!` without a header check.
+- **The formats page, what is left**: 34 formats have no file in the
+  repository the detection test can run, so only their magic is checked
+  (those not in its `FIXTURES` table); 29 have no specification link (no public document, or
+  only their source); the links to the Library of Congress for DNG, TIFF and
+  SWF, to libyal for GPT and to ECMA TR/112 for UDF stand in for the owners'
+  documents, whose sites refused an automated check.
+- **The registry's `magic` of video, audio and HEIF is read by nothing**: the
+  viewer opens them by extension and type (`detect.at` says `name`), and its
+  sniffer has none of those signatures, so its registry test skips them; the
+  `sniffs` of audio (`application/ogg`) has no code either. Either the viewer
+  types them by those bytes, or the entries drop them.
 - **One reader per format**: the compound file, the encrypted workbook, RTF,
   BIFF (records, workbook tables, formulas) and HTML are read once for the
   scanner and the converters ([ARCHITECTURE.md](ARCHITECTURE.md)). Left to
   extract into `exav-unpack`: the PowerPoint records and the Word FIB (the
   scanner reads them to find embedded storages and the encryption flag, the
-  converters to build the document), ZIP packages (the converters open them
-  with the `zip` crate and limits of their own), the XML trees, and the two
+  converters to build the document), the XML trees, and the two
   tables of code pages (AutoCAD's names for drawings, numbers for BIFF; both
   end in `encoding_rs`). Merging the three `limits.rs` of the converters into
   one budget is part of it. The scripts that generated the function table of
@@ -117,9 +126,6 @@ is on exav.org.
   not read; it needs a read at an offset of the (compressed) packed inode.
   Other filesystems worth a reader: XFS, Btrfs and F2FS (larger than any
   here), and squashfs before version 4.
-- **An Office package inside an archive, in the viewer**: a file is told by
-  its ZIP directory (`detectFile`), a member of an archive is not
-  (`detectBytes`), so a DOCX member named `x.zip` opens as a nested archive.
 - **DXF hyperlinks** (`PE_URL` xdata, groups 1001, 1000, 1002, 1071): the DWG
   reader feeds them to the text view and the phishing check
   (`Dwg::hyperlinks`); the DXF reader does not read them. The parse takes
@@ -133,10 +139,6 @@ is on exav.org.
   table. The bytecode PDF object table is built for every PDF when bytecode is
   loaded, before a program is known to run; for a streamed PDF that is a read
   of its own.
-- **Decoder oracle tests**: the LZFSE/LZVN and DCL differential tests against
-  Apple's lzfse and zlib's blast (`#[ignore]`d, built by
-  `crates/exav-unpack/tests/oracle/build.sh`) run on request only; a `make`
-  target and a place in the nightly campaign are not done.
 - **MHTML** (`.mht`, `.mhtml`): look into what exav does beyond typing it
   (`CL_TYPE_MHTML` in `crates/exav-core/src/filetype.rs`): extraction of
   parts, encodings, scripts, viewer support. To scope first.
@@ -174,16 +176,6 @@ holding the file is what recovery needs. The `exav-render` converters hold their
 document model, bounded by `max_memory`; they are the viewer's, not the
 scanner's, and are not part of this aim.
 
-- **The converters' fixed limits, decided: from `--max-object-bytes`.** The
-  scanner runs exav-render's converters for the text of DOC, XLS, PPT, iWork
-  and flat XML files, and sets only their memory (the smaller of
-  `--max-object-bytes` and 1 GiB). Their other limits are fixed: input
-  (512 MiB documents, 256 MiB sheets), cells (2,000,000 and 4,000,000),
-  paragraphs (5,000,000), sheets (4,096), one decompressed part (256 MiB). A
-  file past one has no text view and its scan is incomplete. They are to
-  follow the object limit, with no flags of their own: the input and part
-  sizes the limit itself, the counts in proportion to it, and the memory too
-  past 1 GiB.
 - **The text documents' model per footnote**: a flat ODT of 300,000 one-word
   footnotes takes 2.3 GB of memory (7.6 KB a note) and converts in time that
   grows faster than the notes do, from reading the model rather than from a
@@ -257,6 +249,12 @@ scanner's, and are not part of this aim.
   proxy from the environment the private-address filter sees only addresses
   written out; a check of the object by its digest, in place of the
   validators, for a server that gives none.
+- **Detection reads the end of most objects**: over a ranged source each is a
+  request of its own. Every bzip2 and xz file has its last 512 bytes read (a
+  DMG whose first block is compressed starts as one), and every object the
+  earlier checks do not type pays the DMG and VHD trailers (512 bytes) and the
+  search for a ZIP behind a prefix (the last 64 KiB). The place each format is found at is in
+  `formats/registry.json` (`detect.at`), checked by `format_registry.rs`.
 - **Read whole, rarely large**: ARJ, ZOO, ARC, ALZ, EGG, InstallShield Z,
   BinHex and uuencode. Each needs its own reader to take a source, and none is
   often past the limit.
@@ -272,7 +270,6 @@ scanner's, and are not part of this aim.
   Windows-made one), as is a `$MFT` in several extents.
 - **An encrypted Office package past the buffer limit** is reported as not
   decrypted; decrypting it as it is read would scan it.
-- **`--max-hole-bytes` has no exav-grep flag**: the default (64G) applies.
 - **WIM**: the directory tree (the names) is held whole under the buffer limit;
   without it the files are scanned under the names `wim-resource-N`. LZMS
   resources are reported, not read.
@@ -299,37 +296,39 @@ scanner's, and are not part of this aim.
   as the CAB reader itself is) with a call that returns the decoded part of a
   frame. Quantum's decoder reads zeros past its input, so a part of a frame
   would need its own end-of-input check first.
-- **Inno Setup, what is left**: data versions past 6.4.0.1 (6.4.3 has data
-  entries of 103 bytes, which innoextract does not describe; 6.5 and later),
-  files in a separate `setup-N.bin`, and encrypted files opened with the
-  installer's password. innoextract (zlib licence) is the reference; Inno
-  Setup's own source is under a licence exav does not read sources under.
+- **Inno Setup, what is left**: 7.1.1 and later, which innoextract's pull
+  request 210 does not cover (7.1.0 writes 7.0.2's setup data and is read;
+  the port takes the pull request's diff only, as its commit messages quote
+  Inno Setup's own source); a 6.5
+  `Encryption=full` installer is recognised from a crafted one only, no real
+  sample was at hand; files in a
+  separate `setup-N.bin`; encrypted files opened with the installer's
+  password; file names (members are `inno-file-N`). innoextract (zlib
+  licence) is the reference; Inno Setup's own source is under a licence exav
+  does not read sources under.
 - **Cuts inside a codec header** (a UPX file cut inside its first block, an EGG
   LZMA block cut inside its codec header) stay `Unscannable` on purpose: no
   byte of the stream is there to decode, and a packed file with none of its
   content examined is not reported as examined.
 - **xz checksum after a full block** counts as damage, because the decoder
   cannot tell whether more blocks follow.
-- **A tar hard link** is extracted by `exav-unpack` as an empty file; GNU tar
-  links it. The reader does not pass a hard link's target on
-  (`MemberMeta::link` is for symbolic links).
 - **Small gaps found by the wild-sample sweeps**:
   a UPX-packed DOS `.exe` (`upx -t` accepts it; exav's UPX reader covers PE and
   ELF); CHM overlays appended to PE files (PuTTY builds: 7-Zip lists them,
-  ClamAV does not scan overlays); an empty spreadsheet template (no table) reads as
-  "damaged: no sheets" instead of an empty workbook.
+  ClamAV does not scan overlays).
 - **JBIG2 symbol dictionaries** are bounded only by hayro-jbig2's own
-  65,535 × 65,535 symbol limit: the symbol sizes sit inside the compressed
+  1,048,576-symbol limit (0.4.0): the symbol sizes sit inside the compressed
   data, so they cannot be counted against the memory budget before decoding,
   and the crate has no budget setting. Regions are counted (fuzz finding,
   docs/FUZZING.md), and so is the symbol count of a dictionary (at most eight
   symbols a byte: one with its count changed in two bytes took 100 s and 7 GB),
   but a dictionary within that count can still cost seconds. Needs a budget
-  hook upstream or a pre-pass that bounds the dictionaries. hayro's main
-  branch has both, unreleased after 0.4.0: decoding stops on exhausted
-  arithmetic data (PR 1372; a file that took 36 s ends in 10 ms) and
-  `DecodeSettings::memory_limit` (PR 1789, 1 GiB by default). Recheck on its
-  next release.
+  hook upstream or a pre-pass that bounds the dictionaries. hayro-jbig2 0.4.0
+  has neither (its `DecodeSettings` has only `strict`): the 243-byte case
+  alone grows to a 6 GiB cap in 40 s (118 s with 0.3.1), and exav's pre-pass
+  ends it in 0.01 s. hayro's main branch has decoding stop on exhausted
+  arithmetic data (PR 1372) and `DecodeSettings::memory_limit` (PR 1789).
+  Recheck on its next release.
 - **Image decode time**, measured on a build with optimisations: JBIG2
   regions decode at about 230 Mpx a second when the data is empty (a few times
   slower on real data), JPEG 2000 at about 50 Mpx a second, and the grey
@@ -370,10 +369,8 @@ scanner's, and are not part of this aim.
   drawings gained a one-line CC0 comment at the top, seen 2026-11-15); the CAD
   files, the ISO and the encrypted archives are not byte-reproducible; the
   sidebar is long and wants collapsible sections; viewer gaps the examples
-  showed: `.pages` has
-  no matcher in `ts/core/formats.ts`, G3 fax TIFF is not decoded (G4 only),
-  Minolta MRW has no preview. No clean sample exists for Pentax PEF, Sigma X3F,
-  Phase One IIQ, Hasselblad 3FR, Samsung SRW, Kodak DCR, IWA Pages or a real OBJ.
+  showed: Minolta MRW has no preview. No clean sample exists for Pentax PEF,
+  Sigma X3F, Phase One IIQ, Hasselblad 3FR, Samsung SRW, Kodak DCR, IWA Pages or a real OBJ.
 - **Camera RAW**: the detection rule that makes a TIFF a RAW on a maker's name
   plus a SubIFD or thumbnail (opens old Sony SRF and Nikon scanner NEF); a
   default cap on the preview size in the viewer (today up to about 67 Mpx);
@@ -383,26 +380,29 @@ scanner's, and are not part of this aim.
   viewport), an external file resolver (xrefs, images); 46 DWG oracle
   differences left unexplained (36 MULTILEADER context scales in sample
   0e74f0aa, DWG-only material dictionaries in edf22e18); 3D is out of scope.
-- **PE emulator**: TELock (11 samples, needs a trace on real Windows, see the
-  Windows VM item), Yoda's Protector, and the `PROGRESS_WINDOW` tuning.
+- **PE emulator**: TELock (11 samples: its integrity check shows a message
+  box and exits; needs a trace on real Windows, see the Windows VM item);
+  Yoda's Protector (12: a loop that writes nothing new); MEW and RLPack (whole
+  images, but the start of the program is not recognised); the start of
+  WinUpack (2 of 12), Neolite and JDPack (1 each) is missed, and JDPack's
+  image too; Eronana (a write fault at `0xfffffffc`: 6 whole images, no
+  start); Amber runs its program from memory it allocated, so the image comes
+  back as an allocation member and its start is not recognised; `wsprintfA`
+  formats nothing; FSG is not named by the packer table on the corpus's
+  samples (their members are `runtime-`); the emulator's memory (64 MiB) and
+  dump (32 MiB) caps are constants.
 
 ## Viewer
 
 - **The host and its frame, from a review before 0.0.3**:
-  - A file of the tree opened from a URL or `resolve`, whose size is not
-    known, is downloaded whole before `TREE.maxFileBytes` is checked
-    (`fetchFile`). Decided: the download is capped (the source reader and
-    `http.ts`), and a file that reaches the limit is refused.
   - The lists a frame sends (archive members, warnings) have a cap per field
     and none on the total or the rate.
-  - A `controllers` message with one value the host refuses is dropped whole,
-    where its comment says the known keys are kept: a DXF's warnings with a
-    long name do that.
-  - An `open` or `replace` whose file the frame refuses is never answered, and
-    a `replace` that never settles holds every later one.
-  - A second `ready` sends `open` again and gives document 0 its reads back.
-  - `confirmLink` is given the mounted file after a `replace`.
-  - `AbortSignal.any` is used where the browser floor may not have it.
+  - A `controllers` message with one value the host refuses is dropped whole.
+    The frame fits what it sends to the limits (`fitSnapshot`: names cut, an
+    item with an id too long to name back left out); the archive members and
+    the info counts are checked as they are.
+  - A `replace` the frame never answers holds every later one: a frame that
+    keeps to the protocol answers each, refused ones included.
 - **DWG picture export, what it leaves open**: a single viewport of a paper
   layout cannot be addressed (the scene data on the TS side holds no viewport
   transform, clip or frozen-layer list: it needs a viewport table in
@@ -453,42 +453,14 @@ scanner's, and are not part of this aim.
   claims itself, so that a file looks the same everywhere. Drawing it with
   `<img>` where the browser can, as for the formats browsers draw, would spare
   those users the 540 KB the module grew by (1.1 to 1.65 MB).
-- **`mailto:` links, decided**: the host's link check (`linkTarget`) accepts
-  `mailto:` and asks before opening the mail program; the frame still cannot
-  open one itself. Today a Markdown `mailto:` link shows as its label with the
-  address beside it, not clickable.
-- **One set of hidden characters, decided**: names and text hide the
-  characters that reorder or hide text in six places, each with its own copy;
-  the Markdown link targets (Rust and TypeScript) and the text view miss
-  U+061C, U+200E and U+200F. The TypeScript copies are to take a table
-  generated from Rust's (`exav-unpack` `tree/name.rs`) at build time; how each
-  place shows one, and the text view's tab, LF and CR, stay as they are.
-- **One viewer default per ZIP limit, decided**: the gate (`core/detect.ts`),
-  the archive plugin (`archive/renderer.ts`) and the Office plugins each have
-  their own default for the members and bytes of a ZIP (20,000 and 5,000
-  members), so a plain ZIP of 5,001 to 20,000 members passes the gate and fails
-  in the archive view. One table of viewer defaults that every step reads:
-  20,000 members and 512 MiB extracted, below the scanner's (a browser tab has
-  less memory), and said so in the viewer's docs.
-- **Which converter a text document goes to, decided: per format, the other
-  as the fallback.** The package's plugins take a `converter` each; the
-  frame's one `conversion.converter` is to take one entry per format too
-  (`{ doc: "exav", odt: "external" }`; one word still means every format).
-  Whichever goes first, a file it cannot read goes on to the other when both
-  are there: today with `"exav"` a file exav recognises and cannot read
-  (Pages '09, Word 1 and 2) fails, and with `"external"` a file the external
-  converter refuses is not handed to exav. Nothing chosen stays as it is:
-  text documents to the external converter when one is installed.
-- **Tracked changes in Word 2003 XML, decided: the markup view, as DOC.** The
-  DOC reader strikes deleted text through and underlines inserted text, in
-  dark red (`doc/story.rs`); the Word 2003 XML reader leaves deleted text out
-  (`wml/mod.rs`). It is to show what the file holds, as DOC does.
+- **`mailto:` links in PDF files**: a Markdown `mailto:` link opens the mail
+  program (through the host's question in the frame); a PDF's is not a link
+  (`readLinks` keeps http and https addresses).
 - **Text previews**: line numbers, a collapsible JSON and XML tree, search in the file, reading only the first
   2 MiB of a URL source (the source reader has no prefix read), per-record
   `.jsonl` formatting, GFM task lists and bare-URL autolinks, and refusing a
   binary file named `x.txt` at detection rather than at open.
-- **3D models**: glTF triangle strips and fans, `KHR_mesh_quantization`, Draco
-  and meshopt (counted as unsupported today); PLY point clouds drawn as points
+- **3D models**: glTF triangle strips and fans, Draco and meshopt (counted as unsupported today); PLY point clouds drawn as points
   (refused today); OFF and 3MF; smooth normals for OBJ and PLY files without
   them; detecting the up axis of OBJ and PLY (Y up is assumed); a model-specific
   error message in the viewer. The `mesh` fuzz target is in the nightly
@@ -496,11 +468,20 @@ scanner's, and are not part of this aim.
 - **Which PDF reading is the scanner's, decided: a differential test first.**
   The scanner takes a PDF's members (embedded files, the streams signatures run
   on, JavaScript) from exav-unpack's PDF parser and its visible text (link and
-  text checks) from hayro-syntax, and the viewer draws it with pdf.js. A PDF
-  the two parsers repair differently gives members from one reading and text
-  from the other. A test and a fuzz target are to run each PDF through both
-  and compare the objects and streams each finds; moving either reading waits
-  for what they show.
+  text checks) from hayro-syntax, and the viewer draws it with pdf.js. The
+  test `pdf_readers_diff` and the `pdf_readers` fuzz target run each PDF
+  through both and compare the streams (by number, with their decoded bytes),
+  the script and link strings, and whether the file opens. The repository's
+  40 PDFs agree except three image-only files hayro refuses (no page tree).
+  On damaged variants exav-unpack's parser now reads what hayro reads, and
+  the test's `REPAIRS` table records what is left: hayro drops streams
+  exav-unpack emits (an array left open, a malformed hex string, nesting past
+  64), so the text of those files is not read while their bytes are scanned,
+  and exav-unpack keeps the bytes of a last partial predictor row that hayro
+  drops. Open: a value nested past the depth bound is passed over with no
+  note on the member (a script or link inside it is not harvested), and
+  white space other than one end of line between a `/Length` end and
+  `endstream` falls back to the first `endstream`.
 - **hayro instead of pdf.js** once it supports encrypted PDFs, blend modes and
   knockout groups: the PDF path would be Rust end to end. Compare pixel output
   against pdf.js on a corpus first.
@@ -552,8 +533,10 @@ scanner's, and are not part of this aim.
     `antialias: true` or `preserveDrawingBuffer: true` it is shown. The CAD
     renderer needs `antialias: false` (its strokes antialias in the shader).
     Seen only in the headless WebKit build Playwright ships for Linux, on
-    software rendering; not checked on Safari or a GPU, so whether a user
-    sees it is open (`cad.spec.ts`, not run in WebKit, shares the cause).
+    software rendering: Safari on a Mac draws the demo's `potsdam.dwg`
+    (checked 2026-11-19), so it is the test browser's, not users'. The CAD
+    specs could run in WebKit with a GPU, or on macOS runners
+    (`cad.spec.ts`, not run in WebKit, shares the cause).
   - The other specs have not been tried in Firefox and WebKit.
 - **The Office converters' routing sniffers in Rust**: a compound file's
   streams, a ZIP's members and PowerPoint 2 to 4 are told by `officeKinds` of
@@ -600,45 +583,39 @@ scanner's, and are not part of this aim.
   same metrics it is wrapped with (`dwg/metrics.rs`; glyphs are placed with the
   browser's advances today). Costs a font parser, a rasterizer and brotli for
   WOFF2, and a CJK fallback; list the crates against an in-tree reader first.
-- **The sandboxed host and the frame's navigation**: the host could fail a
-  session on a `securitypolicyviolation` of `frame-src` or `child-src` and
-  ping the frame after `ready`; the navigation e2e could cover a 204 answer and
-  a response that never ends.
+- **The frame's navigation e2e** could cover a 204 answer and a response that
+  never ends (routes in `frame.spec.ts`; the ping ends a frame whose new
+  document never answers).
 
 ## CI
 
-- **No build path in a released file (blocks the next release).** The 0.0.3
-  npm packages were built on a workstation, and their `.wasm` files hold its
-  home directory: the cargo registry's path in panic locations, and in the
-  viewer's the checkout's too (exav-render, exav-unpack). The release
-  workflow's files hold the runners' (`C:\Users\runneradmin`, `/Users/runner`,
-  `/home/runner` in the WASI module); the musl builds, and so the images, only
-  the `/cargo` of `cross`. To do:
-  - every build of a released file maps `$CARGO_HOME` and the checkout to
-    fixed names (`--remap-path-prefix`; Cargo's `trim-paths` once it is stable
-    in the MSRV);
-  - a gate, in `scripts/release.sh` and in the release workflow before any
-    upload, refuses a crate, npm tarball, binary, WASI module, image or chart
-    that holds an absolute path of the machine that built it (`/Users/`,
-    `/home/`, `C:\Users\`, the checkout, `$CARGO_HOME`);
-  - npm and the release carry the same bytes: the npm packages published from
-    the tarballs the release workflow builds (the viewer's to add), or the
-    Rust and wasm-opt versions pinned for every wasm build.
-- **Two native tests time a debug build.** `the_cpu_limit_is_per_job_not_per_worker`
-  (`exav/tests/daemon_client.rs`) gives a scan of 8 MiB of random bytes
-  `--max-scan-secs 1`, and its first job passed it once under a full
-  `make test-native` beside a fuzzing campaign. The DWG
-  `a_long_paragraph_of_several_runs_is_wrapped_in_linear_time` asserts 500 ms:
-  130 to 200 ms alone, 531 ms once under a full `make test-native`.
-- **`markdown.test.ts` "bounds the work and the page for long table" is near
-  its time.** 2.3 s alone on a busy arm64 host, of the 3 s it asserts and the
-  5 s test timeout, which it passed under a full `make test-viewer` beside a
-  fuzzing campaign.
-- **The frame host's tests wait set times**: `ts/frame/host.test.ts` waits
-  a fixed `tick(n)` before 36 expectations on steps that run in a worker. One
-  failed under the full suite's load once the detection took one more
-  asynchronous step, and now waits for its answer (`vi.waitFor`); the others
-  are to follow.
+- **Build paths in released files, what is left.** The remap
+  (`scripts/build-flags.sh`) and the gate (`scripts/check-build-paths.py`)
+  are in place; the release workflow's viewer steps and the Windows and
+  cross/musl legs of the remap have not run yet (check the first tag's run).
+  `@silurus/ooxml`'s `docx_parser_bg.wasm`, `pptx_parser_bg.wasm` and
+  `xlsx_parser_bg.wasm` hold their CI runner's cargo registry path, and
+  pdf.js's worker names a virtual `/home/web_user`: the gate lists those four
+  with `--except` (release.yml, `scripts/stats.py`). Cargo's `trim-paths` in
+  place of the remap once it is stable in the MSRV. The Dockerfile's own
+  build, used by the CI smoke test only, is not remapped.
+- **A daemon test's one failure under load is not explained.**
+  `the_cpu_limit_is_per_job_not_per_worker` (`exav/tests/daemon_client.rs`)
+  gives each job `--max-scan-secs 1`, and its first job passed it once under
+  a full `make test-native` beside a fuzzing campaign. A job, now of 2 MiB
+  rather than 8, uses under 10 ms of CPU in a debug build (measured), so the
+  scan itself is not near the limit; what took the second, if it happens
+  again, is to be looked at in the worker (its start, the database load).
+- **Two browser tests failed once under load**, beside a debug build on a
+  three-core machine (2026-11-19), and pass alone in both modes:
+  `meshes.spec.ts` "house.obj has the house's thirty triangles" in the frame
+  (the 60 s test limit reached while it waits for the picture to settle) and,
+  in WebKit, `selection.spec.ts` "visit.pptx, a line dragged across" (the
+  next line selected: the drag ran before the layout settled). The GLB of
+  the all-files check did the same on 18 November.
+- **`markdown.test.ts` bounds the other inputs' work by a fixed 3 s** each,
+  which a loaded host could reach; the long table, the slowest (2.3 s alone),
+  is timed against half of it instead.
 - **Delete the viewer e2e diagnostics** (`screenshot: "only-on-failure"` in
   `crates/exav-viewer/playwright.config.ts` and the `viewer-e2e-results`
   upload step in `.github/workflows/ci.yml`) once the three PDF tests that
@@ -652,9 +629,6 @@ scanner's, and are not part of this aim.
   Until then `scripts/release.sh` adds them to the five packages with a
   binary at publish time, so those are published with `--allow-dirty` and
   their `.cargo_vcs_info.json` says `"dirty": true`.
-- **Two manifest warnings of cargo 1.100**: `workspace.package.categories` is
-  inherited by no package, and exav's `homepage` is the same URL as its
-  `documentation`.
 
 ## Robustness
 
@@ -688,81 +662,19 @@ scanner's, and are not part of this aim.
   scan, which scans what is there. The local sizes cannot be trusted as the
   central directory's are, which is why the rule exists; telling the two
   apart is left.
-- **An XDP's chunk in a CDATA section, or with a comment in it, is not
-  decoded.** The chunk is read by a byte scan that resolves character
-  references; an XML reader also reads a CDATA section's text and drops
-  comments. The XDP is `UNSCANNABLE` then. The same scan reads only UTF-8
-  (an XDP in UTF-16 is not typed XDP), finds `<chunk>` without a namespace
-  prefix, and copies a chunk's text before it checks the budget (bounded by
-  the input).
-- **The buffer entry points do not apply `max_scan_size` or the object
-  limit.** `analyze` and `analyze_all_with_outcome` scan a slice of any
-  length whole, where `scan_seekable` reports the same bytes over
-  `--max-input-bytes` or reads them through the block cache; the doc of
-  `ScanOptions::max_scan_size` says otherwise. The CLI and the daemon use the
-  seekable functions; a library caller of `analyze` gets the other answer.
-- **At the depth limit, what a bytecode unpacker made ends its object's
-  scan.** `scan_unpacked` returns the depth limit at once, and the checks
-  after it (carving, DLP, phishing, Authenticode, TLSH, the import hash) do not
-  run on that object; the payload paths keep such a limit aside and go on.
-- **The clamd listener, from a review before 0.0.3** (none is a clean reply
-  for a file that was not scanned):
-  - Past `MAX_DRAIN_BYTES` the reply's `file size` is what was read, not the
-    stream's size.
-  - `CONTSCAN` passes over symbolic links, FIFOs, sockets and devices with no
-    line; a root path of that kind answers `OK`.
-  - A walked file whose name is not UTF-8 is opened by its lossy name, which
-    fails (`ERROR`).
-  - `ALLMATCHSCAN` of a directory does not join multi-volume sets, which
-    `CONTSCAN` does.
-  - Some errors close the connection with no reply line (a command that is not
-    UTF-8 or too long, an I/O error of an `INSTREAM` spill).
-  - Descriptors passed with `SCM_RIGHTS` are kept until the connection ends,
-    with no cap.
-  - `CONTSCAN` replies are written once the walk ends: in the pool, the job's
-    alarm loses the detections already made.
-  - The stream verbs have no `catch_unwind` where `SCAN` and `FILDES` do.
-- **`--max-hole-bytes` defaults to the matcher budget or below.** The holes
-  of sparse files in an image are handed over as zeros up to 64G across the
-  image, far past `--max-matcher-bytes` (10G), and making them costs time
-  whatever the image's own size. Decided: the default goes down, its number
-  from a measure of what real sparse images need (VM disks, the corpus), so
-  a real one is still read whole. The fuzz targets of images now set a small
-  one, as their other budgets are.
-- **A self-extractor's stub is not read as its packer.** An executable typed
-  as a self-extractor is read as its archive, and its UPX or packer reading
-  does not run. Typing it as the packer instead (the scanner then carves the
-  archive) was tried for 0.0.3 and gave false partials on installers whose
-  stub exav does not unpack or only looks packed, and lost the archive of a
-  large one and of the walks that carve nothing. A second reading of the stub,
-  in the scanner, keeping only a detection, is what is left.
-- **A container that ends in a limit or a stop drops the reasons kept
-  before it.** `walk_members` reads the reasons only when the walk completed,
-  so an encrypted member followed by a limit is `LIMITS-EXCEEDED`, not
-  `PASSWORD-PROTECTED`, against the precedence the reasons fold by.
-- **`exav-unpack -r` says nothing of a container member that decoded only in
-  part and was opened.** Its members are extracted and the exit status does
-  not change; exav-grep reports the same node (`Grep::leave`).
-- **Two charges of the scan budget too many.** A member read in place that is
-  its whole container is charged and then declined (`intake.rs`), and a part
-  of a set that did not join is charged when read and again when visited.
-  Either can only bring a limit sooner.
-- **`Cx::derived` returns before the reason of a capped kind when nothing was
-  found.** No caller passes such a kind today (the scanner reads the base64
-  kinds itself).
-- **`ScanOptions::structured_cc_count` or `structured_ssn_count` at
-  `Some(0)` makes every text a detection**, as `count >= 0` always holds. The
-  CLI takes 1 or more (`--dlp-credit-cards`, `--dlp-ssns`); the library does
-  not check.
+- **XDP, what is left**: the chunk scan reads only UTF-8 (an XDP in UTF-16
+  is not typed XDP), finds `<chunk>` without a namespace prefix, and copies a
+  chunk's text before it checks the budget (bounded by the input).
+- **XFS and btrfs images are not opened**: typed `data`, their files unread,
+  the scan `OK`.
+- **A self-extractor's stub packed by another packer than UPX** is not read a
+  second time: the UPX stub is (`scan_sfx_stub`, keeping only a detection),
+  the runtime packers `PePacked` reads are not. Under `--clamav-compat` a
+  UPX-packed PE32+ is unpacked, stub or not, where clamscan 1.4.3 leaves it
+  packed.
 - **`read_member` skips a member whose bytes are its container's.** A
   `Container:`-scoped signature cannot fire on that copy. Contrived, and the
   copy is scanned as the container.
-- **Limits set from a `u64` use `as usize` in the volume-set functions.** On
-  wasm32 a limit above 4 GiB wraps to a small one, which fails closed
-  (`Unscannable`). `usize::try_from` with a saturating fallback would say what
-  is meant.
-- **Word's `{\rt` as RTF.** exav types RTF by `{\rtf` at offset 0 only; whether
-  Word opens `{\rt` and what follows is untested.
 - **The saturation sweep leaves JPEG XL out**: exav-render's tests build the
   published zenjxl-decoder 0.3.10, which sizes a section's buffer by the length
   the file declares (a gigabyte for one header). The viewer's copy has
@@ -775,10 +687,6 @@ scanner's, and are not part of this aim.
   `GET /metrics` in the Prometheus text format and `GET /healthz` from the
   health child, so Kubernetes has a native probe and Prometheus a scrape
   target without touching the scan path.
-- **`make stack-frames` in CI.** The audit of release frames runs by hand. It
-  needs a release build of `exav` and of the `exav-render` nesting test (about
-  two minutes), which the `test` job does not otherwise make; a job of its own
-  after `msrv` would run it on every push.
 - **Nesting sweeps for the formats with no fixture or no tool here.** The
   `nesting` suites build their documents by hand or with `zip`, `7z`, `tar`,
   `cpio`, `ar`, `mksquashfs`, `genisoimage`, `gcab`, `gzip`, `bzip2`, `xz`,
@@ -807,19 +715,19 @@ scanner's, and are not part of this aim.
   qemu emulation) would compare each field with its API and confirm the
   emulator's layout. The x86 CONTEXT layout `run.rs` builds for exception
   dispatch is unverified too and could be checked the same way.
-- **Several listeners on one protocol, decided.** Two `--listen` addresses
-  on one protocol are refused today (`endpoint::listeners_of`: "both serve
-  icap; give one"), where clamd serves a Unix socket and TCP at once
-  (`LocalSocket` with `TCPSocket`, `TCPAddr` repeated). Every address is to be
-  served, each with the settings on its own address: in the worker pool each
-  worker waits on all the clamd sockets, and ICAP gets one child per address.
+- **Two names for one machine** (`localhost:p`, `127.0.0.1:p`) are not seen as
+  one address by the duplicate check of `--listen` and `--listen-health`; the
+  bind reports the port in use.
+- **`?max-connections=` on a clamd address under the pool** is not read: the
+  worker count bounds the connections over all the addresses. Counting per
+  address would need the count in the memory the workers share.
 - **ICAP `lingering_close`** reads up to 4 MiB with the per-read timeout after
   a connection ends by idle timeout.
-- **Pool workers end on any accept error that is not a lost race.** The worker
-  logs `worker accept error`, exits and is respawned, so an out-of-descriptors
-  error costs a fork where the in-process listener pauses and retries.
-- **The accept error list is Unix only.** On Windows an out-of-descriptors
-  error (`WSAEMFILE`, `WSAENOBUFS`) still ends the in-process clamd listener.
+- **Names that are not UTF-8, still as text** on the clamd side: the archive
+  name in a split set's `(in <set>)` (exav-core takes a set's names as
+  `String`; the parts themselves are opened and named by their bytes), a walk
+  error's reason, and the client's labels for `--send-as contents|fd`, stdin
+  and `EXINSTREAM MULTI`.
 - **The HTTP client resolves a host on a thread of its own** (ureq, for its
   timeout). One stuck in `getaddrinfo` past the 300 s timeout of the initial
   `--auto-update` fetch would still be running when the updater child and the
@@ -846,36 +754,53 @@ scanner's, and are not part of this aim.
   header.
 - **An MZ file with a PE signature whose headers do not parse** is read as not
   a PE (reported by `--detect broken` only).
-- **YARA's `dotnet` offsets against yara-x 1.23**: yara-x gives
-  `dotnet.field_offsets` and `resources[].offset` as file offsets converted
-  from their RVAs; exav gives the values as stored. The module's tests compare
-  with yara-x 1.19.0, not yet checked for the same.
+- **YARA rules yara-x 1.23 compiles and exav refuses**: `.len()` on a module
+  string (`pe.sections[0].name.len()`), `dotnet.resources[].length`,
+  `dotnet.assembly.culture`, `dotnet.typelib` and `dotnet.classes`. Each is a
+  compile error, not a wrong answer.
+- **YARA `pe` on a file with more than 96 section headers**: yara-x reads at
+  most 96 (`pe.number_of_sections` 96 where the header says 259), and only
+  those whole in the file; exav gives the header's count. Settled by the
+  shared PE reader (U4).
+- **The exav-core tests without default features** do not pass clippy
+  `-D warnings`: unused ZIP writer imports in `tests/suites/import_hash.rs`,
+  `nesting.rs` and `size_caps.rs`, left by the move to exav's own writer.
+- **YARA `elf.telfhash()` follows a yara-x TLSH quirk**: the first and third
+  quartiles stay 0 for about one input in 20, where the TLSH reference gives
+  another digest; revisit if yara-x changes it.
 - **YARA's step budget counts nodes, not the bytes a node reads**: `math.*` and
   `hash.*` over a range, and string operators on module strings, are one step
   each. Digests are not cached per scan, so N rules with
   `hash.md5(0, filesize)` read the object N times.
 - **A YARA pattern past a million matches** makes the scan `LIMITS-EXCEEDED`
   unless a rule matched, where yara-x keeps the first million and answers.
-  One a rule uses at one offset only is looked for there alone, as yara-x
-  does; one used at two offsets (`$a at 0 or $a at 2`), counted or
-  unanchored, still reaches it (`{ 00 00 }` in a file of zeros). The reason
-  does not name the rule or the pattern. Decided for the next cycle: the
-  verdict stays, and the reason names the rule and the pattern ("YARA rule R:
-  pattern $v1 has more than 1,000,000 matches"). yara-x also anchors a
-  pattern used bare beside an `$a at K` that the whole condition needs
-  (`$a and $a at 0`, `all of them and $a at 0`), and takes any constant
-  expression as the offset; exav anchors only when every use names the
-  offset as a number.
+  The reason names the rule and the pattern. One a rule uses at one offset
+  only is looked for there alone, as yara-x does; one used at two offsets
+  (`$a at 0 or $a at 2`), counted or unanchored, still reaches it
+  (`{ 00 00 }` in a file of zeros). yara-x also anchors a pattern used bare
+  beside an `$a at K` that the whole condition needs (`$a and $a at 0`,
+  `all of them and $a at 0`), and takes any constant expression as the
+  offset; exav anchors only when every use names the offset as a number.
 - **`--max-regex-steps` is a count of steps, not time**: on 6,921 corpus
   objects with the full ClamAV database its default moves none to `PARTIAL`
   (462 s against 535 s with `off`). Left: whether a signature whose prefilter
   passes on a 100 MB object is worth a start-position skip (the VM makes one
   backtrack per offset).
-- **The JavaScript normaliser renames every identifier, from `n001`**; clamscan
-  1.4.3's renames the declared ones (`var` names, function names and
-  parameters), from `n000`, and keeps the others as written. A signature written
-  against clamscan's normalised script that names one does not match exav's
-  view.
+- **The JavaScript normaliser still differs from clamscan's** (1.4.3, as a
+  black box) on `eval`: clamscan unrolls one level and folds nothing in the
+  unrolled text, drops the `;` after the call and the last name or number of
+  the text, does not join the strings of an unrolled `eval` with the strings
+  around it, and numbers the names declared in the text after the rest of
+  the script (exav unrolls to 32 layers and folds inside); on `unescape` of
+  an argument that is not one string literal (clamscan loses a `)`); on
+  non-ASCII and control bytes outside strings and the `\n`, `\t`, octal and
+  `\u{..}` escapes in strings; on the extent of a page's scripts (an HTML
+  comment hides the `script` elements in it for clamscan, and the last word
+  of a script with no `</script>` is lost); and in the numbering of declared
+  names inside a function expression of a large script (pdf.js's worker,
+  from its first 16 KB). Renaming as clamscan does costs a minified script
+  about a quarter more time (0.49 s to 0.61 s for 1.26 MB). The decoding
+  mode (`String.fromCharCode`, `decodeURI`, nested `unescape`) is exav's own.
 - **Constants that are not limits yet**: the header detection window
   (`DETECT_HEAD`, 4 MiB + 1 KiB) and `RAR5_MAX_HEADER`; NTFS's most runs read
   from one run list (65,536), references followed in an attribute list
@@ -885,9 +810,9 @@ scanner's, and are not part of this aim.
   (64 KiB), the library default, which differs from the scanner's 1 MiB, and
   the JavaScript normaliser's output (`jsnorm::MAX_OUTPUT`, 32 MiB), past
   which the scan of a page or script is marked incomplete (a plain 40 MB HTML
-  page is PARTIAL). Each wants a field, a flag and `off`.
-- **UDF and ISO at the member limit** end the walk without visiting the members
-  they had enumerated first.
+  page is PARTIAL), with its mark buffer (`jsnorm::MAX_BUFFER`, twice that)
+  and the `String.fromCharCode` values it holds (8 Mi), which follow it. Each
+  wants a field, a flag and `off`.
 - **Email past `--max-object-bytes`: attached messages are one part.** A
   `message/rfc822` part is handed over as its raw bytes and reported, not taken
   apart as it is in memory (`email_stream.rs` `by_parts`); the scanner takes it
@@ -924,8 +849,11 @@ scanner's, and are not part of this aim.
   clamscan; a per-codec switch has to live in the readers.
 - **7z**: the first CRC'd member of an encrypted folder is decoded twice (to
   choose the password, then to scan).
-- **RAR**: a truncated last volume of a RAR5 set makes the set unjoinable,
-  where joining the volumes before it would scan what they hold.
+- **RAR sets, what is left**: the join does not read the end block's
+  "another volume follows" flag, so a set missing its last volume whose last
+  given volume ends between members joins as whole; and a compressed member
+  that goes on in a volume not given is reported, not decoded as far as it
+  goes (the reader skips members flagged as continuing).
 - **Limits that still end a walk from the outside**: `Member::into_bytes` and
   `read_entry` (what `extract` and `@exav/unpack-wasm` read a member with)
   end the walk at a member over the object limit; the EROFS physical cluster
@@ -946,24 +874,10 @@ scanner's, and are not part of this aim.
 - **Members the scanner skips that the readers emit**: an MBR entry from sector
   0 and a Mach-O slice from offset 0 are the container itself; skip them in the
   readers.
-- **Buffers that double**: the `zip` crate's Reduce decoder (ZIP methods 2 to
-  5) drops what it decoded in a read that ends in an error (report it
-  upstream, or read it in small pieces, so the bytes before the damage are
-  scanned); exav-render reads office parts, escher blobs, OLE streams and TIFF
-  strips with `take(max).read_to_end`, which doubles the buffer up to twice
-  the limit: use exav-unpack's stepped read.
-- **`ModuleCtx::build` reads a streamed object whole** for `import "pe"` even
-  when it is not a PE.
-- **Numbers table merges**: `push_merge` is quadratic in the merges, and
-  `merge_owners` is neither capped nor charged.
-- **ODF style resolution**: `Props::get` is a linear search, duplicate
-  attributes are kept, and a style that names itself as its parent is followed
-  33 times. Stop at a repeated name, drop duplicates, and cache the resolved
-  styles.
-- **ICO `decode_largest`** may decode up to 512 entries, each copying the rest
-  of the file.
-- **ODT and Pages list styles** hold nine levels per style that are not
-  charged to the memory limit.
+- **Buffers that double**: exav-render's vendored TIFF decoder reads strips with
+  `take(n).read_to_end`, which doubles the buffer up to twice the strip (the
+  `image` feature builds without exav-unpack's `read_capped`, which the
+  office converters use).
 
 The arithmetic audit (kept outside the repository; its row names are used
 below) found about a hundred sites where a header's number is added
@@ -1033,6 +947,37 @@ Open:
 
 ## Dependencies
 
+- **Zero `unsafe` in exav-core's shipped tree.** Counted on 2026-11-19 in the
+  expanded source of what each target compiles, default features: 3,626
+  keywords in 49 crates on x86-64 Linux (3,160 on ARM64 Linux, 3,222 and 3,834
+  on macOS ARM64 and x86-64, 3,628 on Windows). Zero holds for exav-core as a
+  library: `[patch]` and build flags reach exav's own binaries only, not
+  exav-core taken from crates.io, so they may make the binaries faster but do
+  not count. A crate that only declares C functions (plain `extern` blocks) is
+  accepted, since a call to one needs `unsafe` and no other crate has any; the
+  count then also takes what the compiler's `unsafe_code` lint flags without
+  the keyword in edition 2021 code (`#[no_mangle]`, `#[export_name]`,
+  `#[link_section]`, `global_asm!`). Done this cycle: base64 without
+  `simd-unsafe` (8 keywords fewer), delharc with `no-unsafe-assertions` (30
+  fewer; LHA decodes 5 to 15 percent slower). regex-automata is asked for
+  without `dfa`, but bstr's default `unicode` feature (yara-x-parser takes
+  bstr with its defaults) keeps `dfa-search` on, so its 27 keywords go with
+  bstr. HMAC and PBKDF2 are exav's own (`hmac`, `pbkdf2`, `cmov` and
+  `ctutils` gone: 122 keywords). ELF is read through the `elf` crate (goblin
+  built without its ELF parsers: 90 keywords; none in `elf`). Left this
+  cycle: the `zip` crate dropped (every ZIP reading and writing is exav's own:
+  2 crates and 57 keywords fewer in the scanner's default tree, 5 and 523 in
+  the browser builds). Left this cycle: PE on exav's own reader (goblin,
+  scroll, plain). Later, by keywords removed per line written: the
+  YARA parser vendored without rowan, indexmap and bstr; the hashes and AES
+  in-tree (plain Rust is slower where the CPU has SHA or AES instructions:
+  measure on x86-64 first); the image decoders vendored; the encodings
+  in-tree; LHA on exav's own reader (delharc, chrono, iana-time-zone); ruzstd
+  vendored with a safe window; flate2 to miniz_oxide, crc32fast, num-traits.
+  The regexp prefilters (memchr, aho-corasick) are the hard core and need a
+  safe prefilter first. A feature reachable only through another crate's
+  manifest (simd-adler32 through flate2 and png, moxcms through `image`) is a
+  vendoring decision, not a switch.
 - **TLS without C or assembly**: `ring` (via rustls) is the only C/assembly in
   the tree, in the `http` features and the published Docker image. A pure-Rust
   rustls crypto provider would remove it once one is mature and audited.
@@ -1056,19 +1001,28 @@ Open:
   upstream for a feature. 0.25.10 still requires moxcms 0.8 with its default
   (SIMD) features. Others asked already (image issues 2617 and 2626, open); a
   maintainer answered that colour management cannot be made optional.
-- **`quick-error` and `bitstream-io` stay**: `image-webp` and `zip`'s
-  `legacy-zip` bring them whatever exav's own code does.
+- **`quick-error` and `bitstream-io` stay**: `image-webp` brings the first
+  and the ARJ reader uses the second.
 - **`encoding_rs` stays at 0.8.40 or later, with `simdutf8`** (135 `unsafe`
   keywords): 0.8.40 to 0.8.44 fix decoder buffer boundaries and a size
   computation panic on 32-bit targets, which a pin back to 0.8.35 would lose.
-- **`ppmd8` back to `ppmd-rust`**, at the next early pass: its return
-  condition holds (1.5.2 is `forbid(unsafe_code)`). Compared on the 13
-  method-98 members of the corpus (identical) and on 20,000 mutated streams
-  (no panic on either side, no stream both decode differently). What the
-  swap must keep: `Ppmd8Decoder` reads the end of its input as the end of the
-  data, where the copy reports a stream cut short, so a member of unknown size
-  cut short would read as complete; and it refuses a stream of fewer than 4
-  bytes at its start. 1.5.0 also added `Ppmd7aDecoder`,
+- **`ppmd8` back to `ppmd-rust`, once it allocates its model zeroed**:
+  1.5.2 writes the whole model when it makes it (`resize`), 38 ms for a
+  member that declares 256 MiB, so a ZIP of 2,000 tiny members that each
+  declare it would take about 76 s, where the copy takes 0.13 s
+  (`vec![0; n]`).
+  To be asked upstream. The swap was made and compared, then undone: on the
+  repository's method-98 members, the cut-off fixtures and 180 encoded
+  streams, cut at many points (5,533 runs), both readers agree; on 16,000
+  mutated streams no side panics and the bytes delivered are the same. The
+  one difference: the crate reports an end marker that leaves the range
+  coder's code nonzero as damage, as 7-Zip does, where the copy ended there.
+  What the swap must keep: `Ppmd8Decoder` reads the end of its input as the
+  end of the data, where the copy reports a stream cut short, so a member of
+  unknown size cut short would read as complete; it refuses a stream of
+  fewer than 4 bytes at its start; and a `read` that fails drops the bytes it
+  decoded, so the wrapper reads it a byte at a time. 1.5.0 also added
+  `Ppmd7aDecoder`,
   with the carry-less range coder RAR 3 and 4 use: with RAR's escape codes on
   top it decodes 1,967 PPMd members of 55 real RAR 4 archives to their CRC. It
   cannot start its range decoder again on new input with the model kept,
@@ -1083,7 +1037,8 @@ Open:
 - **`chrono` is unmaintained (RUSTSEC-2026-0543, ignored in `deny.toml`).**
   `delharc` 0.8.0 needs it for LHA timestamps, with no feature to leave it
   out, and exav-unpack's CLI uses it for local times. Its maintainer points to
-  `jiff`; the CLI can move, `delharc` needs an upstream change or a fork.
+  `jiff`. The CLI keeps chrono while delharc needs it (moving it alone would
+  add a crate and remove none); both go with LHA on exav's own reader.
 - **`paste` is a `deny.toml` ignore**: it is unmaintained, build-time
   only, and comes from `zenjxl-decoder-simd`'s `simd_function!`, which expands
   to `paste::paste!` in the decoder. Dropping it means copying that 9,000-line
@@ -1093,11 +1048,3 @@ Open:
   goes with that release.
 - **`mail-parser` stays on 0.11.** 1.0 is a rewrite that needs Rust 1.98 and
   adds SIMD `unsafe`, `encodify` and a hard `simdutf8` dependency.
-- **`lzma-rust2` 0.23 is still in the tree for tests only**, through
-  `sevenz-rust2` 0.24; exav itself is on 0.25.
-- **`zip` is required below 9.1** (register pin): from 9.1.0 it depends on
-  `getrandom` whatever its features (the salts of the AES archives it
-  writes), and from 9.4.2 on `zeroize` and `constant_time_eq`. Next cycle:
-  drop the crate, with exav-unpack's PKZIP 1.x methods (Shrink, Reduce,
-  Implode) and the converters' package reading and writing on exav's own ZIP
-  code.

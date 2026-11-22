@@ -131,7 +131,13 @@ fn every_duration_flag_disables_with_off() {
 /// refuse both.
 #[test]
 fn every_counting_flag_refuses_size_suffixes() {
-    const LIMITS: &[&str] = &["--max-members", "--max-jobs-per-worker"];
+    const LIMITS: &[&str] = &[
+        "--max-members",
+        "--max-jobs-per-worker",
+        "--max-yara-steps",
+        "--max-pe-stub-steps",
+        "--max-pe-idle-steps",
+    ];
     const AT_LEAST_ONE: &[&str] = &["--dlp-ssns", "--dlp-credit-cards"];
     assert!(parses("--max-unpack-depth", "0"));
     assert!(!parses("--max-unpack-depth", "off"));

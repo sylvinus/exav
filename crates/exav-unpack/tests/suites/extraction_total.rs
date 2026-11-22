@@ -8,8 +8,7 @@ use std::io::Write;
 /// A ZIP read by its local headers alone, its directory gone.
 #[test]
 fn a_zip_member_over_what_is_left_of_the_total_costs_nothing() {
-    let deflated = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let deflated = exav_unpack::zip_write::FileOptions::default();
     // Bytes deflate cannot shrink, so the member is decoded to its end.
     let noise: Vec<u8> = (0..100u32 << 10)
         .scan(1u32, |s, _| {
@@ -17,7 +16,7 @@ fn a_zip_member_over_what_is_left_of_the_total_costs_nothing() {
             Some((*s >> 16) as u8)
         })
         .collect();
-    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut w = exav_unpack::zip_write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     w.start_file("big.bin", deflated).unwrap();
     w.write_all(&noise).unwrap();
     w.start_file("small.txt", deflated).unwrap();

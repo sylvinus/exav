@@ -5,7 +5,7 @@
 use exav_core::{ScanOptions, Scanner};
 use std::io::{self, Cursor, Read};
 
-use crate::daemon::{FdSource, Reads, SetReadTimeout, handle_conn};
+use crate::daemon::{FdSource, Passed, Reads, SetReadTimeout, handle_conn};
 
 /// A connection's bytes, from memory. A transport that cannot pass a
 /// descriptor, as TCP cannot.
@@ -24,8 +24,8 @@ impl SetReadTimeout for Memory<'_> {
 }
 
 impl FdSource for Memory<'_> {
-    fn take_fd(&mut self) -> Option<std::fs::File> {
-        None
+    fn take_fd(&mut self) -> Passed {
+        Passed::Nothing
     }
 }
 

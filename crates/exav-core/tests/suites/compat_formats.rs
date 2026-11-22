@@ -12,6 +12,7 @@
 
 use exav_core::loader::Builder;
 use exav_core::{ScanOptions, Scanner, Verdict, analyze};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::io::{Read, Write};
 
 const PAYLOAD: &[u8] = b"MEMBERPAYLOAD";
@@ -633,9 +634,8 @@ fn carrier(archive: &[u8]) -> Vec<u8> {
 }
 
 fn zip_of(member: &[u8]) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = FileOptions::default().method(Method::Deflated);
     z.start_file("payload.txt", opts).unwrap();
     z.write_all(member).unwrap();
     z.finish().unwrap().into_inner()

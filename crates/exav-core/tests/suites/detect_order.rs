@@ -3,6 +3,7 @@
 //! with an object, a ZIP behind a picture, a PDF behind a prefix and a
 //! message are still opened, and a signature on what is inside is found.
 
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::io::Write;
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
@@ -60,9 +61,8 @@ fn deflate(data: &[u8]) -> Vec<u8> {
 }
 
 fn zip_of(member: &[u8]) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = FileOptions::default().method(Method::Deflated);
     z.start_file("payload.txt", opts).unwrap();
     z.write_all(member).unwrap();
     z.finish().unwrap().into_inner()
@@ -113,6 +113,27 @@ fn an_rtf_document_holding_the_marker_has_its_object_scanned() {
         hex(PAYLOAD)
     );
     found_in_both("rtf", rtf.as_bytes(), &over(rtf.as_bytes(), 14));
+}
+
+/// The header is `{\rt` and what follows is free: `{\rt0` holds an object as
+/// `{\rtf1` does, and `{\r` is not an RTF.
+#[test]
+fn an_rtf_with_a_short_header_has_its_object_scanned() {
+    let db = Scanner::builtin();
+    let object = hex(exav_core::unpack::eicar());
+    let scan = |header: &str| {
+        let rtf = format!("{{\\{header}\\ansi {{\\object\\objemb{{\\objdata {object}}}}}}}");
+        analyze(&db, rtf.as_bytes(), &ScanOptions::default()).verdict
+    };
+    for header in ["rtf1", "rt0"] {
+        match scan(header) {
+            Verdict::Infected { signature, .. } => {
+                assert!(signature.to_ascii_lowercase().contains("eicar"), "{header}")
+            }
+            other => panic!("{header}: expected the object to be found, got {other:?}"),
+        }
+    }
+    assert!(!matches!(scan("r0"), Verdict::Infected { .. }));
 }
 
 /// A ZIP behind a picture or a script line is opened, as the readers of ZIP do.

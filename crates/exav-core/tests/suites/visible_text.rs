@@ -465,11 +465,11 @@ fn an_object_not_held_in_memory_is_not_reported_clean_when_it_has_text() {
 
 /// A deflated ZIP of `members`, as an office application writes a package.
 fn package(members: &[(&str, &str)]) -> Vec<u8> {
+    use exav_unpack::zip_write::{FileOptions, ZipWriter};
     use std::io::Write;
-    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut w = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for (name, data) in members {
-        w.start_file(*name, zip::write::SimpleFileOptions::default())
-            .unwrap();
+        w.start_file(name, FileOptions::default()).unwrap();
         w.write_all(data.as_bytes()).unwrap();
     }
     w.finish().unwrap().into_inner()

@@ -3,12 +3,12 @@
  * given text with `textContent`: no markup string is ever parsed, and no
  * attribute carries data from the file except a list's start number, which
  * is a digit string made here. A link is its label with the address it goes
- * to written out beside it. An http or https link is followed on a click or
- * Enter by `window.open`, as a PDF's links are: in the frame a request the
- * host confirms, in the page a new tab with no opener. It is not an anchor,
- * so the document itself never navigates; a `mailto:` link is text, and so
- * is a link whose address `safeTarget` refuses. The reader bounds how deep
- * the tree goes.
+ * to written out beside it. An http, https or mailto link is followed on a
+ * click or Enter by `window.open`, as a PDF's links are: in the frame a
+ * request the host confirms, in the page a new tab with no opener, or the
+ * mail program. It is not an anchor, so the document itself never
+ * navigates; a link whose address `safeTarget` refuses is text. The reader
+ * bounds how deep the tree goes.
  */
 import { plain, safeTarget, type Block, type Inline } from "./markdown.js";
 
@@ -51,7 +51,7 @@ export function drawInline(parent: Node, nodes: Inline[]): void {
         const label = plain(n.c);
         const a = el("span", "exav-viewer-text-link");
         drawInline(a, n.c);
-        if (/^https?:/i.test(url)) {
+        if (/^(https?|mailto):/i.test(url)) {
           const follow = () => window.open(url, "_blank", "noopener,noreferrer");
           a.tabIndex = 0;
           a.setAttribute("role", "link");

@@ -73,12 +73,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: make compiled-once
 
+  # The stack frames of the functions that recurse into nested input, read from
+  # release builds (scripts/stack-frames.py): a frame over 16 KiB is held once
+  # per level of nesting, and a deep enough file runs out of stack. A release
+  # build of `exav` and of exav-render's nesting test; `objdump` is the
+  # runner's.
+  stack-frames:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make stack-frames
+
   # The yara-x A/B differential harness. Deliberately NOT part of `make test`
   # (see the Makefile): a differential test can go red because the other engine
   # changed, so it is not a merge gate. It runs here anyway, unlike the clamav
   # harness, only because it is self-contained: no signature database, just
-  # yara-x's `yr` binary. The tests skip when `yr` is missing, so it is installed
-  # and checked first; without it this job would pass having compared nothing.
+  # yara-x's `yr` binary. The make target fails when `yr` is missing. The corpus
+  # suite needs a directory of rule files that is not in the repository, so CI
+  # runs `test-yara-diff-rules`; `make test-yara-diff` runs both.
   yara-diff:
     runs-on: ubuntu-latest
     steps:
@@ -87,11 +101,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install yr (yara-x CLI)
         run: |
-          YR=v1.21.0
+          YR=v1.23.0
           curl -sSL "https://github.com/VirusTotal/yara-x/releases/download/$YR/yara-x-$YR-x86_64-unknown-linux-gnu.tar.gz" | tar xz -C /tmp
           echo "/tmp" >> "$GITHUB_PATH"
       - run: yr --version
-      - run: make test-yara-diff
+      - run: make test-yara-diff-rules
 
   wasm:
     runs-on: ubuntu-latest
@@ -139,11 +153,15 @@ jobs:
       # (exav-unpack-wasm's pkg/, which test-js built with test-only features)
       # are rebuilt from source, with the wasm-bindgen-cli its Cargo.toml pins,
       # and its demo is driven in Chromium, its sandboxed frame in Chromium,
-      # Firefox and WebKit. See scripts/test-viewer.sh.
+      # Firefox and WebKit. See scripts/test-viewer.sh. Every file of the demo
+      # is opened in the sandboxed frame only; the release opens each in the
+      # page as well (docs/RELEASING.md).
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen@0.2.129
       - run: make test-viewer
+        env:
+          EXAV_EXAMPLES_MODES: sandbox
       # What the browser saw, for the failures that do not happen on a
       # developer's machine.
       - uses: actions/upload-artifact@v4

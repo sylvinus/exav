@@ -331,6 +331,33 @@ impl YaraDb {
         // A condition that ran out of steps evaluated to undefined, and one
         // that saw part of a pattern's matches or no module values may be
         // wrong, so a rule may have failed to match for that reason alone.
+        if let Some((rule, pattern)) = results.capped {
+            crate::engine::mark_search_cut(|| {
+                format!(
+                    "YARA rule {rule}: pattern {pattern} has more than {} matches",
+                    grouped(matcher::MAX_MATCHES)
+                )
+            });
+        }
+        if let Some(rule) = results.spent_by {
+            crate::engine::mark_search_cut(|| {
+                format!("YARA rule {rule}: condition ran out of --max-yara-steps")
+            });
+        }
+        if let Some(reason) = results.module_cut {
+            crate::engine::mark_search_cut(|| reason);
+        }
+        if let Some(((rule, pattern), why)) = results.regex_cut {
+            crate::engine::mark_search_cut(|| match why {
+                matcher::RegexCut::Steps => {
+                    format!("YARA rule {rule}: pattern {pattern} ran out of --max-regex-steps")
+                }
+                matcher::RegexCut::Whole => format!(
+                    "YARA rule {rule}: pattern {pattern} needs the object read whole, which is \
+                     past --max-object-bytes"
+                ),
+            });
+        }
         if results.steps_exhausted || !results.complete {
             crate::engine::mark_scan_truncated();
         }
@@ -358,6 +385,20 @@ impl YaraDb {
     ) -> Vec<String> {
         Vec::new()
     }
+}
+
+/// `n` in decimal with a comma between groups of three digits.
+#[cfg(feature = "yara")]
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The basename of a path, splitting on both `/` and `\` so Windows-style paths
@@ -571,6 +612,31 @@ mod tests {
         }
     }
 
+    /// `.len()` and the functions of the `elf` module are in the blob too.
+    #[test]
+    fn compiled_blob_keeps_len_and_the_elf_hashes() {
+        const ELF: &[u8] = include_bytes!("../../tests/testdata/tiny_elf64");
+        let mut db = YaraDb::new();
+        db.extend_from_text(
+            r#"
+            import "elf"
+            rule len_and_hashes {
+                condition:
+                    elf.sections.len() == 3 and not defined elf.telfhash()
+                    and elf.import_md5() == "d41d8cd98f00b204e9800998ecf8427e"
+            }
+            "#,
+            true,
+        );
+        db.finalize();
+        let bytes = rmp_serde::to_vec(&db).expect("encode YaraDb");
+        let reloaded: YaraDb = rmp_serde::from_slice(&bytes).expect("decode YaraDb");
+        assert!(reloaded.compiled_blob.is_some());
+        for d in [db, reloaded] {
+            assert_eq!(first(&d, ELF, None).as_deref(), Some("YARA.len_and_hashes"));
+        }
+    }
+
     /// If the blob version does not match this build, the loader must ignore the
     /// stale blob and recompile from source, never misreading it or going silent.
     #[test]
@@ -654,6 +720,43 @@ mod tests {
         assert_eq!(
             first(&db, b"....keepme....", None).as_deref(),
             Some("YARA.good_rule")
+        );
+    }
+
+    /// An object past the limit that starts as a PE does, read by the `pe`
+    /// module, leaves its values missing and the scan says which module and
+    /// why. Held whole, it leaves nothing to say.
+    #[test]
+    fn a_module_missing_values_are_named_in_the_search_cut() {
+        use crate::byte_source::BlockCache;
+        let mut db = YaraDb::new();
+        db.extend_from_text(
+            "import \"pe\"\nrule R { condition: pe.number_of_sections == 9999 }",
+            false,
+        );
+        let mut blob = vec![0u8; 100_000];
+        blob[..2].copy_from_slice(b"MZ");
+        let cache = BlockCache::with_sizes(std::io::Cursor::new(blob), 4096, 16 * 4096).unwrap();
+        let scan = |materialize| {
+            crate::engine::reset_scan_truncated();
+            let whole = crate::engine::WholeLimits {
+                materialize,
+                ..crate::engine::WholeLimits::NONE
+            };
+            let found = db.scan_source(&cache, None, false, &whole, None);
+            assert!(found.is_empty());
+            (
+                crate::engine::scan_was_truncated(),
+                crate::engine::scan_search_cut(),
+            )
+        };
+        assert_eq!(scan(usize::MAX), (false, None));
+        assert_eq!(
+            scan(64 * 1024),
+            (
+                true,
+                Some("YARA module pe: the object is past --max-object-bytes".to_string())
+            )
         );
     }
 }

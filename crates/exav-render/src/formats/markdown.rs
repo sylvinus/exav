@@ -293,15 +293,8 @@ fn safe_target(dest: &str) -> bool {
     if !web && !lower.starts_with("mailto:") {
         return false;
     }
-    let bad = |c: char| {
-        let c = c as u32;
-        c <= 0x20
-            || (0x7f..=0x9f).contains(&c)
-            || c == 0x2028
-            || c == 0x2029
-            || (0x202a..=0x202e).contains(&c)
-            || (0x2066..=0x2069).contains(&c)
-    };
+    // White space, and what a name may not show (the bidirectional marks among them).
+    let bad = |c: char| c <= ' ' || exav_unpack::tree::unsafe_to_show(c);
     if dest.chars().any(bad) {
         return false;
     }

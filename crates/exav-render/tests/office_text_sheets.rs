@@ -2,7 +2,9 @@
 
 use exav_render::formats::office::text::Text;
 use exav_render::sheets::{Error, Format, Limits, convert, text};
-use std::io::{Read, Write};
+use exav_unpack::package::Package;
+use exav_unpack::zip_write::{FileOptions, ZipWriter};
+use std::io::Write;
 
 const ALL: [(&str, Format); 8] = [
     ("sample.xls", Format::Xls),
@@ -34,10 +36,9 @@ fn labels(t: &Text) -> Vec<&str> {
 }
 
 fn zip(files: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(vec![]));
+    let mut z = ZipWriter::new(std::io::Cursor::new(vec![]));
     for (name, data) in files {
-        z.start_file(*name, zip::write::SimpleFileOptions::default())
-            .unwrap();
+        z.start_file(name, FileOptions::default()).unwrap();
         z.write_all(data).unwrap();
     }
     z.finish().unwrap().into_inner()
@@ -161,16 +162,12 @@ fn blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
 /// The strings of an XLSX's shared string table and inline strings, and its
 /// sheets' names.
 fn xlsx_strings(xlsx: &[u8]) -> (Vec<String>, Vec<String>) {
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(xlsx)).unwrap();
-    let names: Vec<String> = z
-        .file_names()
-        .filter_map(|n| n.ok().map(|n| n.to_string()))
-        .collect();
+    let mut z = Package::from_bytes(xlsx).unwrap();
+    let names = z.names(usize::MAX);
     let mut strings = vec![];
     let mut sheets = vec![];
     for n in names {
-        let mut xml = String::new();
-        z.by_name(&n).unwrap().read_to_string(&mut xml).unwrap();
+        let xml = String::from_utf8(z.read(&n, u64::MAX).unwrap().unwrap()).unwrap();
         if n == "xl/sharedStrings.xml" {
             strings.extend(blocks(&xml, "si").into_iter().map(t_elements));
         } else if n.starts_with("xl/worksheets/") && n.ends_with(".xml") {
@@ -717,6 +714,29 @@ fn the_wrong_format_is_refused() {
         text(b"", Format::Fods, &l, CAP),
         Err(Error::NotFormat(_) | Error::Malformed(_))
     ));
+}
+
+/// A spreadsheet of no table, as an empty template is, is an empty workbook:
+/// no text, and an XLSX of one empty sheet.
+#[test]
+fn a_spreadsheet_of_no_table_is_an_empty_workbook() {
+    let empty = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document {ODF_NS} office:version="1.3" office:mimetype="application/vnd.oasis.opendocument.spreadsheet"><office:body><office:spreadsheet/></office:body></office:document>"#
+    );
+    let l = Limits::default();
+    assert_eq!(
+        text(empty.as_bytes(), Format::Fods, &l, CAP).unwrap().text,
+        ""
+    );
+    let xlsx = convert(empty.as_bytes(), Format::Fods, &l).unwrap().xlsx;
+    let book = Package::from_bytes(&xlsx)
+        .unwrap()
+        .read("xl/workbook.xml", u64::MAX)
+        .unwrap()
+        .unwrap();
+    let book = String::from_utf8(book).unwrap();
+    assert_eq!(book.matches("<sheet ").count(), 1, "{book}");
 }
 
 #[test]

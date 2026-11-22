@@ -3,7 +3,6 @@
 //! property tables, the shape tree of a drawing and the picture store.
 
 use super::bytes::Cur;
-use std::io::Read;
 
 pub const DGG_CONTAINER: u16 = 0xF000;
 pub const BSTORE_CONTAINER: u16 = 0xF001;
@@ -403,10 +402,8 @@ pub fn blip(r: &Rec) -> Option<Blip> {
     let body = d.get(skip + 34..)?;
     let data = if hdr[32] == 0 {
         let mut out = Vec::new();
-        flate2::read::ZlibDecoder::new(body)
-            .take(MAX_METAFILE)
-            .read_to_end(&mut out)
-            .ok()?;
+        let mut z = flate2::read::ZlibDecoder::new(body);
+        exav_unpack::source::read_capped(&mut z, &mut out, MAX_METAFILE).ok()?;
         out
     } else {
         body.to_vec()

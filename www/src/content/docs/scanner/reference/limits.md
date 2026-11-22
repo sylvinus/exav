@@ -18,14 +18,17 @@ column is for [library users](/subprojects/exav-core/) (`Limits` in exav-unpack,
 | CLI flag | Engine field | Default | What it stops |
 |---|---|---|---|
 | `--max-input-bytes` | `ScanOptions::max_scan_size` | no limit | A top-level input too big to take whole (its first bytes still get the whole scan) |
-| `--max-object-bytes` | `Limits::max_buffer_bytes` (`ScanOptions::limits`) | 256 MiB | The largest single object held in memory; a larger file or member is read through a block cache or a temporary file. Also the PDF object table of bytecode and a GPT entry array |
+| `--max-object-bytes` | `Limits::max_buffer_bytes` (`ScanOptions::limits`) | 256 MiB | The largest single object held in memory; a larger file or member is read through a block cache or a temporary file. Also the PDF object table of bytecode and a GPT entry array, and the input, memory and decompressed part of the office converters that read DOC, XLS, PPT, iWork and flat XML files for their text, whose counts of cells, paragraphs, sheets, slides and shapes grow in proportion to it from their defaults (4,000,000 cells, 5,000,000 paragraphs, 4,096 sheets at 256 MiB); off, they follow `--max-extracted-bytes` |
 | `--max-matcher-bytes` | `Limits::max_scanned_bytes` | 10 GiB | Cumulative bytes fed to the matcher |
-| `--max-hole-bytes` | `Limits::max_hole_bytes` | 64 GiB | Cumulative bytes of holes (the unwritten stretches of sparse files in a filesystem image) fed to the matcher as zeros; they count here and not toward `--max-matcher-bytes` |
+| `--max-hole-bytes` | `Limits::max_hole_bytes` | 10 GiB | Cumulative bytes of holes (the unwritten stretches of sparse files in a filesystem image) fed to the matcher as zeros; they count here and not toward `--max-matcher-bytes` |
 | `--max-pcre-bytes` | `ScanOptions::max_pcre_bytes` | no limit (100 MiB under `--clamav-compat`) | PCRE subsignatures on an object larger than this, which then do not match; the scan is reported incomplete, except under `--clamav-compat` |
 | `--max-regex-steps` | `ScanOptions::max_regex_steps` | 100,000,000 steps | The work one PCRE subsignature (lookaround or back reference) or one YARA regexp pattern may do on an object; a search that reaches it stops, and the scan is `LIMITS-EXCEEDED` unless something is found |
+| `--max-yara-steps` | `ScanOptions::max_yara_steps` | 20,000,000 steps | The condition-evaluation steps all the YARA rules of one scan may take together; a condition that runs out does not match, nor do those after it, and the scan is `LIMITS-EXCEEDED` unless something is found |
 | `--max-matcher-steps` | `ScanOptions::max_matcher_steps` | 2,000,000 steps per MiB, an object counting as at least 256 MiB | The verification of body signatures with wildcards and gaps in one object, and a 32nd of it for one group of signatures sharing an anchor; past either the search stops, and the scan is `LIMITS-EXCEEDED` unless something is found |
 | `--min-scan-bytes` | `ScanOptions::min_scan_bytes` | 6 bytes | Every check on an object smaller than this, which then counts as clean; `0` scans every object |
 | `--max-pe-emulation-steps` | `Limits::max_pe_emulation_steps` | 1,000,000,000 | Emulator instructions across all packed executables in one file |
+| `--max-pe-stub-steps` | `Limits::max_pe_stub_steps` | 500,000,000 | Emulator instructions for one packed executable; past it the image the stub rebuilt so far is still scanned, and the scan is `LIMITS-EXCEEDED` unless something is found |
+| `--max-pe-idle-steps` | `Limits::max_pe_idle_steps` | 64,000,000 | Emulator instructions a stub may run without writing a page it has not written before; the run then stops, which is not a limit reached |
 | `--max-unpack-depth` | `Limits::max_recursion` | 16 | Nesting depth, containers inside containers |
 | `--max-members` | `Limits::max_members` | 100000 | Member-count blowup; also MFT records, ISO and UDF directories and partition table entries |
 | `--max-extracted-bytes` (lowered by `--max-process-bytes`) | `Limits::max_extracted_bytes` | 1 GiB (400M under `--clamav-compat`) | What formats that decode a member into memory themselves have produced so far in one scan; never released. A member handed over as a stream is not counted (ZIP, 7z, TAR, CAB and the stream codecs): the scan holds it up to `--max-object-bytes` and reads a larger one in place or from a spill file, within `--max-matcher-bytes` |
@@ -123,7 +126,8 @@ Notes:
   scanned; the container is then `LIMITS-EXCEEDED` unless something is found.
 
 One more bound is charged against the rules rather than the file: each buffer
-gets 20 million YARA condition-evaluation steps, shared by every rule in the set.
+gets `--max-yara-steps` (20 million by default) YARA condition-evaluation steps,
+shared by every rule in the set.
 A YARA range loop takes its size from the rule text, so
 `for any i in (0..200000000)` would otherwise stall every scan. A YARA string also
 keeps at most one million matches per buffer; one a rule uses at one offset only
@@ -235,13 +239,15 @@ flags bound different quantities, and raising the wrong one changes nothing.
   [block cache](/scanner/concepts/streaming-memory/#the-block-cache) for the
   figures.
 - Deeply nested archives: `--max-unpack-depth`.
-- Many packed executables in one file: `--max-pe-emulation-steps`.
+- Many packed executables in one file: `--max-pe-emulation-steps`; one packed
+  executable whose stub needs more than its budget: `--max-pe-stub-steps`.
 - A stream past a spill budget: `--max-spill-bytes`, `--max-total-spill-bytes`,
   or `--spill-threshold-bytes` under `--spill-dir off`.
 - A scan that never returns: `--max-scan-secs` in the clamd pool or a one-shot
   run, and consider whether you want the file scanned at all. An ICAP scan has
   no time bound; it is bounded by work (`--max-matcher-bytes`,
-  `--max-pe-emulation-steps`, `--max-unpack-depth`, `--max-members`).
+  `--max-pe-emulation-steps`, `--max-pe-stub-steps`, `--max-unpack-depth`,
+  `--max-members`).
 
 Raising a limit trades resources for reach. The defaults keep a scan of hostile
 input bounded on a modest host; a build server scanning its own artifacts can

@@ -1,36 +1,31 @@
 //! ZIP packages (ODP, Keynote) read within the limits.
 
-use crate::formats::office::common::package::open_zip;
+use crate::formats::office::common::package::MAX_NAMES;
 use crate::formats::office::slides::error::{Error, Result};
 use crate::formats::office::slides::limits::Budget;
-use std::io::{Read, Seek};
+use exav_unpack::package::{NotZip, Package, PartError};
 
 /// What a package is read from: its bytes, or a reader that fetches the
 /// parts asked for.
-pub trait Source: Read + Seek {}
-impl<T: Read + Seek> Source for T {}
+pub use exav_unpack::package::ReadSeek as Source;
 
-pub struct Zip<'a> {
-    z: zip::ZipArchive<Box<dyn Source + 'a>>,
+pub struct Zip<'a>(Package<'a>);
+
+fn not_zip(e: NotZip) -> Error {
+    Error::NotFormat(format!("not a ZIP package: {e}"))
 }
 
 impl<'a> Zip<'a> {
     pub fn open(bytes: &'a [u8]) -> Result<Zip<'a>> {
-        Zip::from_source(Box::new(std::io::Cursor::new(bytes)))
+        Package::from_bytes(bytes).map(Zip).map_err(not_zip)
     }
 
     pub fn from_source(source: Box<dyn Source + 'a>) -> Result<Zip<'a>> {
-        let z =
-            open_zip(source).map_err(|e| Error::NotFormat(format!("not a ZIP package: {e}")))?;
-        Ok(Zip { z })
+        Package::from_reader(source).map(Zip).map_err(not_zip)
     }
 
     pub fn names(&self) -> Vec<String> {
-        self.z
-            .file_names()
-            .take(1 << 16)
-            .filter_map(|s| s.ok().map(|s| s.to_string()))
-            .collect()
+        self.0.names(MAX_NAMES)
     }
 
     /// A member, `None` when absent or unreadable; past `max` bytes, an
@@ -45,24 +40,10 @@ impl<'a> Zip<'a> {
 
     /// As `get`, the caller charging the bytes.
     pub fn read(&mut self, name: &str, max: u64) -> Result<Option<Vec<u8>>> {
-        let f = match self.z.by_name(name) {
-            Ok(f) => f,
-            // The crate refuses an encrypted member before it is read.
-            Err(zip::result::ZipError::UnsupportedArchive(m))
-                if m == zip::result::ZipError::PASSWORD_REQUIRED =>
-            {
-                return Err(Error::Encrypted);
-            }
-            Err(_) => return Ok(None),
-        };
-        let mut v = Vec::new();
-        if f.take(max + 1).read_to_end(&mut v).is_err() {
-            return Ok(None);
-        }
-        if v.len() as u64 > max {
-            return Err(Error::TooLarge("a package part"));
-        }
-        Ok(Some(v))
+        self.0.read(name, max).map_err(|e| match e {
+            PartError::Encrypted => Error::Encrypted,
+            PartError::TooLarge => Error::TooLarge("a package part"),
+        })
     }
 }
 

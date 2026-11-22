@@ -264,7 +264,7 @@ pub fn para_props(p: &Props, in_list: bool) -> ParaProps {
         r.bidi = Some(true);
     }
     if !in_list {
-        if let Some(v) = g("fo:margin-left").and_then(odf::twips) {
+        if let Some(v) = p.margin("paragraph", "left").and_then(odf::twips) {
             r.ind_left = Some(v);
         }
         if let Some(v) = g("fo:text-indent").and_then(odf::twips) {
@@ -275,13 +275,13 @@ pub fn para_props(p: &Props, in_list: bool) -> ParaProps {
             }
         }
     }
-    if let Some(v) = g("fo:margin-right").and_then(odf::twips) {
+    if let Some(v) = p.margin("paragraph", "right").and_then(odf::twips) {
         r.ind_right = Some(v);
     }
-    if let Some(v) = g("fo:margin-top").and_then(odf::twips) {
+    if let Some(v) = p.margin("paragraph", "top").and_then(odf::twips) {
         r.space_before = Some(v.max(0));
     }
-    if let Some(v) = g("fo:margin-bottom").and_then(odf::twips) {
+    if let Some(v) = p.margin("paragraph", "bottom").and_then(odf::twips) {
         r.space_after = Some(v.max(0));
     }
     if let Some(v) = g("fo:line-height") {
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn run_and_paragraph_properties() {
-        let p = Props(vec![
+        let p = Props::from(vec![
             ("text/fo:font-weight".into(), "bold".into()),
             ("text/fo:font-size".into(), "12pt".into()),
             ("text/fo:color".into(), "#0000ff".into()),

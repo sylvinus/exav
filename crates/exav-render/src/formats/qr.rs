@@ -361,7 +361,7 @@ fn grey_level(px: &crate::image::Pixels, w: usize, x: usize, y: usize) -> u8 {
 /// does not decode, or is past `max_alloc`.
 pub fn find(data: &[u8], max_alloc: u64, limits: &Limits) -> Result<Found, crate::image::Error> {
     let deadline = deadline(limits);
-    let px = crate::image::decode_any(data, max_alloc)?;
+    let px = crate::image::decode_any_strict(data, max_alloc)?;
     Ok(find_pixels(px, max_alloc, limits, deadline))
 }
 

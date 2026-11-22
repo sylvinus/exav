@@ -1,7 +1,7 @@
 //! The fixtures converted through the public API, the XLSX read back.
 
 use exav_render::sheets::{Error, Format, Limits, convert};
-use std::io::Read;
+use exav_unpack::package::Package;
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(format!(
@@ -12,22 +12,21 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 /// The XLSX's parts as text.
-struct Xlsx(zip::ZipArchive<std::io::Cursor<Vec<u8>>>);
+struct Xlsx(Vec<u8>);
 
 impl Xlsx {
     fn of(name: &str, format: Format) -> Xlsx {
         let c = convert(&fixture(name), format, &Limits::default()).unwrap();
-        Xlsx(zip::ZipArchive::new(std::io::Cursor::new(c.xlsx)).unwrap())
+        Xlsx(c.xlsx)
     }
 
     fn part(&mut self, name: &str) -> String {
-        let mut s = String::new();
-        self.0
-            .by_name(name)
+        let part = Package::from_bytes(&self.0)
             .unwrap()
-            .read_to_string(&mut s)
+            .read(name, u64::MAX)
+            .unwrap()
             .unwrap();
-        s
+        String::from_utf8(part).unwrap()
     }
 }
 

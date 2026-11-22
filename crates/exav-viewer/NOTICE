@@ -137,16 +137,12 @@ hayro-jpeg2000 carries two ICC profiles (ProPhoto, CIELAB) under CC0-1.0
                                                                  slides, docs)
   enough                 Lilith River and the enough developers  (image)
   equator, equator-macro 2023 sarah                              (image)
-  equivalent, indexmap   2016-2023 bluss, Josh Stone             (sheets, slides,
-                                                                 docs)
-  fax                    Sebastian K
+  fax                   Sebastian K
   fdeflate               The image-rs Developers
   flate2                 2014-2026 Alex Crichton                 (image, sheets,
                                                                  slides, docs)
   gif                    2015 nwin
-  hashbrown              2016 Amanieu d'Antras                   (sheets, slides,
-                                                                 docs)
-  hayro-ccitt            Laurenz Stampfl                         (image, jbig2)
+  hayro-ccitt           Laurenz Stampfl                         (image, jbig2)
   hayro-jbig2            Laurenz Stampfl                         (image, jbig2)
   hayro-jpeg2000         Laurenz Stampfl                         (image, jpx)
   image                  The image-rs Developers
@@ -177,15 +173,11 @@ hayro-jpeg2000 carries two ICC profiles (ProPhoto, CIELAB) under CC0-1.0
                                                                  slides, docs)
   smallvec               2018 The Servo Project Developers       (image)
   thiserror              David Tolnay                            (dwg)
-  typed-path             Chip Senkbeil                           (sheets, slides,
-                                                                 docs)
-  typenum                2014 Paho Lurie-Gregg                   (sheets, slides)
+  typenum               2014 Paho Lurie-Gregg                   (sheets, slides)
   unicase                2014-2026 Sean McArthur                 (text)
   wasm-bindgen           2014 Alex Crichton                      (all)
   wasm-bindgen-shared    2014 Alex Crichton                      (all)
   weezl                  2020 HeroicKatora
-  zip                    2014 Mathijs van de Nes                 (sheets, slides,
-                                                                 docs)
   zune-core, zune-jpeg   zune-image developers
 
 Under the Apache License 2.0 (LICENSES/Apache-2.0.txt), each offering it

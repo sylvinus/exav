@@ -191,6 +191,41 @@ fn all_matches_on_stdin_past_the_size_ceiling_reports_its_size() {
     assert!(reason.contains("file size 10000 exceeds"), "{reason}");
 }
 
+/// Past the 64 MiB of a stream that stdin reads to learn its size, what was read
+/// is not the size: the reason says `at least`.
+#[test]
+fn stdin_longer_than_the_drain_gives_its_size_as_a_floor() {
+    use std::io::Write;
+    let db = TempDir::new().unwrap();
+    let body = vec![b'a'; (64 << 20) + 10_000];
+    for extra in [&[][..], &["--all-matches"][..]] {
+        let mut child = exav()
+            .arg("-d")
+            .arg(db.path())
+            .args(["--json", "--max-input-bytes", "4096"])
+            .args(extra)
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("run exav");
+        let mut stdin = child.stdin.take().unwrap();
+        // The scan ends before the end of the stream, so the write may be cut.
+        let _ = stdin.write_all(&body);
+        drop(stdin);
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let first = stdout.lines().next().unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(first).expect(first);
+        let reason = v["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.starts_with("file size at least ")
+                && reason.contains(" exceeds max-input-bytes 4096"),
+            "{extra:?}: {reason}"
+        );
+    }
+}
+
 /// `--profile` must not change the answer, only add timings beside it.
 ///
 /// It prints a CSV row and returns before the reporting path where every other

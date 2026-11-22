@@ -178,6 +178,34 @@ fn an_image_without_a_code_and_what_is_not_an_image() {
     assert!(find(b"not an image", 1 << 28, &Limits::default()).is_err());
 }
 
+/// The viewer shows what a truncated JPEG 2000 or JBIG2 file holds, but the
+/// scan does not take that for the whole image: the search says the image does
+/// not decode.
+#[cfg(all(feature = "jp2", feature = "jbig2"))]
+#[test]
+fn a_truncated_jpeg_2000_or_jbig2_file_is_reported_unread() {
+    let open = Settings {
+        max_pixels: None,
+        max_millis: None,
+        max_codes: None,
+        max_finders: None,
+        max_grids: None,
+        max_buffer_bytes: u64::MAX,
+    };
+    for name in ["rgb.jp2", "rgb.j2k", "generic.jb2"] {
+        let path = format!(
+            "{}/tests/fixtures/images/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let data = std::fs::read(&path).unwrap();
+        assert!(exav_render::image::decode_any(&data[..data.len() / 2], 1 << 28).is_ok());
+        let whole = search(&data, None, &open).unwrap();
+        assert_eq!(whole.unread, None, "{name}");
+        let half = search(&data[..data.len() / 2], None, &open).unwrap();
+        assert!(half.unread.is_some(), "{name} cut in half");
+    }
+}
+
 #[test]
 fn a_search_under_a_callers_settings_says_why_it_was_cut() {
     let png = encoded(DynamicImage::ImageLuma8(grey(URL)), ImageFormat::Png);

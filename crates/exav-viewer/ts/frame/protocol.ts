@@ -7,7 +7,7 @@
  * the host treats every frame message as untrusted, since the frame runs the
  * parsers.
  */
-import { BUILTIN_ORDER, MATCHERS, WASM_IMAGES } from "../core/formats.js";
+import { BUILTIN_ORDER, CONVERTED_FORMATS, MATCHERS, WASM_IMAGES } from "../core/formats.js";
 import { shownName } from "../core/names.js";
 import { checkRasterOptions, checkRegion, isRasterErrorCode, MAX_PICTURE_EDGE, MAX_PICTURE_PIXELS, regionMatches, type RasterErrorCode } from "../core/pictures.js";
 import { checkTheme, isColor, type FrameTheme } from "../core/theme.js";
@@ -49,7 +49,7 @@ export function frameMatcher(id: BuiltinFormat): FormatMatcher {
 }
 
 /** Bumped on any change to the messages; both sides must agree. */
-export const PROTOCOL = 7;
+export const PROTOCOL = 8;
 
 /** The `type` of the one `window.postMessage`, which carries the port. */
 export const HELLO = "exav-frame/hello";
@@ -66,6 +66,8 @@ export const MAX_URL = 2048;
 export const MAX_ITEMS = 100_000;
 /** Pictures the host waits for at once. */
 export const MAX_DRAWS = 8;
+/** A `warnings` list: its entries, the names one entry gives, and the length of each name. */
+export const WARNINGS = { maxEntries: 64, maxNames: 16, maxName: 256 };
 
 /**
  * The keys the frame hands back to the host when the document does not use
@@ -135,7 +137,7 @@ export interface FrameOptions {
   model?: { surface?: number; zUp?: boolean; timeoutMs?: number; maxTriangles?: number };
   archive?: { maxExtractedBytes?: number; maxMembers?: number };
   /** For the converted Office formats (`rtf()`, `doc()`...). */
-  conversion?: { timeoutMs?: number; maxMemory?: number; converter?: "exav" | "external"; externalConverter?: string };
+  conversion?: { timeoutMs?: number; maxMemory?: number; converter?: "exav" | "external" | Partial<Record<BuiltinFormat, "exav" | "external">>; externalConverter?: string };
   /** "none": no player controls in the frame, for a host drawing its own (`MediaController`). */
   media?: { controls?: "native" | "none" };
   /**
@@ -263,7 +265,12 @@ export interface WatchMessage {
   key: WatchedKey;
 }
 
-export type HostMessage = OpenMessage | CommandMessage | BytesMessage | ThemeMessage | RasterMessage | UnrasterMessage | ReplaceMessage | WatchMessage;
+/** Whether the frame's main thread still runs. Answered by a `pong`, from that thread, at any time after the frame's `ready`. */
+export interface PingMessage {
+  type: "ping";
+}
+
+export type HostMessage = OpenMessage | CommandMessage | BytesMessage | ThemeMessage | RasterMessage | UnrasterMessage | ReplaceMessage | WatchMessage | PingMessage;
 
 // ── Frame to host ────────────────────────────────────────────────────────────
 
@@ -362,7 +369,9 @@ export type FrameMessage =
   /** The answer to a `replace`: whether the document was replaced. False: nothing changed. */
   | { type: "replaced"; call: number; ok: boolean }
   /** The answer to a `sniff`: the format the file's bytes, name and type give, null for none. */
-  | { type: "sniffed"; call: number; format: BuiltinFormat | null };
+  | { type: "sniffed"; call: number; format: BuiltinFormat | null }
+  /** The answer to a `ping`. */
+  | { type: "pong" };
 
 /** The picture of a `rastered`, as the frame sends it. */
 export type RasterResult =
@@ -505,7 +514,7 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
     return out;
   },
   warnings(v) {
-    if (!isList(v, 64)) return undefined;
+    if (!isList(v, WARNINGS.maxEntries)) return undefined;
     const out: Warning[] = [];
     for (const w of v) {
       if (!isObject(w) || !isWord(w.key) || !isInt(w.count)) return undefined;
@@ -513,7 +522,7 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
         out.push({ key: w.key, count: w.count });
         continue;
       }
-      if (!isList(w.names, 16) || !w.names.every((n) => isText(n, 256))) return undefined;
+      if (!isList(w.names, WARNINGS.maxNames) || !w.names.every((n) => isText(n, WARNINGS.maxName))) return undefined;
       out.push({ key: w.key, count: w.count, names: (w.names as string[]).map(shownName) });
     }
     return out;
@@ -632,6 +641,73 @@ export function checkHighlights(v: unknown): FrameHighlight[] | undefined {
   return out;
 }
 
+/**
+ * Warnings cut to what the host takes (`WARNINGS`), as the frame sends them:
+ * a drawing can name more files or entity types, or longer ones, and one
+ * value past a limit would drop every controller of the message.
+ */
+export function fitWarnings(list: readonly Warning[]): Warning[] {
+  const clip = (s: string) => clipText(s, WARNINGS.maxName);
+  return list.slice(0, WARNINGS.maxEntries).map((w) => (w.names ? { ...w, names: w.names.slice(0, WARNINGS.maxNames).map(clip) } : w));
+}
+
+/** `s` cut to `max` UTF-16 units with an ellipsis, not inside a surrogate pair. */
+function clipText(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const cut = s.slice(0, max - 1);
+  return /[\uD800-\uDBFF]$/.test(cut) ? `${cut.slice(0, -1)}…` : `${cut}…`;
+}
+
+/**
+ * A snapshot cut to what the host takes, as the frame sends it: a document's
+ * names (outline titles, layers, storeys, layouts, sheets, the selection) are
+ * cut to `MAX_TEXT`, an item whose id is longer is left out (it could not be
+ * named back), and lists to `MAX_ITEMS`. One value past a limit would drop
+ * every controller of the message.
+ */
+export function fitSnapshot<K extends ControllerKey>(key: K, value: Snapshots[K]): Snapshots[K] {
+  const name = (s: string) => clipText(s, MAX_TEXT);
+  const named = <T extends { id: string; name: string }>(items: readonly T[]) =>
+    items
+      .filter((i) => i.id.length <= MAX_TEXT)
+      .slice(0, MAX_ITEMS)
+      .map((i) => ({ ...i, name: name(i.name) }));
+  const v = value as Snapshots[ControllerKey];
+  let out: unknown = v;
+  switch (key) {
+    case "warnings":
+      out = fitWarnings(v as Snapshots["warnings"]);
+      break;
+    case "outline":
+      out = (v as Snapshots["outline"]).slice(0, MAX_ITEMS).map((e) => ({ ...e, title: name(e.title) }));
+      break;
+    case "layers": {
+      const l = v as Snapshots["layers"];
+      out = { ...l, items: named(l.items) };
+      break;
+    }
+    case "storeys":
+      out = { items: named((v as Snapshots["storeys"]).items) };
+      break;
+    case "layouts": {
+      const l = v as Snapshots["layouts"];
+      out = { items: named(l.items), current: l.current.length <= MAX_TEXT ? l.current : "" };
+      break;
+    }
+    case "sheets": {
+      const s = v as Snapshots["sheets"];
+      out = { ...s, items: s.items.slice(0, MAX_ITEMS).map((i) => ({ ...i, name: name(i.name) })) };
+      break;
+    }
+    case "selection": {
+      const s = v as Snapshots["selection"];
+      out = s && { ...s, name: name(s.name), category: name(s.category), ...(s.storey !== undefined && { storey: name(s.storey) }) };
+      break;
+    }
+  }
+  return out as Snapshots[K];
+}
+
 /** The value of `key` if it has the shape that controller's store has, else undefined. */
 export function checkSnapshot<K extends ControllerKey>(key: K, v: unknown): Snapshots[K] | undefined {
   return (CHECKS[key] as (v: unknown) => Snapshots[K] | undefined)(v);
@@ -654,8 +730,8 @@ export function checkStatics(v: unknown): Statics | null {
 }
 
 /**
- * A frame message, checked whole, or null. A `controllers` message keeps only
- * the known keys whose value checks; any other key fails it.
+ * A frame message, checked whole, or null. A `controllers` message with a key
+ * the protocol does not have, or a value that does not check, is null.
  */
 export function checkFrameMessage(v: unknown): FrameMessage | null {
   if (!isObject(v)) return null;
@@ -709,6 +785,8 @@ export function checkFrameMessage(v: unknown): FrameMessage | null {
       return isInt(v.call) && typeof v.ok === "boolean" ? { type: "replaced", call: v.call, ok: v.ok } : null;
     case "sniffed":
       return isInt(v.call) && (v.format === null || oneOf(v.format, BUILTIN_ORDER)) ? { type: "sniffed", call: v.call, format: v.format } : null;
+    case "pong":
+      return { type: "pong" };
     case "rastered":
       return isInt(v.id) ? { type: "rastered", id: v.id, result: checkRasterResult(v.result) } : (closeBitmap(isObject(v.result) ? v.result.bitmap : undefined), null);
     default:
@@ -766,16 +844,28 @@ function checkPolicy(v: unknown): FramePolicy | null {
 }
 
 /**
- * Whether the host may open `url` for the frame: an absolute http(s) URL
- * without credentials (`https://bank.example@evil.example` is refused, as
- * `safeTarget` refuses it). Relative URLs are refused, as the frame has no
- * base the host shares.
+ * Whether the host may open or fetch `url` for the frame: an absolute
+ * http(s) URL without credentials (`https://bank.example@evil.example` is
+ * refused, as `safeTarget` refuses it). Relative URLs are refused, as the
+ * frame has no base the host shares.
  */
 export function linkTarget(url: string): string | null {
   try {
     const parsed = new URL(url);
     if (parsed.username || parsed.password) return null;
     return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A link the host may follow for the frame: `linkTarget`'s, or a `mailto:` with an address. Never a source. */
+export function followTarget(url: string): string | null {
+  const web = linkTarget(url);
+  if (web) return web;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "mailto:" && parsed.pathname ? parsed.href : null;
   } catch {
     return null;
   }
@@ -855,7 +945,14 @@ export function checkOptions(v: unknown): FrameOptions {
       maxMembers: num(archive.maxMembers),
     });
   if (isObject(conversion)) {
-    const converter = oneOf(conversion.converter, ["exav", "external"] as const) ? conversion.converter : undefined;
+    const which = ["exav", "external"] as const;
+    const c = conversion.converter;
+    // One word, or one per converted format: the others are dropped.
+    const converter = oneOf(c, which)
+      ? c
+      : isObject(c)
+        ? Object.fromEntries(CONVERTED_FORMATS.filter((f) => oneOf(c[f], which)).map((f) => [f, c[f] as (typeof which)[number]]))
+        : undefined;
     // A package name the asset manifest lists, or a path or an http(s) URL.
     const external = conversion.externalConverter;
     const externalConverter =
@@ -963,9 +1060,23 @@ export function checkUnraster(v: unknown): UnrasterMessage | null {
   return isObject(v) && v.type === "unraster" && isInt(v.id) ? { type: "unraster", id: v.id } : null;
 }
 
+export function checkPing(v: unknown): PingMessage | null {
+  return isObject(v) && v.type === "ping" ? { type: "ping" } : null;
+}
+
 export function checkWatch(v: unknown): WatchMessage | null {
   if (!isObject(v) || (v.type !== "watch" && v.type !== "unwatch") || !isInt(v.session) || !oneOf(v.key, WATCHED_KEYS)) return null;
   return { type: v.type, session: v.session, key: v.key };
+}
+
+/** Whether a message is an `open` that `checkOpen` does not take: the host still waits for the file to show. */
+export function isRefusedOpen(v: unknown, known: readonly BuiltinFormat[]): boolean {
+  return isObject(v) && v.type === "open" && !checkOpen(v, known);
+}
+
+/** The call of a message that is a `replace` `checkReplace` does not take, or null: the host still waits for its answer. */
+export function refusedReplaceCall(v: unknown, known: readonly BuiltinFormat[]): number | null {
+  return isObject(v) && v.type === "replace" && isInt(v.call) && !checkReplace(v, known) ? v.call : null;
 }
 
 /** A `replace`, its file and source checked as an `open`'s are. */

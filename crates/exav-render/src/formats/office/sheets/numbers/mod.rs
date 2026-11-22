@@ -136,15 +136,13 @@ fn xml_index<'a>(names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
 
 /// Reads a Numbers '08 or '09 document's XML, gzipped or not.
 fn read_xml(data: &[u8], budget: &mut Budget) -> Result<Workbook> {
-    use std::io::Read;
     if !data.starts_with(&[0x1F, 0x8B]) {
         return v09::read(data, budget);
     }
     let max = budget.limits.max_part;
     let mut xml = Vec::new();
-    flate2::read::MultiGzDecoder::new(data)
-        .take(max + 1)
-        .read_to_end(&mut xml)
+    let mut z = flate2::read::MultiGzDecoder::new(data);
+    exav_unpack::source::read_capped(&mut z, &mut xml, max + 1)
         .map_err(|e| Error::Malformed(format!("gzip: {e}")))?;
     if xml.len() as u64 > max {
         return Err(Error::TooLarge("a package part"));
@@ -330,7 +328,7 @@ fn convert(store: &Store, doc: Msg, budget: &mut Budget) -> Result<Workbook> {
         .collect();
     let by_uuid = table_uuids(store, &tables);
     let custom_formats = custom_formats(store, doc);
-    let merges = merge_owners(store, &by_uuid);
+    let merges = merge_owners(store, &by_uuid, budget)?;
     let mut cx = table::Cx {
         store,
         tables: dims,
@@ -421,8 +419,9 @@ fn table_uuids(store: &Store, tables: &[TableRef]) -> HashMap<u128, usize> {
 fn merge_owners(
     store: &Store,
     by_uuid: &HashMap<u128, usize>,
-) -> HashMap<usize, Vec<(u32, u32, u32, u32)>> {
-    let mut out: HashMap<usize, Vec<(u32, u32, u32, u32)>> = HashMap::new();
+    budget: &mut Budget,
+) -> Result<table::Merges> {
+    let mut out = table::Merges::new();
     let mut owners: HashMap<u64, u128> = HashMap::new();
     for ce in store.ids_of(CALC_ENGINE) {
         let Some(m) = store.typed(ce, CALC_ENGINE) else {
@@ -457,12 +456,17 @@ fn merge_owners(
             };
             let Some(r) = rr.msg(2) else { continue };
             let v = |n| r.uint(n).map(|x| x as u32);
-            if let (Some(c1), Some(r1), Some(c2), Some(r2)) = (v(1), v(2), v(3), v(4)) {
-                out.entry(t).or_default().push((r1, c1, r2, c2));
+            // As many to a table as the other merge sources read.
+            let merges = out.entry(t).or_default();
+            if let (Some(c1), Some(r1), Some(c2), Some(r2)) = (v(1), v(2), v(3), v(4))
+                && merges.len() < 1 << 16
+            {
+                budget.alloc(16)?;
+                merges.push((r1, c1, r2, c2));
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// TSK.CustomFormatListArchive (uuids 1, custom_formats 2): UUID to format.

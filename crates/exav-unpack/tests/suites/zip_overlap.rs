@@ -15,11 +15,11 @@ use std::io::Write;
 
 /// A normal archive, written by a real ZIP writer.
 fn ordinary_zip(members: usize) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut z = exav_unpack::zip_write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for i in 0..members {
         z.start_file(
-            format!("file{i}.txt"),
-            zip::write::SimpleFileOptions::default(),
+            &format!("file{i}.txt"),
+            exav_unpack::zip_write::FileOptions::default(),
         )
         .unwrap();
         z.write_all(format!("contents of member {i}\n").as_bytes())
@@ -132,13 +132,13 @@ fn a_nested_stored_archive_is_not_an_overlap() {
     use std::io::Write;
 
     // The inner archive: deflated members, nothing remarkable.
-    let mut inner = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut inner = exav_unpack::zip_write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for i in 0..12 {
         inner
             .start_file(
-                format!("cls{i}.class"),
-                zip::write::SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Deflated),
+                &format!("cls{i}.class"),
+                exav_unpack::zip_write::FileOptions::default()
+                    .method(exav_unpack::zip_write::Method::Deflated),
             )
             .unwrap();
         inner.write_all(b"totally benign class data").unwrap();
@@ -146,12 +146,12 @@ fn a_nested_stored_archive_is_not_an_overlap() {
     let inner = inner.finish().unwrap().into_inner();
 
     // Stored, so the inner headers land verbatim inside the outer member.
-    let mut outer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut outer = exav_unpack::zip_write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     outer
         .start_file(
             "META-INF/jars/dep.jar",
-            zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored),
+            exav_unpack::zip_write::FileOptions::default()
+                .method(exav_unpack::zip_write::Method::Stored),
         )
         .unwrap();
     outer.write_all(&inner).unwrap();

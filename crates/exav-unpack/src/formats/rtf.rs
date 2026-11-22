@@ -200,7 +200,7 @@ fn decode_object(lex: &mut Lexer<'_>) -> (Vec<u8>, usize) {
 }
 
 pub(crate) fn extract_rtf(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
-    if !data.starts_with(b"{\\rtf") {
+    if !crate::is_rtf(data) {
         return Ok(None);
     }
     let mut lex = Lexer::new(data);

@@ -354,6 +354,11 @@ pub(crate) enum Cond {
     OffsetVar(usize, Option<Box<Cond>>),
     /// Anonymous `!`/`![i]` inside a `for … of` body: match length.
     LengthVar(usize, Option<Box<Cond>>),
+    /// `<array or map>.len()`; the operand is a `ModAccess`, `VarAccess` or
+    /// `Var` the compiler checked to be an array or map. Last, so that the
+    /// variants of a compiled rule set stored by an earlier build keep their
+    /// numbers.
+    Len(Box<Cond>),
 }
 
 /// Per pattern of the `n` there are, the offset it is anchored at: the one
@@ -440,7 +445,9 @@ impl Cond {
                     i.uses(u);
                 }
             }
-            Cond::Defined(c) | Cond::Not(c) | Cond::Neg(c) | Cond::BitNot(c) => c.uses(u),
+            Cond::Defined(c) | Cond::Not(c) | Cond::Neg(c) | Cond::BitNot(c) | Cond::Len(c) => {
+                c.uses(u)
+            }
             Cond::IntRead(_, c) | Cond::Matches(c, _) => c.uses(u),
             Cond::And(cs) | Cond::Or(cs) | Cond::ModCall(_, cs) => {
                 cs.iter().for_each(|c| c.uses(u));
@@ -544,23 +551,18 @@ pub(crate) struct EvalCtx<'a> {
     /// through shared references.
     pub env: RefCell<Vec<Binding>>,
     /// Condition-evaluation steps left for this scan, shared by every rule in
-    /// it. See [`crate::yara::ir::EVAL_STEP_BUDGET`].
+    /// it (`--max-yara-steps`).
+    ///
+    /// A YARA range loop takes its bounds from the rule, not from the file, so
+    /// `for any i in (0..200000000) : ( … )` is a well-formed rule that runs
+    /// two hundred million iterations on every buffer it is offered. Nothing
+    /// in the language caps that, and the scan has no other clock. The default
+    /// is far above what real rulesets reach (large community feeds evaluate
+    /// in the low millions of steps for a whole scan). It counts nodes: one
+    /// that reads a range of the object (a `math` or `hash` call, a string
+    /// operator) costs by its range.
     pub steps: &'a Cell<u64>,
 }
-
-/// Condition-evaluation steps one scan may spend across all of its rules.
-///
-/// A YARA range loop takes its bounds from the rule, not from the file, so
-/// `for any i in (0..200000000) : ( … )` is a well-formed rule that runs two
-/// hundred million iterations on every buffer it is offered. Nothing in the
-/// language caps that, and the scan has no other clock: without a step budget a
-/// single such rule stalls every scan for as long as it takes.
-///
-/// The ceiling is far above what real rulesets reach (large community feeds
-/// evaluate in the low millions of steps for a whole scan), so it costs
-/// legitimate rules nothing. It counts nodes: one that reads a range of the
-/// object (a `math` or `hash` call, a string operator) costs by its range.
-pub(crate) const EVAL_STEP_BUDGET: u64 = 20_000_000;
 
 impl EvalCtx<'_> {
     /// Spend one step. Returns `false` once the scan's budget is gone, which the
@@ -720,6 +722,8 @@ impl Cond {
                 walk_access(base, path, ctx)
             }
 
+            Cond::Len(operand) => eval_len(operand, ctx),
+
             Cond::ForIn(f) => eval_for_in(f, ctx),
             Cond::ForOf(f) => eval_for_of(f, ctx),
             Cond::With(w) => eval_with(w, ctx),
@@ -836,6 +840,43 @@ fn walk_access(base: Value, path: &[Access], ctx: &EvalCtx) -> Option<Value> {
         };
     }
     Some(cur)
+}
+
+/// `<array or map>.len()`. As in yara-x, an array the module did not fill (the
+/// module is absent, or the field is not in its struct) is empty, not
+/// undefined; a failed index step on the way to it is undefined.
+fn eval_len(operand: &Cond, ctx: &EvalCtx) -> Option<Value> {
+    fn count(v: &Value) -> Option<Value> {
+        let n = match v {
+            Value::Array(items) => items.len(),
+            Value::Map(map) => match map.as_ref() {
+                MapVal::Str(m) => m.len(),
+                MapVal::Int(m) => m.len(),
+            },
+            _ => return None,
+        };
+        Some(Value::Int(n as i64))
+    }
+    let (base, path, module_chain) = match operand {
+        Cond::ModAccess(module, path) => (ctx.modules.root(*module).cloned(), path, true),
+        Cond::VarAccess(slot, path) => (ctx.env_val(*slot), path, false),
+        Cond::Var(slot) => return count(&ctx.env_val(*slot)?),
+        _ => return None,
+    };
+    let (last, prefix) = path.split_last()?;
+    let parent = if prefix.is_empty() {
+        base
+    } else {
+        walk_access(base?, prefix, ctx)
+    };
+    match last {
+        Access::Field(name) => match parent {
+            Some(Value::Struct(fields)) => fields.get(name).map_or(Some(Value::Int(0)), count),
+            None if module_chain && prefix.is_empty() => Some(Value::Int(0)),
+            _ => None,
+        },
+        Access::Index(_) => count(&walk_access(parent?, std::slice::from_ref(last), ctx)?),
+    }
 }
 
 fn eval_int(c: &Cond, ctx: &EvalCtx) -> Option<i64> {

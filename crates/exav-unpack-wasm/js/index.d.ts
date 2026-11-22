@@ -6,6 +6,12 @@ export interface Limits {
   maxBufferBytes?: number;
   /** Cumulative bytes fed to the matching core across the whole archive. */
   maxScannedBytes?: number;
+  /**
+   * Bytes of holes (the unwritten stretches of a sparse file in a disk image)
+   * handed over as zeros across the whole archive. They count here instead of
+   * in `maxScannedBytes`.
+   */
+  maxHoleBytes?: number;
   /** Number of members. */
   maxMembers?: number;
   /** How deep an archive inside an archive may nest. */

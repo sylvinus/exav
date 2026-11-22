@@ -4,13 +4,15 @@
 
 use exav_render::formats::office::test_util::build_cfb as build;
 use exav_render::slides::{Error, Format, Limits, convert};
-use std::io::Read;
+use exav_unpack::package::Package;
 
 fn part(pptx: &[u8], name: &str) -> String {
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(pptx)).unwrap();
-    let mut s = String::new();
-    z.by_name(name).unwrap().read_to_string(&mut s).unwrap();
-    s
+    let part = Package::from_bytes(pptx)
+        .unwrap()
+        .read(name, u64::MAX)
+        .unwrap()
+        .unwrap();
+    String::from_utf8(part).unwrap()
 }
 
 /// A PowerPoint 95 record: type, flag (0xFFFF for a container), length and

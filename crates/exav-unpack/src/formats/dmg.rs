@@ -176,7 +176,7 @@ fn derive_key_dmg(password: &[u8], salt: &[u8; 32], salt_len: u32, iterations: u
     let iter =
         std::num::NonZeroU32::new(iterations).unwrap_or(std::num::NonZeroU32::new(1000).unwrap());
     let mut key = [0u8; 24];
-    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password, &salt[..salt_len as usize], iter.get(), &mut key);
+    crate::hmac::pbkdf2::<sha1::Sha1>(password, &salt[..salt_len as usize], iter.get(), &mut key);
     key
 }
 
@@ -220,12 +220,9 @@ fn decrypt_keyblob(
 /// Compute per-chunk IV using HMAC-SHA1(hmac_key, chunk_no_be32)[0..16].
 #[cfg(feature = "decrypt")]
 fn compute_chunk_iv(hmac_key: &[u8], chunk_no: u32) -> [u8; 16] {
-    use hmac::{Hmac, KeyInit, Mac};
-    type HmacSha1 = Hmac<sha1::Sha1>;
-
-    let mut mac = HmacSha1::new_from_slice(hmac_key).expect("HMAC accepts any key size");
+    let mut mac = crate::hmac::Hmac::<sha1::Sha1>::new(hmac_key);
     mac.update(&chunk_no.to_be_bytes());
-    let result = mac.finalize().into_bytes();
+    let result = mac.finalize();
     let mut iv = [0u8; 16];
     iv.copy_from_slice(&result[..16]);
     iv

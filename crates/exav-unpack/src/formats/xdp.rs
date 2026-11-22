@@ -6,8 +6,9 @@
 //! reconstructed PDF as a single member for the engine to recurse into.
 //!
 //! Parsing is a plain byte scan, fully bounds-checked so truncated/hostile
-//! input cannot panic. A chunk's character references are read, as an XML
-//! reader does; CDATA sections and comments in a chunk are not.
+//! input cannot panic. A chunk is read as an XML reader reads it: its
+//! character references resolved, the text of its CDATA sections kept, its
+//! comments dropped.
 //!
 //! The format is also found by a string in a text ([`looks_like_xdp`]): a text
 //! whose root is not an XDP's and whose chunks are not base64 has no PDF, and
@@ -86,24 +87,79 @@ fn declaration_len(s: &[u8]) -> Option<usize> {
     None
 }
 
-/// Where the next `<chunk>` start tag is in `data` from `pos`: `<chunk` then
-/// `>`, `/` or whitespace, not `<chunks>` or `<chunk-id>`.
+/// Whether `s` starts with a `<chunk>` start tag: `<chunk` then `>`, `/` or
+/// whitespace, not `<chunks>` or `<chunk-id>`.
+fn is_chunk_tag(s: &[u8]) -> bool {
+    s.starts_with(b"<chunk")
+        && s.get(6)
+            .is_none_or(|&b| b == b'>' || b == b'/' || b.is_ascii_whitespace())
+}
+
+/// Where the next `<chunk>` start tag is in `data` from `pos`.
 fn next_chunk(data: &[u8], mut pos: usize) -> Option<usize> {
     loop {
         let at = pos + memchr::memmem::find(&data[pos..], b"<chunk")?;
-        match data.get(at + 6) {
-            Some(&b) if b != b'>' && b != b'/' && !b.is_ascii_whitespace() => pos = at + 6,
-            _ => return Some(at),
+        if is_chunk_tag(&data[at..]) {
+            return Some(at);
         }
+        pos = at + 6;
     }
 }
 
+/// The comment or CDATA section `s` starts with: its length up to the end of
+/// its close (or to the end of `s` when it is not closed), and for a CDATA
+/// section the text in it.
+fn markup(s: &[u8]) -> Option<(usize, Option<&[u8]>)> {
+    let (open, close, cdata): (&[u8], &[u8], bool) = if s.starts_with(b"<!--") {
+        (b"<!--", b"-->", false)
+    } else if s.starts_with(b"<![CDATA[") {
+        (b"<![CDATA[", b"]]>", true)
+    } else {
+        return None;
+    };
+    let inner = &s[open.len()..];
+    let (text, len) = match memchr::memmem::find(inner, close) {
+        Some(e) => (&inner[..e], open.len() + e + close.len()),
+        None => (inner, s.len()),
+    };
+    Some((len, cdata.then_some(text)))
+}
+
+/// Where the body of a chunk that starts at `from` ends: `Ok` at its
+/// `</chunk`, the comments and CDATA sections in it passed over, or at the
+/// end of `data` for a truncated document; `Err` at a chunk start tag met
+/// first, which is the element the one before only named.
+fn body_end(data: &[u8], from: usize) -> Result<usize, usize> {
+    let mut i = from;
+    while let Some(r) = memchr::memchr(b'<', &data[i..]) {
+        let at = i + r;
+        let rest = &data[at..];
+        if rest.starts_with(b"</chunk") {
+            return Ok(at);
+        }
+        if is_chunk_tag(rest) {
+            return Err(at);
+        }
+        i = at + markup(rest).map_or(1, |(len, _)| len);
+    }
+    Ok(data.len())
+}
+
 /// Appends the text of a chunk's body to `out`, as the base64 decoder reads
-/// it: character references resolved, whitespace dropped. A reference that
-/// is not to an ASCII character is kept as written, which does not decode.
+/// it: character references resolved, the text of CDATA sections taken as it
+/// is, comments dropped, whitespace dropped. A reference that is not to an
+/// ASCII character is kept as written, which does not decode.
 fn chunk_text(body: &[u8], out: &mut Vec<u8>) {
     let mut i = 0;
     while i < body.len() {
+        if body[i] == b'<'
+            && let Some((len, text)) = markup(&body[i..])
+        {
+            let text = text.unwrap_or_default();
+            out.extend(text.iter().filter(|b| !b.is_ascii_whitespace()));
+            i += len;
+            continue;
+        }
         if body[i] == b'&'
             && let Some((c, len)) = char_ref(&body[i..])
         {
@@ -163,15 +219,13 @@ pub(crate) fn extract_xdp(data: &[u8], budget: &mut Budget, visit: Sink) -> crat
         // The body ends at the next "</chunk" (or EOF for a truncated doc). A
         // chunk that starts before it is the element; the one before was a
         // string.
-        let body_end = memchr::memmem::find(&data[body_start..], b"</chunk")
-            .map(|r| body_start + r)
-            .unwrap_or(data.len());
-        if let Some(inner) = next_chunk(data, body_start)
-            && inner < body_end
-        {
-            pos = inner;
-            continue;
-        }
+        let body_end = match body_end(data, body_start) {
+            Ok(end) => end,
+            Err(inner) => {
+                pos = inner;
+                continue;
+            }
+        };
         let from = b64.len();
         chunk_text(&data[body_start..body_end], &mut b64);
         // In a text, a chunk that is not base64 is words, not part of a PDF.
@@ -261,6 +315,24 @@ mod tests {
         let xdp = format!(
             "<?xml version=\"1.0\"?>\n<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\">\
              <pdf><document><chunk>{a}&#10;&#xD;&#x0a;{b}&#13;</chunk></document></pdf></xdp:xdp>"
+        );
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Xdp, &xdp.as_bytes(), &mut budget).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].data, pdf);
+    }
+
+    /// A chunk's text in a CDATA section is read, and a comment in it is
+    /// dropped, as an XML reader has them, a `</chunk>` inside either too.
+    #[test]
+    fn cdata_and_comments_in_a_chunk_are_read_as_xml_has_them() {
+        let pdf = b"%PDF-1.4 MALWARETEST in a CDATA section";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pdf);
+        let (a, b) = b64.split_at(12);
+        let xdp = format!(
+            "<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\"><pdf><document>\
+             <chunk><![CDATA[{a}]]><!-- </chunk> not the end -->\n{b}\
+             <![CDATA[]]></chunk></document></pdf></xdp:xdp>"
         );
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Xdp, &xdp.as_bytes(), &mut budget).unwrap();

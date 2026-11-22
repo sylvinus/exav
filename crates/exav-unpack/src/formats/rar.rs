@@ -2542,11 +2542,6 @@ mod tests {
                 "part 1 goes on with a member whose start is missing",
             );
             expect(
-                format!("{name} without its last volume"),
-                join(&[0, 1]),
-                "the last part ends inside a member",
-            );
-            expect(
                 format!("{name} with a volume given twice"),
                 join(&[0, 0]),
                 "part 2 drops a member mid-way",
@@ -2561,6 +2556,19 @@ mod tests {
             let refs: Vec<&[u8]> = [&gap[0], &gap[2]].iter().map(|v| v.as_slice()).collect();
             expect(
                 format!("{name} without the volume between"),
+                join_volumes(&refs),
+                "a stored member of 1000 bytes has 600 in the parts given",
+            );
+            // The same with the last volume cut: what it declares counts.
+            let mut cut_gap = gap.clone();
+            let end = cut_gap[2].len() - 50;
+            cut_gap[2].truncate(end);
+            let refs: Vec<&[u8]> = [&cut_gap[0], &cut_gap[2]]
+                .iter()
+                .map(|v| v.as_slice())
+                .collect();
+            expect(
+                format!("{name} without the volume between, the last cut"),
                 join_volumes(&refs),
                 "a stored member of 1000 bytes has 600 in the parts given",
             );
@@ -2586,6 +2594,96 @@ mod tests {
             "the first part is not a RAR archive",
         );
         assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// A stored member over three volumes: 400, 400 and 200 bytes of it.
+    fn three_volumes(arc: &[u8]) -> Vec<Vec<u8>> {
+        let vols = split(arc, 400);
+        assert_eq!(vols.len(), 3);
+        vols
+    }
+
+    fn payload() -> Vec<u8> {
+        (0..1000).map(|i| (i * 7 % 251) as u8).collect()
+    }
+
+    /// A set whose last volume ends inside the member is joined as the archive
+    /// cut there is read: the bytes the volumes hold, with no reason, in the
+    /// walk of a source and in the whole-archive path alike. A volume but the
+    /// last that ends inside a block is still refused.
+    #[test]
+    fn a_set_whose_last_volume_ends_inside_a_member_reads_as_an_archive_cut_there() {
+        let payload = payload();
+        for (label, arc, name) in [
+            ("rar4", rar4_stored(b"hi.txt", &payload), "hi.txt"),
+            ("rar5", rar5_stored(b"a/b.bin", &payload), "a/b.bin"),
+        ] {
+            let vols = three_volumes(&arc);
+            let data_at = vols[2].len() - 200;
+            for kept in [0, 1, 150] {
+                let mut cut = vols.clone();
+                cut[2].truncate(data_at + kept);
+                let refs: Vec<&[u8]> = cut.iter().map(Vec::as_slice).collect();
+                let joined = join_volumes(&refs).unwrap_or_else(|e| panic!("{label} {kept}: {e}"));
+                let want = vec![(name.to_string(), payload[..800 + kept].to_vec(), false)];
+                assert_eq!(
+                    whole_path(&joined, budget()),
+                    Ok(want.clone()),
+                    "{label} {kept}"
+                );
+                let span = RarSpan::new(sources(&cut, false), usize::MAX).unwrap();
+                assert_eq!(
+                    streamed_from(&span, 4096, budget()),
+                    Ok(want),
+                    "{label} {kept} streamed"
+                );
+            }
+            // A volume of the middle cut is a hole, not an end.
+            let mut hole = vols.clone();
+            let end = hole[1].len() - 3;
+            hole[1].truncate(end);
+            let refs: Vec<&[u8]> = hole.iter().map(Vec::as_slice).collect();
+            let why = join_volumes(&refs).unwrap_err();
+            assert!(why.contains("part 2 ends inside a block"), "{label}: {why}");
+        }
+    }
+
+    /// A set that ends where a member goes on, in a volume not given, joins
+    /// with that member flagged as continuing, as a volume read alone has it:
+    /// the members before are whole, and what the volumes hold of this one is
+    /// there.
+    #[test]
+    fn a_set_without_its_last_volume_has_its_last_member_flagged_as_going_on() {
+        let payload = payload();
+        for (label, arc) in [
+            ("rar4", rar4_stored(b"m", &payload)),
+            ("rar5", rar5_stored(b"m", &payload)),
+        ] {
+            let vols = three_volumes(&arc);
+            // The last volume given whole but one, and the last given cut
+            // inside the header of its part of the member.
+            let mut headless = vols.clone();
+            headless[2].truncate(vols[2].len() - 200 - 3);
+            for set in [
+                vec![&vols[0], &vols[1]],
+                vec![&vols[0], &vols[1], &headless[2]],
+            ] {
+                let refs: Vec<&[u8]> = set.iter().map(|v| v.as_slice()).collect();
+                let joined = join_volumes(&refs).unwrap_or_else(|e| panic!("{label}: {e}"));
+                let got = extract_rar(&joined, &mut budget()).unwrap();
+                let going_on: Vec<_> = got
+                    .iter()
+                    .filter_map(|e| e.unsupported)
+                    .filter(|w| w.contains("continues in another volume"))
+                    .collect();
+                assert_eq!(going_on.len(), 1, "{label}: {going_on:?}");
+                assert!(
+                    got.iter()
+                        .any(|e| e.unsupported.is_none() && e.data == payload[..800]),
+                    "{label}: the 800 bytes held"
+                );
+            }
+        }
     }
 
     /// A service block whose name length is the largest vint cannot place its

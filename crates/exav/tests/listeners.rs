@@ -316,6 +316,151 @@ fn one_process_serves_both_protocols() {
     }
 }
 
+/// A Unix socket and a TCP port on one clamd listener, as clamd's `LocalSocket`
+/// with `TCPSocket`: both answer, in the thread model and in the pool.
+///
+/// The pool runs one worker, so the same process has to wake for a connection
+/// on either socket, one after the other and in turn.
+#[test]
+fn several_clamd_addresses_all_answer() {
+    for workers in ["1", "threads"] {
+        let dir = TempDir::new().unwrap();
+        let sigs = sig_dir();
+        let sock = dir.path().join("clamd.sock");
+        let port = free_port();
+        let _server = Server::start(
+            dir,
+            &[
+                "--workers",
+                workers,
+                "--listen",
+                &format!("clamd://{}", sock.display()),
+                "--listen",
+                &format!("clamd://127.0.0.1:{port}"),
+                "-d",
+                sigs.path().to_str().unwrap(),
+            ],
+        );
+        let ping_unix = || {
+            until_answered("ping", || {
+                let mut s = std::os::unix::net::UnixStream::connect(&sock)?;
+                s.set_read_timeout(Some(Duration::from_secs(30)))?;
+                s.write_all(b"zPING\0")?;
+                let mut out = Vec::new();
+                s.read_to_end(&mut out)?;
+                Ok(String::from_utf8_lossy(&out)
+                    .trim_end_matches('\0')
+                    .to_string())
+            })
+        };
+        for _ in 0..2 {
+            assert_eq!(ping_unix(), "PONG", "workers={workers}: the Unix socket");
+            assert_eq!(clamd_ping(port), "PONG", "workers={workers}: the TCP port");
+        }
+    }
+}
+
+/// Two ICAP addresses, each with the options on its own: the services it
+/// answers on, and the connection limit it advertises. Alone in the thread
+/// model, and beside a clamd address in the pool, where each gets a child.
+#[test]
+fn several_icap_addresses_each_answer_with_their_own_options() {
+    /// The whole answer to an `OPTIONS` for `service` at `port`.
+    fn options(port: u16, service: &str) -> String {
+        until_answered("OPTIONS", || {
+            let mut s = dial(port, "icap");
+            s.write_all(
+                format!(
+                    "OPTIONS icap://127.0.0.1:{port}/{service} ICAP/1.0\r\n\
+                     Host: 127.0.0.1\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )?;
+            let mut out = Vec::new();
+            s.read_to_end(&mut out)?;
+            Ok(String::from_utf8_lossy(&out).into_owned())
+        })
+    }
+    for with_clamd in [false, true] {
+        let sigs = sig_dir();
+        let (a, b, clamd) = (free_port(), free_port(), free_port());
+        let mut args = vec![
+            "--listen".to_string(),
+            format!("icap://127.0.0.1:{a}?service=one&max-connections=5"),
+            "--listen".to_string(),
+            format!("icap://127.0.0.1:{b}?service=two&max-connections=9"),
+            "-d".to_string(),
+            sigs.path().to_str().unwrap().to_string(),
+        ];
+        if with_clamd {
+            args.extend(["--workers", "1", "--listen"].map(String::from));
+            args.push(format!("clamd://127.0.0.1:{clamd}"));
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let _server = Server::start(TempDir::new().unwrap(), &args);
+
+        let first = options(a, "one");
+        assert!(
+            first.starts_with("ICAP/1.0 200 OK"),
+            "{with_clamd}: {first}"
+        );
+        assert!(
+            first.contains("Max-Connections: 5"),
+            "{with_clamd}: {first}"
+        );
+        let second = options(b, "two");
+        assert!(
+            second.starts_with("ICAP/1.0 200 OK"),
+            "{with_clamd}: {second}"
+        );
+        assert!(
+            second.contains("Max-Connections: 9"),
+            "{with_clamd}: {second}"
+        );
+        // Each address answers on its own services only.
+        for (port, other) in [(a, "two"), (b, "one")] {
+            let answer = options(port, other);
+            assert!(
+                answer.starts_with("ICAP/1.0 404 "),
+                "{with_clamd}: {port} must not serve /{other}: {answer}"
+            );
+        }
+    }
+}
+
+/// One socket given twice is refused at start, whatever the options on each
+/// copy and however the path is spelled: for a Unix path the second bind would
+/// replace the first socket and the first address's options would never serve.
+#[test]
+fn the_same_address_twice_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("clamd.sock");
+    let mut server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--allow-no-db",
+            "--listen",
+            &format!("clamd://{}", sock.display()),
+            "--listen",
+            &format!("{}//?mode=660", sock.display()),
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server started with one socket given twice"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let err = server.stderr();
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(err.contains("same socket"), "{err}");
+}
+
 /// One `icap://` address is a whole deployment on its own, and it serves ICAP
 /// and nothing else.
 ///
@@ -355,6 +500,140 @@ fn icap_alone_serves_only_icap() {
     assert!(
         !String::from_utf8_lossy(&out).contains("PONG"),
         "an ICAP port must not also answer the clamd protocol"
+    );
+}
+
+/// The `(label, scans)` of each scan-totals line in the server's log, in order.
+fn totals_lines(server: &Server) -> Vec<(String, u64)> {
+    server
+        .stderr()
+        .lines()
+        .filter_map(|line| {
+            let (head, rest) = line.split_once(": SCANSTATS: scans ")?;
+            let label = head.strip_prefix("exav: ")?.to_string();
+            Some((label, rest.split_whitespace().next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The totals lines once `scans` scans have been counted and three more
+/// intervals (of one second) have passed, so a second writer would have shown.
+/// The count must show within 8 seconds, under the pool supervisor's 10 second
+/// poll: its loop wakes for the interval.
+fn totals_after(server: &Server, scans: u64) -> Vec<(String, u64)> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !totals_lines(server).iter().any(|(_, n)| *n >= scans) {
+        assert!(
+            Instant::now() < deadline,
+            "no totals line reached {scans} scans:\n{}",
+            server.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    totals_lines(server)
+}
+
+/// The totals are written once per interval and labelled `daemon`, whichever
+/// listeners the pool serves: one clamd address and two ICAP addresses, whose
+/// children share the counters, must not write the same totals twice.
+#[test]
+fn a_pool_writes_one_totals_line_per_interval_for_all_its_listeners() {
+    let sigs = sig_dir();
+    let (clamd, a, b) = (free_port(), free_port(), free_port());
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "2",
+            "--metrics-secs",
+            "1",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--listen",
+            &format!("icap://127.0.0.1:{a}"),
+            "--listen",
+            &format!("icap://127.0.0.1:{b}"),
+            "-d",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert!(clamd_instream(clamd, ALPHA).contains("FOUND"));
+    for port in [a, b] {
+        assert!(icap_respmod(port, ALPHA).contains("Exav.Test.Alpha"));
+    }
+
+    let lines = totals_after(&server, 3);
+    assert!(
+        lines.iter().all(|(label, _)| label == "daemon"),
+        "{lines:?}"
+    );
+    // A line is written only when the count moved, so one writer never repeats
+    // a total.
+    let mut counts: Vec<u64> = lines.iter().map(|(_, n)| *n).collect();
+    counts.dedup();
+    assert_eq!(
+        counts.len(),
+        lines.len(),
+        "a total was written twice: {lines:?}"
+    );
+    assert_eq!(counts.last(), Some(&3), "{lines:?}");
+}
+
+/// A pool that serves clamd alone writes the totals as well: before, only the
+/// ICAP children did.
+#[test]
+fn a_pool_serving_clamd_alone_writes_the_totals() {
+    let sigs = sig_dir();
+    let clamd = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "2",
+            "--metrics-secs",
+            "1",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "-d",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert!(clamd_instream(clamd, ALPHA).contains("FOUND"));
+
+    assert_eq!(
+        totals_after(&server, 1),
+        [("daemon".to_string(), 1)],
+        "{}",
+        server.stderr()
+    );
+}
+
+/// The thread model with ICAP alone labels its totals `daemon` like every other
+/// deployment, not `icap`.
+#[test]
+fn icap_alone_writes_its_totals_as_the_daemon() {
+    let sigs = sig_dir();
+    let icap = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--metrics-secs",
+            "1",
+            "--listen",
+            &format!("icap://127.0.0.1:{icap}"),
+            "-d",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    wait_for_log(&server, "serving ICAP on tcp:");
+    assert!(icap_respmod(icap, ALPHA).contains("Exav.Test.Alpha"));
+
+    assert_eq!(
+        totals_after(&server, 1),
+        [("daemon".to_string(), 1)],
+        "{}",
+        server.stderr()
     );
 }
 

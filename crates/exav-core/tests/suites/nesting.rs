@@ -9,6 +9,7 @@
 
 use exav_core::loader::Builder;
 use exav_core::{ScanOptions, analyze};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::time::{Duration, Instant};
 
 const STACK: usize = 512 * 1024;
@@ -358,9 +359,8 @@ fn yara_sources() {
 #[cfg(feature = "all-formats")]
 fn stored_zip(data: &[u8]) -> Vec<u8> {
     use std::io::Write;
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let o =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let o = FileOptions::default().method(Method::Stored);
     z.start_file("a.bin", o).unwrap();
     z.write_all(data).unwrap();
     z.finish().unwrap().into_inner()

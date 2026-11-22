@@ -19,7 +19,9 @@
 //     ts/core/formats.generated.ts, and formats/code.generated.json (each
 //     format's reader and the crates its feature pulls in). The site's formats
 //     page reads the registry and that file when the site is built.
-// The detection of the scanner is compared by a Rust test
+// Every entry also has `detect` ({ at, how }) and may have `spec`: their shape
+// is checked here. The detection of the scanner, and the places `detect.at`
+// names, are compared by a Rust test
 // (crates/exav-core/tests/suites/format_registry.rs). No dependencies.
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -32,6 +34,8 @@ export const registry = JSON.parse(read("formats/registry.json"));
 const KINDS = Object.keys(registry.kinds);
 const SCAN_MODES = Object.keys(registry.scanModes);
 const READS = ["stream", "members", "whole", "reported"];
+/** The places `detect.at` names (documented in the registry's "about"). */
+const PLACES = ["start", "end", "after-image", "string", "structure", "content", "name"];
 /** FileType values that type no file on their own. */
 const INTERNAL_TYPES = ["graphics", "data", "normalised HTML", "normalised text", "normalised script"];
 
@@ -99,6 +103,15 @@ function readerPath(f, walked) {
   return null;
 }
 
+/** Whether `u` is an https URL with a host and no white space. */
+function isHttps(u) {
+  try {
+    return typeof u === "string" && !/\s/.test(u) && new URL(u).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 /** The `[name]` section of a Cargo manifest, comments removed. */
 function tomlSection(toml, name) {
   const start = toml.indexOf(`\n[${name}]\n`);
@@ -152,6 +165,20 @@ export function problems() {
     }
     for (const alt of f.magic ?? []) {
       if (!Array.isArray(alt) || !alt.length || !alt.every((c) => /^\d+:([0-9a-f]{2})+$/.test(c))) add(`${where}: magic is a list of alternatives, each offset:hex conditions`);
+    }
+    const places = typeof f.detect?.at === "string" ? [f.detect.at] : f.detect?.at;
+    if (!Array.isArray(places) || !places.length || new Set(places).size !== places.length || !places.every((p) => PLACES.includes(p))) {
+      add(`${where}: detect.at is a place or a list of distinct places among ${PLACES.join(", ")}`);
+    }
+    if (typeof f.detect?.how !== "string" || !f.detect.how.trim() || f.detect.how.includes("\n")) add(`${where}: detect.how is one line`);
+    if (f.spec !== undefined) {
+      // A list names what each of its links is for: the site shows the title.
+      const titled = (s) => s && typeof s === "object" && isHttps(s.url) && typeof s.title === "string" && s.title.trim() !== "";
+      const one = typeof f.spec === "string" && isHttps(f.spec);
+      const urls = Array.isArray(f.spec) && f.spec.every(titled) ? f.spec.map((s) => s.url) : [];
+      if (!one && (urls.length < 2 || new Set(urls).size !== urls.length)) {
+        add(`${where}: spec is an https URL, or a list of two or more { url, title }`);
+      }
     }
     if (!f.scan || !SCAN_MODES.includes(f.scan.mode) || !("type" in f.scan)) add(`${where}: scan is { type, mode }`);
     if (f.unpack !== null && f.unpack !== undefined) {

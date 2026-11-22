@@ -264,9 +264,6 @@ Specifications and public-domain sources, recorded for completeness
 
 - src/formats/ppmd7/ is vendored and adapted from ppmd-rust 1.4.0
   (https://crates.io/crates/ppmd-rust), CC0-1.0 OR MIT-0.
-- src/formats/aplib.rs reproduces the bit and gamma readers of the reference
-  depack.c from aPLib by Jørgen Ibsen, released free to use
-  (https://ibsensoftware.com/products_aPLib.html).
 - The BIFF reader (src/formats/biff/) follows Microsoft's [MS-XLS] under the
   Microsoft Open Specifications Promise, and, for BIFF2 to BIFF5 formula
   tokens and the argument counts of the function table (ftab.rs),

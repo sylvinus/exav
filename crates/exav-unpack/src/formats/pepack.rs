@@ -6,43 +6,35 @@
 //! decompressed. UPX is handled separately (see `upx.rs`). This module covers
 //! the next tier of common packers.
 //!
-//! Three routes, tried in that order:
+//! Two routes:
 //!
-//! * **aPLib-compressed packers**: Petite 2.x, FSG 2.0 and NsPack wrap the
-//!   original image in an [`aplib`] stream. For these we locate the compressed
-//!   stream and decompress it, then **accept the result only if it reconstructs
-//!   a valid PE image** (`MZ`/`PE\0\0`). That output-validity gate means we do
-//!   not need packer-version-exact stub reverse-engineering to be *safe*: a
-//!   wrong guess fails the gate and is discarded, never fed to the matcher as
-//!   bogus data. When it passes, the recovered original PE is emitted for
-//!   scanning. Cheapest route, so it is tried first.
-//!
-//! * **Everything else that looks packed**: Aspack, MEW, Upack, wwpack32,
-//!   PeSpin, Yoda's Cryptor, and packers with no name at all. Their stubs are
-//!   *run*, under the bounded x86 interpreter in `exav-pe-emu`, which captures
-//!   the image the stub rebuilds. Whatever scheme a packer uses, it has to
-//!   reconstruct the original program in memory before it can jump to it, and
-//!   that is what this catches. The same output gate applies: a dump is emitted
-//!   only if it reads back as a PE.
+//! * **Everything that looks packed**: Petite, FSG, NsPack, Aspack, MEW, Upack,
+//!   wwpack32, PeSpin, Yoda's Cryptor, and packers with no name at all. Their
+//!   stubs are *run*, under the bounded x86 interpreter in `exav-pe-emu`, which
+//!   captures the image the stub rebuilds. Whatever scheme a packer uses, it
+//!   has to reconstruct the original program in memory before it can jump to
+//!   it, and that is what this catches. A dump is emitted only if it reads back
+//!   as a PE.
 //!
 //! * **Virtualizing protectors**: VMProtect, Themida, Enigma. Never emulated:
 //!   the protected code was translated to a private bytecode at build time, so
 //!   there is no original image in memory at any point to capture, and running
 //!   the stub would spend the budget proving it. Reported instead.
 //!
-//! A packed file that survives all three is reported `unsupported` (→
-//! `Unscannable`) rather than passed over: the packed bytes were scanned, the
-//! image the stub would unfold was not, and a scanner that stays quiet about
-//! that has produced a silent clean.
+//! A packed file that survives both (or any, in a build without the `pe-emu`
+//! feature) is reported `unsupported` (→ `Unscannable`) rather than passed
+//! over: the packed bytes were scanned, the image the stub would unfold was
+//! not, and a scanner that stays quiet about that has produced a silent clean.
 //!
 //! `#![forbid(unsafe_code)]` (crate root): all PE parsing is bounds-checked and
 //! returns `None`/empty rather than panicking on malformed input.
 
+#[cfg(feature = "pe-emu")]
+use crate::LimitHit;
 use crate::pe::{Headers, PE32, PE32_PLUS, Section};
 use crate::source::ByteSource;
-use crate::{Budget, Entry, LimitHit, Sink};
+use crate::{Budget, Entry, Sink};
 
-use super::aplib;
 #[cfg(feature = "pe-emu")]
 use exav_pe_emu as x86;
 
@@ -109,6 +101,7 @@ struct Pe<'a> {
     clr_rva: u32,
 }
 
+#[cfg(feature = "pe-emu")]
 #[inline]
 fn u16_le(d: &[u8], o: usize) -> Option<u16> {
     Some(u16::from_le_bytes([*d.get(o)?, *d.get(o + 1)?]))
@@ -156,11 +149,9 @@ impl<'a> Pe<'a> {
 /// Recognised PE runtime packers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Packer {
-    /// aPLib-compressed families we attempt to decompress.
     Nspack,
     Petite,
     Fsg,
-    /// Detected but not decompressed (bespoke / emulation-required).
     Aspack,
     Mew,
     Upack,
@@ -193,12 +184,6 @@ enum Packer {
 }
 
 impl Packer {
-    /// Whether this packer wraps the original image in an aPLib stream we try to
-    /// decompress.
-    fn is_aplib(self) -> bool {
-        matches!(self, Packer::Nspack | Packer::Petite | Packer::Fsg)
-    }
-
     /// Whether this is a virtualizing protector rather than a compressor. The
     /// distinction changes what exav can truthfully say: a compressor hides content
     /// that could in principle be recovered, a virtualizer leaves nothing to
@@ -591,46 +576,30 @@ fn import_count(pe: &Pe, data: &[u8]) -> u32 {
     total
 }
 
-/// Maximum size we will decompress an inner PE to (guards crafted streams; the
-/// budget cap further constrains this).
+/// Maximum size of an unpacked PE (the budget cap further constrains this).
+#[cfg(feature = "pe-emu")]
 const MAX_INNER: usize = 128 << 20;
 
-/// Attempt to recover and emit the original image from a packed PE. For
-/// aPLib-family packers, locate the compressed stream at candidate offsets and
-/// decompress, accepting only output that reconstructs a valid PE. Returns
-/// `Ok(None)` when nothing could be safely recovered (the caller still scans the
-/// raw bytes).
+/// Attempt to recover and emit the original image from a packed PE, by running
+/// its stub. Returns `Ok(None)` when nothing could be safely recovered (the
+/// caller still scans the raw bytes).
 pub(crate) fn extract_pepack(data: &[u8], budget: &mut Budget, visit: Sink) -> crate::Extracted {
     let Some(pe) = Pe::parse(data) else {
         return Ok(None);
     };
     let identified = identify(&pe);
 
-    // The aPLib families first: a static depack is exact and costs a
-    // decompression, where emulation costs millions of instructions.
-    let mut recovered = false;
-    if let Some(packer) = identified.filter(|p| p.is_aplib()) {
-        match aplib_unpack(&pe, data, budget, visit, packer)? {
-            Recovered::Halt(r) => return Ok(Some(r)),
-            Recovered::Emitted => recovered = true,
-            Recovered::Nothing => {}
-        }
-    }
-
-    // Then the emulator, for everything except the virtualizers: for those
+    // The emulator, for everything except the virtualizers: for those
     // there is no original image in memory at any point, so running the stub
     // would burn the budget to reconstruct something that does not exist.
     #[cfg(feature = "pe-emu")]
-    if !recovered && !identified.is_some_and(Packer::is_virtualizer) {
+    if !identified.is_some_and(Packer::is_virtualizer) {
         let label = identified.map(packer_name).unwrap_or("runtime");
         match emulated_unpack(data, budget, visit, label)? {
             Recovered::Halt(r) => return Ok(Some(r)),
-            Recovered::Emitted => recovered = true,
+            Recovered::Emitted => return Ok(None),
             Recovered::Nothing => {}
         }
-    }
-    if recovered {
-        return Ok(None);
     }
 
     let Some(packer) = identified else {
@@ -641,7 +610,7 @@ pub(crate) fn extract_pepack(data: &[u8], budget: &mut Budget, visit: Sink) -> c
         return Ok(None);
     };
     {
-        // Detected, but not an aPLib family: no verifiable unpack, and we
+        // Detected, but nothing recovered: no verifiable unpack, and we
         // fabricate nothing. The caller still scans the raw (packed) bytes, so a
         // signature written against the stub still fires; what is NOT examined
         // is the original image the stub will unfold at runtime.
@@ -677,72 +646,16 @@ pub(crate) fn extract_pepack(data: &[u8], budget: &mut Budget, visit: Sink) -> c
     }
 }
 
-/// Locate and decompress the aPLib stream Petite/FSG2/NsPack wrap the original
-/// image in, accepting the result only if it reconstructs a valid PE. That
-/// output check is what makes brute-forcing the stream offset safe: a wrong
-/// guess fails it and is discarded rather than handed to the matcher as data.
-fn aplib_unpack(
-    pe: &Pe,
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink,
-    packer: Packer,
-) -> Result<Recovered, LimitHit> {
-    budget.count_entry()?;
-    let cap = budget.reserve()?.min(MAX_INNER as u64) as usize;
-
-    // Candidate stream starts, most-likely first: each section's raw data (the
-    // packed payload lives in one of them), plus the byte after the entry-point
-    // stub. Deduplicated, bounded.
-    let mut candidates: Vec<usize> = Vec::new();
-    for s in &pe.headers.sections {
-        let start = s.raw_pointer as usize;
-        if start < data.len() {
-            candidates.push(start);
-        }
-    }
-    if let Some(ep) = pe.rva_to_off(pe.headers.entry_point) {
-        candidates.push(ep);
-    }
-    candidates.sort_unstable();
-    candidates.dedup();
-
-    for &start in &candidates {
-        let stream = &data[start..];
-        if stream.len() < 8 {
-            continue;
-        }
-        if let Some(out) = aplib::depack(stream, cap)
-            && looks_like_pe(&out)
-        {
-            budget.commit(out.len() as u64);
-            let name = format!("{}-unpacked", packer_name(packer));
-            return Ok(match visit(Entry::new(name, out), budget) {
-                Some(r) => Recovered::Halt(r),
-                None => Recovered::Emitted,
-            });
-        }
-    }
-    Ok(Recovered::Nothing)
-}
-
 /// What an unpacking attempt did, distinguishing "produced nothing" from
 /// "produced a member the sink kept going past". A sink that collects every
-/// member returns `None` for each one, so without that distinction a successful
-/// static unpack would be followed by a redundant emulation of the same file.
+/// member returns `None` for each one, so without that distinction a
+/// successful unpack would be reported as if it had recovered nothing.
+#[cfg(feature = "pe-emu")]
 pub(crate) enum Recovered {
     Nothing,
     Emitted,
     Halt(crate::Stop),
 }
-
-/// Instruction budget for one stub. Runtime packers spend on the order of a
-/// hundred instructions per byte they produce, so this is what bounds the size
-/// of image the emulator can follow to completion, and what bounds the CPU a
-/// hostile file can demand. At tens of millions of ticks a second it is a few
-/// seconds in the worst case, and only for files that already look packed.
-#[cfg(feature = "pe-emu")]
-const MAX_EMU_TICKS: u64 = 120_000_000;
 
 /// Ceiling on the emulator's address space, and on the dump it produces.
 ///
@@ -782,8 +695,10 @@ pub(crate) fn emulated_unpack(
     if room == 0 {
         return Err(budget.pe_emulation_exhausted());
     }
+    let stub_steps = budget.limits.max_pe_stub_steps;
     let limits = x86::run::EmuLimits {
-        max_ticks: MAX_EMU_TICKS.min(room),
+        max_ticks: stub_steps.min(room),
+        max_idle_ticks: budget.limits.max_pe_idle_steps,
         max_dump: cap.min(MAX_EMU_DUMP),
         max_pages: cap.min(MAX_EMU_MEMORY) / exav_pe_emu::PAGE_SIZE,
         ..Default::default()
@@ -791,14 +706,17 @@ pub(crate) fn emulated_unpack(
     let report =
         crate::profile::timed("emu", data.len() as u64, || x86::run::unpack(data, &limits));
     budget.charge_pe_emulation(report.ticks);
-    // The per-stub cap ending a run is the emulator's normal behavior; the
-    // scan-wide one ending it means this stub was not given its full share.
-    let cut_short = limits.max_ticks < MAX_EMU_TICKS && report.ticks >= limits.max_ticks;
+    // Either budget ending the run leaves the image incomplete, and the scan
+    // says so after the partial image is emitted. The scan-wide one is named
+    // when it is the smaller, as it is then what ended the run.
+    let cut_short = report.ticks >= limits.max_ticks;
     let ended = |budget: &Budget, done: Recovered| {
-        if cut_short {
+        if !cut_short {
+            Ok(done)
+        } else if room <= stub_steps {
             Err(budget.pe_emulation_exhausted())
         } else {
-            Ok(done)
+            Err(budget.pe_stub_exhausted())
         }
     };
 
@@ -873,10 +791,10 @@ fn packer_name(p: Packer) -> &'static str {
     }
 }
 
-/// Output-validity gate: accept a decompressed buffer only if it reconstructs a
-/// plausible PE image (`MZ` + reachable `PE\0\0`). This is what makes candidate
-/// brute-forcing safe: random or wrongly-located depack output is rejected
-/// here rather than handed to the matcher as data.
+/// Output-validity gate: accept an unpacked buffer only if it reads back as a
+/// plausible PE image (`MZ` + reachable `PE\0\0`): a dump whose headers the stub
+/// overwrote is rejected here rather than handed to the matcher as data.
+#[cfg(feature = "pe-emu")]
 fn looks_like_pe(out: &[u8]) -> bool {
     if out.len() < 0x40 || &out[..2] != b"MZ" {
         return false;
@@ -1118,41 +1036,49 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pe-emu")]
     #[test]
-    fn end_to_end_aplib_family_unpack() {
-        // Inner "original" PE carrying a detectable marker string.
-        const MARKER: &[u8] = b"EXAV_PEPACK_INNER_MARKER";
-        let mut inner_body = Vec::new();
-        inner_body.extend_from_slice(MARKER);
-        inner_body.extend_from_slice(&[0x90u8; 300]); // padding to give aPLib matches
-        inner_body.extend_from_slice(MARKER);
-        let inner = build_pe(&[b".text"], &inner_body, 0);
+    fn a_named_packer_is_emulated_and_the_dump_carries_its_name() {
+        // Petite, FSG and NsPack were once unpacked by a static decoder; their
+        // stubs now run like any other, and the member is named after the
+        // packer the section names identify.
+        const MARKER: &[u8] = b"EXAV_NAMED_PACKER_MARKER";
+        let mut plain = Vec::new();
+        while plain.len() < 0xc000 {
+            plain.extend_from_slice(MARKER);
+        }
+        let cipher: Vec<u8> = plain.iter().map(|b| b ^ 0x5a).collect();
+        let mut stub: Vec<u8> = vec![0xbe];
+        stub.extend_from_slice(&0x0040_f000u32.to_le_bytes());
+        stub.push(0xbf);
+        stub.extend_from_slice(&0x0040_1000u32.to_le_bytes());
+        stub.push(0xb9);
+        stub.extend_from_slice(&(cipher.len() as u32).to_le_bytes());
+        stub.extend_from_slice(&[0xac, 0x34, 0x5a, 0xaa, 0xe2, 0xfa]);
+        let jmp_at = 0x0040_e000u32 + stub.len() as u32;
+        stub.push(0xe9);
+        stub.extend_from_slice(&0x0040_1000u32.wrapping_sub(jmp_at + 5).to_le_bytes());
 
-        // Pack it with the aPLib encoder and lay the stream into an NsPack-named
-        // outer PE section: exactly the shape the extractor expects.
-        let packed_stream = aplib::encoder::pack(&inner);
-        let outer = build_pe(&[b".nsp0", b".nsp1"], &packed_stream, 1);
+        let mut file = packed_pe(&stub, &cipher);
+        let sec_table = 0x80 + 24 + 0xe0;
+        file[sec_table..sec_table + 8].copy_from_slice(b".nsp0\0\0\0");
+        file[sec_table + 40..sec_table + 48].copy_from_slice(b".nsp1\0\0\0");
+        assert!(is_pepack(&file));
 
-        assert!(is_pepack(&outer), "outer PE must be detected as packed");
         let mut b = Budget::new(Limits {
             max_extracted_bytes: 1 << 30,
             max_buffer_bytes: 1 << 30,
-            max_compression_ratio: u64::MAX,
             ..Default::default()
         });
-        let entries = extract(Format::PePacked, &outer, &mut b).unwrap();
-        assert_eq!(entries.len(), 1, "recovered exactly one inner image");
-        let rec = &entries[0].data;
-        assert_eq!(rec, &inner, "recovered inner PE must be byte-exact");
-        assert!(
-            rec.windows(MARKER.len()).any(|w| w == MARKER),
-            "marker recovered from inside the packed stream"
-        );
+        let entries = extract(Format::PePacked, &file, &mut b).unwrap();
+        assert_eq!(entries.len(), 1, "one reconstructed image");
+        assert_eq!(entries[0].name, "NsPack-emulated");
+        assert!(entries[0].data.windows(MARKER.len()).any(|w| w == MARKER));
     }
 
     #[test]
-    fn detected_non_aplib_packer_is_reported_not_silently_dropped() {
-        // ASPack is detected but not decompressed. Nothing may be *fabricated*
+    fn a_detected_packer_that_does_not_unpack_is_reported_not_silently_dropped() {
+        // An ASPack-named file whose stub unpacks nothing. Nothing may be *fabricated*
         // (the entry carries no data), but the file must not scan clean either:
         // the original image is present in the packed bytes and was not
         // examined, so it is surfaced as unsupported (→ UNSCANNABLE).
@@ -1210,9 +1136,10 @@ mod tests {
         let _ = extract(Format::PePacked, &d, &mut b);
     }
 
+    #[cfg(feature = "pe-emu")]
     #[test]
     fn looks_like_pe_extreme_e_lfanew_does_not_panic() {
-        // Depack output whose e_lfanew is u32::MAX: `e + 24` in looks_like_pe
+        // Dump whose e_lfanew is u32::MAX: `e + 24` in looks_like_pe
         // must not overflow-panic on 32-bit targets; the buffer is rejected.
         let mut out = vec![0u8; 0x40];
         out[..2].copy_from_slice(b"MZ");

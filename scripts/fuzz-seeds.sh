@@ -33,7 +33,7 @@ SKIP="crates/exav-unpack/tests/fixtures/rar/ppmd_lzss_conversion.rar"
 
 cd "$ROOT"
 rm -rf "$OUT"
-mkdir -p "$OUT"/{containers,pe,drawing,imagehash,raw_preview,cad_dxf,cad_dwg,ifc,mesh,markdown,visible_text,full_pipeline,seekable,volumes,vdisk,fsimage,installers,rar_walk,lzo,yara,pcre,cvd,database,authenticode,sheets_xls,sheets_ods,sheets_numbers,sheets_text,slides_ppt,slides_odp,slides_odg,slides_vsdx,slides_keynote,docs_doc,docs_odt,docs_rtf,docs_wml,docs_html,docs_pages}
+mkdir -p "$OUT"/{containers,pe,drawing,imagehash,pdf_readers,raw_preview,cad_dxf,cad_dwg,ifc,mesh,markdown,visible_text,full_pipeline,seekable,volumes,vdisk,fsimage,installers,rar_walk,lzo,yara,pcre,cvd,database,authenticode,sheets_xls,sheets_ods,sheets_numbers,sheets_text,slides_ppt,slides_odp,slides_odg,slides_vsdx,slides_keynote,docs_doc,docs_odt,docs_rtf,docs_wml,docs_html,docs_pages}
 
 # Tracked files, and new ones not yet committed (but not ignored ones).
 files() { git ls-files -co --exclude-standard -- "$@"; }
@@ -112,6 +112,13 @@ while IFS= read -r f; do
 done < <(
   files 'crates/exav-imagehash/tests/fixtures/img/**' 'fuzz/seeds/imagehash/**' \
     'crates/exav-render/tests/fixtures/images/**' 'crates/exav-viewer/e2e/fixtures/pdf-images/**'
+)
+
+# pdf_readers: every PDF of the repository, the viewer's included.
+while IFS= read -r f; do add "$f" "$OUT/pdf_readers"; done < <(
+  files 'crates/exav-unpack/test_data/pdf/*.pdf' 'crates/exav-unpack/tests/fixtures/pdf/*.pdf' \
+    'crates/exav-core/tests/testdata/*.pdf' 'crates/exav-viewer/demo/examples/files/pdf/*.pdf' \
+    'crates/exav-viewer/e2e/fixtures/pdf-images/*.pdf'
 )
 
 # raw_preview: exav-render's synthetic camera RAW files (written by their
@@ -480,6 +487,6 @@ python3 scripts/fuzz-seeds-synth.py "$OUT"
 for t in analyze unpack filetype; do ln -sfn containers "$OUT/$t"; done
 ln -sfn pe "$OUT/pe_emulator"
 
-for d in containers pe drawing imagehash raw_preview cad_dxf cad_dwg ifc mesh markdown visible_text full_pipeline seekable volumes yara pcre cvd database authenticode sheets_xls sheets_ods sheets_numbers sheets_text slides_ppt slides_odp slides_odg slides_vsdx slides_keynote docs_doc docs_odt docs_rtf docs_wml docs_html docs_pages; do
+for d in containers pe drawing imagehash pdf_readers raw_preview cad_dxf cad_dwg ifc mesh markdown visible_text full_pipeline seekable volumes yara pcre cvd database authenticode sheets_xls sheets_ods sheets_numbers sheets_text slides_ppt slides_odp slides_odg slides_vsdx slides_keynote docs_doc docs_odt docs_rtf docs_wml docs_html docs_pages; do
   echo "$d: $(find "$OUT/$d" -type f | wc -l) seeds"
 done

@@ -185,12 +185,10 @@ fn unzip_xml(name: &str, data: Vec<u8>, budget: &mut Budget) -> Result<Vec<u8>> 
     if !(name.ends_with(".gz") || data.starts_with(&[0x1F, 0x8B])) {
         return Ok(data);
     }
-    use std::io::Read;
     let max = budget.limits.max_part;
     let mut out = vec![];
-    let n = flate2::read::MultiGzDecoder::new(&data[..])
-        .take(max + 1)
-        .read_to_end(&mut out)
+    let mut z = flate2::read::MultiGzDecoder::new(&data[..]);
+    let n = exav_unpack::source::read_capped(&mut z, &mut out, max + 1)
         .map_err(|e| Error::Malformed(format!("gzip: {e}")))?;
     if n as u64 > max {
         return Err(Error::TooLarge("a package part"));

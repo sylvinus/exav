@@ -1,8 +1,9 @@
 //! Drawings of a table: pictures, charts (embedded objects), text boxes and
 //! shapes, anchored to a cell or to the page.
 
-use super::styles::{parse_color, parse_len_pt};
+use super::styles::parse_color;
 use super::{Doc, paragraphs, parse_addr};
+use crate::formats::office::common::odf::pt;
 use crate::formats::office::common::xml::Node;
 use crate::formats::office::sheets::error::Result;
 use crate::formats::office::sheets::limits::Budget;
@@ -107,10 +108,7 @@ impl PtGrid {
 }
 
 fn len(n: &Node, k: &str) -> f64 {
-    n.attr(k)
-        .and_then(parse_len_pt)
-        .unwrap_or(0.0)
-        .clamp(-1e7, 1e7)
+    n.attr(k).and_then(pt).unwrap_or(0.0).clamp(-1e7, 1e7)
 }
 
 /// A frame's or shape's corners in points from the sheet's origin.
@@ -302,7 +300,7 @@ fn shape(n: &Node, cell: Option<(u32, u32)>, g: &PtGrid, doc: &Doc, depth: u32) 
         let mut it = tr
             .split([' ', ','])
             .filter(|s| !s.is_empty())
-            .map(|s| parse_len_pt(s).unwrap_or(0.0));
+            .map(|s| pt(s).unwrap_or(0.0));
         let (tx, ty) = (it.next().unwrap_or(0.0), it.next().unwrap_or(0.0));
         let (ox, oy) = cell.map_or((0.0, 0.0), |(r, c)| g.cell(r, c));
         let (w, h) = (len(n, "svg:width"), len(n, "svg:height"));
@@ -328,20 +326,8 @@ fn shape(n: &Node, cell: Option<(u32, u32)>, g: &PtGrid, doc: &Doc, depth: u32) 
         shp.flip_v = c.3 < c.1;
     }
     shp.rotation = rot;
-    let gp = n
-        .attr("draw:style-name")
-        .and_then(|sn| doc.st.other("graphic", sn))
-        .and_then(|s| s.child("style:graphic-properties"));
-    let parent_gp = n
-        .attr("draw:style-name")
-        .and_then(|sn| doc.st.other("graphic", sn))
-        .and_then(|s| s.attr("style:parent-style-name"))
-        .and_then(|p| doc.st.other("graphic", p))
-        .and_then(|s| s.child("style:graphic-properties"));
-    let prop = |k: &str| {
-        gp.and_then(|g| g.attr(k))
-            .or_else(|| parent_gp.and_then(|g| g.attr(k)))
-    };
+    let gp = doc.st.chain("graphic", n.attr("draw:style-name"));
+    let prop = |k: &str| gp.get(&format!("graphic/{k}"));
     let filled = prop("draw:fill").is_none_or(|f| f != "none");
     if filled && geom != "line" {
         // The default fill of a shape is light blue in the application.
@@ -360,7 +346,7 @@ fn shape(n: &Node, cell: Option<(u32, u32)>, g: &PtGrid, doc: &Doc, depth: u32) 
                 .unwrap_or(0x3465A4),
         );
         shp.line_width = prop("svg:stroke-width")
-            .and_then(parse_len_pt)
+            .and_then(pt)
             .map(|w| (w * 12700.0) as i64)
             .filter(|&w| w > 0);
         if prop("draw:stroke") == Some("dash") {

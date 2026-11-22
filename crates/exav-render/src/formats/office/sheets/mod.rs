@@ -209,6 +209,10 @@ fn finish(mut wb: model::Workbook, limits: &Limits, used: u64) -> Result<Convert
     if !fits {
         return Err(Error::TooLarge("memory"));
     }
+    // An XLSX has a sheet at least: an empty workbook is one empty sheet.
+    if wb.sheets.is_empty() {
+        wb.sheets.push(model::Sheet::new("Sheet1".into()));
+    }
     let xlsx = xlsx::write(&wb, left)?;
     Ok(Converted {
         xlsx,

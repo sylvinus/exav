@@ -1,3 +1,7 @@
+import { HIDDEN_CLASS } from "../core/hidden.generated.js";
+
+const UNSAFE = new RegExp(`[${HIDDEN_CLASS}<>:"|?*]`, "gu");
+
 /**
  * A member's name, made safe to offer as a download name. The archive wrote
  * it: it can hold a path, `..`, control characters or characters a file
@@ -6,11 +10,9 @@
 export function safeFileName(name: string, fallback = "file"): string {
   const base = name.split(/[/\\]/).pop() ?? "";
   const cleaned = base
-    // C0 and C1 controls, the line and paragraph separators, the
-    // bidirectional marks, embeddings, overrides and isolates (a name that
-    // would show in another order than it is stored), and what Windows
-    // refuses in a name.
-    .replace(/[\u{0}-\u{1f}\u{7f}-\u{9f}\u{61c}\u{200e}\u{200f}\u{2028}\u{2029}\u{202a}-\u{202e}\u{2066}-\u{2069}<>:"|?*]/gu, "_")
+    // What a name may not show (`HIDDEN_CLASS`: controls, separators, the
+    // bidirectional characters), and what Windows refuses in a name.
+    .replace(UNSAFE, "_")
     .replace(/^[.\s]+|[.\s]+$/g, "")
     .slice(0, 200);
   return cleaned || fallback;

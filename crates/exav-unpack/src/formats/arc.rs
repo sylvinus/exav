@@ -134,9 +134,11 @@ pub(crate) fn is_arc_in(p: &crate::Probe) -> bool {
         return false;
     };
     // A member whose data runs past the end is a truncated archive, which is
-    // still an archive.
+    // still an archive, when its name is more than one character: a compiled
+    // terminfo entry (`1A 01`, then its names' size, one byte and a NUL) reads
+    // as a header of method 1 with a one-letter name.
     if next >= p.len {
-        return true;
+        return data.get(3).is_some_and(|&b| b != 0);
     }
     let at_next = p.window(next, HEADER_LEN_V1);
     at_next.get(..2) == Some(&[MARKER, 0][..]) || plausible_header(&at_next, 0)
@@ -373,7 +375,14 @@ pub(crate) fn extract_arc(data: &[u8], budget: &mut Budget, visit: Sink) -> crat
 
         budget.count_entry()?;
         let cap = budget.reserve()? as usize;
-        if orig_size > cap {
+        // What decoding writes: a stored body is the bytes there are, whatever
+        // size the header declares past the end of the file.
+        let planned = if matches!(method, 1 | 2) {
+            body.len()
+        } else {
+            orig_size
+        };
+        if planned > cap {
             if let Some(r) = visit(
                 Entry::over_limit(
                     name,

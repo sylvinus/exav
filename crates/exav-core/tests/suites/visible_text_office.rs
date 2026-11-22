@@ -44,6 +44,15 @@ fn an_rtf_phrase_split_by_its_groups_is_matched_as_the_words() {
 }
 
 #[test]
+fn an_rtf_with_a_short_header_is_matched_as_the_words() {
+    let rtf = b"{\\rt0\\ansi Please down{\\b load} the \\i attach\\i0 ment\\par}";
+    assert!(found("please download the attachment", "mail.rtf", rtf));
+    // The same bytes under a header that is not RTF's are plain text.
+    let other = b"{\\r0\\ansi Please down{\\b load} the \\i attach\\i0 ment\\par}";
+    assert!(!found("please download the attachment", "mail.rtf", other));
+}
+
+#[test]
 fn the_words_of_a_doc_an_xls_and_a_ppt_are_matched() {
     assert!(found("revenue grew by twelve percent", "report.doc", DOC));
     assert!(found("merged note across three columns", "budget.xls", XLS));
@@ -166,6 +175,38 @@ fn a_damaged_document_whose_text_cannot_be_taken_out_makes_the_scan_incomplete()
         verdict(&db, "broken.bin", &d, false),
         Verdict::Clean
     ));
+}
+
+#[test]
+fn a_raised_object_limit_raises_the_converters_counts_too() {
+    // 4,097 worksheets: one past the sheets a converter takes at the default
+    // object limit, which scales with it.
+    let mut xml = String::from(
+        r#"<?xml version="1.0"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">"#,
+    );
+    for i in 0..4097 {
+        xml.push_str(&format!(
+            r#"<Worksheet ss:Name="S{i}"><Table><Row><Cell><Data ss:Type="String">x</Data></Cell></Row></Table></Worksheet>"#
+        ));
+    }
+    xml.push_str("</Workbook>");
+    let db = scanner("never present");
+    let scan = |object: u64| {
+        let mut o = ScanOptions::default();
+        o.filename = Some("book.xml".to_string());
+        o.limits.max_buffer_bytes = object;
+        analyze(&db, xml.as_bytes(), &o).verdict
+    };
+    let default = ScanOptions::default().limits.max_buffer_bytes;
+    // Past the count: no text view, and the scan is not complete.
+    let v = scan(default);
+    assert!(
+        !matches!(v, Verdict::Clean | Verdict::Infected { .. }),
+        "{v:?}"
+    );
+    // Twice the object limit, twice the sheets: the text is read.
+    let v = scan(2 * default);
+    assert!(matches!(v, Verdict::Clean), "{v:?}");
 }
 
 #[test]

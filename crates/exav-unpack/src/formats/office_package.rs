@@ -132,13 +132,13 @@ mod tests {
     #[test]
     fn a_package_whose_directory_is_lost_is_read_by_its_local_headers() {
         use std::io::Write;
-        let mut z = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let mut z = crate::zip_write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         for (name, data) in [
             ("docProps/app.xml", &b"word/document.xml"[..]),
             ("[Content_Types].xml", b"<Types/>"),
             ("word/document.xml", b"<w:document/>"),
         ] {
-            z.start_file(name, ::zip::write::SimpleFileOptions::default())
+            z.start_file(name, crate::zip_write::FileOptions::default())
                 .unwrap();
             z.write_all(data).unwrap();
         }

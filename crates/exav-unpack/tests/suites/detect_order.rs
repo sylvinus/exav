@@ -170,6 +170,20 @@ fn an_rtf_document_with_the_marker_and_an_object_is_one() {
     assert!(contains(&members(Format::Rtf, &over(rtf, 14)), payload));
 }
 
+/// The header is `{\rt` and what follows is free.
+#[cfg(feature = "rtf")]
+#[test]
+fn an_rtf_with_a_short_header_is_one_and_gives_its_object() {
+    let payload = b"PAYLOAD-OF-AN-RTF-OBJECT";
+    let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+    let rtf = format!("{{\\rt0\\ansi ABCD {{\\object\\objemb{{\\objdata {hex}}}}}}}");
+    let rtf = rtf.as_bytes();
+    same_type_and_members(rtf, &over(rtf, 14), Format::Rtf);
+    assert!(contains(&members(Format::Rtf, rtf), payload));
+    let other = format!("{{\\r0\\ansi ABCD {{\\object\\objemb{{\\objdata {hex}}}}}}}");
+    assert_eq!(detect(&other.as_bytes()), None);
+}
+
 #[cfg(feature = "dxf")]
 #[test]
 fn a_dxf_drawing_with_the_marker_is_one() {

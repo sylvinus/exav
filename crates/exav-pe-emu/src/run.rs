@@ -9,13 +9,17 @@
 //! clear, and it has a signature the emulator can recognise without knowing
 //! anything about the packer:
 //!
-//! > execution arrives at an address inside the image, in a **different
-//! > section** from the one the stub started in, on a page **the stub itself
-//! > wrote**.
+//! > execution arrives, by a jump of the stub's, at an address inside the
+//! > image, in a **different section** from the ones the stub has been running
+//! > in, on a page **the stub itself wrote**.
 //!
 //! Both halves matter. "Different section" alone would fire on the stub calling
 //! a helper; "written page" alone would fire on the stub's own scratch data. A
-//! page that the stub produced *and* then executed is the original code.
+//! page that the stub produced *and* then executed is the original code. The
+//! stub's sections are those it ran a few dozen instructions in from the file's
+//! own bytes, not simply the entry point's section; and an exception handler
+//! the stub decompressed along with the program is entered without a jump, so
+//! neither entering it nor running it counts.
 //!
 //! ## When the stub does not get there
 //!
@@ -82,14 +86,10 @@ const MIN_PARTIAL_DIRTY: u64 = 64 * 1024;
 /// instructions; without a floor, that is indistinguishable from an unpack.
 const MIN_UNPACK_DIRTY: u64 = 32 * 1024;
 
-/// How long a run may go without writing a page it has not written before.
-/// Sized so a slow but genuine decompressor (which produces output steadily)
-/// never trips it, while a spin loop is cut off in a fraction of a second.
-const PROGRESS_WINDOW: u64 = 8_000_000;
-
-/// How many distinct pages a run must write within one progress window to
-/// count as still unpacking. A sweep over a destination lights up far more than
-/// this; a spin loop hammering one address lights up one.
+/// How many distinct pages a run must write within one idle window
+/// ([`EmuLimits::max_idle_ticks`]) to count as still unpacking. A sweep over a
+/// destination lights up far more than this; a spin loop hammering one address
+/// lights up one.
 const MIN_WRITE_SPREAD: u32 = 6;
 
 /// How many calls to unimplemented exports a run may make before it is treated
@@ -135,6 +135,11 @@ pub struct EmuLimits {
     /// Instruction budget. A `rep` counts its iterations, so this bounds work,
     /// not instruction *count*: a stub cannot buy time with one long `rep`.
     pub max_ticks: u64,
+    /// How long a run may go without writing a page it has not written before
+    /// (in ticks). A slow but genuine decompressor produces output steadily and
+    /// never trips it; a spin loop is cut off after this many ticks. A run it
+    /// ends is reported through [`Report::stop`]. `u64::MAX` disables it.
+    pub max_idle_ticks: u64,
     /// Resident-page cap for the whole address space.
     pub max_pages: usize,
     /// Largest dump to build.
@@ -159,6 +164,7 @@ impl Default for EmuLimits {
             // decompressor, and small enough that a stub which loops forever
             // costs a bounded amount of CPU.
             max_ticks: 200_000_000,
+            max_idle_ticks: 64_000_000,
             // 192 MiB of emulated memory.
             max_pages: 48 * 1024,
             max_dump: 64 << 20,
@@ -264,6 +270,11 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
     // point straight away. `tls_cb_array` is the VA of the callback array, re-
     // read before each call because a callback can grow it.
     let tls_cb_array = setup_tls(&image, &mut env, &mut mem);
+    image.protect_headers(&mut mem);
+    // Binding the imports and the TLS index wrote into the image; that is the
+    // loader's work, not the stub's, so it is part of the baseline too.
+    mem.clear_dirty(image.base, image.size_of_image);
+    mem.watch(image.base, image.size_of_image);
     let mut tls_next: u32 = 0;
     let mut tls_calls: u32 = 0;
     let mut in_tls = false;
@@ -285,17 +296,32 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
         return report;
     }
 
-    let stub_section = image.section_of(image.entry_rva);
+    // Instructions run in each section from pages that held the file's own
+    // bytes when first run (the stub, not what it produced). `run_sec` is the
+    // section to credit while execution stays on `run_page`, so a page is
+    // looked up only when execution moves to another.
+    let mut ran_in: Vec<u64> = vec![0; image.sections.len()];
+    let mut run_page: u32 = u32::MAX;
+    let mut run_sec: Option<usize> = None;
 
+    // A program smaller than the floor cannot rebuild that much: for such an
+    // image half of it is what a jump into it has to find rewritten.
+    let unpack_floor = limits
+        .min_unpack_dirty
+        .min(u64::from(image.size_of_image) / 2);
+    // Address of the instruction run last.
+    let mut last_eip: u32 = 0;
+    let seh_nested = env.seh_nested();
     let mut seh = SehState {
         seh_return,
+        seh_nested,
         ..Default::default()
     };
     let mut oep: Option<u32> = None;
     let mut ticks: u64 = 0;
     let mut unimplemented_calls = 0u32;
     let mut faulted_api_calls = 0u32;
-    let mut progress_deadline: u64 = PROGRESS_WINDOW;
+    let mut progress_deadline: u64 = limits.max_idle_ticks;
     let stop_reason: String;
     let mut trace: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut recheck: Vec<u64> = vec![0; image.sections.len() + 1];
@@ -312,10 +338,10 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
         // place. Checked on a coarse interval so the check itself is free.
         if ticks >= progress_deadline {
             if mem.take_write_spread() < MIN_WRITE_SPREAD {
-                stop_reason = format!("no progress in {PROGRESS_WINDOW} ticks");
+                stop_reason = format!("no progress in {} ticks", limits.max_idle_ticks);
                 break;
             }
-            progress_deadline = ticks + PROGRESS_WINDOW;
+            progress_deadline = ticks.saturating_add(limits.max_idle_ticks);
         }
         // A TLS callback that outran its slice of the budget. Abandon the rest
         // of the TLS phase and start the entry point with what it produced.
@@ -364,12 +390,16 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
             stop_reason = "the stub returned to the loader".to_string();
             break;
         }
-        if eip == seh_return {
+        if eip == seh_return || eip == seh_nested {
             // Charged like any other step. Dispatching a handler runs no
             // instruction, so an SEH chain that keeps returning here would
             // otherwise advance neither the tick budget nor the progress
             // window: a loop the emulator cannot see itself taking.
             ticks += 1;
+            if eip == seh_nested {
+                // ExceptionContinueSearch: the nested record only watches.
+                cpu.regs[EAX] = 1;
+            }
             match seh.handler_returned(&mut cpu, &mut mem) {
                 Ok(SehOutcome::Resumed) => continue,
                 Ok(SehOutcome::TryNext) => match seh.dispatch_next(&mut cpu, &mut mem) {
@@ -449,7 +479,7 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
         }
 
         // The tail transfer: into the image, into a different section from the
-        // stub's, onto a page the stub wrote.
+        // stub's, onto a page the stub wrote, by a jump from the stub.
         //
         // The conditions are ordered cheapest-first: the watched-range count is
         // a field read, and until the stub has rebuilt `min_unpack_dirty` no
@@ -459,22 +489,34 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
         // side-effect free except `rebuilt`, which stays last under the same
         // call conditions as before (so its recheck throttle behaves identically).
         if oep.is_none()
-            && mem.watched_dirty_bytes() >= limits.min_unpack_dirty
+            && mem.watched_dirty_bytes() >= unpack_floor
             && eip >= image.base
             && eip < image_end
             && mem.is_dirty(eip)
+            && !seh.landing
         {
             let rva = eip - image.base;
             let sec = image.section_of(rva);
-            // The transfer has to cross into another SECTION, not merely onto a
-            // page the stub wrote and never executed. The page-level rule is the
-            // tempting one and it is wrong: a stub that relocates its own
-            // decompressor to a fresh page and jumps there satisfies it, which
-            // PEtite does within ten thousand instructions of starting. The run
-            // then stops at what only looks like an entry point and dumps a
-            // *half-decompressed* image. Stopping late and dumping everything
-            // beats stopping at the first plausible-looking jump.
-            if sec != stub_section && rebuilt(&image, sec, &mut mem, &mut recheck, ticks) {
+            // The transfer has to cross into another SECTION than the stub's,
+            // not merely onto a page the stub wrote and never executed. The
+            // page-level rule is the tempting one and it is wrong: a stub that
+            // relocates its own decompressor to a fresh page and jumps there
+            // satisfies it, which PEtite does within ten thousand instructions
+            // of starting. The run then stops at what only looks like an entry
+            // point and dumps a *half-decompressed* image. Stopping late and
+            // dumping everything beats stopping at the first plausible-looking
+            // jump. The stub's sections are the ones it ran in (`ran_in`), not
+            // the entry point's: NsPack's entry point is a `jmp` out of the
+            // section that holds the program.
+            //
+            // And the jump has to come from the stub. A packer decompresses
+            // its exception handler along with the program, so control lands on
+            // a rebuilt page without any jump, and then runs on there: neither
+            // the landing nor anything the handler runs is the program starting.
+            if !sec.is_some_and(|i| ran_in[i] >= STUB_RUN_INSNS)
+                && comes_from_stub(&image, &mut mem, &ran_in, last_eip)
+                && rebuilt(&image, sec, &mut mem, &mut recheck, ticks)
+            {
                 oep = Some(rva);
                 stop_reason = format!("reached the original entry point at RVA {rva:#x}");
                 break;
@@ -496,6 +538,22 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
         match cpu.step(&mut mem) {
             Ok(t) => {
                 ticks += t;
+                last_eip = eip;
+                seh.landing = false;
+                // After the step, because that is when a page's first fetch
+                // settles whether it holds produced code.
+                if eip >> 12 != run_page {
+                    run_page = eip >> 12;
+                    run_sec =
+                        if eip >= image.base && eip < image_end && !mem.runs_produced_code(eip) {
+                            image.section_of(eip - image.base)
+                        } else {
+                            None
+                        };
+                }
+                if let Some(i) = run_sec {
+                    ran_in[i] += 1;
+                }
                 if stepping && cpu.tf {
                     // Single-step exception, delivered to the stub's own
                     // handler exactly as the processor would. The flag is
@@ -709,6 +767,30 @@ fn next_tls_callback(mem: &mut Mem, cb_array: u32, idx: u32, image: &PeImage) ->
     }
 }
 
+/// Instructions run from the file's own bytes in a section before it counts as
+/// the stub's. The entry point's section is not always where the stub is:
+/// NsPack's entry is a `jmp` out of the section that holds the program,
+/// PECompact's installs a handler that lives in another one. A section the
+/// entry point only passes through does not get anywhere near this.
+const STUB_RUN_INSNS: u64 = 64;
+
+/// Whether the instruction at `at`, which transferred control, belongs to the
+/// stub: it is outside the image, in a section the stub ran in, or on a page
+/// the stub never wrote. An instruction on a page it did write, in another
+/// section, is the rebuilt program (or a handler it unpacked) running.
+fn comes_from_stub(image: &PeImage, mem: &mut Mem, ran_in: &[u64], at: u32) -> bool {
+    let Some(rva) = at.checked_sub(image.base) else {
+        return true;
+    };
+    if rva >= image.size_of_image {
+        return true;
+    }
+    image
+        .section_of(rva)
+        .is_some_and(|i| ran_in[i] >= STUB_RUN_INSNS)
+        || !mem.is_dirty(at)
+}
+
 /// Whether the section execution just entered was *rebuilt* rather than merely
 /// touched.
 ///
@@ -880,6 +962,14 @@ fn exception_code(stop: &Stop) -> Option<u32> {
 struct SehState {
     /// Where a handler returns to, so the driver regains control.
     seh_return: u32,
+    /// Handler of the record linked in front of the chain while a handler runs.
+    seh_nested: u32,
+    /// Head of the chain when the exception was raised, restored when the
+    /// handler returns.
+    head: u32,
+    /// Set when control was just handed to a handler: the next instruction
+    /// was reached by the exception, not by a jump of the stub's.
+    landing: bool,
     /// Registration record currently being tried.
     frame: u32,
     /// Address of the `CONTEXT` handed to the handler.
@@ -919,6 +1009,7 @@ impl SehState {
         mem.write_bytes(record, &rec).map_err(Stop::Fault)?;
         write_context(cpu, mem, context, at)?;
 
+        self.head = head;
         self.frame = head;
         self.context = context;
         self.record = record;
@@ -931,6 +1022,18 @@ impl SehState {
     /// Push the handler's four arguments and jump to it.
     fn enter_handler(&mut self, cpu: &mut Cpu, mem: &mut Mem) -> Result<(), Stop> {
         let handler = mem.read_u32(self.frame + 4).map_err(Stop::Fault)?;
+        // ntdll runs a handler under a registration record of its own, linked
+        // in front of the chain: {Next = the head the exception was raised
+        // on, Handler, EstablisherFrame}. A handler that wants the frame it
+        // was called for reads it as `[fs:[0]]`, which Petite's does to
+        // unwind to its own frame.
+        self.landing = true;
+        let (head, nested, frame) = (self.head, self.seh_nested, self.frame);
+        cpu.push32(mem, frame)?;
+        cpu.push32(mem, nested)?;
+        cpu.push32(mem, head)?;
+        let record_at = cpu.regs[ESP];
+        mem.write_u32(cpu.fs_base, record_at).map_err(Stop::Fault)?;
         cpu.push32(mem, 0)?; // DispatcherContext
         let ctx = self.context;
         cpu.push32(mem, ctx)?;
@@ -948,6 +1051,8 @@ impl SehState {
         if !self.active {
             return Ok(SehOutcome::TryNext);
         }
+        // The handler's own record leaves the chain whatever it answers.
+        mem.write_u32(cpu.fs_base, self.head).map_err(Stop::Fault)?;
         match cpu.regs[EAX] {
             // ExceptionContinueExecution: resume from the context, which the
             // handler will usually have edited. Resuming from anything else
@@ -1269,6 +1374,223 @@ mod tests {
             "the handler resumed execution and the stub reached its target: {}",
             r.stop
         );
+    }
+
+    /// The handler every test below installs: `mov eax,[esp+0xc]` (the
+    /// `CONTEXT`), set its Eip to `resume`, `ExceptionContinueExecution`.
+    fn resume_handler(resume: u32) -> Vec<u8> {
+        let mut h = vec![0x8b, 0x44, 0x24, 0x0c, 0xc7, 0x80, 0xb8, 0x00, 0x00, 0x00];
+        h.extend_from_slice(&resume.to_le_bytes());
+        h.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+        h
+    }
+
+    /// `push handler ; push fs:[0] ; mov fs:[0], esp`.
+    fn install_handler(handler: u32) -> Vec<u8> {
+        let mut s = vec![0x68];
+        s.extend_from_slice(&handler.to_le_bytes());
+        s.extend_from_slice(&[0x64, 0xff, 0x35, 0, 0, 0, 0]);
+        s.extend_from_slice(&[0x64, 0x89, 0x25, 0, 0, 0, 0]);
+        s
+    }
+
+    /// `mov [0x401000], eax ; jmp 0x401000`: the tail the stubs above end in,
+    /// placed at `at`.
+    fn store_and_jump(at: u32) -> Vec<u8> {
+        let mut t = vec![0xa3, 0x00, 0x10, 0x40, 0x00, 0xe9];
+        let rel = 0x0040_1000u32.wrapping_sub(at + 10) as i32;
+        t.extend_from_slice(&rel.to_le_bytes());
+        t
+    }
+
+    #[test]
+    fn a_write_to_the_headers_is_an_access_violation() {
+        // Windows maps the headers read-only. A stub that stores into them
+        // gets its handler, and one that is let through goes on to the next
+        // instruction, which here spins.
+        //
+        //   <install handler>
+        //   c6 05 00 00 40 00 00   mov byte [0x400000], 0   <- access violation
+        //   eb fe                  jmp $                    <- if let through
+        //   <store_and_jump>                                <- the handler resumes here
+        let base = 0x0040_2000u32;
+        let mut stub = install_handler(0);
+        stub.extend_from_slice(&[0xc6, 0x05, 0x00, 0x00, 0x40, 0x00, 0x00]);
+        stub.extend_from_slice(&[0xeb, 0xfe]);
+        let resume = base + stub.len() as u32;
+        stub.extend_from_slice(&store_and_jump(resume));
+        let handler = base + stub.len() as u32;
+        stub[1..5].copy_from_slice(&handler.to_le_bytes());
+        stub.extend_from_slice(&resume_handler(resume));
+
+        let limits = EmuLimits {
+            max_ticks: 50_000,
+            ..tiny_limits()
+        };
+        let r = unpack(&packed_pe(&stub, 0x1000), &limits);
+        assert!(
+            r.unpacked.as_ref().is_some_and(|u| u.reached_oep),
+            "the store did not fault into the handler: {}",
+            r.stop
+        );
+    }
+
+    #[test]
+    fn a_handler_finds_its_frame_one_link_down_the_chain() {
+        // ntdll runs a handler under a registration record of its own, linked
+        // in front of the chain, so `[[fs:0]]` is the frame the handler was
+        // called for (Petite's handler unwinds to its frame this way). This
+        // handler checks that against the EstablisherFrame argument.
+        //
+        //   xor eax,eax ; mov [eax], 0          <- access violation
+        // handler:
+        //   64 a1 00 00 00 00   mov eax, fs:[0]
+        //   8b 00               mov eax, [eax]
+        //   3b 44 24 08         cmp eax, [esp+8]
+        //   75 11               jne bad
+        //   <resume_handler>
+        // bad:
+        //   eb fe               jmp $
+        let base = 0x0040_2000u32;
+        let mut stub = install_handler(0);
+        stub.extend_from_slice(&[0x31, 0xc0, 0xc7, 0x00, 0, 0, 0, 0]);
+        let resume = base + stub.len() as u32;
+        stub.extend_from_slice(&store_and_jump(resume));
+        let handler = base + stub.len() as u32;
+        stub[1..5].copy_from_slice(&handler.to_le_bytes());
+        stub.extend_from_slice(&[0x64, 0xa1, 0, 0, 0, 0, 0x8b, 0x00, 0x3b, 0x44, 0x24, 0x08]);
+        stub.extend_from_slice(&[0x75, 0x11]);
+        stub.extend_from_slice(&resume_handler(resume));
+        stub.extend_from_slice(&[0xeb, 0xfe]);
+
+        let limits = EmuLimits {
+            max_ticks: 50_000,
+            ..tiny_limits()
+        };
+        let r = unpack(&packed_pe(&stub, 0x1000), &limits);
+        assert!(
+            r.unpacked.as_ref().is_some_and(|u| u.reached_oep),
+            "the handler did not find its frame at [[fs:0]]: {}",
+            r.stop
+        );
+    }
+
+    /// A packed PE whose `.text` is two pages (0x1000 and 0x2000) and whose
+    /// stub, at 0x3000, carries `payload` at +0x800. The image is 0x4000, so
+    /// two dirty pages are half of it.
+    fn two_page_text(stub: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut file = packed_pe(stub, 0x1000);
+        let sec_table = 0x80 + 24 + 0xe0;
+        let (s0, s1) = (sec_table, sec_table + 40);
+        let opt = 0x80 + 24;
+        file[s0 + 8..s0 + 12].copy_from_slice(&0x2000u32.to_le_bytes()); // VirtualSize
+        file[s1 + 8..s1 + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+        file[s1 + 12..s1 + 16].copy_from_slice(&0x3000u32.to_le_bytes());
+        file[s1 + 16..s1 + 20].copy_from_slice(&0x1000u32.to_le_bytes()); // SizeOfRawData
+        file[opt + 16..opt + 20].copy_from_slice(&0x3000u32.to_le_bytes()); // entry
+        file[opt + 56..opt + 60].copy_from_slice(&0x4000u32.to_le_bytes()); // SizeOfImage
+        file.resize(0x400 + 0x1000, 0);
+        file[0x400 + 0x800..0x400 + 0x800 + payload.len()].copy_from_slice(payload);
+        file
+    }
+
+    /// `mov esi, 0x403800 ; mov edi, 0x401fe0 ; mov ecx, 0x40 ; rep movsb`:
+    /// copy the payload across the page boundary inside `.text`.
+    fn copy_across_the_pages() -> Vec<u8> {
+        vec![
+            0xbe, 0x00, 0x38, 0x40, 0x00, 0xbf, 0xe0, 0x1f, 0x40, 0x00, 0xb9, 0x40, 0x00, 0x00,
+            0x00, 0xf3, 0xa4,
+        ]
+    }
+
+    #[test]
+    fn a_handler_the_stub_unpacked_is_not_the_entry_point() {
+        // The stub unpacks its handler along with the program and the
+        // exception delivers control there: a rebuilt page in another section,
+        // entered without a jump. The handler hands control back to the stub,
+        // which jumps into the program on the next page.
+        //
+        //   <install handler 0x401fe0> ; <copy_across_the_pages>
+        //   cc          int3
+        //   eb fe       jmp $
+        // resume:
+        //   e9 <0x402000>
+        // payload: the handler at 0x401fe0 resuming at `resume`, and at
+        // 0x402000 a `ret`.
+        let mut stub = install_handler(0x0040_1fe0);
+        stub.extend_from_slice(&copy_across_the_pages());
+        stub.extend_from_slice(&[0xcc, 0xeb, 0xfe]);
+        let resume = 0x0040_3000 + stub.len() as u32;
+        stub.push(0xe9);
+        stub.extend_from_slice(&0x0040_2000u32.wrapping_sub(resume + 5).to_le_bytes());
+        let mut payload = resume_handler(resume);
+        payload.resize(0x20, 0x90);
+        payload.push(0xc3);
+
+        let r = unpack(&two_page_text(&stub, &payload), &tiny_limits());
+        let u = r.unpacked.expect("the image was reconstructed");
+        assert!(u.reached_oep, "{}", r.stop);
+        assert_eq!(
+            u.oep_rva, 0x2000,
+            "the handler was taken for the entry point"
+        );
+    }
+
+    #[test]
+    fn an_entry_point_that_only_jumps_out_of_its_section_is_not_the_stub() {
+        // NsPack's entry is a `jmp` in the first section, whose code is the
+        // program; the stub is elsewhere and jumps back into the first section.
+        //
+        // .text (entry 0x1000): e9 <rel to 0x402000>
+        // stub  (0x402000):     copy 16 bytes to 0x401100 ; jmp 0x401100
+        let plain: [u8; 16] = *b"ORIGINAL PROGRAM";
+        let mut stub = vec![0xbe, 0x00, 0x30, 0x40, 0x00, 0xbf, 0x00, 0x11, 0x40, 0x00];
+        stub.extend_from_slice(&[0xb9, 0x10, 0x00, 0x00, 0x00, 0xf3, 0xa4]);
+        let jmp_at = 0x0040_2000u32 + stub.len() as u32;
+        stub.push(0xe9);
+        stub.extend_from_slice(&0x0040_1100u32.wrapping_sub(jmp_at + 5).to_le_bytes());
+
+        let mut file = packed_pe(&stub, 0x1000);
+        let sec_table = 0x80 + 24 + 0xe0;
+        let opt = 0x80 + 24;
+        // The stub section carries the plain bytes at +0x1000.
+        file[sec_table + 40 + 8..sec_table + 40 + 12].copy_from_slice(&0x2000u32.to_le_bytes());
+        file[sec_table + 40 + 16..sec_table + 40 + 20].copy_from_slice(&0x2000u32.to_le_bytes());
+        file[opt + 56..opt + 60].copy_from_slice(&0x4000u32.to_le_bytes());
+        file.resize(0x400 + 0x2000, 0);
+        file[0x400 + 0x1000..0x400 + 0x1010].copy_from_slice(&plain);
+        // .text gets 0x200 bytes of raw data holding the trampoline.
+        let raw = file.len();
+        file.resize(raw + 0x200, 0);
+        let rel = 0x0040_2000u32.wrapping_sub(0x0040_1000 + 5);
+        file[raw] = 0xe9;
+        file[raw + 1..raw + 5].copy_from_slice(&rel.to_le_bytes());
+        file[sec_table + 16..sec_table + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        file[sec_table + 20..sec_table + 24].copy_from_slice(&(raw as u32).to_le_bytes());
+        file[opt + 16..opt + 20].copy_from_slice(&0x1000u32.to_le_bytes()); // entry
+
+        let r = unpack(&file, &tiny_limits());
+        let u = r.unpacked.expect("the image was reconstructed");
+        assert!(u.reached_oep, "{}", r.stop);
+        assert_eq!(u.oep_rva, 0x1100);
+    }
+
+    #[test]
+    fn a_program_smaller_than_the_floor_is_still_recognised() {
+        // The shipping floor is 32 KiB of rewritten image, which a program of
+        // 16 KiB cannot reach; for it, half the image is what counts. Two
+        // pages rewritten of four, then a jump into them.
+        let mut stub = copy_across_the_pages();
+        stub.push(0xe9);
+        let rel = 0x0040_2000u32.wrapping_sub(0x0040_3000 + stub.len() as u32 + 4);
+        stub.extend_from_slice(&rel.to_le_bytes());
+        let mut payload = vec![0x90; 0x20];
+        payload.push(0xc3);
+
+        let r = unpack(&two_page_text(&stub, &payload), &EmuLimits::default());
+        let u = r.unpacked.expect("the image was reconstructed");
+        assert!(u.reached_oep, "{}", r.stop);
+        assert_eq!(u.oep_rva, 0x2000);
     }
 
     #[test]

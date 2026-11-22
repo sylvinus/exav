@@ -20,6 +20,7 @@ export type BuiltinFormat =
   | "rtf"
   | "doc"
   | "odt"
+  | "pages"
   | "ppt"
   | "odp"
   | "keynote"
@@ -258,7 +259,11 @@ export interface Detector {
     signal?: AbortSignal,
     tail?: (length: number) => Promise<{ bytes: Uint8Array; size: number } | null>,
   ): Promise<FormatId | null>;
-  /** `detectFile` for a file known by its name alone: an archive member. */
+  /**
+   * `detectFile` for a file known by its name alone: an archive member. When
+   * `head` is the whole file, its end is read from it, so a ZIP is told by
+   * its directory too.
+   */
   detectBytes(name: string, head: Uint8Array, size?: number, signal?: AbortSignal): Promise<FormatId | null>;
   /**
    * The content type exav's detection gives the start of a file, or "" when

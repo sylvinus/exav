@@ -467,6 +467,30 @@ mod tests {
         assert!(matches!(analyze(&db, &buf, &high).verdict, Verdict::Clean));
     }
 
+    /// A threshold of 0 is 1, as in ClamAV: a text with no number is clean.
+    #[test]
+    fn a_threshold_of_zero_needs_one_number() {
+        use crate::{ScanOptions, Scanner, Verdict, analyze};
+        let db = Scanner::builtin();
+        let zero = ScanOptions {
+            structured_cc_count: Some(0),
+            structured_ssn_count: Some(0),
+            ..ScanOptions::default()
+        };
+        let text = b"a plain line of text with no numbers in it\n";
+        assert_eq!(analyze(&db, text, &zero).verdict, Verdict::Clean);
+        for (data, name) in [
+            (VISA, "Heuristics.Structured.CreditCardNumber"),
+            (&b"078-05-1120"[..], "Heuristics.Structured.SSN"),
+        ] {
+            let verdict = analyze(&db, data, &zero).verdict;
+            assert!(
+                matches!(&verdict, Verdict::Infected { signature, .. } if signature == name),
+                "{verdict:?}"
+            );
+        }
+    }
+
     #[test]
     fn counts_read_in_blocks_are_the_counts_from_memory() {
         use crate::byte_source::{BlockCache, CHUNK, Stepper};

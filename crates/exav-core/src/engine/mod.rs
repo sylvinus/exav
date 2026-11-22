@@ -430,6 +430,10 @@ thread_local! {
     /// Why a check could not read part of an object that is malformed, the
     /// first such reason this scan. Setting it also sets [`SCAN_TRUNCATED`].
     static SCAN_UNREADABLE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+
+    /// Why a signature search kept only part of its matches, the first such
+    /// reason this scan. Setting it also sets [`SCAN_TRUNCATED`].
+    static SCAN_SEARCH_CUT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Clear the per-scan verify-truncation flag. Call at the start of a top-level scan.
@@ -438,6 +442,7 @@ pub fn reset_scan_truncated() {
     SCAN_OVER_SIZE.with(|r| r.borrow_mut().take());
     SCAN_CAPPED.with(|r| r.borrow_mut().take());
     SCAN_UNREADABLE.with(|r| r.borrow_mut().take());
+    SCAN_SEARCH_CUT.with(|r| r.borrow_mut().take());
     CLEAN_SEEN.with(|m| m.borrow_mut().clear());
 }
 
@@ -531,6 +536,23 @@ pub(crate) fn mark_unreadable(reason: impl FnOnce() -> String) {
 /// The reason recorded by [`mark_unreadable`] this scan, if any.
 pub(crate) fn scan_unreadable() -> Option<String> {
     SCAN_UNREADABLE.with(|r| r.borrow().clone())
+}
+
+/// Record that a signature search kept only part of its matches, and why.
+#[cfg(feature = "yara")]
+pub(crate) fn mark_search_cut(reason: impl FnOnce() -> String) {
+    SCAN_TRUNCATED.with(|c| c.set(true));
+    SCAN_SEARCH_CUT.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.is_none() {
+            *r = Some(reason());
+        }
+    });
+}
+
+/// The reason recorded by [`mark_search_cut`] this scan, if any.
+pub(crate) fn scan_search_cut() -> Option<String> {
+    SCAN_SEARCH_CUT.with(|r| r.borrow().clone())
 }
 
 /// Record that a check outside this module (YARA's condition step budget, the
@@ -887,11 +909,13 @@ pub(crate) fn unmarked<R>(f: impl FnOnce() -> R) -> R {
     let over_size = SCAN_OVER_SIZE.with(|r| r.borrow().clone());
     let capped = SCAN_CAPPED.with(|r| r.borrow().clone());
     let unreadable = SCAN_UNREADABLE.with(|r| r.borrow().clone());
+    let search_cut = SCAN_SEARCH_CUT.with(|r| r.borrow().clone());
     let r = f();
     SCAN_TRUNCATED.with(|c| c.set(truncated));
     SCAN_OVER_SIZE.with(|r| *r.borrow_mut() = over_size);
     SCAN_CAPPED.with(|r| *r.borrow_mut() = capped);
     SCAN_UNREADABLE.with(|r| *r.borrow_mut() = unreadable);
+    SCAN_SEARCH_CUT.with(|r| *r.borrow_mut() = search_cut);
     r
 }
 
@@ -1287,6 +1311,9 @@ pub(crate) struct WholeLimits {
     /// regex engines that can be made to take long (`--max-regex-steps`);
     /// a search that reaches it stops and the scan is incomplete.
     pub(crate) regex_steps: usize,
+    /// Steps the conditions of the YARA rules of one scan may take together
+    /// (`--max-yara-steps`), `None` for no bound.
+    pub(crate) yara_steps: Option<u64>,
     /// Steps per MiB of an object the body-signature verifier may take
     /// (`--max-matcher-steps`), `None` for no bound; see [`matcher_bounds`].
     pub(crate) matcher_steps: Option<u64>,
@@ -1311,6 +1338,9 @@ pub(crate) struct WholeLimits {
 /// The default of `--max-regex-steps`.
 pub(crate) const DEFAULT_REGEX_STEPS: usize = 100_000_000;
 
+/// The default of `--max-yara-steps`.
+pub(crate) const DEFAULT_YARA_STEPS: u64 = 20_000_000;
+
 impl WholeLimits {
     /// No bound on the size of an object. The step budgets stay at their
     /// defaults: a search of a hostile pattern must end.
@@ -1319,6 +1349,7 @@ impl WholeLimits {
         pcre: usize::MAX,
         pcre_said: true,
         regex_steps: DEFAULT_REGEX_STEPS,
+        yara_steps: Some(DEFAULT_YARA_STEPS),
         matcher_steps: Some(DEFAULT_MATCHER_STEPS),
         all_image_formats: true,
         near_reach: usize::MAX,

@@ -11,7 +11,7 @@ DBDIR   ?= exav-db
 EXAVDB  ?= exav.exavdb
 
 .DEFAULT_GOAL := build
-.PHONY: build release test test-native test-yara-diff test-wasm test-js test-viewer test-www test-formats formats test-helm wasm-sizes lint fmt msrv stack-frames compiled-once deps-review av-audit miri publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
+.PHONY: build release test test-native test-yara-diff test-yara-diff-rules need-yr test-oracles test-inno test-wasm test-js test-viewer test-www test-formats formats test-helm wasm-sizes lint fmt msrv stack-frames compiled-once deps-review av-audit miri publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
 
 ## build: compile the release binary
 build release:
@@ -94,6 +94,7 @@ test-native:
 	$(CARGO) test -p exav-unpack --features text
 	$(CARGO) test -p exav-render --no-default-features --features text
 	$(CARGO) test -p exav-unpack --features text-pdf --test all text::
+	$(CARGO) test -p exav-unpack --features text-pdf --test all pdf_readers_diff
 	$(CARGO) test -p exav-render --no-default-features --features text-pdf
 	$(CARGO) test -p exav-core --features visible-text-pdf --test all visible_text
 	$(CARGO) test -p exav-grep --features text-pdf --test text
@@ -115,6 +116,8 @@ test-native:
 	# The viewer's wasm crate, natively: its own workspace, so `--workspace`
 	# does not reach it.
 	$(CARGO) test --manifest-path crates/exav-viewer/Cargo.toml --all-features
+	# The check that no released file holds a path of its build machine.
+	scripts/test-build-paths.sh
 
 ## test-yara-diff: the yara-x A/B differential harness. Compiles the SAME rules
 ##                 with both engines and asserts equal matching-rule sets. NOT
@@ -132,11 +135,53 @@ test-native:
 ##                 in a way a program on PATH cannot.
 ##
 ##                 Install the oracle with `cargo install yara-x-cli`, or point
-##                 EXAV_DEBUG_YR_BIN at a build. WITHOUT it the tests SKIP and report
-##                 green having checked nothing, so read the output, not just
-##                 the exit code. Run it when you touch the YARA engine.
-test-yara-diff:
+##                 EXAV_DEBUG_YR_BIN at a build. A plain `cargo test` skips these
+##                 tests without `yr` (so a machine without it passes the normal
+##                 suite); this target fails instead when `yr` is missing, and
+##                 when EXAV_DEBUG_YARA_CORPUS (a directory of .yar/.yara files
+##                 for the coverage suite) is unset or not a directory. Run it
+##                 when you touch the YARA engine.
+test-yara-diff: need-yr
+	@if [ ! -d "$$EXAV_DEBUG_YARA_CORPUS" ]; then \
+		echo "test-yara-diff: EXAV_DEBUG_YARA_CORPUS must name a directory of .yar/.yara files (the coverage suite checks nothing without it); 'make test-yara-diff-rules' runs the rest" >&2; \
+		exit 1; \
+	fi
 	$(CARGO) test -p exav-core --test yara_difftest --test yara_coverage_difftest -- --nocapture
+
+## test-yara-diff-rules: test-yara-diff without the corpus suite (no corpus
+##                 variable needed). This is what CI runs: the corpus is not in
+##                 the repository.
+test-yara-diff-rules: need-yr
+	$(CARGO) test -p exav-core --test yara_difftest -- --nocapture
+
+# Fails when yara-x's `yr` is not found (EXAV_DEBUG_YR_BIN, else PATH).
+need-yr:
+	@yr="$${EXAV_DEBUG_YR_BIN:-yr}"; \
+	if ! "$$yr" --version >/dev/null 2>&1; then \
+		echo "yara-diff: yr (yara-x CLI) not found as '$$yr'; install it with 'cargo install yara-x-cli' or set EXAV_DEBUG_YR_BIN" >&2; \
+		exit 1; \
+	fi
+
+## test-oracles: exav-unpack's LZFSE, LZVN and DCL decoders against the
+##               reference ones (Apple's lzfse, zlib's blast), compiled with
+##               sanitizers from their fetched sources into target/oracles by
+##               crates/exav-unpack/tests/oracle/build.sh. Needs the network
+##               and a C compiler with AddressSanitizer. Run by the nightly.
+test-oracles:
+	crates/exav-unpack/tests/oracle/build.sh $(CURDIR)/target/oracles
+	EXAV_LZFSE_ORACLE=$(CURDIR)/target/oracles/lzfse_oracle \
+	EXAV_DCL_ORACLE=$(CURDIR)/target/oracles/dcl_oracle \
+	  $(CARGO) test -p exav-unpack --lib -- --ignored oracle
+
+## test-inno: exav-unpack's Inno Setup reader over Inno Setup's own released
+##            installers (crates/exav-unpack/tests/inno/installers.txt): every
+##            file listed must come out whole with its stored SHA-256. Fetches
+##            them into target/inno, refusing a file whose hash differs from
+##            the list. Needs the network. Run by the nightly.
+test-inno:
+	crates/exav-unpack/tests/inno/fetch.sh $(CURDIR)/target/inno
+	EXAV_DEBUG_INNO_DIR=$(CURDIR)/target/inno \
+	  $(CARGO) test -p exav-unpack --lib -- --ignored --nocapture released_installers
 
 ## test-js: the exav-unpack-wasm JavaScript suites: vitest units plus the
 ##          playwright browser e2e against a freshly built pkg/. This is the
@@ -149,8 +194,8 @@ test-js:
 ##              among them), then the package built and checked as `npm publish`
 ##              would upload it, the sink and wasm-import gates, and the demo
 ##              built for production and driven in headless Chromium under its
-##              Content-Security-Policy, its sandboxed frame in Chromium,
-##              Firefox and WebKit. The
+##              Content-Security-Policy, every file it lists opened, its
+##              sandboxed frame in Chromium, Firefox and WebKit. The
 ##              archive plugin's peer, exav-unpack-wasm's pkg/, is rebuilt from
 ##              the current source too. Needs wasm-bindgen-cli at the version
 ##              crates/exav-viewer pins.

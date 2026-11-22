@@ -215,9 +215,12 @@ Routing these through the knob would only let an operator lower them:
 - core's JavaScript normaliser output (32 MiB). The raw bytes are scanned in
   full; when the normalised view is cut, the scan is reported incomplete
   (`LIMITS-EXCEEDED` unless something is found). The normaliser reads the
-  script in one pass and holds only the output, the identifiers it renamed and
-  the calls still open (at most 256, a `fromCharCode` list as 4-byte values),
-  so the output cap is what bounds it.
+  script in one pass and holds only the output (a renamed identifier is a mark
+  and an id in it until the end), one entry for each identifier and the calls
+  still open (at most 256). The cap counts the output bytes only; the buffer
+  that holds the marks has a bound of its own at twice the cap (64 MiB), past
+  which the view is cut and reported the same way. In the decoding mode a
+  `fromCharCode` list is held as numbers, at most 8 Mi of them (32 MiB).
 
 ### Excluded by design
 

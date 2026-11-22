@@ -196,3 +196,26 @@ describe("a server that answers 200 to a range request", () => {
     expect(e.state.pulled).toBeLessThan(10);
   });
 });
+
+describe("a download with a limit", () => {
+  const limited = (max: number) => createSourceReader({ url: "https://files.test/f" }, new AbortController().signal, max);
+
+  it("is the file when it is within the limit", async () => {
+    vi.stubGlobal("fetch", server().fetch);
+    expect((await limited(FILE.length).bytes()).length).toBe(FILE.length);
+  });
+
+  it("stops past the limit, read or declared", async () => {
+    const pulled = { n: 0 };
+    const body = new ReadableStream<Uint8Array>({ pull: (c) => void (pulled.n++, c.enqueue(new Uint8Array(100))) });
+    vi.stubGlobal("fetch", server({ answer: (range) => (range ? null : new Response(body)) }).fetch);
+    await expect(limited(1000).bytes()).rejects.toThrow(RangeError);
+    expect(pulled.n).toBeLessThan(15);
+    // Its Content-Length says it is larger: not read.
+    const declared = { n: 0 };
+    const big = new ReadableStream<Uint8Array>({ pull: (c) => void (declared.n++, c.enqueue(new Uint8Array(100))) });
+    vi.stubGlobal("fetch", server({ answer: (range) => (range ? null : new Response(big, { headers: { "content-length": "5000" } })) }).fetch);
+    await expect(limited(1000).bytes()).rejects.toThrow(RangeError);
+    expect(declared.n).toBeLessThan(2);
+  });
+});

@@ -1,7 +1,8 @@
 //! What the slides targets check of a conversion that succeeds.
-use std::io::Read;
-
 use exav_render::slides::{Format, Limits, convert, convert_first};
+
+#[path = "zip_parts.rs"]
+mod zip_parts;
 
 /// Converts `doc` whole, then, when it has more than one slide, its first
 /// slide alone; checks both.
@@ -32,27 +33,27 @@ pub fn limits() -> Limits {
 /// character.
 pub fn pptx(bytes: &[u8], slides: usize, limits: &Limits) {
     assert!(bytes.len() as u64 <= limits.max_memory);
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a ZIP");
+    let parts = zip_parts::parts(bytes);
     for part in [
         "[Content_Types].xml",
         "ppt/presentation.xml",
         "ppt/slideMasters/slideMaster1.xml",
         "ppt/slideLayouts/slideLayout1.xml",
     ] {
-        assert!(z.index_for_name(part).is_some(), "{part}");
+        assert!(parts.iter().any(|(name, _)| name == part), "{part}");
     }
     if slides > 0 {
-        assert!(z.index_for_name("ppt/slides/slide1.xml").is_some());
+        assert!(
+            parts
+                .iter()
+                .any(|(name, _)| name == "ppt/slides/slide1.xml")
+        );
     }
-    for i in 0..z.len() {
-        let mut f = z.by_index(i).expect("a part");
-        let name = f.name().map(|n| n.to_string()).unwrap_or_default();
+    for (name, data) in &parts {
         if !(name.ends_with(".xml") || name.ends_with(".rels")) {
             continue;
         }
-        let mut s = String::new();
-        f.read_to_string(&mut s)
-            .unwrap_or_else(|_| panic!("{name}: UTF-8"));
+        let s = std::str::from_utf8(data).unwrap_or_else(|_| panic!("{name}: UTF-8"));
         assert!(s.starts_with("<?xml"), "{name}");
         // No C0 control character but white space: XML 1.0 refuses them.
         assert!(

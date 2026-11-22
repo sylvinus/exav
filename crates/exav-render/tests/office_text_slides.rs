@@ -2,7 +2,7 @@
 //! fill and not from a PPTX written and read back.
 
 use exav_render::slides::{Error, Format, Limits, convert, text};
-use std::io::Read;
+use exav_unpack::package::Package;
 
 fn fixture(dir: &str, name: &str) -> Vec<u8> {
     let p = format!(
@@ -204,10 +204,10 @@ fn it_refuses_what_the_converter_refuses() {
 
 /// The words of the PPTX the converter writes for a fixture, in order.
 fn pptx_words(pptx: &[u8]) -> Vec<String> {
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(pptx)).unwrap();
+    let mut z = Package::from_bytes(pptx).unwrap();
     let mut names: Vec<String> = z
-        .file_names()
-        .filter_map(|n| n.ok().map(|n| n.to_string()))
+        .names(usize::MAX)
+        .into_iter()
         .filter(|n| n.starts_with("ppt/slides/slide") && n.ends_with(".xml"))
         .collect();
     names.sort_by_key(|n| {
@@ -218,8 +218,7 @@ fn pptx_words(pptx: &[u8]) -> Vec<String> {
     });
     let mut out = vec![];
     for n in names {
-        let mut xml = String::new();
-        z.by_name(&n).unwrap().read_to_string(&mut xml).unwrap();
+        let xml = String::from_utf8(z.read(&n, u64::MAX).unwrap().unwrap()).unwrap();
         let mut rest = xml.as_str();
         while let Some(i) = rest.find("<a:t>") {
             let from = i + 5;

@@ -1,6 +1,14 @@
 pub(crate) struct Lexer<'a> {
     data: &'a [u8],
     pos: usize,
+    /// A value nested past the parser's depth bound was passed over since this
+    /// was last taken ([`Lexer::take_passed_over`]).
+    passed_over: bool,
+}
+
+/// The PDF white-space characters (ISO 32000-1, table 1).
+pub(crate) fn is_white(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\x00')
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,7 +34,21 @@ pub(crate) enum Token {
 
 impl<'a> Lexer<'a> {
     pub(crate) fn new(data: &'a [u8]) -> Self {
-        Lexer { data, pos: 0 }
+        Lexer {
+            data,
+            pos: 0,
+            passed_over: false,
+        }
+    }
+
+    /// Notes that a value was passed over for its depth.
+    pub(super) fn pass_over(&mut self) {
+        self.passed_over = true;
+    }
+
+    /// Whether a value was passed over for its depth since the last call.
+    pub(crate) fn take_passed_over(&mut self) -> bool {
+        std::mem::take(&mut self.passed_over)
     }
 
     pub(crate) fn pos(&self) -> usize {
@@ -49,12 +71,7 @@ impl<'a> Lexer<'a> {
     /// miss an `N G obj` after it on the same line, which a reader that goes by
     /// the cross-reference table finds, and the scan for objects must too.
     fn skip_blank(&mut self) {
-        while self.pos < self.data.len()
-            && matches!(
-                self.data[self.pos],
-                b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\x00'
-            )
-        {
+        while self.pos < self.data.len() && is_white(self.data[self.pos]) {
             self.pos += 1;
         }
     }

@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::rc::Rc;
 
 use crate::stream::Disk;
 
@@ -691,11 +692,28 @@ impl<B: ByteSource + ?Sized> ByteSource for Lower<'_, B> {
 /// A `Read + Seek` cursor over a source, for the extractors that take one.
 #[derive(Clone)]
 pub struct Reader<'a> {
-    src: &'a dyn ByteSource,
+    src: Held<'a>,
     pos: u64,
     /// Where in `src` the reader's offset 0 is, and how many bytes it covers.
     base: u64,
     len: u64,
+}
+
+/// The source of a [`Reader`]: borrowed, or shared with the readers cloned
+/// from it, so that one that owns its source is the same type as the others.
+#[derive(Clone)]
+enum Held<'a> {
+    Borrowed(&'a dyn ByteSource),
+    Shared(Rc<dyn ByteSource + 'a>),
+}
+
+impl Held<'_> {
+    fn get(&self) -> &dyn ByteSource {
+        match self {
+            Held::Borrowed(s) => *s,
+            Held::Shared(s) => &**s,
+        }
+    }
 }
 
 impl<'a> Reader<'a> {
@@ -703,12 +721,23 @@ impl<'a> Reader<'a> {
         Self::range(src, 0, src.len())
     }
 
+    /// A reader over a source it shares with its clones, rather than borrows.
+    pub fn shared(src: Rc<dyn ByteSource + 'a>) -> Self {
+        let len = src.len() as u64;
+        Reader {
+            src: Held::Shared(src),
+            pos: 0,
+            base: 0,
+            len,
+        }
+    }
+
     /// A reader over `[from, to)` of `src` only, its offsets counted from `from`.
     pub fn range(src: &'a dyn ByteSource, from: usize, to: usize) -> Self {
         let to = to.min(src.len());
         let from = from.min(to);
         Reader {
-            src,
+            src: Held::Borrowed(src),
             pos: 0,
             base: from as u64,
             len: (to - from) as u64,
@@ -723,11 +752,11 @@ impl Read for Reader<'_> {
             return Ok(0);
         }
         let want = buf.len().min((len - self.pos) as usize).min(CHUNK);
-        let w = self.src.window((self.base + self.pos) as usize, want);
+        let src = self.src.get();
+        let w = src.window((self.base + self.pos) as usize, want);
         if w.is_empty() {
             return Err(std::io::Error::other(
-                self.src
-                    .read_error()
+                src.read_error()
                     .unwrap_or_else(|| "the source ended early".to_string()),
             ));
         }

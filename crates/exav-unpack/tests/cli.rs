@@ -305,9 +305,8 @@ fn an_absolute_member_name_is_rerooted_under_the_output_directory() {
 fn a_member_cut_by_the_scan_budget_is_said_so_in_words() {
     use std::io::Write;
     let sc = Scratch::new("budget-cut");
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let deflated = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let mut z = exav_unpack::zip_write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = exav_unpack::zip_write::FileOptions::default();
     z.start_file("big.txt", deflated).unwrap();
     z.write_all(&vec![b'a'; 200 << 10]).unwrap();
     let f = sc.write("big.zip", &z.finish().unwrap().into_inner());
@@ -574,6 +573,41 @@ fn a_chain_of_links_does_not_walk_out_of_the_extraction_directory() {
     );
 }
 
+/// A tar hard link is made a hard link to the file its target was written to,
+/// as GNU tar makes it; one to a name no member was written as is an error.
+#[cfg(unix)]
+#[test]
+fn a_tar_hard_link_is_linked_to_its_target() {
+    use std::os::unix::fs::MetadataExt;
+    let sc = Scratch::new("hardlink");
+    let t = sc.write(
+        "a.tar",
+        &tar_of(&[
+            ("dir/a.txt", b'0', 0o644, 0, "", b"content"),
+            ("dir/b.txt", b'1', 0o644, 0, "dir/a.txt", b""),
+        ]),
+    );
+    let out = sc.subdir("out");
+    let o = run(&[s(&t), "-d", s(&out)]);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    let (a, b) = (out.join("dir/a.txt"), out.join("dir/b.txt"));
+    assert_eq!(std::fs::read(&b).unwrap(), b"content");
+    assert_eq!(
+        std::fs::metadata(&a).unwrap().ino(),
+        std::fs::metadata(&b).unwrap().ino(),
+        "one file, two names"
+    );
+    let missing = sc.write(
+        "missing.tar",
+        &tar_of(&[("b.txt", b'1', 0o644, 0, "never.txt", b"")]),
+    );
+    let out2 = sc.subdir("out2");
+    let o = run(&[s(&missing), "-d", s(&out2)]);
+    assert_ne!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains("cannot hard link"), "{}", stderr(&o));
+    assert!(!out2.join("b.txt").exists());
+}
+
 /// tar keeps what unzip restores: the time, the permission bits, the links.
 #[cfg(unix)]
 #[test]
@@ -662,9 +696,8 @@ fn test_decodes_everything_and_writes_nothing() {
 fn a_member_over_the_ratio_is_left_out_and_the_others_come_out() {
     use std::io::Write;
     let sc = Scratch::new("ratio");
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let deflated = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let mut z = exav_unpack::zip_write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = exav_unpack::zip_write::FileOptions::default();
     z.start_file("zeros.bin", deflated).unwrap();
     z.write_all(&vec![0u8; 1 << 20]).unwrap();
     z.start_file("after.txt", deflated).unwrap();
@@ -741,16 +774,15 @@ fn a_7z_member_that_fails_its_crc_fails_the_test() {
 /// A ZIP of stored members, each ZipCrypto-encrypted with its password if it
 /// has one.
 fn zip_locked(members: &[(&str, &[u8], Option<&str>)]) -> Vec<u8> {
+    use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
     use std::io::Write;
-    use zip::unstable::write::FileOptionsExt;
-    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut w = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for (name, body, pw) in members {
-        let mut opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let mut opts = FileOptions::default().method(Method::Stored);
         if let Some(pw) = pw {
-            opts = opts.with_deprecated_encryption(pw.as_bytes()).unwrap();
+            opts = opts.zipcrypto(pw.as_bytes());
         }
-        w.start_file(*name, opts).unwrap();
+        w.start_file(name, opts).unwrap();
         w.write_all(body).unwrap();
     }
     w.finish().unwrap().into_inner()
@@ -1297,6 +1329,30 @@ fn recursive_lists_the_members_of_the_archives_inside() {
     assert_eq!(stdout(&o), "inner.zip!a.txt\ninner.zip!dir/c.txt\n");
     let o = run(&["-Z1", "-r", s(&f), "*", "-x", "*c.txt"]);
     assert_eq!(stdout(&o), "inner.zip!a.txt\nb.txt\n");
+}
+
+/// A tar.gz without its gzip trailer: the tar inside decodes whole, the gzip
+/// stream does not end. Opened, the tar is still an error, as it is unopened.
+#[cfg(unix)]
+#[test]
+fn recursive_says_an_opened_archive_was_decoded_in_part() {
+    let sc = Scratch::new("rpart");
+    let tar = tar_of(&[
+        ("a.txt", b'0', 0o644, 0, "", b"alpha"),
+        ("b.txt", b'0', 0o644, 0, "", b"beta"),
+    ]);
+    let gz = gzip_of(&tar);
+    let f = sc.write("cut.tar.gz", &gz[..gz.len() - 8]);
+    let flat = run(&["-t", s(&f)]);
+    assert_eq!(code(&flat), 2, "{}", stderr(&flat));
+    let o = run(&["-tr", s(&f)]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    assert!(
+        stdout(&o).contains("!a.txt") && stdout(&o).contains("!b.txt"),
+        "{}",
+        stdout(&o)
+    );
+    assert!(stderr(&o).contains("error:"), "{}", stderr(&o));
 }
 
 #[test]
@@ -1987,4 +2043,41 @@ fn a_listing_into_a_closed_pipe_ends_quietly() {
     assert!(!err.contains("panicked"), "{err}");
     assert!(!err.contains("failed printing"), "{err}");
     assert_ne!(status.code(), Some(101), "{err}");
+}
+
+/// An archive and an output directory whose names are not UTF-8 are opened as
+/// they are named, not a crash at start; `-d` takes its directory joined to it
+/// or as the next argument.
+#[cfg(unix)]
+#[test]
+fn a_path_argument_that_is_not_utf8_is_opened() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let sc = Scratch::new("non-utf8");
+    let archive = sc.path().join(OsStr::from_bytes(b"caf\xe9.zip"));
+    std::fs::write(&archive, zip_of(&[("one.txt", b"hello")])).unwrap();
+
+    let listed = Command::new(BIN).arg("-Z1").arg(&archive).output().unwrap();
+    assert_eq!(code(&listed), 0, "stderr: {}", stderr(&listed));
+    assert_eq!(stdout(&listed), "one.txt\n");
+
+    let out_dir = sc.path().join(OsStr::from_bytes(b"out\xe9"));
+    std::fs::create_dir(&out_dir).unwrap();
+    let mut joined = b"-d".to_vec();
+    joined.extend_from_slice(out_dir.as_os_str().as_bytes());
+    for dir_args in [
+        vec![std::ffi::OsString::from_vec(joined)],
+        vec!["-d".into(), out_dir.clone().into_os_string()],
+    ] {
+        let o = Command::new(BIN)
+            .arg("-o")
+            .arg(&archive)
+            .args(&dir_args)
+            .output()
+            .unwrap();
+        assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+        assert_eq!(std::fs::read(out_dir.join("one.txt")).unwrap(), b"hello");
+        std::fs::remove_file(out_dir.join("one.txt")).unwrap();
+    }
 }

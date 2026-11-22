@@ -3,10 +3,16 @@
 # `exav-imagehash` and `exav-qr` for each target, archives each with LICENSE
 # and NOTICE, and attaches them to the GitHub Release for that tag. Static musl
 # Linux builds run on any distro (no glibc).
-# The `wasm` job adds the two WebAssembly artifacts: the unpacker npm tarball
-# (`@exav/unpack-wasm`, standard preset: exactly what `npm publish` ships via
-# `prepublishOnly`) and the engine as a WASI module (`exav-core --features
-# wasi-bin`, same command CI's `wasm` job builds).
+# The `wasm` job adds the WebAssembly artifacts: the npm tarballs of the
+# unpacker (`@exav/unpack-wasm`, standard preset) and the viewer
+# (`@exav/viewer`), and the engine as a WASI module (`exav-core --features
+# wasi-bin`, same command CI's `wasm` job builds). The npm packages are
+# published from these tarballs (docs/RELEASING.md), so that npm and the
+# release carry the same bytes.
+#
+# Every build maps the checkout and the cargo home to fixed names
+# (scripts/build-flags.sh), and scripts/check-build-paths.py refuses to upload
+# an archive, tarball or module that holds a path of the runner.
 #
 # For a fancier setup (a `curl | sh` installer + auto-generated Homebrew
 # formula), migrate to `dist` (https://opensource.axo.dev/cargo-dist/) later;
@@ -74,6 +80,74 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      # The checkout, the cargo home and the rustup home are mapped to fixed
+      # names in everything built below (cross passes RUSTFLAGS to its
+      # container), so that no binary holds a path of the runner.
+      - name: Map build paths to fixed names
+        shell: bash
+        run: echo "RUSTFLAGS=$(scripts/build-flags.sh)" >> "$GITHUB_ENV"
+      # The six builds once without uploading, then the gate, then the same six
+      # with the upload (cargo finds the build fresh and only archives it
+      # again): nothing is uploaded that holds a path of the runner.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: exav
+          target: ${{ matrix.target }}
+          archive: exav-$tag-$target
+          include: LICENSE,NOTICE
+          dry-run: true
+          dry-run-intended: true
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: exav-unpack
+          target: ${{ matrix.target }}
+          archive: exav-unpack-$tag-$target
+          include: LICENSE,NOTICE
+          dry-run: true
+          dry-run-intended: true
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: exav-grep
+          target: ${{ matrix.target }}
+          archive: exav-grep-$tag-$target
+          include: LICENSE,NOTICE
+          dry-run: true
+          dry-run-intended: true
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: exav-qr
+          features: qr
+          target: ${{ matrix.target }}
+          archive: exav-qr-$tag-$target
+          include: LICENSE,NOTICE
+          dry-run: true
+          dry-run-intended: true
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: exav-pe-emu
+          target: ${{ matrix.target }}
+          archive: exav-pe-emu-$tag-$target
+          include: LICENSE,NOTICE
+          dry-run: true
+          dry-run-intended: true
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: exav-imagehash
+          target: ${{ matrix.target }}
+          archive: exav-imagehash-$tag-$target
+          include: LICENSE,NOTICE
+          dry-run: true
+          dry-run-intended: true
+      - name: Refuse a build path in any archive
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(exav*-"$GITHUB_REF_NAME"-*.tar.gz exav*-"$GITHUB_REF_NAME"-*.zip)
+          [ "${#files[@]}" = 6 ] || { echo "expected 6 archives, found ${#files[@]}: ${files[*]}"; exit 1; }
+          python -I scripts/check-build-paths.py "${files[@]}"
       # Builds the `exav` binary, cross-compiling musl targets
       # via `cross` as needed, archives it as `exav-<target>.tar.gz`/`.zip`, and
       # uploads it to the Release for the pushed tag.
@@ -156,20 +230,50 @@ jobs:
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           [ "$PKG_VERSION" = "$TAG_VERSION" ] || { echo "package.json ($PKG_VERSION) != tag ($TAG_VERSION)"; exit 1; }
         working-directory: crates/exav-unpack-wasm
+      - name: Map build paths to fixed names
+        run: echo "RUSTFLAGS=$(scripts/build-flags.sh)" >> "$GITHUB_ENV"
       - name: Build unpacker wasm (standard preset, as published to npm)
         run: npm run build
         working-directory: crates/exav-unpack-wasm
-      - name: Pack npm tarball
-        run: npm pack
+      - name: Pack the unpacker's npm tarball
+        run: npm run prepublishOnly && npm pack
         working-directory: crates/exav-unpack-wasm
       - name: Build engine WASI module
         run: cargo build --release --target wasm32-wasip1 -p exav-core --features wasi-bin
+      # The viewer: its wasm modules (the wasm-bindgen-cli its Cargo.toml pins,
+      # which build-wasm.sh checks; wasm-opt from binaryen, as CI), then the
+      # package on top of the unpacker's pkg/ built above.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.129
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the viewer
+        run: |
+          npm ci
+          npm run build:wasm
+          npm run build
+        working-directory: crates/exav-viewer
+      - name: Pack the viewer's npm tarball
+        run: npm run prepublishOnly && npm pack
+        working-directory: crates/exav-viewer
+      # The viewer ships three wasm parsers of @silurus/ooxml as that project
+      # built them (on a GitHub runner), and pdf.js's worker names a virtual
+      # /home/web_user: not our builds, not a path of this runner.
+      - name: Refuse a build path in any upload
+        run: |
+          cp target/wasm32-wasip1/release/exav-wasm.wasm "exav-wasm-$GITHUB_REF_NAME-wasm32-wasip1.wasm"
+          python3 -I scripts/check-build-paths.py \
+            --except /docx_parser_bg.wasm --except /pptx_parser_bg.wasm --except /xlsx_parser_bg.wasm --except /pdfjs.worker.js \
+            crates/exav-unpack-wasm/*.tgz crates/exav-viewer/*.tgz "exav-wasm-$GITHUB_REF_NAME-wasm32-wasip1.wasm"
       - name: Upload to the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # `npm pack` names the tarball from package.json (checked above), the
-        # WASI module is named after the tag like the native `exav-$tag-$target`
-        # archives. `--clobber` makes re-runs idempotent.
-        run: |
-          cp target/wasm32-wasip1/release/exav-wasm.wasm "exav-wasm-$GITHUB_REF_NAME-wasm32-wasip1.wasm"
-          gh release upload "$GITHUB_REF_NAME" --clobber crates/exav-unpack-wasm/*.tgz "exav-wasm-$GITHUB_REF_NAME-wasm32-wasip1.wasm"
+        # `npm pack` names the tarballs from package.json (checked above for
+        # the unpacker, by the first job for both), the WASI module is named
+        # after the tag like the native `exav-$tag-$target` archives.
+        # `--clobber` makes re-runs idempotent.
+        run: gh release upload "$GITHUB_REF_NAME" --clobber crates/exav-unpack-wasm/*.tgz crates/exav-viewer/*.tgz "exav-wasm-$GITHUB_REF_NAME-wasm32-wasip1.wasm"

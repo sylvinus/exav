@@ -36,8 +36,12 @@ pub(super) fn decode_largest(data: &[u8], max_alloc: u64) -> Result<Pixels, Erro
     for (_, entry, size, at) in entries {
         // The length the entry gives, then all that follows it: a length
         // that is too short is a common fault.
-        let stated = at.checked_add(size).and_then(|end| data.get(at..end));
-        for image in [stated, data.get(at..)].into_iter().flatten() {
+        let rest = data.get(at..);
+        let stated = at
+            .checked_add(size)
+            .and_then(|end| data.get(at..end))
+            .filter(|s| Some(s.len()) != rest.map(<[u8]>::len));
+        for image in [stated, rest].into_iter().flatten() {
             let decoded = if image.starts_with(b"\x89PNG") {
                 decode(image, Format::Png, max_alloc)
             } else {
@@ -54,17 +58,19 @@ pub(super) fn decode_largest(data: &[u8], max_alloc: u64) -> Result<Pixels, Erro
 /// An icon file of the one image: its entry corrected to what the image
 /// holds (size, length, offset), and an AND mask cut short filled with
 /// zeros, which keep the pixels.
-fn single_icon(entry: &[u8], image: &[u8]) -> Vec<u8> {
+fn single_icon(entry: &[u8], src: &[u8]) -> Vec<u8> {
     let mut e = entry.to_vec();
-    let mut image = image.to_vec();
+    let mut image = Vec::new();
     let le = |at: usize, n: usize| {
-        image.get(at..at + n).map_or(0, |b| {
+        src.get(at..at + n).map_or(0, |b| {
             b.iter().rev().fold(0u64, |v, &x| v << 8 | u64::from(x))
         })
     };
     // The header is BITMAPINFOHEADER, or the V4 or V5 one that extends it.
     let header = le(0, 4);
-    if matches!(header, 40 | 108 | 124) {
+    if !matches!(header, 40 | 108 | 124) {
+        image = src.to_vec();
+    } else {
         let (width, rows) = (le(4, 4), le(8, 4) as u32 as i32);
         let (rows, bpp, used) = (u64::from(rows.unsigned_abs()) / 2, le(14, 2), le(32, 4));
         let compression = le(16, 4);
@@ -93,7 +99,12 @@ fn single_icon(entry: &[u8], image: &[u8]) -> Vec<u8> {
         let xor_end = start.saturating_add(stride(bpp).saturating_mul(rows));
         let mask = stride(1).saturating_mul(rows);
         let with_mask = xor_end.saturating_add(mask);
-        image.truncate(profile_at.max(start as usize));
+        // The pixels and their mask, and not the rest of the file, for each
+        // entry tried.
+        let keep = profile_at
+            .min(usize::try_from(with_mask).unwrap_or(usize::MAX))
+            .max(start as usize);
+        image.extend_from_slice(&src[..src.len().min(keep)]);
         // The mask is never longer than the pixels in front of it, and a header
         // that says otherwise (no bits to a pixel) does not get a buffer made
         // as large as the width and height say.

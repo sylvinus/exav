@@ -78,15 +78,19 @@ pub(crate) fn walk(
     visit: crate::stream::Visit<()>,
 ) -> Result<Option<()>, LimitHit> {
     let mut source = crate::source::Reader::new(src);
-    let (members, mut seen) = stream_offsets(&mut source, budget)?;
+    let (members, mut seen, cut) = stream_offsets(&mut source, budget)?;
     if let Some(t) = crate::stream::stream_stored_ranges(src, budget, visit, members)? {
         return Ok(Some(t));
+    }
+    if let Some(hit) = cut {
+        return Err(hit);
     }
     crate::formats::udf::stream_udf(&mut source, budget, visit, &mut seen)
 }
 
-/// The ISO 9660 regions, and the sectors the files start at.
-type StreamedTree = (Vec<Region>, HashSet<(u64, u64)>);
+/// The ISO 9660 regions, the sectors the files start at, and the member limit
+/// when the directories past it were left unread.
+type StreamedTree = (Vec<Region>, HashSet<(u64, u64)>, Option<LimitHit>);
 
 /// Walk the ISO 9660 directory tree(s) via targeted reads (directory records
 /// are small) and return each file as a region; file extents, the bulk of a
@@ -125,8 +129,9 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
     }
     let mut out = Vec::new();
     let mut seen_files: HashSet<(u64, u64)> = HashSet::new();
+    let mut cut = None;
     if roots.is_empty() {
-        return Ok((out, seen_files));
+        return Ok((out, seen_files, cut));
     }
     // Each queued dir carries the Joliet flag of the tree it belongs to.
     // A directory is walked once per tree, however many records name it: a
@@ -136,8 +141,13 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
     // walked first, and a file in both trees takes its long name.
     let mut dirs: Vec<(bool, u64, u64)> = roots.into_iter().rev().collect();
     while let Some((joliet, lba, len)) = dirs.pop() {
-        // A walk past the member limit ends here, not quietly: the remaining
-        // directories are unenumerated.
+        // A walk past the member limit ends, not quietly: the directories left
+        // are not read. It ends while the files found before them still fit,
+        // so that they are visited first.
+        if let Err(hit) = budget.entries_fit((out.len() as u64).saturating_add(1)) {
+            cut = Some(hit);
+            break;
+        }
         budget.count_entry()?;
         let start = lba.saturating_mul(SECTOR);
         let avail = total_len.saturating_sub(start);
@@ -201,5 +211,5 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
             p = p.saturating_add(rec_len);
         }
     }
-    Ok((out, seen_files))
+    Ok((out, seen_files, cut))
 }

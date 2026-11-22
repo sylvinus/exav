@@ -90,6 +90,10 @@ pub fn visible_text(
             cap,
         ));
     }
+    #[cfg(feature = "text-office")]
+    if super::office::visible::flat_xml(head) {
+        return office(name, data, cap, limits);
+    }
     if let Some(kind) = exav_unpack::text::kind(name, &data) {
         let e = exav_unpack::text::extract(kind, data, cap, limits);
         return Some(Visible {

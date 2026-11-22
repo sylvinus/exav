@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{CommandFactory, FromArgMatches, Parser};
+use daemon::SetResult;
 use exav_core::{ScanOptions, ScanReport, Scanner, Verdict, VerdictCategory, loader, scan_path};
 
 /// Categories the daemon names before the closing ` ERROR` when a verdict is
@@ -82,8 +83,19 @@ macro_rules! outln {
     ($($arg:tt)*) => {{
         let line = format!($($arg)*);
         println!("{line}");
-        log_line(&line);
+        log_line(line.as_bytes());
     }};
+}
+
+/// [`outln!`] for a line that is bytes: a file name that is not UTF-8 reaches
+/// stdout and `--log` as it is.
+fn out_bytes(line: &[u8]) {
+    use std::io::Write;
+    let mut out = io::stdout().lock();
+    out.write_all(line)
+        .and_then(|()| out.write_all(b"\n"))
+        .unwrap_or_else(|e| panic!("failed printing to stdout: {e}"));
+    log_line(line);
 }
 
 /// Read a newline-separated list of paths, skipping blanks and `#` comments.
@@ -149,7 +161,7 @@ fn log_open(path: &std::path::Path) -> std::io::Result<()> {
 /// separate processes sharing this one appending descriptor, and a line written
 /// in two calls can have another worker's line land between them, so the log
 /// would carry results no reader can attribute.
-pub(crate) fn log_line(line: &str) {
+pub(crate) fn log_line(line: &[u8]) {
     use std::io::Write;
     let mut g = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((f, path)) = g.as_mut() {
@@ -161,10 +173,10 @@ pub(crate) fn log_line(line: &str) {
                 Err(e) => eprintln!("exav: --log {}: reopening: {e}", path.display()),
             }
         }
-        let mut buf = String::with_capacity(line.len() + 1);
-        buf.push_str(line);
-        buf.push('\n');
-        let _ = f.write_all(buf.as_bytes());
+        let mut buf = Vec::with_capacity(line.len() + 1);
+        buf.extend_from_slice(line);
+        buf.push(b'\n');
+        let _ = f.write_all(&buf);
         let _ = f.flush();
     }
 }
@@ -419,9 +431,10 @@ struct Cli {
     ///                        scans and read the verdicts.
     ///   max-connections=200  concurrent connections accepted here. Default 128
     ///                        for clamd, 100 for ICAP (which also advertises it
-    ///                        as `Max-Connections`). Bounds the clamd listener
-    ///                        only under `--workers threads`; the prefork pool
-    ///                        bounds concurrency by its worker count.
+    ///                        as `Max-Connections`). Bounds a clamd address
+    ///                        only under `--workers threads`, each address on
+    ///                        its own count; the prefork pool bounds concurrency
+    ///                        by its worker count, over all its addresses.
     ///   idle-secs=120        the most seconds a connection waits for its client
     ///                        before it is closed, on each read and each write:
     ///                        default 120 for clamd (clamd's ReadTimeout), 600
@@ -471,6 +484,11 @@ struct Cli {
     /// Naming both protocols serves both from one process over one loaded
     /// database, which is what replaces a `c-icap` + `clamav` container pair.
     /// The database is loaded once, so callers pay no per-scan startup cost.
+    ///
+    /// A protocol can be named more than once, a Unix socket and a TCP port for
+    /// clamd (clamd's `LocalSocket` with `TCPSocket`) or two ICAP ports with
+    /// their own services. Each address is served with the options on it. The
+    /// same socket named twice is refused.
     #[arg(
         long = "listen",
         value_name = "ADDR",
@@ -665,7 +683,7 @@ struct Cli {
     /// than let a scanned payload touch a disk. Worst-case memory is then
     /// --spill-threshold-bytes times the number of concurrent scans.
     #[arg(long = "spill-dir", value_name = "DIR|off", env = "EXAV_SPILL_DIR")]
-    spill_dir: Option<String>,
+    spill_dir: Option<PathBuf>,
 
     /// How much of a streamed object is held in RAM before it spills to a temp
     /// file. K/M/G/T suffixes; `0` spills every object at once. [default: 16M]
@@ -883,7 +901,7 @@ struct Cli {
     /// file. They count here instead of toward --max-matcher-bytes, so a large
     /// sparse file does not end the walk of the rest of the volume. A
     /// CPU/time bound. K/M/G/T suffixes; `off` or `0` means no limit.
-    /// [default: 64G]
+    /// [default: 10G]
     #[arg(
         long = "max-hole-bytes",
         env = "EXAV_MAX_HOLE_BYTES",
@@ -924,6 +942,20 @@ struct Cli {
     )]
     max_regex_steps: Option<u64>,
 
+    /// Steps the conditions of the YARA rules may take in one scan, all the
+    /// rules together. A rule's range loop takes its bounds from the rule, not
+    /// from the object. A condition that runs out does not match, nor do those
+    /// after it, and the scan is LIMITS-EXCEEDED (PARTIAL, exit 3) unless
+    /// something is found. A CPU bound. `off` or `0` means no limit, and a
+    /// crafted rule then runs until it ends. [default: 20000000]
+    #[arg(
+        long = "max-yara-steps",
+        env = "EXAV_MAX_YARA_STEPS",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_yara_steps: Option<u64>,
+
     /// Steps the verifier of body signatures with wildcards and gaps may take,
     /// per MiB of the object it searches; an object under 256 MiB counts as
     /// 256 MiB, so by default one gets 512 million. One group of signatures
@@ -960,6 +992,33 @@ struct Cli {
         value_parser = parse_count
     )]
     max_pe_emulation_steps: Option<u64>,
+
+    /// Most x86 instructions the PE unpacking emulator may run for one packed
+    /// executable. A run that reaches it is cut short: what the stub rebuilt
+    /// is still scanned, as a `-emulated-partial` member, and the scan is
+    /// LIMITS-EXCEEDED unless something is found. `off` or `0` means no limit
+    /// (`--max-pe-emulation-steps` still applies).
+    /// [default: 500000000, seconds to tens of seconds of CPU]
+    #[arg(
+        long = "max-pe-stub-steps",
+        env = "EXAV_MAX_PE_STUB_STEPS",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_pe_stub_steps: Option<u64>,
+
+    /// Instructions a packed executable's stub may run in the PE unpacking
+    /// emulator without writing a page it has not written before. A stub that
+    /// goes that long is looping on nothing: the run stops and what it rebuilt
+    /// is scanned, which is not a limit reached. `off` or `0` means no limit
+    /// (`--max-pe-stub-steps` still applies). [default: 64000000]
+    #[arg(
+        long = "max-pe-idle-steps",
+        env = "EXAV_MAX_PE_IDLE_STEPS",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_pe_idle_steps: Option<u64>,
 
     /// Maximum nesting depth for recursive unpacking: a zip inside a tar
     /// inside a disk image. `0` opens no container: each file is scanned as
@@ -1351,10 +1410,10 @@ struct Cli {
     /// [default: 300]
     ///
     /// The clamd `STATS` command reports the same figures on demand, but only
-    /// where a clamd listener exists and only for the process that answers: an
-    /// ICAP-only deployment binds no clamd port, and under the worker pool ICAP
-    /// is a forked child of its own. The log is the channel every arrangement
-    /// has. Silent while nothing is being scanned.
+    /// where a clamd listener exists, and an ICAP-only deployment binds no
+    /// clamd port. The log is the channel every arrangement has. Written once per
+    /// interval for the whole daemon (under the worker pool, the pool's totals),
+    /// labelled `daemon`. Silent while nothing is being scanned.
     #[arg(
         long = "metrics-secs",
         value_name = "SECS|off",
@@ -1451,10 +1510,24 @@ impl Filters {
 /// could reach.
 pub(crate) struct Walk {
     pub files: Vec<PathBuf>,
-    /// One ready-to-print `"<path>: <reason> ERROR"` line per unreachable path.
-    pub errors: Vec<String>,
+    /// One entry per unreachable path.
+    pub errors: Vec<WalkError>,
     /// Directories descended into, including `root` when it is one.
     pub dirs: u64,
+}
+
+/// A path a walk could not reach. The path is kept as it is on disk, so a
+/// surface that answers in bytes can name it as it is.
+pub(crate) struct WalkError {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+impl WalkError {
+    /// `<path>: <reason> ERROR`, the path as text.
+    fn line(&self) -> String {
+        format!("{}: {} ERROR", self.path.display(), self.reason)
+    }
 }
 
 /// How far into a directory target a walk goes.
@@ -1535,11 +1608,10 @@ pub(crate) fn walk_tree(root: &Path, filters: Option<&Filters>, descent: Descent
             }
             Ok(_) => {}
             Err(e) => {
-                let at = e
-                    .path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| root.display().to_string());
-                out.errors.push(format!("{at}: {e} ERROR"));
+                out.errors.push(WalkError {
+                    path: e.path().unwrap_or(root).to_path_buf(),
+                    reason: e.to_string(),
+                });
             }
         }
     }
@@ -1579,26 +1651,28 @@ fn health_endpoints(cli: &Cli) -> Vec<endpoint::Endpoint> {
     endpoint::health_listeners_of(&cli.listen_health).unwrap_or_default()
 }
 
-/// The clamd endpoint, if one was asked for.
-fn clamd_endpoint(cli: &Cli) -> Option<endpoint::Endpoint> {
+/// The clamd endpoints asked for, in the order given.
+fn clamd_endpoints(cli: &Cli) -> Vec<endpoint::Endpoint> {
     listeners(cli)
-        .ok()?
+        .unwrap_or_default()
         .into_iter()
-        .find(|e| e.proto == endpoint::Proto::Clamd)
+        .filter(|e| e.proto == endpoint::Proto::Clamd)
+        .collect()
 }
 
-/// The ICAP endpoint, if one was asked for.
+/// The ICAP endpoints asked for, in the order given.
 ///
 /// Without the `icap` feature there is no such listener and the whole ICAP path
 /// compiles out: an `icap://` address is then refused at startup rather than
 /// silently ignored, because a listener that was asked for and never bound is a
 /// deployment that thinks it is scanning.
 #[cfg(feature = "icap")]
-fn icap_endpoint(cli: &Cli) -> Option<endpoint::Endpoint> {
+fn icap_endpoints(cli: &Cli) -> Vec<endpoint::Endpoint> {
     listeners(cli)
-        .ok()?
+        .unwrap_or_default()
         .into_iter()
-        .find(|e| e.proto == endpoint::Proto::Icap)
+        .filter(|e| e.proto == endpoint::Proto::Icap)
+        .collect()
 }
 
 /// Whether this run serves anything at all.
@@ -1860,7 +1934,11 @@ fn main() -> ExitCode {
     restore_default_sigpipe();
     // Before `Cli::parse`, which exits the process on an unknown argument and
     // would never reach this.
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Only flags are looked up in it, so a path that is not UTF-8 may be lossy.
+    let argv: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     if let Some(msg) = removed_flag(&argv) {
         eprintln!("exav: {msg}");
         return ExitCode::from(2);
@@ -2018,12 +2096,22 @@ fn main() -> ExitCode {
 
     // Every listener address is parsed once, here, so a malformed one stops the
     // run before anything is loaded rather than when a bind is attempted.
-    if let Err(e) = listeners(&cli) {
-        eprintln!("exav: --listen: {e}");
-        return ExitCode::from(2);
-    }
-    if let Err(e) = endpoint::health_listeners_of(&cli.listen_health) {
-        eprintln!("exav: --listen-health: {e}");
+    let listen = match listeners(&cli) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("exav: --listen: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let health = match endpoint::health_listeners_of(&cli.listen_health) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("exav: --listen-health: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = endpoint::apart(&listen, &health) {
+        eprintln!("exav: {e}");
         return ExitCode::from(2);
     }
 
@@ -2046,7 +2134,7 @@ fn main() -> ExitCode {
     // worker processes) only exists for the daemon. Default to the CPU-core
     // count on Unix; `--workers threads` (0 here) is the in-process thread
     // model. One-shot scans never use the pool.
-    let pool_workers = if clamd_endpoint(&cli).is_some() {
+    let pool_workers = if !clamd_endpoints(&cli).is_empty() {
         cli.workers.unwrap_or_else(default_workers)
     } else {
         0
@@ -2386,9 +2474,10 @@ fn reload_watch_dir(cli: &Cli) -> Option<PathBuf> {
 /// process would let a handful of idle proxy connections occupy the whole pool.
 ///
 /// Under the pool the two therefore live in separate processes: the supervisor
-/// binds both listeners, forks the scan workers, and forks one more child for
-/// ICAP. Every child shares the warmed database copy-on-write, and a reload
-/// re-forks all of them from the new one.
+/// binds every listener, forks the scan workers (each waits on all the clamd
+/// addresses), and forks one more child for each ICAP address. Every child
+/// shares the warmed database copy-on-write, and a reload re-forks all of them
+/// from the new one.
 fn run_listeners(
     cli: &Cli,
     db: Scanner,
@@ -2423,26 +2512,28 @@ fn run_listeners(
     let reload = || load_db(cli).and_then(|db| guard_not_empty(db, &reload_source, allow_no_db));
 
     #[cfg(feature = "icap")]
-    let icap_server = if icap_endpoint(cli).is_some() {
-        let cfg = match icap::config_from_cli(cli) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("exav: {e}");
-                return ExitCode::from(2);
-            }
-        };
-        // Bound before anything is spawned or forked, so a busy port or a bad
-        // address is reported by the process that was asked to listen rather
-        // than by a child nobody is watching.
-        match icap::bind(cfg) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("exav: icap: {e}");
-                return ExitCode::from(2);
+    let icap_servers = {
+        let mut servers = Vec::new();
+        for endpoint in icap_endpoints(cli) {
+            let cfg = match icap::config_for(cli, Some(&endpoint)) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("exav: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            // Bound before anything is spawned or forked, so a busy port or a
+            // bad address is reported by the process that was asked to listen
+            // rather than by a child nobody is watching.
+            match icap::bind(cfg) {
+                Ok(s) => servers.push(s),
+                Err(e) => {
+                    eprintln!("exav: icap {endpoint}: {e}");
+                    return ExitCode::from(2);
+                }
             }
         }
-    } else {
-        None
+        servers
     };
 
     // Bound with the others, before anything is forked or spawned, so a busy
@@ -2462,13 +2553,16 @@ fn run_listeners(
     let db = std::sync::Arc::new(db);
     let opts = std::sync::Arc::new(opts);
 
-    let clamd = clamd_endpoint(cli);
+    let clamd = clamd_endpoints(cli);
 
-    // ICAP alone: its own listener thread, and this thread becomes the
-    // supervisor that reloads the database.
+    // ICAP alone: a listener thread for each address, and this thread becomes
+    // the supervisor that reloads the database.
     #[cfg(feature = "icap")]
-    if clamd.is_none() {
-        let server = icap_server.expect("an icap:// address is the only listener asked for");
+    if clamd.is_empty() {
+        assert!(
+            !icap_servers.is_empty(),
+            "an icap:// address is the only listener asked for"
+        );
         // A proxy that hangs up mid-response must cost one connection, not the
         // listener, the same reason the clamd daemon does this. Set here rather
         // than inside the ICAP module, which is `forbid(unsafe_code)` and stays
@@ -2476,56 +2570,53 @@ fn run_listeners(
         ignore_sigpipe();
         // Serving ICAP alone binds no clamd port, so `STATS` cannot be asked
         // here at all and the log is the only channel the totals have.
-        metrics::spawn_reporter(metrics_interval(cli), "icap");
+        metrics::spawn_reporter(metrics_interval(cli));
         let shared = std::sync::Arc::new(daemon::SharedDb::new(db));
         health::spawn(health, shared_version(&shared));
-        icap::spawn(server, std::sync::Arc::clone(&shared), opts);
+        for server in icap_servers {
+            icap::spawn(
+                server,
+                std::sync::Arc::clone(&shared),
+                std::sync::Arc::clone(&opts),
+            );
+        }
         daemon::supervise(&shared, watch, &reload);
     }
 
-    // `?max-connections=` on the clamd address, the same option the ICAP one
-    // reads. Only the thread model consults it: the prefork pool bounds
-    // concurrency by its worker count instead, so a second cap there would be a
-    // setting with nothing to do.
-    let clamd_max_connections = clamd
-        .as_ref()
-        .and_then(|e| e.max_connections)
-        .unwrap_or(daemon::DEFAULT_MAX_CONNECTIONS);
-    // `?idle-secs=` on the clamd address bounds each read and write,
+    // Each clamd address with the settings on it. `?max-connections=` is only
+    // consulted by the thread model: the prefork pool bounds concurrency by its
+    // worker count, across all the addresses, so a second cap there would be a
+    // setting with nothing to do. `?idle-secs=` bounds each read and write,
     // `?request-secs=` a command, `?session-secs=` the connection and
     // `?reply-secs=` the writes of one reply, in either model.
-    let reads = daemon::Reads {
-        idle: clamd
-            .as_ref()
-            .and_then(|e| e.idle_secs)
-            .map_or(daemon::DEFAULT_IDLE, std::time::Duration::from_secs),
-        command: daemon::command_read_limit(clamd.as_ref().and_then(|e| e.request_secs)),
-        session: clamd
-            .as_ref()
-            .and_then(|e| e.session_secs)
-            .map(std::time::Duration::from_secs),
-        reply: clamd
-            .as_ref()
-            .and_then(|e| e.reply_secs)
-            .map(std::time::Duration::from_secs),
-    };
-    let addr = match clamd.map(|e| e.addr) {
-        Some(endpoint::Addr::Tcp(a)) => daemon::ListenAddr::Tcp(a),
-        #[cfg(unix)]
-        Some(endpoint::Addr::Unix { path, mode }) => daemon::ListenAddr::Unix {
-            path,
-            mode: mode.unwrap_or(daemon::DEFAULT_SOCKET_MODE),
-        },
-        #[cfg(not(unix))]
-        Some(endpoint::Addr::Unix { .. }) => {
-            eprintln!("exav: a Unix-socket address needs a Unix platform; use host:port");
-            return ExitCode::from(2);
-        }
-        None => {
-            eprintln!("exav: no listener to serve");
-            return ExitCode::from(2);
-        }
-    };
+    let mut clamd_listeners = Vec::new();
+    for e in clamd {
+        let addr = match e.addr {
+            endpoint::Addr::Tcp(a) => daemon::ListenAddr::Tcp(a),
+            #[cfg(unix)]
+            endpoint::Addr::Unix { path, mode } => daemon::ListenAddr::Unix {
+                path,
+                mode: mode.unwrap_or(daemon::DEFAULT_SOCKET_MODE),
+            },
+            #[cfg(not(unix))]
+            endpoint::Addr::Unix { .. } => {
+                eprintln!("exav: a Unix-socket address needs a Unix platform; use host:port");
+                return ExitCode::from(2);
+            }
+        };
+        clamd_listeners.push(daemon::ClamdListener {
+            addr,
+            max_connections: e.max_connections.unwrap_or(daemon::DEFAULT_MAX_CONNECTIONS),
+            reads: daemon::Reads {
+                idle: e
+                    .idle_secs
+                    .map_or(daemon::DEFAULT_IDLE, std::time::Duration::from_secs),
+                command: daemon::command_read_limit(e.request_secs),
+                session: e.session_secs.map(std::time::Duration::from_secs),
+                reply: e.reply_secs.map(std::time::Duration::from_secs),
+            },
+        });
+    }
 
     // A prefork worker pool (--workers N > 0) is the isolated/killable model;
     // it's Unix-only (relies on fork for COW DB-sharing + kernel limits).
@@ -2544,18 +2635,27 @@ fn run_listeners(
             max_jobs: cli.max_jobs_per_worker.unwrap_or(1000),
             allow_shutdown: shutdown_allowed(cli.allow_shutdown),
             allow_http_scan: cli.allow_http_scan,
-            reads,
+            metrics_interval: metrics_interval(cli),
         };
-        // One child each, forked and re-forked with the workers: ICAP for its
-        // long-lived connections, and the health listeners, which no worker
-        // may be needed to answer.
+        // One child each, forked and re-forked with the workers: every ICAP
+        // address for its long-lived connections, and the health listeners,
+        // which no worker may be needed to answer.
         let mut side: Vec<daemon::SideListener> = Vec::new();
         #[cfg(feature = "icap")]
-        side.extend(icap_server.map(|s| icap::forked_child(s, metrics_interval(cli))));
+        side.extend(icap_servers.into_iter().map(icap::forked_child));
         if !health.is_empty() {
             side.push(health::side_listener(health));
         }
-        return match daemon::run_prefork(db, addr, opts, cfg, watch, &reload, &side, updater) {
+        return match daemon::run_prefork(
+            db,
+            clamd_listeners,
+            opts,
+            cfg,
+            watch,
+            &reload,
+            &side,
+            updater,
+        ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("exav: daemon error: {e}");
@@ -2571,7 +2671,7 @@ fn run_listeners(
     let _ = updater;
 
     // Thread model: one process, so one reporter covers every listener it runs.
-    metrics::spawn_reporter(metrics_interval(cli), "daemon");
+    metrics::spawn_reporter(metrics_interval(cli));
 
     // Each listener on a thread of its own, and this one the supervisor that
     // reloads the database they share.
@@ -2583,7 +2683,7 @@ fn run_listeners(
     ignore_sigpipe();
     health::spawn(health, shared_version(&shared));
     #[cfg(feature = "icap")]
-    if let Some(server) = icap_server {
+    for server in icap_servers {
         icap::spawn(
             server,
             std::sync::Arc::clone(&shared),
@@ -2596,12 +2696,10 @@ fn run_listeners(
     std::thread::spawn(move || {
         if let Err(e) = daemon::run(
             clamd_db,
-            addr,
+            clamd_listeners,
             opts,
             allow_shutdown,
             allow_http_scan,
-            clamd_max_connections,
-            reads,
         ) {
             eprintln!("exav: daemon error: {e}");
         }
@@ -2717,6 +2815,9 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     if let Some(n) = cli.max_regex_steps {
         opts.max_regex_steps = (n != 0).then_some(n);
     }
+    if let Some(n) = cli.max_yara_steps {
+        opts.max_yara_steps = (n != 0).then_some(n);
+    }
     if let Some(n) = cli.max_matcher_steps {
         opts.max_matcher_steps = (n != 0).then_some(n);
     }
@@ -2725,6 +2826,12 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     }
     if let Some(n) = cli.max_pe_emulation_steps.map(no_limit_at_zero) {
         opts.limits.max_pe_emulation_steps = n;
+    }
+    if let Some(n) = cli.max_pe_stub_steps.map(no_limit_at_zero) {
+        opts.limits.max_pe_stub_steps = n;
+    }
+    if let Some(n) = cli.max_pe_idle_steps.map(no_limit_at_zero) {
+        opts.limits.max_pe_idle_steps = n;
     }
     // --max-unpack-depth: nesting depth. exav default 16; compat 17.
     if let Some(r) = cli.max_recursion.or_else(|| compat.then_some(17)) {
@@ -2848,14 +2955,10 @@ fn configure_spill(cli: &Cli) -> Result<(), String> {
     let off = cli
         .spill_dir
         .as_deref()
-        .is_some_and(|d| d.eq_ignore_ascii_case("off"));
+        .is_some_and(|d| d.as_os_str().eq_ignore_ascii_case("off"));
     let cfg = spill::SpillConfig {
         enabled: !off,
-        dir: if off {
-            None
-        } else {
-            cli.spill_dir.as_deref().map(PathBuf::from)
-        },
+        dir: if off { None } else { cli.spill_dir.clone() },
         threshold: cli.spill_threshold.unwrap_or(d.threshold),
         max_object: no_ceiling(cli.max_spill_bytes, d.max_object),
         max_total: no_ceiling(cli.max_total_spill_bytes, d.max_total),
@@ -3011,7 +3114,7 @@ fn drop_unused_env_settings(cli: &mut Cli, matches: &clap::ArgMatches) -> Vec<St
     const CLAMD: &str = "--listen clamd://…";
     const POOL: &str = "the worker pool (--listen clamd://… with --workers N)";
     let any = serves(cli);
-    let clamd = clamd_endpoint(cli).is_some();
+    let clamd = !clamd_endpoints(cli).is_empty();
     let pool = clamd && cli.workers.unwrap_or_else(default_workers) > 0;
 
     // One row per setting: its field, whether it has a value, whether the run
@@ -3108,14 +3211,14 @@ fn check_flag_conflicts(cli: &Cli) -> Result<(), String> {
                 .to_string(),
         );
     }
-    let clamd = clamd_endpoint(cli);
-    if cli.workers.is_some() && clamd.is_none() {
+    let clamd = clamd_endpoints(cli);
+    if cli.workers.is_some() && clamd.is_empty() {
         return Err(
             "--workers is the clamd listener's worker model; it needs --listen clamd://…"
                 .to_string(),
         );
     }
-    if cli.allow_shutdown && clamd.is_none() {
+    if cli.allow_shutdown && clamd.is_empty() {
         return Err(
             "--allow-shutdown answers the clamd SHUTDOWN command; it needs --listen clamd://… \
              (ICAP has no such request)"
@@ -3303,9 +3406,9 @@ fn scan_target(
         let mut split: Vec<PathBuf> = Vec::new();
         let walk = walk_tree(path, Some(filters), descent);
         totals.dirs += walk.dirs;
-        for line in &walk.errors {
+        for e in &walk.errors {
             totals.errors += 1;
-            errln(line);
+            errln(&e.line());
         }
         daemon::note_run(totals.infected, totals.errors);
         for file in &walk.files {
@@ -3416,32 +3519,56 @@ fn scan_split_sets(
         by_dir.entry(dir).or_default().push(name.to_string());
     }
     for (dir, names) in by_dir {
-        let verdicts = exav_core::analyze_split_sets_seekable(db, &names, opts, |name| {
-            std::fs::File::open(dir.join(name))
-        });
+        let open_part = |name: &str| std::fs::File::open(dir.join(name));
         // The sets `only` is a part of, or every set.
         let wanted = only.and_then(|p| p.file_name()).and_then(|n| n.to_str());
-        let relevant: std::collections::HashSet<String> = verdicts
-            .iter()
-            .filter(|v| wanted.is_none_or(|w| v.name == w))
-            .map(|v| v.set.clone())
-            .collect();
+        let relevant = |parts: Vec<(&str, &str)>| -> std::collections::HashSet<String> {
+            parts
+                .into_iter()
+                .filter(|(name, _)| wanted.is_none_or(|w| *name == w))
+                .map(|(_, set)| set.to_string())
+                .collect()
+        };
+        let sets: Vec<SetResult> = if cli.allmatch {
+            exav_core::analyze_split_sets_seekable_all(db, &names, opts, open_part)
+                .into_iter()
+                .map(SetResult::from)
+                .collect()
+        } else {
+            exav_core::analyze_split_sets_seekable(db, &names, opts, open_part)
+                .into_iter()
+                .map(SetResult::from)
+                .collect()
+        };
+        let relevant = relevant(
+            sets.iter()
+                .map(|s| (s.name.as_str(), s.set.as_str()))
+                .collect(),
+        );
         let mut seen = std::collections::HashSet::new();
-        for v in verdicts {
-            if !relevant.contains(&v.set) || !seen.insert(v.set.clone()) {
-                continue;
-            }
-            if matches!(v.report.verdict.category(), VerdictCategory::Clean) {
-                continue;
-            }
-            totals.scanned += 1;
-            report_result(
-                &dir.join(&v.set).display().to_string(),
-                v.report,
-                cli,
-                totals,
-            );
+        for s in sets.into_iter().filter(|s| relevant.contains(&s.set)) {
+            report_set(dir, s, &mut seen, cli, totals);
         }
+    }
+}
+
+/// Report a multi-volume set under the archive's own name, once per set and
+/// only when it is not clean.
+fn report_set(
+    dir: &Path,
+    s: SetResult,
+    seen: &mut std::collections::HashSet<String>,
+    cli: &Cli,
+    totals: &mut Totals,
+) {
+    if !seen.insert(s.set.clone()) || s.is_clean() {
+        return;
+    }
+    totals.scanned += 1;
+    let shown = dir.join(&s.set).display().to_string();
+    match s.scan {
+        daemon::SetScan::First(report) => report_result(&shown, report, cli, totals),
+        daemon::SetScan::All(found, outcome) => report_all(&shown, (found, outcome), cli, totals),
     }
 }
 
@@ -3483,7 +3610,7 @@ fn scan_volume_sets(
         by_dir.entry(dir).or_default().push(name.to_string());
     }
     for (dir, names) in by_dir {
-        let verdicts = exav_core::analyze_volume_sets(db, &names, opts, |name| {
+        let read_part = |name: &str| {
             let mut data = Vec::new();
             exav_core::unpack::source::read_capped(
                 &mut std::fs::File::open(dir.join(name))?,
@@ -3491,24 +3618,25 @@ fn scan_volume_sets(
                 opts.limits.max_buffer_bytes.saturating_add(1),
             )?;
             Ok(data)
-        });
+        };
+        // One line per *archive*, not per part: every part of a set carries the
+        // same verdict, and repeating it once per fragment would be noise.
+        let sets: Vec<SetResult> = if cli.allmatch {
+            exav_core::analyze_volume_sets_all(db, &names, opts, read_part)
+                .into_iter()
+                .map(SetResult::from)
+                .collect()
+        } else {
+            exav_core::analyze_volume_sets(db, &names, opts, read_part)
+                .into_iter()
+                .map(SetResult::from)
+                .collect()
+        };
         // One line per *archive*, not per part: every part of a set carries the
         // same verdict, and repeating it once per fragment would be noise.
         let mut seen = std::collections::HashSet::new();
-        for v in verdicts {
-            if !seen.insert(v.set.clone()) {
-                continue;
-            }
-            if matches!(v.report.verdict.category(), VerdictCategory::Clean) {
-                continue;
-            }
-            totals.scanned += 1;
-            report_result(
-                &dir.join(&v.set).display().to_string(),
-                v.report,
-                cli,
-                totals,
-            );
+        for s in sets {
+            report_set(dir, s, &mut seen, cli, totals);
         }
     }
 }
@@ -3519,8 +3647,9 @@ fn scan_volume_sets(
 /// gets the one scan.
 enum Input<'a> {
     File(&'a Path),
-    /// What was held, and the stream's size.
-    Held(daemon::Held, u64),
+    /// What was held, the stream's size as far as it was counted, and whether
+    /// the count stopped before the stream's end (the size is then a floor).
+    Held(daemon::Held, u64, daemon::Rest),
 }
 
 impl<'a> Input<'a> {
@@ -3545,26 +3674,32 @@ impl<'a> Input<'a> {
         let limit = opts.max_scan_size.map_or(u64::MAX, |m| m.saturating_add(1));
         let held = daemon::buffer_to_seekable(&mut io::Read::take(&mut r, limit))?;
         let mut size = held.payload.len();
+        let mut rest = daemon::Rest::Read;
         if held.short.is_some() || size >= limit {
-            size += io::copy(
+            let drained = io::copy(
                 &mut io::Read::take(&mut r, daemon::MAX_DRAIN_BYTES),
                 &mut io::sink(),
             )?;
+            size += drained;
+            if drained == daemon::MAX_DRAIN_BYTES && io::Read::read(&mut r, &mut [0u8; 1])? > 0 {
+                rest = daemon::Rest::Unread;
+            }
         }
-        Ok(Self::Held(held, size))
+        Ok(Self::Held(held, size, rest))
     }
 
     fn size(&self) -> u64 {
         match self {
             Self::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
-            Self::Held(_, n) => *n,
+            Self::Held(_, n, _) => *n,
         }
     }
 
     fn scan(&self, db: &Scanner, opts: &ScanOptions) -> io::Result<exav_core::ScanReport> {
         match self {
             Self::File(p) => scan_path(db, p, opts),
-            Self::Held(held, n) => daemon::scan_held(db, opts, held, *n).map(|(r, _)| r),
+            Self::Held(held, n, rest) => daemon::scan_held(db, opts, held, *n)
+                .map(|(report, _)| daemon::size_counted(report, *n, *rest)),
         }
     }
 
@@ -3577,8 +3712,12 @@ impl<'a> Input<'a> {
     ) -> io::Result<Option<(Vec<(String, exav_core::Method)>, exav_core::AllMatchOutcome)>> {
         match self {
             Self::File(p) => exav_core::analyze_all_path(db, p, opts).map(Some),
-            Self::Held(held, n) if held.short.is_none() => {
-                held.payload.all_matches(db, opts, *n).map(Some)
+            Self::Held(held, n, rest) if held.short.is_none() => {
+                let (found, mut outcome) = held.payload.all_matches(db, opts, *n)?;
+                if let exav_core::AllMatchOutcome::LimitsExceeded(reason) = &mut outcome {
+                    daemon::size_floor(reason, *n, *rest);
+                }
+                Ok(Some((found, outcome)))
             }
             Self::Held(..) => Ok(None),
         }
@@ -3622,8 +3761,7 @@ fn scan_input(
     if cli.profile {
         exav_core::profile::enable();
     }
-    let mut scanned =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| input.scan(db, opts)));
+    let mut scanned = daemon::contained(|| input.scan(db, opts));
     if cli.profile {
         let prof = exav_core::profile::take();
         // `--profile` returns before `report_result`, so the partial policy has
@@ -3631,11 +3769,11 @@ fn scan_input(
         // except this one: the same files would exit 3 under `--profile` and 0
         // without it, and the CSV would name a verdict the operator asked to be
         // reported as something else.
-        if let Ok(Ok(r)) = &mut scanned {
+        if let Ok(r) = &mut scanned {
             policy::apply(r, policy::current());
         }
         let (verdict, sig) = match &scanned {
-            Ok(Ok(r)) => {
+            Ok(r) => {
                 let v = &r.verdict;
                 // Counted, not just labelled, and counted the way `report_result`
                 // counts: through the exhaustive `VerdictCategory`. The CSV row
@@ -3670,13 +3808,13 @@ fn scan_input(
                     _ => ("other", String::new()),
                 }
             }
-            Ok(Err(e)) => {
-                totals.errors += 1;
-                ("error", e.to_string())
-            }
-            Err(_) => {
+            Err(e) if daemon::scan_panicked(e) => {
                 totals.errors += 1;
                 ("panic", String::new())
+            }
+            Err(e) => {
+                totals.errors += 1;
+                ("error", e.to_string())
             }
         };
         println!(
@@ -3686,14 +3824,8 @@ fn scan_input(
         return;
     }
     match scanned {
-        Ok(Ok(report)) => report_result(&path.display().to_string(), report, cli, totals),
-        Ok(Err(e)) => report_error(&path.display().to_string(), &e.to_string(), cli, totals),
-        Err(_) => report_error(
-            &path.display().to_string(),
-            "internal error while scanning",
-            cli,
-            totals,
-        ),
+        Ok(report) => report_result(&path.display().to_string(), report, cli, totals),
+        Err(e) => report_error(&path.display().to_string(), &e.to_string(), cli, totals),
     }
 }
 
@@ -3729,7 +3861,16 @@ fn report_error(name: &str, message: &str, cli: &Cli, totals: &mut Totals) {
 /// Print an error line to stderr and mirror it into `--log`. Not silenced by
 /// `--quiet`, which drops the `OK` lines and the summary, never an error.
 fn errln(line: &str) {
-    eprintln!("{line}");
+    err_bytes(line.as_bytes());
+}
+
+/// [`errln`] for a line that is bytes.
+fn err_bytes(line: &[u8]) {
+    use std::io::Write;
+    let mut err = io::stderr().lock();
+    err.write_all(line)
+        .and_then(|()| err.write_all(b"\n"))
+        .unwrap_or_else(|e| panic!("failed printing to stderr: {e}"));
     log_line(line);
 }
 
@@ -3759,13 +3900,9 @@ fn scan_url(url: &str, db: &Scanner, opts: &ScanOptions, cli: &Cli, totals: &mut
             return;
         }
     };
-    let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        exav_core::scan_seekable(db, reader, size, opts)
-    }));
-    match scanned {
-        Ok(Ok(report)) => report_result(url, report, cli, totals),
-        Ok(Err(e)) => report_error(url, &e.to_string(), cli, totals),
-        Err(_) => report_error(url, "internal error while scanning", cli, totals),
+    match daemon::contained(|| exav_core::scan_seekable(db, reader, size, opts)) {
+        Ok(report) => report_result(url, report, cli, totals),
+        Err(e) => report_error(url, &e.to_string(), cli, totals),
     }
 }
 
@@ -3915,6 +4052,12 @@ fn client_connect(cli: &Cli) -> Result<Box<dyn ReadWrite>, ExitCode> {
 /// Read one NUL-terminated reply, without the terminator or trailing blanks.
 /// `None` means the daemon closed the connection instead of answering.
 fn read_reply(r: &mut impl std::io::BufRead) -> io::Result<Option<String>> {
+    Ok(read_reply_bytes(r)?.map(|b| String::from_utf8_lossy(&b).into_owned()))
+}
+
+/// [`read_reply`] as bytes: a file name that is not UTF-8 stays as the daemon
+/// wrote it.
+fn read_reply_bytes(r: &mut impl std::io::BufRead) -> io::Result<Option<Vec<u8>>> {
     let mut buf = Vec::new();
     if r.read_until(0, &mut buf)? == 0 {
         return Ok(None);
@@ -3922,7 +4065,8 @@ fn read_reply(r: &mut impl std::io::BufRead) -> io::Result<Option<String>> {
     if buf.last() == Some(&0) {
         buf.pop();
     }
-    Ok(Some(String::from_utf8_lossy(&buf).trim_end().to_string()))
+    buf.truncate(buf.trim_ascii_end().len());
+    Ok(Some(buf))
 }
 
 /// Read every reply a command produced, up to the daemon closing the
@@ -3935,10 +4079,10 @@ fn read_reply(r: &mut impl std::io::BufRead) -> io::Result<Option<String>> {
 /// with verdicts; what must not happen is treating them as the complete answer,
 /// which would call a tree clean on the strength of the part of it that was
 /// scanned before the connection broke.
-fn read_replies_until_close(r: &mut impl std::io::BufRead) -> (Vec<String>, Option<String>) {
+fn read_replies_until_close(r: &mut impl std::io::BufRead) -> (Vec<Vec<u8>>, Option<String>) {
     let mut out = Vec::new();
     loop {
-        match read_reply(r) {
+        match read_reply_bytes(r) {
             Ok(Some(line)) => {
                 if !line.is_empty() {
                     out.push(line);
@@ -3953,12 +4097,15 @@ fn read_replies_until_close(r: &mut impl std::io::BufRead) -> (Vec<String>, Opti
 /// Split an IDSESSION reply message into the command id it answers and the
 /// reply itself. Only a leading run of digits counts as an id: a verdict line
 /// carries colons of its own, starting with the one after the path.
-fn split_session_id(msg: &str) -> (Option<u64>, &str) {
-    match msg.split_once(": ") {
-        Some((head, rest)) => match head.parse::<u64>() {
-            Ok(id) => (Some(id), rest),
-            Err(_) => (None, msg),
-        },
+fn split_session_id(msg: &[u8]) -> (Option<u64>, &[u8]) {
+    let Some(at) = msg.windows(2).position(|w| w == b": ") else {
+        return (None, msg);
+    };
+    match std::str::from_utf8(&msg[..at])
+        .ok()
+        .and_then(|h| h.parse().ok())
+    {
+        Some(id) => (Some(id), &msg[at + 2..]),
         None => (None, msg),
     }
 }
@@ -3976,10 +4123,10 @@ fn split_session_id(msg: &str) -> (Option<u64>, &str) {
 /// `Err` is a daemon that closed, failed, or answered out of order before the
 /// marker arrived: the command is then unanswered, which is not the same as
 /// answered clean.
-fn read_session_replies(r: &mut impl std::io::BufRead, marker_id: u64) -> io::Result<Vec<String>> {
+fn read_session_replies(r: &mut impl std::io::BufRead, marker_id: u64) -> io::Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     loop {
-        let Some(msg) = read_reply(r)? else {
+        let Some(msg) = read_reply_bytes(r)? else {
             return Err(io::Error::other("the daemon closed the connection"));
         };
         let (id, body) = split_session_id(&msg);
@@ -3997,15 +4144,15 @@ fn read_session_replies(r: &mut impl std::io::BufRead, marker_id: u64) -> io::Re
             }
             Some(_) => {
                 if !body.is_empty() {
-                    out.push(body.to_string());
+                    out.push(body.to_vec());
                 }
             }
             // A daemon that tags no ids leaves nothing to find the marker by, so
             // its message is taken as the whole answer rather than blocking on
             // one that may never come. `PONG` is the marker answering untagged.
             None => {
-                if !body.is_empty() && body != "PONG" {
-                    out.push(body.to_string());
+                if !body.is_empty() && body != b"PONG" {
+                    out.push(body.to_vec());
                 }
                 return Ok(out);
             }
@@ -4084,8 +4231,8 @@ fn write_chunks<W: std::io::Write, R: io::Read>(
 ///
 /// `INSTREAM` answers about `stream` and `FILDES` about `fd`; neither means
 /// anything to whoever named a file on the command line, and clamdscan rewrites
-/// the same way. A protocol-level error (`FILDES: …`) is left alone: it is
-/// about the request, not about a file.
+/// the same way. A protocol-level error (`No file descriptor received.`) is
+/// left alone: it is about the request, not about a file.
 fn retarget(line: &str, target: &str) -> String {
     for prefix in ["stream: ", "fd: "] {
         if let Some(rest) = line.strip_prefix(prefix) {
@@ -4128,7 +4275,7 @@ fn client_fdpass(cli: &Cli, path: &Path) -> io::Result<String> {
     };
     let file = std::fs::File::open(path)?;
     let stream = std::os::unix::net::UnixStream::connect(sock)?;
-    daemon::send_fd_command(&stream, b"zFILDES\0", file.as_fd())?;
+    daemon::send_fd_command(&stream, b"zFILDES\0", &[file.as_fd()])?;
     let mut r = BufReader::new(stream.try_clone()?);
     match read_reply(&mut r)? {
         Some(line) => Ok(retarget(&line, &path.display().to_string())),
@@ -4193,7 +4340,7 @@ fn client_stream_set(cli: &Cli, dir: &Path, parts: &[PathBuf], totals: &mut Tota
     for (part, entry) in parts.iter().zip(entries) {
         totals.scanned += 1;
         print_daemon_reply(
-            &set_entry_line(&part.display().to_string(), entry),
+            set_entry_line(&part.display().to_string(), entry).as_bytes(),
             cli,
             totals,
         );
@@ -4365,9 +4512,9 @@ fn run_client(cli: &Cli) -> ExitCode {
     }
 
     let mut totals = Totals::default();
-    for line in &walk_errors {
+    for e in &walk_errors {
         totals.errors += 1;
-        errln(line);
+        errln(&e.line());
     }
 
     if scan_stdin {
@@ -4378,7 +4525,7 @@ fn run_client(cli: &Cli) -> ExitCode {
         // consumer or a log reader does not have to know whether the scan went
         // over a socket.
         match client_stream(cli, "stdin", io::stdin().lock()) {
-            Ok(line) => print_daemon_reply(&line, cli, &mut totals),
+            Ok(line) => print_daemon_reply(line.as_bytes(), cli, &mut totals),
             // Counted as scanned even so, as every other surface counts a file
             // it could not read: the target was named, and the summary says
             // what became of each one.
@@ -4392,7 +4539,7 @@ fn run_client(cli: &Cli) -> ExitCode {
         for f in &files {
             totals.scanned += 1;
             match client_send_file(cli, f) {
-                Ok(line) => print_daemon_reply(&line, cli, &mut totals),
+                Ok(line) => print_daemon_reply(line.as_bytes(), cli, &mut totals),
                 Err(e) => report_error(&f.display().to_string(), &e.to_string(), cli, &mut totals),
             }
         }
@@ -4461,12 +4608,10 @@ fn run_client(cli: &Cli) -> ExitCode {
         client_verbose_cmd(cli, verb, &name);
         // `PING` rides behind the scan as its end marker. See
         // [`read_session_replies`] for why a session needs one.
-        let cmd = format!("z{verb} {name}\0zPING\0");
-        if conn
-            .write_all(cmd.as_bytes())
-            .and_then(|_| conn.flush())
-            .is_err()
-        {
+        let mut cmd = format!("z{verb} ").into_bytes();
+        cmd.extend_from_slice(&daemon::path_bytes(&abs));
+        cmd.extend_from_slice(b"\0zPING\0");
+        if conn.write_all(&cmd).and_then(|_| conn.flush()).is_err() {
             eprintln!("exav: daemon connection lost");
             return ExitCode::from(2);
         }
@@ -4519,13 +4664,15 @@ fn client_oneshot(
     verb: &str,
     target: &Path,
     totals: &mut Totals,
-) -> Result<Vec<String>, ExitCode> {
+) -> Result<Vec<Vec<u8>>, ExitCode> {
     use std::io::{BufReader, Write};
     let name = target.display().to_string();
     client_verbose_cmd(cli, verb, &name);
     let mut c = client_connect(cli)?;
-    let cmd = format!("z{verb} {name}\0");
-    if c.write_all(cmd.as_bytes()).and_then(|_| c.flush()).is_err() {
+    let mut cmd = format!("z{verb} ").into_bytes();
+    cmd.extend_from_slice(&daemon::path_bytes(target));
+    cmd.push(0);
+    if c.write_all(&cmd).and_then(|_| c.flush()).is_err() {
         eprintln!("exav: daemon connection lost");
         return Err(ExitCode::from(2));
     }
@@ -4607,10 +4754,16 @@ fn print_partial_and_errors(totals: &Totals) {
 /// detection is worse than no log, and client mode writing nothing to a log the
 /// operator asked for would be exactly that. In `--json` mode the line is turned
 /// into an object, so the flag means the same thing whichever surface answered.
-fn print_daemon_reply(line: &str, cli: &Cli, totals: &mut Totals) {
-    let line = line.trim_end();
+///
+/// The line is bytes and prints as it came, so a file name that is not UTF-8
+/// reaches the output and the log unchanged. The classification reads a lossy
+/// copy: the status words are ASCII and sit at the end, where lossy text and
+/// bytes agree. JSON text cannot carry the bytes, so `--json` gets the lossy copy.
+fn print_daemon_reply(line: &[u8], cli: &Cli, totals: &mut Totals) {
+    let line = line.trim_ascii_end();
+    let text = String::from_utf8_lossy(line);
     if cli.json {
-        return json_daemon_reply(line, cli, totals);
+        return json_daemon_reply(&text, cli, totals);
     }
     // A verdict earned by a rejoined multi-volume set is reported on each part
     // as `<part>: <sig> FOUND (in <set>)`. The status word is therefore not last,
@@ -4618,10 +4771,10 @@ fn print_daemon_reply(line: &str, cli: &Cli, totals: &mut Totals) {
     // unrecognised line, which prints and counts as clean. Strip the annotation
     // before classifying; the printed line keeps it, because it is what tells an
     // operator which archive the part belongs to.
-    let verdict = strip_set_annotation(line);
+    let verdict = strip_set_annotation(&text);
     if verdict.ends_with("FOUND") {
         totals.infected += 1;
-        outln!("{line}");
+        out_bytes(line);
         if cli.bell {
             print!("\x07");
         }
@@ -4639,16 +4792,16 @@ fn print_daemon_reply(line: &str, cli: &Cli, totals: &mut Totals) {
             // them. Having read the category back, say what a local scan of the
             // same object says, or the status word depends on which end held
             // the database.
-            match line.strip_suffix("ERROR") {
-                Some(head) => outln!("{head}PARTIAL"),
-                None => outln!("{line}"),
+            match line.strip_suffix(b"ERROR") {
+                Some(head) => out_bytes(&[head, b"PARTIAL"].concat()),
+                None => out_bytes(line),
             }
         } else {
             totals.errors += 1;
-            errln(line);
+            err_bytes(line);
         }
     } else if !cli.quiet {
-        outln!("{line}");
+        out_bytes(line);
     }
 }
 
@@ -4757,30 +4910,32 @@ fn scan_one_allmatch(
     let fall_back = |totals: &mut Totals| {
         // The single-match scan scans the budgeted prefix before reporting the
         // limit, so a detection in the part that did fit still wins.
-        let scanned =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| input.scan(db, opts)));
-        match scanned {
-            Ok(Ok(report)) => report_result(&name, report, cli, totals),
-            // An I/O failure has a cause worth printing; only a panic is truly
-            // opaque, and folding the two loses the one that says what went
-            // wrong.
-            Ok(Err(e)) => report_error(&name, &e.to_string(), cli, totals),
-            Err(_) => report_error(&name, "internal error while scanning", cli, totals),
+        match daemon::contained(|| input.scan(db, opts)) {
+            Ok(report) => report_result(&name, report, cli, totals),
+            Err(e) => report_error(&name, &e.to_string(), cli, totals),
         }
     };
-    let found =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| input.all_matches(db, opts)));
-    let found = match found {
-        Ok(Ok(Some(found))) => Ok(found),
-        Ok(Ok(None)) => return fall_back(totals),
-        Ok(Err(e)) => {
+    let found = match daemon::contained(|| input.all_matches(db, opts)) {
+        Ok(Some(found)) => found,
+        Ok(None) => return fall_back(totals),
+        Err(e) => {
             report_error(&name, &e.to_string(), cli, totals);
             return;
         }
-        Err(panic) => Err(panic),
     };
+    report_all(&name, found, cli, totals);
+}
+
+/// Report the result of an all-match scan of `name`: every detection, and the
+/// search not having finished when it did not.
+fn report_all(
+    name: &str,
+    found: (Vec<(String, exav_core::Method)>, exav_core::AllMatchOutcome),
+    cli: &Cli,
+    totals: &mut Totals,
+) {
     match found {
-        Ok((dets, outcome)) if !dets.is_empty() => {
+        (dets, outcome) if !dets.is_empty() => {
             totals.infected += 1;
             // A detection does not mean the search finished. All-match exists to
             // report everything that matched, so "here is what matched" and "we
@@ -4828,7 +4983,7 @@ fn scan_one_allmatch(
                 // `signatures` is the plural of its `signature`, which is the
                 // one thing all-match genuinely adds.
                 let mut obj = serde_json::Map::new();
-                obj.insert("file".into(), name.as_str().into());
+                obj.insert("file".into(), name.into());
                 obj.insert("status".into(), "FOUND".into());
                 obj.insert("signatures".into(), sigs.into());
                 // Absent rather than `false` when the search did finish, like
@@ -4873,7 +5028,7 @@ fn scan_one_allmatch(
         // the counters, the exit code, the line grammar and the JSON schema all
         // come from one place: the same file must not answer differently for
         // having been passed `--all-matches`.
-        Ok((_, outcome)) => {
+        (_, outcome) => {
             let verdict = match outcome {
                 exav_core::AllMatchOutcome::Complete => Verdict::Clean,
                 exav_core::AllMatchOutcome::LimitsExceeded(reason) => {
@@ -4884,9 +5039,8 @@ fn scan_one_allmatch(
                     Verdict::PasswordProtected { reason }
                 }
             };
-            report_result(&name, ScanReport::new(verdict, Vec::new()), cli, totals);
+            report_result(name, ScanReport::new(verdict, Vec::new()), cli, totals);
         }
-        Err(_) => report_error(&name, "internal error while scanning", cli, totals),
     }
 }
 
@@ -5322,6 +5476,29 @@ mod tests {
         );
     }
 
+    /// A scan that panics is an error for its file, worded as the clamd
+    /// listener and ICAP word it, with and without `--all-matches`.
+    #[test]
+    fn a_panic_in_a_scan_is_reported_in_the_words_of_the_other_surfaces() {
+        let dir = tmpfile::TempDir::new().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"abc").unwrap();
+        let log = dir.path().join("log");
+        log_open(&log).unwrap();
+        daemon::before_scan::set(|| panic!("a scan that panics"));
+        let (db, opts) = (Scanner::builtin(), ScanOptions::default());
+        for argv in [&["exav"][..], &["exav", "--all-matches"]] {
+            let mut totals = Totals::default();
+            scan_one(&file, &db, &opts, &Cli::parse_from(argv), &mut totals);
+            assert_eq!(totals.errors, 1, "{argv:?}");
+        }
+        *LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let said = std::fs::read_to_string(&log).unwrap();
+        let line = format!("{}: {} ERROR\n", file.display(), daemon::SCAN_PANICKED);
+        // Tests running beside this one may log to the same file.
+        assert_eq!(said.matches(&line).count(), 2, "{said}");
+    }
+
     /// `--ping` probes what this configuration serves, so a health check need
     /// not repeat an address that only the environment knows.
     ///
@@ -5539,8 +5716,8 @@ mod tests {
         assert_eq!(
             replies,
             vec![
-                "/t/a: OK".to_string(),
-                "/t/b: Eicar-Test-Signature FOUND".to_string(),
+                b"/t/a: OK".to_vec(),
+                b"/t/b: Eicar-Test-Signature FOUND".to_vec(),
             ],
             "every message before the marker belongs to the scan"
         );
@@ -5579,7 +5756,7 @@ mod tests {
         let untagged: &[u8] = b"/t/a: OK\x00";
         assert_eq!(
             read_session_replies(&mut std::io::BufReader::new(untagged), 2).unwrap(),
-            vec!["/t/a: OK".to_string()],
+            vec![b"/t/a: OK".to_vec()],
             "an untagged reply is taken as the whole answer, not waited on"
         );
     }
@@ -5589,13 +5766,16 @@ mod tests {
     /// one of those as the id would strip part of the file name off the reply.
     #[test]
     fn only_a_leading_number_is_a_session_id() {
-        assert_eq!(split_session_id("7: /t/x: OK"), (Some(7), "/t/x: OK"));
         assert_eq!(
-            split_session_id("/t/od: d: OK"),
-            (None, "/t/od: d: OK"),
+            split_session_id(b"7: /t/x: OK"),
+            (Some(7), &b"/t/x: OK"[..])
+        );
+        assert_eq!(
+            split_session_id(b"/t/od: d: OK"),
+            (None, &b"/t/od: d: OK"[..]),
             "a path with a colon in it is not an id"
         );
-        assert_eq!(split_session_id("PONG"), (None, "PONG"));
+        assert_eq!(split_session_id(b"PONG"), (None, &b"PONG"[..]));
     }
 
     /// A reachable daemon must not be stoppable by whoever reaches it.
@@ -5703,6 +5883,8 @@ mod tests {
         assert_eq!(opts.limits.max_extracted_bytes, 1024 * 1024 * 1024);
         assert_eq!(opts.limits.max_buffer_bytes, 256 * 1024 * 1024);
         assert_eq!(opts.limits.max_scanned_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(opts.limits.max_hole_bytes, 10 * 1024 * 1024 * 1024);
+        assert!(opts.limits.max_hole_bytes <= opts.limits.max_scanned_bytes);
         assert_eq!(opts.limits.max_recursion, 16);
         assert_eq!(opts.limits.max_members, 100_000);
         assert_eq!(opts.limits.max_compression_ratio, 1000);
@@ -5710,6 +5892,8 @@ mod tests {
         assert_eq!(opts.limits.max_carved_archives, 32);
 
         assert_eq!(opts.limits.max_pe_emulation_steps, 1_000_000_000);
+        assert_eq!(opts.limits.max_pe_stub_steps, 500_000_000);
+        assert_eq!(opts.limits.max_pe_idle_steps, 64_000_000);
 
         // The --clamav-compat preset supplies ClamAV's documented defaults.
         let opts = build_scan_options(&Cli::parse_from(["exav", "--clamav-compat"]));
@@ -6123,6 +6307,15 @@ mod tests {
     fn off_lifts_a_limit() {
         let opts = build_scan_options(&Cli::parse_from(["exav", "--max-pe-emulation-steps", "7"]));
         assert_eq!(opts.limits.max_pe_emulation_steps, 7);
+        let opts = build_scan_options(&Cli::parse_from([
+            "exav",
+            "--max-pe-stub-steps",
+            "8",
+            "--max-pe-idle-steps",
+            "9",
+        ]));
+        assert_eq!(opts.limits.max_pe_stub_steps, 8);
+        assert_eq!(opts.limits.max_pe_idle_steps, 9);
         for off in ["off", "0"] {
             let opts = build_scan_options(&Cli::parse_from([
                 "exav",
@@ -6130,16 +6323,25 @@ mod tests {
                 off,
                 "--max-matcher-bytes",
                 off,
+                "--max-hole-bytes",
+                off,
                 "--max-pe-emulation-steps",
+                off,
+                "--max-pe-stub-steps",
+                off,
+                "--max-pe-idle-steps",
                 off,
             ]));
             assert_eq!(opts.limits.max_buffer_bytes, u64::MAX, "{off}: object");
             assert_eq!(opts.limits.max_scanned_bytes, u64::MAX, "{off}: matcher");
+            assert_eq!(opts.limits.max_hole_bytes, u64::MAX, "{off}: holes");
             assert_eq!(
                 opts.limits.max_pe_emulation_steps,
                 u64::MAX,
                 "{off}: emulation"
             );
+            assert_eq!(opts.limits.max_pe_stub_steps, u64::MAX, "{off}: stub");
+            assert_eq!(opts.limits.max_pe_idle_steps, u64::MAX, "{off}: idle");
         }
     }
 
@@ -6172,6 +6374,37 @@ mod tests {
             assert_eq!(opts.max_regex_steps, None, "{off}");
         }
         assert!(Cli::try_parse_from(["exav", "--max-regex-steps", "many"]).is_err());
+    }
+
+    /// The step budget of the YARA conditions: 20,000,000 by default, under
+    /// `--clamav-compat` too, set by the flag or its variable, and `off` or
+    /// `0` is no limit.
+    #[test]
+    fn the_yara_step_budget_is_a_setting() {
+        let var = [("EXAV_MAX_YARA_STEPS", Some("9"))];
+        with_env(
+            "tests::the_yara_step_budget_is_a_setting",
+            "9",
+            &var,
+            || {
+                let opts = build_scan_options(&Cli::parse_from(["exav"]));
+                assert_eq!(opts.max_yara_steps, Some(9), "the variable");
+            },
+        );
+        if env_child() {
+            return;
+        }
+        for argv in [&["exav"][..], &["exav", "--clamav-compat"]] {
+            let opts = build_scan_options(&Cli::parse_from(argv));
+            assert_eq!(opts.max_yara_steps, Some(20_000_000), "{argv:?}");
+        }
+        let opts = build_scan_options(&Cli::parse_from(["exav", "--max-yara-steps", "7"]));
+        assert_eq!(opts.max_yara_steps, Some(7));
+        for off in ["off", "0"] {
+            let opts = build_scan_options(&Cli::parse_from(["exav", "--max-yara-steps", off]));
+            assert_eq!(opts.max_yara_steps, None, "{off}");
+        }
+        assert!(Cli::try_parse_from(["exav", "--max-yara-steps", "many"]).is_err());
     }
 
     /// The step bounds of the body-signature verifier: 2,000,000 per MiB by
@@ -6355,7 +6588,9 @@ mod tests {
         let Some(endpoint::Endpoint {
             addr: endpoint::Addr::Unix { mode, .. },
             ..
-        }) = clamd_endpoint(&Cli::parse_from(["exav", "--listen", "/run/x.sock"]))
+        }) = clamd_endpoints(&Cli::parse_from(["exav", "--listen", "/run/x.sock"]))
+            .into_iter()
+            .next()
         else {
             panic!("a path is a Unix clamd listener");
         };
@@ -6473,11 +6708,11 @@ mod tests {
             &["--listen", "clamd://h:1", "--auto-update"],
         ] {
             assert!(
-                icap_endpoint(&cli(quiet)).is_none(),
+                icap_endpoints(&cli(quiet)).is_empty(),
                 "{quiet:?} must not start an ICAP listener"
             );
         }
-        assert!(icap_endpoint(&cli(&["--listen", "icap://h:1"])).is_some());
+        assert!(!icap_endpoints(&cli(&["--listen", "icap://h:1"])).is_empty());
 
         assert!(
             check_flag_conflicts(&cli(&["--listen", "icap://h:1", "file"])).is_err(),
@@ -6878,7 +7113,7 @@ mod tests {
         let cli = Cli::parse_from(["exav"]);
         let mut totals = Totals::default();
         print_daemon_reply(
-            "/x/set.zip.001: Exav.Test.EICAR FOUND (in set.zip)",
+            b"/x/set.zip.001: Exav.Test.EICAR FOUND (in set.zip)",
             &cli,
             &mut totals,
         );
@@ -6890,10 +7125,10 @@ mod tests {
 
         // The plain form still works, and a clean line is still clean.
         let mut totals = Totals::default();
-        print_daemon_reply("/x/a.exe: Sig.Name FOUND", &cli, &mut totals);
+        print_daemon_reply(b"/x/a.exe: Sig.Name FOUND", &cli, &mut totals);
         assert_eq!(totals.infected, 1);
         let mut totals = Totals::default();
-        print_daemon_reply("/x/a.txt: OK", &cli, &mut totals);
+        print_daemon_reply(b"/x/a.txt: OK", &cli, &mut totals);
         assert_eq!(
             (totals.infected, totals.errors, totals.limits),
             (0, 0, 0),
@@ -6905,7 +7140,7 @@ mod tests {
         // is only where `partial_category` looks for it once it is stripped.
         let mut totals = Totals::default();
         print_daemon_reply(
-            "/x/set.7z.001: part 2 is missing LIMITS-EXCEEDED ERROR (in set.7z)",
+            b"/x/set.7z.001: part 2 is missing LIMITS-EXCEEDED ERROR (in set.7z)",
             &cli,
             &mut totals,
         );
@@ -6919,7 +7154,7 @@ mod tests {
         // cannot be told apart by the annotation alone.
         let mut totals = Totals::default();
         print_daemon_reply(
-            "/x/set.7z.001: cannot open file ERROR (in set.7z)",
+            b"/x/set.7z.001: cannot open file ERROR (in set.7z)",
             &cli,
             &mut totals,
         );

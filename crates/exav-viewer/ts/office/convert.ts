@@ -5,19 +5,19 @@
  *
  * Spreadsheets (XLS, ODS, Numbers) are converted to XLSX by exav-render's
  * `sheets`, presentations and OpenDocument drawings (PPT, ODP, Keynote, ODG)
- * to PPTX by `slides`, and, unless `converter: "external"`, text documents
- * (DOC, ODT, RTF) to DOCX by `docs` where no external converter is set. A
- * file such a converter recognises and cannot convert fails with its reason
- * (`SheetConversionError`, `SlideConversionError`, `DocConversionError`),
- * never going on to the external converter; one it does not recognise goes
- * to the external converter (`external.ts`), or ends in a
- * `NeedsConverterError` where there is none.
+ * to PPTX by `slides`, and text documents (DOC, ODT, RTF, Pages) to DOCX by `docs`,
+ * in the order `ConversionOptions.converter` and `nativeFirst` give with the
+ * external converter (`external.ts`): a file the first cannot read goes on
+ * to the other. Where both fail, the first one's error is the file's; the
+ * package's converters say why (`SheetConversionError`,
+ * `SlideConversionError`, `DocConversionError`). A file neither takes ends
+ * in a `NeedsConverterError` where no external converter is set.
  */
 import type { Renderer, RenderContext, ViewerFile } from "../core/types.js";
 import type { ConversionOptions, ConvertedFormat } from "./index.js";
 import { convertDocs, DocConversionError, sniffDocs } from "./docs.js";
 import { ExternalConversionError, externalUrl, loadExternal, NeedsConverterError, statusOf } from "./external.js";
-import { nativeFirst } from "./route.js";
+import { nativeFirst, nativeOf, type Native } from "./route.js";
 import { convertSheet, SheetConversionError, sniffSheet } from "./sheets.js";
 import { convertSlides, SlideConversionError, sniffSlides } from "./slides.js";
 import { officeKinds } from "./zip.js";
@@ -158,31 +158,62 @@ function show(host: HTMLElement, ctx: RenderContext<ConversionOptions>, format: 
   return { controllers: {}, resize: () => session.resize(), destroy: () => session.destroy() };
 }
 
+/** The file converted by the package's converter `native`, or `null` when it is not one it recognises. */
+async function byNative(native: Native, bytes: Uint8Array, ctx: RenderContext<ConversionOptions>): Promise<{ format: "xlsx" | "pptx" | "docx"; bytes: Uint8Array } | null> {
+  const format = native === "sheets" ? "xlsx" : native === "slides" ? "pptx" : "docx";
+  const made = await (native === "sheets" ? bySheets : native === "slides" ? bySlides : byDocs)(bytes, ctx);
+  return made && { format, bytes: made };
+}
+
 export function rendererFor(kind: ConvertedFormat): Renderer<ConversionOptions> {
   return {
     async mount(host, ctx) {
       ctx.status({ phase: "loading" });
       const bytes = await ctx.source.bytes();
-      // What the package's own converter recognises is converted by it alone:
-      // its failure is the file's (its error, with its kind). The external
-      // converter gets only what it does not recognise.
-      const native = nativeFirst(kind, ctx.options);
-      if (native === "sheets") {
-        const xlsx = await bySheets(bytes, ctx);
-        if (xlsx) return show(host, ctx, "xlsx", xlsx);
-      } else if (native === "slides") {
-        const pptx = await bySlides(bytes, ctx);
-        if (pptx) return show(host, ctx, "pptx", pptx);
-      } else if (native === "docs") {
-        const docx = await byDocs(bytes, ctx);
-        if (docx) return show(host, ctx, "docx", docx);
+      const native = nativeOf(kind);
+      const first = nativeFirst(kind, ctx.options);
+      const external = ctx.options.externalConverter !== undefined;
+      // The package's converter first: what it recognises and cannot convert
+      // goes on to the external converter, and fails with its own error
+      // (with its kind) where that one fails too or there is none.
+      if (first) {
+        let made;
+        try {
+          made = await byNative(first, bytes, ctx);
+        } catch (error) {
+          if (ctx.signal.aborted || !external) throw error;
+          console.warn(`office: ${kind}: the package's converter could not convert it, the external converter is tried`, error);
+          try {
+            const shown = await byExternal(kind, bytes, ctx);
+            return show(host, ctx, shown.format, shown.bytes);
+          } catch (late) {
+            if (ctx.signal.aborted) throw late;
+            throw error;
+          }
+        }
+        if (made) return show(host, ctx, made.format, made.bytes);
       }
       let shown;
       try {
         shown = await byExternal(kind, bytes, ctx);
       } catch (error) {
+        if (ctx.signal.aborted) throw error;
+        // The external converter first and failing, or none set: the
+        // package's converter, where it has one it did not try already.
+        if (!first && native) {
+          if (external) console.warn(`office: ${kind}: the external converter failed, the package's converter is tried`, error);
+          let made;
+          try {
+            made = await byNative(native, bytes, ctx);
+          } catch (late) {
+            // Its own reason, where there was no external converter to fail first.
+            if (ctx.signal.aborted || !external) throw late;
+            throw error;
+          }
+          if (made) return show(host, ctx, made.format, made.bytes);
+        }
         // Said as its own kind of failure: the viewer's message is about the converter.
-        if (!(error instanceof NeedsConverterError) || ctx.signal.aborted) throw error;
+        if (!(error instanceof NeedsConverterError)) throw error;
         ctx.status({ phase: "error", error: { code: "needs_converter", cause: error } });
         return { controllers: {}, resize: () => {}, destroy: () => {} };
       }

@@ -1,7 +1,7 @@
 //! The `dotnet` YARA module, checked against yara-x.
 //!
 //! Every expected value here is `yr dump --module dotnet` output from the
-//! yara-x CLI 1.19.0, the reference implementation's, not this crate's. A
+//! yara-x CLI 1.23.0, the reference implementation's, not this crate's. A
 //! module validated against its own parser can agree with itself on a
 //! misreading of the metadata format, and several of these fields are exactly
 //! the kind that invites one:
@@ -11,7 +11,10 @@
 //! * `constants` is only the *string* rows of the Constant table: on
 //!   Newtonsoft.Json that is 95 of 568;
 //! * `field_offsets` comes from **FieldRVA**, not the similarly-named
-//!   FieldLayout table, which is usually empty;
+//!   FieldLayout table, which is usually empty, and holds file offsets, not the
+//!   RVAs of the table;
+//! * `resources[].offset` is the file offset of the data of a resource, after
+//!   its four bytes of length;
 //! * a one-byte `#US` entry is a lone flag byte with no characters, and is not
 //!   counted.
 //!
@@ -23,12 +26,23 @@
 //! Newtonsoft.Json 13.0.3 (493 classes, 783 user strings, 95 constants, 22
 //! field offsets, 22 assembly refs), which is too large to commit;
 //! `scripts/yara-dotnet-difftest.sh` reproduces that run.
+//!
+//! Two more assemblies from NuGet hold what that one does not: the netstandard2.0
+//! build of System.Buffers 4.5.1 (MIT) has an embedded resource, and SHA3 1.0.0
+//! (Apache-2.0) has a field with an initial value.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
 
+#[path = "../dotnet_damaged/mod.rs"]
+mod dotnet_damaged;
+
 fn fixture() -> Vec<u8> {
+    fixture_named("system_buffers.dll")
+}
+
+fn fixture_named(name: &str) -> Vec<u8> {
     let p = format!(
-        "{}/tests/fixtures/dotnet/system_buffers.dll",
+        "{}/tests/fixtures/dotnet/{name}",
         env!("CARGO_MANIFEST_DIR")
     );
     exav_core::unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
@@ -53,9 +67,14 @@ fn scanner_for(condition: &str) -> Result<Scanner, String> {
 
 /// Whether the rule both compiled and matched the fixture.
 fn matches(condition: &str) -> bool {
+    matches_in(&fixture(), condition)
+}
+
+/// As [`matches`], over the bytes `data`.
+fn matches_in(data: &[u8], condition: &str) -> bool {
     let db = scanner_for(condition).unwrap_or_else(|e| panic!("compile `{condition}`: {e}"));
     matches!(
-        analyze(&db, &fixture(), &ScanOptions::default()).verdict,
+        analyze(&db, data, &ScanOptions::default()).verdict,
         Verdict::Infected { .. }
     )
 }
@@ -151,4 +170,102 @@ fn a_file_that_is_not_dotnet_reads_as_such() {
         analyze(&db, &not_dotnet, &ScanOptions::default()).verdict,
         Verdict::Infected { .. }
     ));
+}
+
+#[test]
+fn len_of_an_array_matches_yara_x() {
+    for cond in [
+        "dotnet.streams.len() == 5",
+        "dotnet.streams.len() == dotnet.number_of_streams",
+        "dotnet.guids.len() == 1",
+        "dotnet.assembly_refs.len() == 1",
+        "dotnet.field_offsets.len() == 0",
+        "dotnet.resources.len() == 0",
+    ] {
+        assert!(matches(cond), "expected `{cond}` to hold");
+    }
+    let not_dotnet = b"MZ\x90\x00this is not a managed assembly";
+    assert!(matches_in(not_dotnet, "dotnet.streams.len() == 0"));
+}
+
+/// The RVA a FieldRVA row holds is converted to a file offset, and a row whose
+/// RVA is in no section has no entry.
+#[test]
+fn field_offsets_are_file_offsets() {
+    let assembly = fixture_named("sha3_field_rva.dll");
+    // The RVA of the data is 0x2000 + 9312 - 0x200.
+    assert!(matches_in(
+        &assembly,
+        "dotnet.number_of_field_offsets == 1 and dotnet.field_offsets[0] == 9312"
+    ));
+    // The size of the `.text` section (its header is at 376, the virtual size
+    // 8 bytes into it and the size in the file 16) ends before the data.
+    let mut cut = assembly.clone();
+    for at in [376 + 8, 376 + 16] {
+        cut[at..at + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+    }
+    assert!(matches_in(
+        &cut,
+        "dotnet.is_dotnet and dotnet.number_of_field_offsets == 0 \
+         and not defined dotnet.field_offsets[0]"
+    ));
+}
+
+/// The offset of a resource is that of its data, four bytes after the offset
+/// the table gives from the start of the resources of the CLI header; a
+/// resource that is in another file, or that does not start inside those
+/// resources, has none and still counts.
+#[test]
+fn a_resource_offset_is_the_file_offset_of_its_data() {
+    let assembly = fixture_named("system_buffers_resource.dll");
+    let name = r#"dotnet.resources[0].name == "FxResources.System.Buffers.SR.resources""#;
+    assert!(matches_in(
+        &assembly,
+        &format!(
+            "dotnet.number_of_resources == 1 and {name} and dotnet.resources[0].offset == 8852"
+        )
+    ));
+    // The ManifestResource row is at 4756 (offset, flags, name, implementation),
+    // and the resources of the CLI header, at 520 + 24, are 344 bytes.
+    let patched = |edit: &dyn Fn(&mut Vec<u8>)| {
+        let mut data = assembly.clone();
+        edit(&mut data);
+        data
+    };
+    let undefined = format!(
+        "dotnet.number_of_resources == 1 and {name} and not defined dotnet.resources[0].offset"
+    );
+    let at = |data: &mut Vec<u8>, offset: usize, value: u32| {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    };
+    // 340 and the 4 bytes of length end where the resources end.
+    assert!(matches_in(
+        &patched(&|d| at(d, 4756, 340)),
+        "dotnet.resources[0].offset == 8848 + 340 + 4"
+    ));
+    assert!(matches_in(&patched(&|d| at(d, 4756, 341)), &undefined));
+    // Held in another file.
+    assert!(matches_in(&patched(&|d| d[4756 + 10] = 1), &undefined));
+    // The resources of the CLI header in no section.
+    assert!(matches_in(
+        &patched(&|d| at(d, 520 + 24, 0x9000_0000)),
+        &undefined
+    ));
+}
+
+/// An assembly with a header, a table or a heap damaged reads as yara-x reads
+/// it: what it cannot read is undefined, and what comes after a table it
+/// cannot read is not read. The conditions are what `yr` holds true for each
+/// case (`differential_dotnet_damaged` checks that it still does).
+#[test]
+fn a_damaged_assembly_reads_as_yara_x_reads_it() {
+    let mut failed = Vec::new();
+    for case in dotnet_damaged::cases() {
+        for cond in &case.holds {
+            if !matches_in(&case.data, cond) {
+                failed.push(format!("{}: {cond}", case.name));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{} fail: {failed:#?}", failed.len());
 }

@@ -1,6 +1,7 @@
 //! What a reader says of the samples of a member that is raw pixels with no
-//! file header, so that a consumer can build them. Data only: no pixel code
-//! lives in this crate.
+//! file header, so that a consumer can build them. The one piece of pixel
+//! code here is [`Predictor::undo`], which the PDF reader also runs on the
+//! streams that are not images.
 
 /// The samples of a PDF image XObject, as its dictionary describes them. The
 /// member's bytes are the stream with its filters undone, except a predictor
@@ -71,6 +72,131 @@ pub struct Predictor {
     pub bits: u8,
     /// `/Columns`.
     pub columns: u32,
+}
+
+impl Predictor {
+    /// The bytes of a row of samples, and whether a byte that says how the
+    /// row was written leads it (PNG). `None` for parameters no predictor has.
+    pub fn row(&self) -> Option<(u64, bool)> {
+        let png = (10..=15).contains(&self.kind);
+        if !(png || self.kind == 2)
+            || !(1..=255).contains(&self.colors)
+            || !matches!(self.bits, 1 | 2 | 4 | 8 | 16)
+            || self.columns == 0
+        {
+            return None;
+        }
+        let pixel = u64::from(self.colors) * u64::from(self.bits);
+        Some(((pixel * u64::from(self.columns)).div_ceil(8), png))
+    }
+
+    /// Undoes the predictor in `data`, every row, the last one as far as it
+    /// goes: the output is never longer than the input. `false`, with `data`
+    /// as it was, for parameters no predictor has.
+    pub fn undo(&self, data: &mut Vec<u8>) -> bool {
+        let Some((rowlen, png)) = self.row() else {
+            return false;
+        };
+        // A row longer than the data is the data.
+        let rowlen = usize::try_from(rowlen)
+            .map_or(data.len(), |n| n.min(data.len()))
+            .max(1);
+        let colors = self.colors as usize;
+        if png {
+            undo_png(data, rowlen, (colors * usize::from(self.bits)).div_ceil(8));
+        } else {
+            let samples = usize::try_from(u64::from(self.colors) * u64::from(self.columns))
+                .unwrap_or(usize::MAX);
+            undo_tiff(data, rowlen, colors, self.bits, samples);
+        }
+        true
+    }
+}
+
+/// PNG predictors: every row is a byte that says how it was written, then
+/// `rowlen` bytes. A byte past 4 is no prediction. `bpp` is the bytes in a
+/// pixel.
+fn undo_png(data: &mut Vec<u8>, rowlen: usize, bpp: usize) {
+    let stride = rowlen + 1;
+    let mut written = 0;
+    let mut y = 0;
+    while y * stride < data.len() {
+        let src = y * stride;
+        let dst = y * rowlen;
+        let tag = data[src];
+        let have = rowlen.min(data.len() - src - 1);
+        // The row moves down over the bytes of the rows before it, which are
+        // done with: its place is never past where it was.
+        data.copy_within(src + 1..src + 1 + have, dst);
+        for i in 0..have {
+            let left = if i >= bpp { data[dst + i - bpp] } else { 0 };
+            let (up, up_left) = if y > 0 {
+                let above = dst - rowlen + i;
+                (data[above], if i >= bpp { data[above - bpp] } else { 0 })
+            } else {
+                (0, 0)
+            };
+            let predicted = match tag {
+                1 => left,
+                2 => up,
+                3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
+                4 => paeth(left, up, up_left),
+                _ => 0,
+            };
+            data[dst + i] = data[dst + i].wrapping_add(predicted);
+        }
+        written = dst + have;
+        y += 1;
+    }
+    data.truncate(written);
+}
+
+fn paeth(a: u8, b: u8, c: u8) -> u8 {
+    let (a, b, c) = (i32::from(a), i32::from(b), i32::from(c));
+    let p = a + b - c;
+    let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs());
+    if pa <= pb && pa <= pc {
+        a as u8
+    } else if pb <= pc {
+        b as u8
+    } else {
+        c as u8
+    }
+}
+
+/// The TIFF predictor: every sample is the difference to the one `colors`
+/// before it in its row. `samples` is the most a row holds.
+fn undo_tiff(data: &mut [u8], rowlen: usize, colors: usize, bits: u8, samples: usize) {
+    for row in data.chunks_mut(rowlen) {
+        match bits {
+            8 => {
+                for i in colors..row.len().min(samples) {
+                    row[i] = row[i].wrapping_add(row[i - colors]);
+                }
+            }
+            16 => {
+                for i in colors..(row.len() / 2).min(samples) {
+                    let at = |k: usize| u16::from_be_bytes([row[2 * k], row[2 * k + 1]]);
+                    let sum = at(i).wrapping_add(at(i - colors)).to_be_bytes();
+                    row[2 * i..2 * i + 2].copy_from_slice(&sum);
+                }
+            }
+            _ => {
+                let bits = usize::from(bits);
+                let mask = (1u8 << bits) - 1;
+                // The sample `k`: the byte it is in, and its shift.
+                let place = |k: usize| (k * bits / 8, 8 - bits - k * bits % 8);
+                for i in colors..(row.len() * 8 / bits).min(samples) {
+                    let (byte, shift) = place(i);
+                    let (before, before_shift) = place(i - colors);
+                    let sum = ((row[byte] >> shift) & mask)
+                        .wrapping_add((row[before] >> before_shift) & mask)
+                        & mask;
+                    row[byte] = (row[byte] & !(mask << shift)) | (sum << shift);
+                }
+            }
+        }
+    }
 }
 
 /// An image codec that is not decoded here.

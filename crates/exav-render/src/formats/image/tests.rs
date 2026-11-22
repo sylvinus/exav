@@ -1707,8 +1707,8 @@ fn bits(s: &str) -> Vec<u8> {
         .collect()
 }
 
-/// CCITT fax: Group 3 one-dimensional (compression 2) and Group 4 with a fill
-/// order of 2, which the hashing decoder does not read.
+/// CCITT fax: modified Huffman (compression 2) and Group 4 with a fill order
+/// of 2, which the hashing decoder does not read.
 #[cfg(feature = "ccitt")]
 #[test]
 fn tiffs_of_ccitt_fax_are_shown() {
@@ -1758,6 +1758,78 @@ fn tiffs_of_ccitt_fax_are_shown() {
     };
     assert_ne!(hashed, half);
     assert_eq!(grey(&file), half);
+}
+
+/// CCITT Group 3 (compression 3): lines opened by an EOL, one-dimensional or
+/// with a tag bit and 2-D coding, with fill bits, and in a fill order of 2.
+/// libtiff's fax files are read the same (the viewer's demo has one).
+#[cfg(feature = "ccitt")]
+#[test]
+fn tiffs_of_ccitt_group_3_are_shown() {
+    let eol = "000000000001";
+    // Three rows of 4 white pixels, then 4 black: runs of 4 are 1011 and 011.
+    let half = [255u8, 255, 255, 255, 0, 0, 0, 0];
+    let page: Vec<u8> = [half, half, half].concat();
+    // The line after the EOL: 1-D, or in 2-D coding a tag bit (1: 1-D, 0:
+    // 2-D) and, for the 2-D line, V0 for each of the two changes.
+    let rows_1d = ["1011011"; 3];
+    let rows_2d = ["11011011", "011", "011"];
+    // Each row opens with an EOL; with fill bits, zeros come first so that the
+    // EOL ends on a byte boundary.
+    let join = |rows: &[&str], fill_bits: bool| {
+        let mut s = String::new();
+        for row in rows {
+            if fill_bits {
+                s.push_str(&"0".repeat((8 - (s.len() + eol.len()) % 8) % 8));
+            }
+            s.push_str(eol);
+            s.push_str(row);
+        }
+        s
+    };
+    let mut cases = Vec::new();
+    for fill_bits in [false, true] {
+        cases.push((0u32, join(&rows_1d, fill_bits)));
+        cases.push((1, join(&rows_2d, fill_bits)));
+    }
+    assert!(
+        cases[3].1.len() > cases[1].1.len(),
+        "the fill bits are there"
+    );
+    for (options, stream) in cases {
+        for fill_order in [1u16, 2] {
+            let data: Vec<u8> = bits(&stream)
+                .iter()
+                .map(|b| {
+                    if fill_order == 2 {
+                        b.reverse_bits()
+                    } else {
+                        *b
+                    }
+                })
+                .collect();
+            let file = tiff_strip(
+                8,
+                3,
+                &data,
+                &[
+                    (258, 3, short(1)),
+                    (259, 3, short(3)),
+                    (262, 3, short(0)),
+                    (266, 3, short(fill_order)),
+                    (277, 3, short(1)),
+                    (292, 4, options.to_le_bytes().to_vec()),
+                ],
+            );
+            let Samples::U8(got) = decode_any(&file, DECODE_MAX).unwrap().samples else {
+                panic!()
+            };
+            assert!(
+                got == page,
+                "options {options}, fill order {fill_order}, {stream}"
+            );
+        }
+    }
 }
 
 /// Found by the `imagehash` fuzz target: values of 3, 5, 6 and 7 bits run
@@ -2005,6 +2077,49 @@ fn an_icon_header_with_huge_sizes_and_no_bits_is_refused_cheaply() {
     assert!(decode_any(&file, DECODE_MAX).is_err());
 }
 
+/// Each image of an icon is tried on its own bytes: the time does not grow
+/// with what follows the images, however many fail.
+#[cfg(feature = "ico")]
+#[test]
+#[cfg_attr(target_family = "wasm", ignore = "timing")]
+fn an_icon_of_many_failing_images_is_read_in_time_of_its_images() {
+    let icon = |tail: usize| {
+        let mut dib = Vec::new();
+        for v in [40u32, 2, 4] {
+            dib.extend_from_slice(&v.to_le_bytes());
+        }
+        dib.extend_from_slice(&[1, 0, 32, 0]);
+        // A compression no decoder reads.
+        dib.extend_from_slice(&99u32.to_le_bytes());
+        dib.resize(40 + 16 + 8, 0);
+        let mut file = vec![0, 0, 1, 0, 0, 1];
+        let first = 6 + 16 * 256;
+        for i in 0..256u32 {
+            file.extend_from_slice(&[2, 2, 0, 0, 1, 0, 32, 0]);
+            file.extend_from_slice(&(dib.len() as u32).to_le_bytes());
+            file.extend_from_slice(&(first + i * dib.len() as u32).to_le_bytes());
+        }
+        for _ in 0..256 {
+            file.extend_from_slice(&dib);
+        }
+        file.resize(file.len() + tail, 0);
+        file
+    };
+    let best = |file: &[u8]| {
+        (0..3)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                assert!(decode_any(file, DECODE_MAX).is_err());
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    let (small, large) = (best(&icon(1 << 20)), best(&icon(16 << 20)));
+    let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+    assert!(ratio < 4.0, "{large:?} against {small:?}");
+}
+
 /// Windows draws a 32-bit icon by its alpha and leaves its AND mask out, unless
 /// there is no alpha; `image` applies the mask over the alpha.
 #[cfg(feature = "ico")]
@@ -2119,7 +2234,8 @@ fn damaged_icons_and_cursors_are_shown() {
 
 /// A bare JPEG 2000 codestream of 4x4 pixels, written by opj_compress from
 /// Y = 100, Cb = 128, Cr = 200 with the chroma subsampled 2x2: it has no
-/// colour box, and is YCbCr.
+/// colour box, and is YCbCr (hayro-jpeg2000 converts it, rounding the red of
+/// 200.9 up).
 #[cfg(feature = "jp2")]
 #[test]
 fn a_codestream_with_subsampled_chroma_is_ycbcr() {
@@ -2131,7 +2247,7 @@ fn a_codestream_with_subsampled_chroma_is_ycbcr() {
     );
     let p = decode(&file, Format::Jpeg2000, DECODE_MAX).unwrap();
     assert_eq!((p.width, p.height), (4, 4));
-    assert_eq!(p.to_rgba8()[..4], [200, 49, 100, 255]);
+    assert_eq!(p.to_rgba8()[..4], [201, 49, 100, 255]);
 }
 
 /// Four 8-bit components under a greyscale colour box (what GDAL writes for a

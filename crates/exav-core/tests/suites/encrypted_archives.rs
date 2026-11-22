@@ -12,6 +12,7 @@
 //! is `PasswordProtected`, never `Clean`, never `Infected`.
 
 use exav_core::{ScanOptions, Verdict, analyze, loader};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 
 fn builtin_db() -> exav_core::Scanner {
     // The built-in DB carries the EICAR signature, which is all we need.
@@ -202,9 +203,8 @@ fn an_encrypted_archive_inside_an_archive_is_password_protected() {
     let db = builtin_db();
     let inner = fixture("zip_aes256_store.zip");
     for encrypted_first in [true, false] {
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let stored = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let stored = FileOptions::default().method(Method::Stored);
         let mut members: Vec<(&str, &[u8])> =
             vec![("inner.zip", &inner[..]), ("note.txt", b"nothing to see")];
         if !encrypted_first {
@@ -254,4 +254,85 @@ fn an_encrypted_zip_appended_to_a_picture_is_reported() {
         analyze(&db, &headless, &ScanOptions::default()).verdict,
         Verdict::Clean
     );
+}
+
+/// A walk that stops at a limit after an encrypted member still reports it:
+/// password protection over a limit, as a container's reasons fold.
+#[test]
+fn an_encrypted_member_before_a_limit_is_password_protected() {
+    use std::io::Write;
+    let stored = FileOptions::default().method(Method::Stored);
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    z.start_file("locked.zip", stored).unwrap();
+    z.write_all(&fixture("zip_aes256_store.zip")).unwrap();
+    for i in 0..40 {
+        z.start_file(&format!("f{i}.txt"), stored).unwrap();
+        z.write_all(b"padding\n").unwrap();
+    }
+    let blob = z.finish().unwrap().into_inner();
+    let mut opts = ScanOptions::default();
+    opts.limits.max_members = 4;
+    match analyze(&builtin_db(), &blob, &opts).verdict {
+        Verdict::PasswordProtected { .. } => {}
+        other => panic!("expected PasswordProtected, got {other:?}"),
+    }
+    // Under `--alert-exceeds-max` the limit is a detection, which wins.
+    opts.alert_exceeds_max = true;
+    match analyze(&builtin_db(), &blob, &opts).verdict {
+        Verdict::Infected { signature, .. } => {
+            assert_eq!(signature, "Heuristics.Limits.Exceeded.MaxFiles")
+        }
+        other => panic!("expected the MaxFiles alert, got {other:?}"),
+    }
+}
+
+/// A RAR archive of a member whose dictionary is over the object limit and a
+/// member encrypted after it: the reader notes the limit on the first and goes
+/// on, so the walk completes. The limit is a detection when reported as found, and wins over
+/// password protection as a detection does, in the default scan and in
+/// `--all-matches`.
+#[test]
+fn a_limit_noted_on_a_member_beats_an_encrypted_one_when_reported_as_found() {
+    let blob = fixture("rar_locked_and_over_limit.rar");
+    let mut opts = ScanOptions::default();
+    opts.limits.max_buffer_bytes = 4096;
+    match analyze(&builtin_db(), &blob, &opts).verdict {
+        Verdict::PasswordProtected { .. } => {}
+        other => panic!("expected PasswordProtected, got {other:?}"),
+    }
+    opts.alert_exceeds_max = true;
+    match analyze(&builtin_db(), &blob, &opts).verdict {
+        Verdict::Infected { signature, .. } => {
+            assert_eq!(signature, "Heuristics.Limits.Exceeded.MaxFileSize")
+        }
+        other => panic!("expected the MaxFileSize alert, got {other:?}"),
+    }
+    let (names, outcome) = exav_core::analyze_all_with_outcome(&builtin_db(), &blob, &opts);
+    assert_eq!(
+        names.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        ["Heuristics.Limits.Exceeded.MaxFileSize"],
+        "{outcome:?}"
+    );
+}
+
+/// The same limit noted on a first member, and the walk stopped by a header
+/// that does not parse after it (made with `rar` 7.23, then the second file
+/// header's CRC changed): reported as found, the limit is a detection and wins
+/// over the damage, as a signature found before it would.
+#[test]
+fn a_limit_noted_on_a_member_beats_a_later_stop_at_damage_when_reported_as_found() {
+    let blob = fixture("rar_over_limit_then_damaged.rar");
+    let mut opts = ScanOptions::default();
+    opts.limits.max_buffer_bytes = 4096;
+    match analyze(&builtin_db(), &blob, &opts).verdict {
+        Verdict::Unscannable { .. } => {}
+        other => panic!("expected Unscannable, got {other:?}"),
+    }
+    opts.alert_exceeds_max = true;
+    match analyze(&builtin_db(), &blob, &opts).verdict {
+        Verdict::Infected { signature, .. } => {
+            assert_eq!(signature, "Heuristics.Limits.Exceeded.MaxFileSize")
+        }
+        other => panic!("expected the MaxFileSize alert, got {other:?}"),
+    }
 }

@@ -97,6 +97,8 @@ pub mod old_ppt;
 pub(crate) mod ole;
 #[cfg(all(feature = "ole", feature = "decrypt"))]
 mod ole_crypto;
+#[cfg(feature = "zip")]
+pub mod package;
 #[cfg(feature = "pdf")]
 pub(crate) mod pdf;
 #[cfg(feature = "pdf")]
@@ -198,7 +200,7 @@ pub(crate) mod squashfs;
 /// conventions of malware distribution. A password-protected dropper is a
 /// classic scanner-evasion trick, so opening these with no configuration
 /// matters, as `VelvetSweatshop` does for Office.
-#[cfg(feature = "decrypt")]
+#[cfg(all(feature = "decrypt", any(feature = "zip", feature = "rar")))]
 pub(crate) const DEFAULT_ARCHIVE_PASSWORDS: &[&str] =
     &["infected", "virus", "malware", "password", "123456"];
 // Every container exav recognises but does not open reports through here.
@@ -276,15 +278,15 @@ mod xz_nocheck;
 pub mod zip;
 #[cfg(all(feature = "zip", feature = "decrypt"))]
 mod zip_crypto;
+#[cfg(feature = "zip")]
+mod zip_legacy;
 #[cfg(feature = "zoo")]
 pub(crate) mod zoo;
 #[cfg(feature = "zoo")]
 mod zoo_parse;
-// aPLib codec: the compression used by the Petite/FSG2/NsPack PE packers.
+
 #[cfg(feature = "aimodel")]
 mod aimodel;
-#[cfg(feature = "pepack")]
-mod aplib;
 #[cfg(feature = "javaclass")]
 mod javaclass;
 #[cfg(feature = "pepack")]

@@ -46,10 +46,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "npm run build:e2e && playwright test",
-    "build": "wasm-pack build --release --target web",
+    "build": "RUSTFLAGS=\"$(../../scripts/build-flags.sh)\" wasm-pack build --release --target web",
     "build:e2e": "wasm-pack build --release --target web -- --features testing-faults",
-    "build:full": "wasm-pack build --release --target web -- --no-default-features --features full",
-    "build:minimal": "wasm-pack build --release --target web -- --no-default-features --features minimal",
+    "build:full": "RUSTFLAGS=\"$(../../scripts/build-flags.sh)\" wasm-pack build --release --target web -- --no-default-features --features full",
+    "build:minimal": "RUSTFLAGS=\"$(../../scripts/build-flags.sh)\" wasm-pack build --release --target web -- --no-default-features --features minimal",
     "prepublishOnly": "node -e \"for (const f of ['LICENSE','NOTICE','README.md','pkg/exav_unpack_wasm.js','pkg/exav_unpack_wasm.d.ts','pkg/exav_unpack_wasm_bg.wasm','pkg/exav_unpack_wasm_bg.wasm.d.ts']) if (!require('fs').existsSync(f)) { console.error('refusing to publish without ' + f + ': the wasm in pkg/ is built elsewhere (CI/VM with wasm-pack) and copied in; publish from the crate root with pkg/ populated'); process.exit(1); }\"",
     "serve": "npx serve . -l 3847"
   },

@@ -8,11 +8,15 @@
 //!
 //! Two properties matter beyond plain load/store:
 //!
-//! * **Mapped-ness is enforced, protection is not.** An access to an unmapped
-//!   page is a fault that stops emulation; a write to a page the PE marked
-//!   read-only is allowed. Packers routinely rewrite their own code section
-//!   after calling `VirtualProtect`, and enforcing page protection would only
-//!   produce faults on files that run fine on Windows.
+//! * **Mapped-ness is enforced, and write protection only where it is
+//!   tracked.** An access to an unmapped page is a fault. A write to a page
+//!   marked read-only is a fault too, but only the pages the emulator marks
+//!   are: the loaded image's headers, and what `VirtualProtect` sets. A
+//!   section's own protection is not modelled, since packers rewrite their
+//!   code section and a wrong guess would fault files that run fine on
+//!   Windows. The headers are different: Windows maps them read-only, and some
+//!   stubs write to them on purpose to raise the access violation their
+//!   exception handler continues from.
 //! * **Every page remembers whether it was written.** That is the signal the
 //!   unpacker uses to decide where the original image was reconstructed: a jump
 //!   into a page the stub wrote is the classic tail transfer to the original
@@ -47,6 +51,11 @@ struct Page {
     /// Whether an instruction has been fetched from this page. A write to such
     /// a page is self-modifying code, and invalidates the decode cache.
     executed: bool,
+    /// The page had been written when code was first fetched from it: what
+    /// runs there is something the run produced, not bytes of the file.
+    produced: bool,
+    /// A write to this page faults. Set by [`Mem::set_read_only`].
+    read_only: bool,
 }
 
 /// The emulator's address space.
@@ -149,7 +158,21 @@ impl Mem {
     #[inline]
     pub fn mark_executed(&mut self, addr: u32) {
         if let Some(slot) = self.slot(addr >> PAGE_SHIFT) {
-            self.pages[slot as usize].executed = true;
+            let p = &mut self.pages[slot as usize];
+            if !p.executed {
+                p.produced = p.dirty;
+            }
+            p.executed = true;
+        }
+    }
+
+    /// Whether the page holding `addr` runs code the run produced (see
+    /// `Page::produced`). A page nothing has run from yet is not.
+    #[inline]
+    pub fn runs_produced_code(&mut self, addr: u32) -> bool {
+        match self.slot(addr >> PAGE_SHIFT) {
+            Some(slot) => self.pages[slot as usize].produced,
+            None => false,
         }
     }
 
@@ -194,6 +217,8 @@ impl Mem {
                 bytes: Box::new([0u8; PAGE_SIZE]),
                 dirty: false,
                 executed: false,
+                produced: false,
+                read_only: false,
             });
             self.index.insert(page, (self.pages.len() - 1) as u32);
         }
@@ -205,12 +230,19 @@ impl Mem {
     /// an image is free to claim any base, including the one a real
     /// `kernel32.dll` occupies.
     pub fn any_mapped(&self, addr: u32, len: u32) -> bool {
+        self.first_mapped(addr, len).is_some()
+    }
+
+    /// Address of the first mapped page covering `addr..addr+len`.
+    pub fn first_mapped(&self, addr: u32, len: u32) -> Option<u32> {
         if len == 0 {
-            return false;
+            return None;
         }
         let first = addr >> PAGE_SHIFT;
         let last = addr.saturating_add(len - 1) >> PAGE_SHIFT;
-        (first..=last).any(|p| self.index.contains_key(&p))
+        (first..=last)
+            .find(|p| self.index.contains_key(p))
+            .map(|p| p << PAGE_SHIFT)
     }
 
     /// Whether every page covering `addr..addr+len` is mapped. A range past
@@ -232,6 +264,29 @@ impl Mem {
     pub fn is_dirty(&self, addr: u32) -> bool {
         match self.index.get(&(addr >> PAGE_SHIFT)) {
             Some(&slot) => self.pages[slot as usize].dirty,
+            None => false,
+        }
+    }
+
+    /// Make the mapped pages covering `addr..addr+len` read-only or writable
+    /// again. Pages that are not mapped are left alone.
+    pub fn set_read_only(&mut self, addr: u32, len: u32, read_only: bool) {
+        if len == 0 {
+            return;
+        }
+        let first = addr >> PAGE_SHIFT;
+        let last = addr.saturating_add(len - 1) >> PAGE_SHIFT;
+        for page in first..=last {
+            if let Some(&slot) = self.index.get(&page) {
+                self.pages[slot as usize].read_only = read_only;
+            }
+        }
+    }
+
+    /// Whether the page holding `addr` is mapped read-only.
+    pub fn is_read_only(&self, addr: u32) -> bool {
+        match self.index.get(&(addr >> PAGE_SHIFT)) {
+            Some(&slot) => self.pages[slot as usize].read_only,
             None => false,
         }
     }
@@ -265,6 +320,9 @@ impl Mem {
         let page = addr >> PAGE_SHIFT;
         let slot = self.slot(page).ok_or(Fault { addr, write: true })?;
         let p = &mut self.pages[slot as usize];
+        if p.read_only {
+            return Err(Fault { addr, write: true });
+        }
         p.bytes[(addr & PAGE_MASK) as usize] = v;
         let was = p.dirty;
         self.recent_pages |= 1u64 << (page & 63);
@@ -333,6 +391,9 @@ impl Mem {
             let page = addr >> PAGE_SHIFT;
             let slot = self.slot(page).ok_or(Fault { addr, write: true })?;
             let p = &mut self.pages[slot as usize];
+            if p.read_only {
+                return Err(Fault { addr, write: true });
+            }
             p.bytes[off..off + src.len()].copy_from_slice(src);
             let was = p.dirty;
             self.recent_pages |= 1u64 << (page & 63);
@@ -455,6 +516,41 @@ mod tests {
         assert!(m.is_dirty(0x1000));
         m.clear_dirty(0x1000, 0x1000);
         assert!(!m.is_dirty(0x1000));
+    }
+
+    #[test]
+    fn a_read_only_page_faults_on_every_kind_of_write_until_made_writable() {
+        let mut m = Mem::new(16);
+        m.map(0x1000, 0x2000).unwrap();
+        m.write_u32(0x1000, 5).unwrap();
+        m.set_read_only(0x1000, 0x1000, true);
+        assert!(m.is_read_only(0x1800));
+        assert!(!m.is_read_only(0x2000), "only the named page");
+        assert_eq!(m.read_u32(0x1000).unwrap(), 5, "reads still work");
+        let fault = Fault {
+            addr: 0x1004,
+            write: true,
+        };
+        assert_eq!(m.write_u8(0x1004, 1), Err(fault));
+        assert_eq!(m.write_bytes(0x1004, &[1, 2]), Err(fault));
+        assert!(m.write_u32(0x1ffe, 0).is_err(), "a write that starts here");
+        m.set_read_only(0x1000, 0x1000, false);
+        assert!(m.write_u8(0x1004, 1).is_ok());
+    }
+
+    #[test]
+    fn code_is_produced_when_the_page_was_written_before_it_first_ran() {
+        let mut m = Mem::new(16);
+        m.map(0x1000, 0x2000).unwrap();
+        m.write_u8(0x2000, 0x90).unwrap();
+        m.mark_executed(0x1000);
+        m.mark_executed(0x2000);
+        assert!(!m.runs_produced_code(0x1000), "the file's own bytes");
+        assert!(m.runs_produced_code(0x2000), "written, then run");
+        // Writing the first page afterwards does not change what it was.
+        m.write_u8(0x1000, 0x90).unwrap();
+        m.mark_executed(0x1000);
+        assert!(!m.runs_produced_code(0x1000));
     }
 
     #[test]

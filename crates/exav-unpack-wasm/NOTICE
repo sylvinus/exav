@@ -197,8 +197,6 @@ Public-domain sources, recorded for completeness
 ------------------------------------------------
 
 - ppmd-rust 1.4.0 (PPMd7 model, vendored), CC0-1.0 OR MIT-0.
-- aPLib's reference depack.c by Jørgen Ibsen (bit and gamma readers), released
-  free to use.
 - Didier Stevens' decode-vbe.py (Microsoft Script Encoder tables), public
   domain.
 
@@ -228,12 +226,10 @@ the copyright its license file states, or its authors where it states none:
   cfg-if                 2014 Alex Crichton
   chrono                 2014 Kang Seonghoon
   cipher                 2016-2025 RustCrypto Developers
-  cmov                   2022-2026 The RustCrypto Project Developers
   const-oid              2020-2026 The RustCrypto Project Developers
   cpubits                2023-2026 The RustCrypto Project Developers
   crc32fast              2018 Sam Rijs, Alex Crichton and contributors
   crypto-common          2021-2026 RustCrypto Developers
-  ctutils                2025-2026 The RustCrypto Project Developers
   deflate64              .NET Foundation and Contributors; 2023 anatawa12
   delharc                2023 Rafal Michalski
   des                    2017 Gulshan Singh, Antoni Boucher, Artyom Pavlov;
@@ -247,7 +243,6 @@ the copyright its license file states, or its authors where it states none:
   futures-task           2016 Alex Crichton; 2017 The Tokio Authors
   futures-util           2016 Alex Crichton; 2017 The Tokio Authors
   hashbrown              2016 Amanieu d'Antras
-  hmac                   2017 Artyom Pavlov
   hybrid-array           2022-2026 The RustCrypto Project Developers
   indexmap               2016-2017 the indexmap authors
   inout                  2022 Artyom Pavlov; 2022-2025 The RustCrypto Project Developers
@@ -265,7 +260,6 @@ the copyright its license file states, or its authors where it states none:
   no_std_io2             2020-2021 Brendan Molloy
   num-traits             2014 The Rust Project Developers
   once_cell              Aleksey Kladov
-  pbkdf2                 2017 Artyom Pavlov; 2018-2023 The RustCrypto Project Developers
   pin-project-lite       the pin-project-lite authors
   quick-xml              2016 Johann Tuffe
   ruzstd                 2019 Moritz Borcherding
@@ -280,8 +274,7 @@ the copyright its license file states, or its authors where it states none:
   tar                    The tar-rs Project Contributors
   thiserror              David Tolnay
   tinyvec                2019 Daniel "Lokathor" Gee
-  typed-path             Chip Senkbeil
-  typenum                2014 Paho Lurie-Gregg
+  typenum               2014 Paho Lurie-Gregg
   unicode-bidi           2015 The Rust Project Developers
   unicode-normalization  2015 The Rust Project Developers
   unicode-properties     2015 The Rust Project Developers
@@ -293,7 +286,6 @@ the copyright its license file states, or its authors where it states none:
   web-time               2023 dAxpeDDa
   xz4rust                2025 Alexander Schütz; 2018 Sam Rijs, Alex Crichton and
                          contributors
-  zip                    2014 Mathijs van de Nes
 
 Under the Apache License, Version 2.0 (text below), its only license; it ships
 no NOTICE file:

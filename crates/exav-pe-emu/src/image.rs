@@ -220,6 +220,19 @@ impl PeImage {
         Ok(())
     }
 
+    /// Make the pages holding the headers read-only, as the Windows loader maps
+    /// them. Called once the loader-side work that writes into the image
+    /// (import binding, the TLS index) is done. An image with a section inside
+    /// the header page is left writable: there the headers share their page
+    /// with section data.
+    pub fn protect_headers(&self, mem: &mut Mem) {
+        let end = align_up(self.size_of_headers, crate::mem::PAGE_SIZE as u32);
+        if self.sections.iter().any(|s| s.vaddr < end) {
+            return;
+        }
+        mem.set_read_only(self.base, end, true);
+    }
+
     /// End of the part of the image worth dumping: past the last section that
     /// carries data, rounded to the section alignment.
     fn content_end(&self) -> u32 {

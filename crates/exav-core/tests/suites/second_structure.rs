@@ -8,6 +8,7 @@
 //! not in the bytes of the file.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze};
+use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 use std::io::Write;
 
 fn payload() -> Vec<u8> {
@@ -24,9 +25,8 @@ fn verdict(data: &[u8]) -> Verdict {
 }
 
 fn zip_with_payload() -> Vec<u8> {
-    let deflated = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = FileOptions::default().method(Method::Deflated);
+    let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     z.start_file("e.com", deflated).unwrap();
     z.write_all(&payload()).unwrap();
     z.finish().unwrap().into_inner()

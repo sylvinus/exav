@@ -163,8 +163,9 @@ describe("a spreadsheet opened", () => {
         expect((error as SheetConversionError).kind).toBe(kind);
         expect((error as SheetConversionError).format).toBe("xls");
         expect(nested).not.toHaveBeenCalled();
-        // The external converter never got the file.
-        expect(convertExternal).not.toHaveBeenCalled();
+        // An external converter set got the file next, and failing too, left the first error the file's.
+        expect(convertExternal).toHaveBeenCalledTimes(external ? 1 : 0);
+        convertExternal.mockClear();
         warn.mockRestore();
       }
     }
@@ -237,11 +238,12 @@ describe("a spreadsheet opened", () => {
     expect(convertExternal).toHaveBeenCalledWith(XLS, expect.objectContaining({ hint: "xls" }));
   });
 
-  it("ends in the needs-converter error when the options ask for an external converter and there is none", async () => {
+  it("goes to the package's converter when the options ask for an external converter and there is none", async () => {
     const { rendererFor } = await import("./convert.js");
-    const { ctx, statuses } = context(XLS, { converter: "external" }, false);
+    convertSheet.mockResolvedValue({ xlsx: new Uint8Array([1]).buffer, warnings: "" });
+    const { ctx, nested } = context(XLS, { converter: "external" }, false);
     await rendererFor("xls").mount(document.createElement("div"), ctx);
-    expect((statuses.at(-1) as { error: { code: string } }).error.code).toBe("needs_converter");
-    expect(convertSheet).not.toHaveBeenCalled();
+    expect(convertSheet).toHaveBeenCalledTimes(1);
+    expect((nested.mock.calls[0] as unknown as [unknown, { format: string }])[1].format).toBe("xlsx");
   });
 });

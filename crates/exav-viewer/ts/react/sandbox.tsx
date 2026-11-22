@@ -27,7 +27,10 @@ export function SandboxedViewerProvider({ sandbox, locale, translate, components
   const tRef = useRef(t);
   tRef.current = t;
   const frame = useRef(sandbox).current;
-  const viewer = useMemo(() => createSandboxedViewer({ confirmLink: (url) => window.confirm(tRef.current("link_confirm", { url })), ...frame }), [frame]);
+  const viewer = useMemo(
+    () => createSandboxedViewer({ confirmLink: (url) => window.confirm(tRef.current(url.startsWith("mailto:") ? "link_confirm_mail" : "link_confirm", { url })), ...frame }),
+    [frame],
+  );
   return (
     <ViewerProvider viewer={viewer} locale={locale} translate={translate} components={components}>
       {children}

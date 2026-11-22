@@ -602,6 +602,60 @@ fn a_real_volume_set_joins_into_its_archive() {
     }
 }
 
+/// The real sets with their last volume not given, or cut inside `noise.bin`:
+/// the member before is whole, and `noise.bin` is what the volumes hold of it.
+/// Not given, it is reported as continuing; cut, it is decoded as far as it
+/// goes, as the member of an archive cut there is.
+#[test]
+fn a_real_volume_set_cut_at_its_end_gives_what_the_volumes_hold() {
+    for parts in [
+        ["set5.part1.rar", "set5.part2.rar", "set5.part3.rar"],
+        ["set4.rar", "set4.r00", "set4.r01"],
+    ] {
+        let vols: Vec<Vec<u8>> = parts
+            .iter()
+            .map(|p| fixture(&format!("../rar_volumes/{p}")))
+            .collect();
+        let join = |last: Option<&[u8]>| {
+            let mut refs: Vec<&[u8]> = vec![&vols[0], &vols[1]];
+            refs.extend(last);
+            let joined = exav_unpack::join_rar_volumes(&refs)
+                .unwrap_or_else(|e| panic!("{}: {e}", parts[0]));
+            members(&joined)
+        };
+        let text = |m: &[Entry]| {
+            m.iter()
+                .find(|x| x.name == "text.txt")
+                .map(|x| (sha256_hex(&x.data), x.unsupported))
+        };
+        // Not given.
+        let got = join(None);
+        assert_eq!(text(&got), Some((TEXT.to_string(), None)), "{}", parts[0]);
+        assert!(
+            got.iter().any(|x| x.name == "noise.bin"
+                && x.unsupported
+                    .is_some_and(|w| w.contains("continues in another volume"))),
+            "{}: {:?}",
+            parts[0],
+            got.iter()
+                .map(|x| (&x.name, x.unsupported))
+                .collect::<Vec<_>>()
+        );
+        // Cut inside the data of `noise.bin`.
+        let cut = &vols[2][..vols[2].len() / 2];
+        let got = join(Some(cut));
+        assert_eq!(text(&got), Some((TEXT.to_string(), None)), "{}", parts[0]);
+        let n = got.iter().find(|x| x.name == "noise.bin").unwrap();
+        assert!(
+            n.unsupported.is_none() && !n.data.is_empty() && n.data.len() < 20000,
+            "{}: {} bytes, {:?}",
+            parts[0],
+            n.data.len(),
+            n.unsupported
+        );
+    }
+}
+
 /// A RAR4 volume of an archive header and an end block that records `number`
 /// as its volume number.
 #[cfg(feature = "rar")]

@@ -25,7 +25,7 @@ describe("the converter's progress", () => {
 });
 
 describe("which converter takes a file", () => {
-  const kinds = ["rtf", "doc", "odt", "ppt", "odp", "keynote", "xls", "ods", "numbers", "odg", "visio", "coreldraw", "publisher", "pagemaker", "freehand", "quarkxpress", "zonerdraw", "wpg"] as const;
+  const kinds = ["rtf", "doc", "odt", "pages", "ppt", "odp", "keynote", "xls", "ods", "numbers", "odg", "visio", "coreldraw", "publisher", "pagemaker", "freehand", "quarkxpress", "zonerdraw", "wpg"] as const;
 
   it("is the package's own for spreadsheets, presentations and OpenDocument drawings, by default", () => {
     for (const kind of ["xls", "ods", "numbers"] as const) expect(nativeFirst(kind, {})).toBe("sheets");
@@ -35,7 +35,7 @@ describe("which converter takes a file", () => {
   });
 
   it("is the package's `docs` for text documents without an external converter, or when asked, the external one otherwise", () => {
-    for (const kind of ["doc", "odt", "rtf"] as const) {
+    for (const kind of ["doc", "odt", "rtf", "pages"] as const) {
       expect(nativeFirst(kind, {})).toBe("docs");
       expect(nativeFirst(kind, { externalConverter: "x" })).toBeNull();
       expect(nativeFirst(kind, { converter: "exav", externalConverter: "x" })).toBe("docs");

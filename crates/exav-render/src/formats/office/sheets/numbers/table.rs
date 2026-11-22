@@ -32,6 +32,10 @@ use std::rc::Rc;
 /// Days from 1899-12-30, the 1900 date system's day 0, to 2001-01-01.
 const EPOCH_DAYS: f64 = 36_892.0;
 
+/// Merged ranges by table: (first row, first column, last row, last
+/// column).
+pub type Merges = HashMap<usize, Vec<(u32, u32, u32, u32)>>;
+
 /// What tables share: the object store, the tables as references see
 /// them, custom formats and resolved styles.
 pub struct Cx<'a> {
@@ -40,9 +44,8 @@ pub struct Cx<'a> {
     pub by_uuid: HashMap<u128, usize>,
     /// Custom format UUIDs to their CustomFormatArchive.
     pub custom_formats: HashMap<u128, Msg<'a>>,
-    /// Merged ranges the calculation engine records, by table: (first
-    /// row, first column, last row, last column).
-    pub merges: HashMap<usize, Vec<(u32, u32, u32, u32)>>,
+    /// Merged ranges the calculation engine records.
+    pub merges: Merges,
     pub cell_props: HashMap<u64, CellProps>,
     pub text_props: HashMap<u64, TextProps>,
 }
@@ -239,12 +242,12 @@ pub fn read_table(
             m.and_then(|m| Some((m.uint(1)? as u32, m.uint(2).or(m.uint(1))? as u32)))
         };
         if let (Some((r1, r2)), Some((c1, c2))) = (span(t.msgs(4).next()), span(t.msgs(3).next())) {
-            push_merge(sheet, &d, r1, c1, r2, c2);
+            push_merge(sheet, &d, budget, (r1, c1), (r2, c2));
         }
     }
     if sheet.merges.is_empty() {
         for &(r1, c1, r2, c2) in cx.merges.get(&idx).into_iter().flatten() {
-            push_merge(sheet, &d, r1, c1, r2, c2);
+            push_merge(sheet, &d, budget, (r1, c1), (r2, c2));
         }
     }
     if sheet.merges.is_empty()
@@ -258,7 +261,7 @@ pub fn read_table(
             let (c1, r1) = (o >> 16, o & 0xFFFF);
             let (nc, nr) = (s >> 16, s & 0xFFFF);
             if nc > 0 && nr > 0 {
-                push_merge(sheet, &d, r1, c1, r1 + nr - 1, c1 + nc - 1);
+                push_merge(sheet, &d, budget, (r1, c1), (r1 + nr - 1, c1 + nc - 1));
             }
         }
     }
@@ -492,18 +495,32 @@ pub(super) fn width_chars(pt: f64) -> f64 {
     ((pt * 96.0 / 72.0 / 7.0 * 256.0).round() / 256.0).min(255.0)
 }
 
-pub(super) fn push_merge(sheet: &mut Sheet, d: &TableDims, r1: u32, c1: u32, r2: u32, c2: u32) {
-    if r1 > r2 || c1 > c2 || r2 >= d.rows || c2 >= d.cols || (r1 == r2 && c1 == c2) {
+/// Keep a merge of more than one cell inside the table, unless it overlaps
+/// one kept before. The overlap is looked for while the budget's comparisons
+/// last; past them a merge is kept unchecked, as the other readers keep every
+/// merge.
+pub(super) fn push_merge(
+    sheet: &mut Sheet,
+    d: &TableDims,
+    budget: &mut Budget,
+    (r1, c1): (u32, u32),
+    (r2, c2): (u32, u32),
+) {
+    if r1 > r2
+        || c1 > c2
+        || r2 >= d.rows
+        || c2 >= d.cols
+        || (r1 == r2 && c1 == c2)
+        || sheet.merges.len() >= 1 << 20
+    {
         return;
     }
     let m = Range { r1, c1, r2, c2 };
-    if !sheet
-        .merges
-        .iter()
-        .any(|x| x.r1 <= m.r2 && m.r1 <= x.r2 && x.c1 <= m.c2 && m.c1 <= x.c2)
-    {
-        sheet.merges.push(m);
+    let overlaps = |x: &Range| x.r1 <= m.r2 && m.r1 <= x.r2 && x.c1 <= m.c2 && m.c1 <= x.c2;
+    if budget.compare(sheet.merges.len() as u64) && sheet.merges.iter().any(overlaps) {
+        return;
     }
+    sheet.merges.push(m);
 }
 
 /// The XLSX code of a cell's format, `None` for General.

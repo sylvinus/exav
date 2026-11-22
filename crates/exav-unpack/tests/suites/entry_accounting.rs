@@ -34,8 +34,8 @@ fn tar_of(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn zip_of(name: &str, data: &[u8]) -> Vec<u8> {
-    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    w.start_file(name, zip::write::SimpleFileOptions::default())
+    let mut w = exav_unpack::zip_write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    w.start_file(name, exav_unpack::zip_write::FileOptions::default())
         .unwrap();
     w.write_all(data).unwrap();
     w.finish().unwrap().into_inner()

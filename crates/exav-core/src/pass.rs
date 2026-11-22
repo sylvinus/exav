@@ -257,8 +257,10 @@ impl<'a> Facts<'a> {
     }
 
     /// Whether the object holds a UPX pack header, as
-    /// [`pe::upx_header_in`] says: in its start.
+    /// [`pe::upx_header_in`] says: in its start. Detection says it from its
+    /// read of the start; where it did not read the start, this reads it.
     pub(crate) fn upx_header(&self) -> bool {
+        self.format();
         *self.upx.get_or_init(|| pe::upx_header_in(self.data))
     }
 

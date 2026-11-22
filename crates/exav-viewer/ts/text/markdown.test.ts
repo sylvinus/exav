@@ -122,6 +122,11 @@ describe("links", () => {
     }
   });
 
+  it("refuses the marks that move what is around them, invisible in an address", () => {
+    // In the path, where the URL reader would take them (it refuses them in a host).
+    for (const c of [0x61c, 0x200e, 0x200f]) expect(safeTarget(`https://example.com/a${String.fromCharCode(c)}b`), c.toString(16)).toBeNull();
+  });
+
   it("uses the browser's own reading of the address, so a lookalike host is shown as it really is", () => {
     expect(safeTarget("https://EXAMPLE.com:443/a")).toBe("https://example.com/a");
     expect(safeTarget(`https://${String.fromCharCode(0x430)}pple.com/`)).toBe("https://xn--pple-43d.com/");
@@ -195,7 +200,6 @@ describe("limits", () => {
     ["20k blank-separated items", sizes(20_000, "- a\n\n")],
     ["50k headings", sizes(50_000, "# h\n")],
     ["wide table", "|" + sizes(5000, "a|") + "\n|" + sizes(5000, "-|") + "\n" + sizes(2000, "|" + sizes(100, "x|") + "\n")],
-    ["long table", "|a|b|\n|-|-|\n" + sizes(50_000, "|1|2|\n")],
     ["html storm", sizes(30_000, "<div><script>")],
     ["emphasis inside a link inside a quote", sizes(5000, "> [*a **b ") + sizes(5000, "](x)")],
   ];
@@ -213,6 +217,26 @@ describe("limits", () => {
       expectInert(root, name);
     });
   }
+
+  it("reads a long table in time that grows with its rows, and draws a bounded page", async () => {
+    // Timed against half of it rather than against a clock: 2.3 s alone on a
+    // busy host is near any fixed bound. Linear is a ratio of 2, the
+    // quadratic work this guards against 4.
+    const table = (rows: number) => "|a|b|\n|-|-|\n" + sizes(rows, "|1|2|\n");
+    const time = async (md: string) => {
+      const t = performance.now();
+      const parsed = await readMarkdown(splitLines(md, 50_000).lines.join("\n"));
+      return { ms: performance.now() - t, parsed };
+    };
+    await time(table(1000));
+    const half = await time(table(25_000));
+    const whole = await time(table(50_000));
+    expect(whole.ms / half.ms, `${whole.ms | 0} ms against ${half.ms | 0} ms`).toBeLessThan(3);
+    const root = document.createElement("div");
+    drawBlocks(root, whole.parsed.blocks);
+    expect(root.querySelectorAll("*").length).toBeLessThan(250_000);
+    expectInert(root, "long table");
+  }, 30_000);
 
   it("stops nesting quotes and lists at the limit, and keeps the rest as text", async () => {
     const r = await render(sizes(50, "> ") + "deep text");

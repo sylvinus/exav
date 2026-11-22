@@ -26,6 +26,7 @@
  * refused. A region that needs a Word page or slide drawn past about 16
  * million pixels is refused as too large: the engines draw whole pages only.
  */
+import { DEFAULT_PACKAGE_LIMITS } from "../core/detect.js";
 import { MATCHERS } from "../core/formats.js";
 import type { Capability, FormatPlugin } from "../core/types.js";
 import { docsFirst, slidesFirst } from "./route.js";
@@ -48,8 +49,8 @@ export interface OfficeOptions {
   maxArchiveEntries?: number;
 }
 
-/** The entry limit used when `OfficeOptions.maxArchiveEntries` is not given. */
-export const DEFAULT_MAX_ARCHIVE_ENTRIES = 20000;
+/** The entry limit used when `OfficeOptions.maxArchiveEntries` is not given: the viewer's limit on a ZIP's members. */
+export const DEFAULT_MAX_ARCHIVE_ENTRIES = DEFAULT_PACKAGE_LIMITS.maxMembers;
 
 /** For the converted formats. */
 export interface ConversionOptions {
@@ -63,25 +64,29 @@ export interface ConversionOptions {
    */
   maxMemory?: number;
   /**
-   * What converts: "exav" is the converters this package ships (exav-render,
-   * in WebAssembly), where there is one for the format; "external" is the
-   * external converter alone, for every format.
+   * What converts first: "exav" is the converters this package ships
+   * (exav-render, in WebAssembly), where there is one for the format;
+   * "external" is the external converter. One word for every format, or one
+   * per format (`{ doc: "exav", odt: "external" }`; a format not named keeps
+   * the default). Whichever goes first, a file it cannot read goes on to the
+   * other when both are there.
    *
-   * Spreadsheets (XLS, ODS, Numbers), presentations (PPT of any version, ODP,
-   * Keynote of any version) and OpenDocument drawings (ODG, OTG, FODG) go to
-   * the package's converters by default. A file one recognises and cannot
-   * convert fails, its error's cause a `SheetConversionError`,
-   * `SlideConversionError` or `DocConversionError` saying why; a file it does
-   * not recognise (an HTML table saved as .xls, say) goes to the external
-   * converter, or ends in a `NeedsConverterError` ("needs_converter") where
-   * there is none.
-   *
-   * Text documents (DOC, ODT, RTF) go to the external converter when one is
-   * set, and to the package's `docs` converter when not, or when this says
-   * "exav". The other formats (CorelDRAW, Visio, Publisher and the like) go
-   * to the external converter, and end in "needs_converter" without one.
+   * By default spreadsheets (XLS, ODS, Numbers), presentations (PPT of any
+   * version, ODP, Keynote of any version) and OpenDocument drawings (ODG,
+   * OTG, FODG) go to the package's converters first, and text documents
+   * (DOC, ODT, RTF, Pages) to the external converter when one is set, else to
+   * the package's `docs`, which reads Pages 5 (2013) and later and says
+   * "unsupported" of a Pages '09 file. A file the package's converter recognises and cannot
+   * convert goes on to the external converter, and without one fails, its
+   * error's cause a `SheetConversionError`, `SlideConversionError` or
+   * `DocConversionError` saying why; a file it does not recognise (an HTML
+   * table saved as .xls, say) goes to the external converter, or ends in a
+   * `NeedsConverterError` ("needs_converter") where there is none. A file
+   * the external converter fails on goes on to the package's converter, where
+   * there is one for the format. The other formats (CorelDRAW, Publisher and
+   * the like) go to the external converter alone.
    */
-  converter?: "exav" | "external";
+  converter?: Converter | Partial<Record<ConvertedFormat, Converter>>;
   /**
    * The external converter: the URL of an ES module (absolute, rooted, or
    * relative to the page), or the name of a package that
@@ -92,6 +97,9 @@ export interface ConversionOptions {
   externalConverter?: string;
 }
 
+/** Which converter goes first for a format (`ConversionOptions.converter`). */
+export type Converter = "exav" | "external";
+
 type Kind = "docx" | "xlsx" | "pptx" | "csv";
 
 /** The formats `@exav/viewer/office` converts, by the viewer's name for them (the converter's `hint`). */
@@ -99,6 +107,7 @@ export type ConvertedFormat =
   | "rtf"
   | "doc"
   | "odt"
+  | "pages"
   | "ppt"
   | "odp"
   | "keynote"
@@ -162,6 +171,8 @@ export const rtf = (options: ConversionOptions = {}) => converted("rtf", options
 /** Word 97 and later, 6.0 and 95. */
 export const doc = (options: ConversionOptions = {}) => converted("doc", options);
 export const odt = (options: ConversionOptions = {}) => converted("odt", options);
+/** Pages 5 (2013) and later; Pages '09 fails as unsupported. */
+export const pages = (options: ConversionOptions = {}) => converted("pages", options);
 export const ppt = (options: ConversionOptions = {}) => converted("ppt", options);
 export const odp = (options: ConversionOptions = {}) => converted("odp", options);
 /** Keynote 1 to 6. */

@@ -1,20 +1,45 @@
 //! JBIG2Decode: an embedded stream (T.88 Annex D.3) and its optional
 //! `/JBIG2Globals`, through hayro-jbig2.
 
-use hayro_jbig2::{DecodeError, Decoder, FormatError, Image};
+use hayro_jbig2::{DecodeError, DecodeSettings, Decoder, FormatError, Globals, Page};
 
 use super::{Error, row_bytes};
 
 /// The page as `height` rows of `width` bits (the image dictionary's size),
 /// 1 for white, each row padded to a byte with 1s. A page of another size is
 /// cut or padded with white; a stream cut before its page information is a
-/// white page, as pdf.js's decoder gives one.
+/// white page, as pdf.js's decoder gives one. A stream that breaks the
+/// specification, such as a text region whose symbols are missing, is decoded
+/// as far as it goes (this is for pdf.js, in the viewer).
 pub fn decode_jbig2(
     data: &[u8],
     width: u32,
     height: u32,
     globals: Option<&[u8]>,
     max_alloc: u64,
+) -> Result<Vec<u8>, Error> {
+    decode(data, width, height, globals, max_alloc, false)
+}
+
+/// [`decode_jbig2`] for the scanner: a stream that breaks the specification is
+/// an error.
+pub fn decode_jbig2_strict(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    globals: Option<&[u8]>,
+    max_alloc: u64,
+) -> Result<Vec<u8>, Error> {
+    decode(data, width, height, globals, max_alloc, true)
+}
+
+fn decode(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    globals: Option<&[u8]>,
+    max_alloc: u64,
+    strict: bool,
 ) -> Result<Vec<u8>, Error> {
     let failed = || Error::new("Failed to decode the image");
     let stride = row_bytes(width);
@@ -33,7 +58,21 @@ pub fn decode_jbig2(
         }
         None => data,
     };
-    let image = match Image::new_embedded(data, globals) {
+    let regions = declared_pixels(data, globals);
+    // Decoding a region costs time per pixel, whatever the memory its bitmap
+    // takes, so the declared pixels are charged at a byte each as well. The
+    // budget may be a gigabyte (the viewer's), but the time is bounded as it
+    // is for a file: by `DECODE_MAX`. Checked before the globals, whose
+    // symbol dictionaries are decoded as they are read.
+    if regions > max_alloc.min(crate::formats::DECODE_MAX) {
+        return Err(Error::new("Image too large"));
+    }
+    let settings = DecodeSettings { strict };
+    let shared = match globals {
+        Some(g) => Some(Globals::new(g, &settings).map_err(|_| failed())?),
+        None => None,
+    };
+    let image = match Page::new_embedded(data, shared.as_ref(), &settings) {
         Ok(image) => image,
         Err(DecodeError::Format(FormatError::MissingPageInfo)) => {
             return Ok(vec![0xFF; out_len as usize]);
@@ -41,14 +80,6 @@ pub fn decode_jbig2(
         Err(_) => return Err(failed()),
     };
     let page = u64::from(image.width()) * u64::from(image.height());
-    let regions = declared_pixels(data, globals);
-    // Decoding a region costs time per pixel, whatever the memory its bitmap
-    // takes, so the declared pixels are charged at a byte each as well. The
-    // budget may be a gigabyte (the viewer's), but the time is bounded as it
-    // is for a file: by `DECODE_MAX`.
-    if regions > max_alloc.min(crate::formats::DECODE_MAX) {
-        return Err(Error::new("Image too large"));
-    }
     // The page and region bitmaps, the page's rows as the decoder emits
     // them, and the output.
     if (page / 8)

@@ -369,6 +369,7 @@ mod slides {
 mod sheets {
     use super::*;
     use exav_render::sheets::{Error, Format, Limits, convert};
+    use exav_unpack::zip_write::{FileOptions, Method, ZipWriter};
 
     fn record(id: u16, body: &[u8]) -> Vec<u8> {
         let mut v = id.to_le_bytes().to_vec();
@@ -477,13 +478,12 @@ mod sheets {
              <chart:categories table:cell-range-address=\"{range}\"/></chart:axis>{series}\
              </chart:plot-area></chart:chart></office:chart></office:body></office:document-content>"
         );
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let stored = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let mut z = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let stored = FileOptions::default().method(Method::Stored);
         z.start_file("mimetype", stored).unwrap();
         z.write_all(b"application/vnd.oasis.opendocument.spreadsheet")
             .unwrap();
-        let deflated = zip::write::SimpleFileOptions::default();
+        let deflated = FileOptions::default();
         z.start_file("content.xml", deflated).unwrap();
         z.write_all(content.as_bytes()).unwrap();
         z.start_file("Object 1/content.xml", deflated).unwrap();

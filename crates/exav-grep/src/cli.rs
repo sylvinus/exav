@@ -49,6 +49,80 @@ pub struct ReadArgs {
     )]
     max_extracted_bytes: Option<String>,
 
+    /// Most bytes searched for one file named on the command line: its
+    /// members, decoded or not, summed (default 10G). A CPU/time bound, not a
+    /// memory one. A file that reaches it is reported not fully read. K/M/G/T
+    /// suffixes; `off` or `0` sets no limit. The scanner's
+    /// `--max-matcher-bytes`.
+    #[arg(
+        long = "max-matcher-bytes",
+        env = "EXAV_MAX_MATCHER_BYTES",
+        value_name = "SIZE|off"
+    )]
+    max_matcher_bytes: Option<String>,
+
+    /// Most bytes of holes (the unwritten stretches of a sparse file in a
+    /// filesystem image) searched as zeros for one file named on the command
+    /// line (default 10G). They count here instead of toward
+    /// --max-matcher-bytes, so a large sparse file does not end the walk of the
+    /// rest of the volume. K/M/G/T suffixes; `off` or `0` sets no limit.
+    #[arg(
+        long = "max-hole-bytes",
+        env = "EXAV_MAX_HOLE_BYTES",
+        value_name = "SIZE|off"
+    )]
+    max_hole_bytes: Option<String>,
+
+    /// Max members to visit inside each input file (default 100000); `off` or
+    /// `0` sets no limit. The budget is per file, not a total across the tree:
+    /// a directory of N archives may yield N times this many members.
+    #[arg(long = "max-members", env = "EXAV_MAX_MEMBERS", value_name = "N|off")]
+    max_members: Option<String>,
+
+    /// Leave out a member that decodes to more than N times its size, once it
+    /// is past --max-object-bytes (default 1000); the other members are still
+    /// searched and the file is reported as not fully read. `off` or `0` sets
+    /// no limit.
+    #[arg(
+        long = "max-compression-ratio",
+        env = "EXAV_MAX_COMPRESSION_RATIO",
+        value_name = "N|off"
+    )]
+    max_compression_ratio: Option<String>,
+
+    /// Most x86 instructions the emulator that unpacks packed executables may
+    /// run for one file named on the command line, summed over every packed
+    /// executable in it (default 1000000000). A file that runs out is
+    /// reported not fully read. `off` or `0` sets no limit.
+    #[arg(
+        long = "max-pe-emulation-steps",
+        env = "EXAV_MAX_PE_EMULATION_STEPS",
+        value_name = "N|off"
+    )]
+    max_pe_emulation_steps: Option<String>,
+
+    /// Most x86 instructions the emulator that unpacks packed executables may
+    /// run for one packed executable (default 500000000). A run that reaches
+    /// it is cut short: what the stub rebuilt is still searched, and the file
+    /// is reported not fully read. `off` or `0` sets no limit.
+    #[arg(
+        long = "max-pe-stub-steps",
+        env = "EXAV_MAX_PE_STUB_STEPS",
+        value_name = "N|off"
+    )]
+    max_pe_stub_steps: Option<String>,
+
+    /// Instructions a packed executable's stub may run in that emulator without
+    /// writing a page it has not written before (default 64000000). A stub that
+    /// goes that long is looping on nothing: the run stops and what it rebuilt
+    /// is searched, which is not a limit reached. `off` or `0` sets no limit.
+    #[arg(
+        long = "max-pe-idle-steps",
+        env = "EXAV_MAX_PE_IDLE_STEPS",
+        value_name = "N|off"
+    )]
+    max_pe_idle_steps: Option<String>,
+
     /// Max nesting depth of archives within archives. `0` opens no archive:
     /// each file is searched as it stands. There is no `off`: every level
     /// costs stack.
@@ -67,7 +141,7 @@ pub struct ReadArgs {
     /// (default: the system temporary directory). `off` writes nothing, and
     /// such a container is reported unreadable.
     #[arg(long = "spill-dir", env = "EXAV_SPILL_DIR", value_name = "DIR|off")]
-    spill_dir: Option<String>,
+    spill_dir: Option<PathBuf>,
 
     /// Most the spill files open at once may hold, with K/M/G/T suffixes
     /// (default 2G). A container that would pass it is reported unreadable.
@@ -114,6 +188,29 @@ impl ReadArgs {
             limits.max_extracted_bytes =
                 size_limit("--max-extracted-bytes", v)?.unwrap_or(u64::MAX);
         }
+        if let Some(v) = self.max_matcher_bytes.as_deref() {
+            limits.max_scanned_bytes = size_limit("--max-matcher-bytes", v)?.unwrap_or(u64::MAX);
+        }
+        if let Some(v) = self.max_hole_bytes.as_deref() {
+            limits.max_hole_bytes = size_limit("--max-hole-bytes", v)?.unwrap_or(u64::MAX);
+        }
+        if let Some(v) = self.max_members.as_deref() {
+            limits.max_members = count_limit("--max-members", v)?.unwrap_or(u64::MAX);
+        }
+        if let Some(v) = self.max_compression_ratio.as_deref() {
+            limits.max_compression_ratio =
+                count_limit("--max-compression-ratio", v)?.unwrap_or(u64::MAX);
+        }
+        if let Some(v) = self.max_pe_emulation_steps.as_deref() {
+            limits.max_pe_emulation_steps =
+                count_limit("--max-pe-emulation-steps", v)?.unwrap_or(u64::MAX);
+        }
+        if let Some(v) = self.max_pe_stub_steps.as_deref() {
+            limits.max_pe_stub_steps = count_limit("--max-pe-stub-steps", v)?.unwrap_or(u64::MAX);
+        }
+        if let Some(v) = self.max_pe_idle_steps.as_deref() {
+            limits.max_pe_idle_steps = count_limit("--max-pe-idle-steps", v)?.unwrap_or(u64::MAX);
+        }
         if let Some(d) = self.max_depth {
             limits.max_recursion = d;
         }
@@ -134,8 +231,8 @@ impl ReadArgs {
             defaults.object_cache_block_bytes,
         )?;
         let spill_dir = match self.spill_dir.as_deref() {
-            Some("off") => None,
-            Some(dir) => Some(dir.into()),
+            Some(dir) if dir.as_os_str() == "off" => None,
+            Some(dir) => Some(dir.to_path_buf()),
             None => Some(std::env::temp_dir()),
         };
         let max_spill_bytes = match self.max_spill_bytes.as_deref() {
@@ -252,14 +349,23 @@ impl QrArgs {
 /// reads them, `default` when not given. `Err` names the flag.
 #[cfg(feature = "qr")]
 fn limit_or_off(v: Option<&str>, default: u64, flag: &str) -> Result<Option<u64>, String> {
-    match v.map(str::trim) {
+    match v {
         None => Ok(Some(default)),
-        Some(n) if n.eq_ignore_ascii_case("off") => Ok(None),
-        Some(n) => match n.parse::<u64>() {
-            Ok(0) => Ok(None),
-            Ok(n) => Ok(Some(n)),
-            Err(_) => Err(format!("{flag}: expected a number or `off`, got `{n}`")),
-        },
+        Some(n) => count_limit(flag, n),
+    }
+}
+
+/// A count given as a number or `off`: `None` for `off` or `0`, as `exav`
+/// reads them. `Err` names the flag.
+fn count_limit(flag: &str, value: &str) -> Result<Option<u64>, String> {
+    let n = value.trim();
+    if n.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    match n.parse::<u64>() {
+        Ok(0) => Ok(None),
+        Ok(n) => Ok(Some(n)),
+        Err(_) => Err(format!("{flag}: expected a number or `off`, got `{n}`")),
     }
 }
 
@@ -289,6 +395,86 @@ fn size_limit(flag: &str, value: &str) -> Result<Option<u64>, String> {
         None => Err(format!(
             "{flag}: expected a size (bytes, or K/M/G/T suffixes) or `off`, got `{value}`"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Command {
+        #[command(flatten)]
+        read: ReadArgs,
+    }
+
+    fn limits(args: &[&str]) -> Limits {
+        let args = std::iter::once("exav-grep").chain(args.iter().copied());
+        Command::try_parse_from(args)
+            .unwrap()
+            .read
+            .options()
+            .unwrap()
+            .limits
+    }
+
+    /// The walk's limits as one tuple, in the order of the flags below.
+    fn walk(l: &Limits) -> (u64, u64, u64, u64, u64, u64, u64) {
+        (
+            l.max_scanned_bytes,
+            l.max_hole_bytes,
+            l.max_members,
+            l.max_compression_ratio,
+            l.max_pe_emulation_steps,
+            l.max_pe_stub_steps,
+            l.max_pe_idle_steps,
+        )
+    }
+
+    #[test]
+    fn the_walk_limits_are_set_by_their_flags() {
+        let set = limits(&[
+            "--max-matcher-bytes",
+            "3K",
+            "--max-hole-bytes",
+            "2M",
+            "--max-members",
+            "7",
+            "--max-compression-ratio",
+            "9",
+            "--max-pe-emulation-steps",
+            "11",
+            "--max-pe-stub-steps",
+            "13",
+            "--max-pe-idle-steps",
+            "15",
+        ]);
+        assert_eq!(walk(&set), (3 << 10, 2 << 20, 7, 9, 11, 13, 15));
+        let off = limits(&[
+            "--max-matcher-bytes",
+            "off",
+            "--max-hole-bytes",
+            "0",
+            "--max-members",
+            "off",
+            "--max-compression-ratio",
+            "0",
+            "--max-pe-emulation-steps",
+            "off",
+            "--max-pe-stub-steps",
+            "off",
+            "--max-pe-idle-steps",
+            "0",
+        ]);
+        let m = u64::MAX;
+        assert_eq!(walk(&off), (m, m, m, m, m, m, m));
+        assert_eq!(walk(&limits(&[])), walk(&Limits::default()));
+        let l = Limits::default();
+        assert_eq!(
+            (l.max_pe_stub_steps, l.max_pe_idle_steps),
+            (500_000_000, 64_000_000)
+        );
     }
 }
 

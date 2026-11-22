@@ -294,7 +294,7 @@ describe("Markdown", () => {
     expect(o.host.querySelectorAll("li").length).toBe(2);
   });
 
-  it("follows an http or https link on a click or Enter, as a PDF's links are, and no other", async () => {
+  it("follows an http, https or mailto link on a click or Enter, as a PDF's links are, and no other", async () => {
     const opened: unknown[][] = [];
     const real = window.open;
     window.open = ((...args: unknown[]) => {
@@ -305,18 +305,18 @@ describe("Markdown", () => {
       const o = await open("links.md", enc("[a](https://example.com/a) [b](http://example.com/b) <https://example.com/c> [m](mailto:me@example.com) [x](javascript:alert(1))\n"));
       const links = [...o.host.querySelectorAll<HTMLElement>(".exav-viewer-text-link")];
       expect(links.map((l) => l.textContent)).toEqual(["a", "b", "https://example.com/c", "m"]);
-      expect(links.map((l) => l.getAttribute("role"))).toEqual(["link", "link", "link", null]);
+      expect(links.map((l) => l.getAttribute("role"))).toEqual(["link", "link", "link", "link"]);
       expect(o.host.querySelector("a")).toBeNull();
       links[0]!.click();
       links[1]!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
       links[1]!.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true }));
       links[2]!.click();
-      // The mail address is only text, and nothing else is a link.
       links[3]!.click();
       expect(opened).toEqual([
         ["https://example.com/a", "_blank", "noopener,noreferrer"],
         ["http://example.com/b", "_blank", "noopener,noreferrer"],
         ["https://example.com/c", "_blank", "noopener,noreferrer"],
+        ["mailto:me@example.com", "_blank", "noopener,noreferrer"],
       ]);
     } finally {
       window.open = real;

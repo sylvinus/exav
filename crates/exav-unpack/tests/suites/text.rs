@@ -261,9 +261,9 @@ mod package {
     use std::io::Write;
 
     pub(crate) fn zip_of(members: &[(&str, &str)]) -> Vec<u8> {
-        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let mut w = exav_unpack::zip_write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         for (name, data) in members {
-            w.start_file(*name, zip::write::SimpleFileOptions::default())
+            w.start_file(name, exav_unpack::zip_write::FileOptions::default())
                 .unwrap();
             w.write_all(data.as_bytes()).unwrap();
         }

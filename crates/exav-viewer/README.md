@@ -60,7 +60,7 @@ then the engines of the formats you open (all optional peer dependencies):
 | Images, SVG, camera RAW (DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF, PEF, SRW, 3FR, IIQ, X3F and more: the largest embedded preview) | `image({ wasmDecoders: true })` from `@exav/viewer/image` | nothing |
 | DWG, DXF | `dwg()`, `dxf()` from `@exav/viewer/cad` | nothing |
 | Word, Excel, PowerPoint, CSV | `docx()`, `xlsx()`, `pptx()`, `csv()` from `@exav/viewer/office` | `@silurus/ooxml` (a ZIP's central directory is read first by exav-unpack's ZIP reader, and a CSV or TSV is read into an XLSX by exav-render, in a small wasm module of the package) |
-| RTF, DOC, ODT | `rtf()`, `doc()`, `odt()` from `@exav/viewer/office`, beside `docx()` | `@silurus/ooxml` (read by exav-render's `docs`, a prototype; an external converter and `pdf()` do better) |
+| RTF, DOC, ODT, Pages | `rtf()`, `doc()`, `odt()`, `pages()` from `@exav/viewer/office`, beside `docx()` | `@silurus/ooxml` (read by exav-render's `docs`, a prototype; an external converter and `pdf()` do better) |
 | XLS, ODS, Numbers | `xls()`, `ods()`, `numbers()` from `@exav/viewer/office`, beside `xlsx()` | `@silurus/ooxml` (an external converter for the files exav-render's `sheets` does not recognise) |
 | PPT, ODP, Keynote, ODG, Visio (VSDX) | `ppt()`, `odp()`, `keynote()`, `odg()`, `visio()` from `@exav/viewer/office`, beside `pptx()` | `@silurus/ooxml` (an external converter and `pdf()` for the files exav-render's `slides` does not recognise, such as the binary .vsd) |
 | Binary Visio (VSD), CorelDRAW, Publisher, PageMaker, FreeHand, QuarkXPress, Zoner Draw, WPG | `visio()`, `coreldraw()`, `publisher()`, `pagemaker()`, `freehand()`, `quarkxpress()`, `zonerdraw()`, `wpg()` from `@exav/viewer/office`, beside `pdf()` | an external converter (see below) |
@@ -81,7 +81,7 @@ IFC models (IFC2X3, IFC4, IFC4X3) are read and meshed by exav's own engine
 
 XLS, ODS and Numbers are converted to XLSX, shown by `xlsx()` as a
 workbook; PPT, ODP, Keynote, ODG and VSDX (a page to a slide) to PPTX, shown
-by `pptx()`; RTF, DOC and ODT to DOCX, shown by `docx()`. All by exav-render,
+by `pptx()`; RTF, DOC, ODT and Pages to DOCX, shown by `docx()`. All by exav-render,
 which the package ships as WebAssembly modules
 (`wasm/exav_viewer_sheets_bg.wasm`, `..._slides_...`, `..._docs_...`): no
 install is needed, and nothing is fetched besides the module. What no
@@ -106,8 +106,9 @@ and 97 to 2003 (2 to 4 are recognised and reported as unsupported), Excel 2
 to 2003, the text formats Excel opens from a .xls file (XML Spreadsheet
 2003, HTML tables, SYLK), OpenDocument drawings (a page to a slide, in the
 largest page's size) and Keynote and Numbers of every version. Text
-documents (DOC, ODT, RTF) are read by `docs`, a prototype, where no external
-converter is set; with one, text documents go to it.
+documents (DOC, ODT, RTF, Pages) are read by `docs`, a prototype, where no
+external converter is set; with one, text documents go to it. `docs` reads
+Pages 5 (2013) and later and reports Pages '09 as unsupported.
 
 ### The external converter
 
@@ -130,8 +131,8 @@ The module exports `convert`, and may export `prefetch`:
 
 ```ts
 export function convert(bytes: Uint8Array, options: {
-  hint: string;          // what the viewer took the file for: "rtf", "doc", "odt", "ppt",
-                         // "odp", "keynote", "xls", "ods", "numbers", "odg", "visio",
+  hint: string;          // what the viewer took the file for: "rtf", "doc", "odt", "pages",
+                         // "ppt", "odp", "keynote", "xls", "ods", "numbers", "odg", "visio",
                          // "coreldraw", "publisher", "pagemaker", "freehand", "quarkxpress",
                          // "zonerdraw" or "wpg": a hint, the bytes decide
   maxMemory?: number;    // bytes, when the host set the `maxMemory` option

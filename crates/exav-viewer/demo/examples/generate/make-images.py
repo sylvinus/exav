@@ -574,7 +574,6 @@ if tool("tiffcp"):
         p = os.path.join(WORK, f"fax{n}.tif")
         fax_page(1728, 2200, n).convert("1").save(p, dpi=(204, 196))
         pages.append(p)
-    # Group 3 is written to show what the viewer says about it: its TIFF decoder reads Group 4 only.
     for name, mode in [("fax-g4.tif", "g4"), ("fax-g3-1d.tif", "g3:1d")]:
         run("tiffcp", "-c", mode, "-r", "2200", pages[0], out(name))
     run("tiffcp", "-c", "g4", "-r", "2200", *pages, out("fax-g4-3pages.tif"))

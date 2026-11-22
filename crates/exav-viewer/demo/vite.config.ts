@@ -5,7 +5,7 @@
 //     npm run demo          # dev server, http://localhost:4322/
 //     npm run demo:build    # static site in demo/dist; DEMO_BASE sets its base path
 import fs from "node:fs";
-import type { ServerResponse } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -115,6 +115,78 @@ function licences(): Plugin {
   };
 }
 
+// A third above clip.webm's bitrate (10 MB for 13 s): it plays without stalling.
+const PACE = 1024 * 1024;
+
+/**
+ * `file` as a file server sends it: whole, or the range asked for unless
+ * `whole`; `paced`, PACE bytes a second.
+ */
+function serveFile(req: IncomingMessage, res: ServerResponse, file: string, type: string, o: { paced?: boolean; whole?: boolean } = {}) {
+  const send = (range?: { start: number; end: number }) => {
+    const stream = fs.createReadStream(file, { ...range, highWaterMark: 64 * 1024 });
+    if (!o.paced) return stream.pipe(res);
+    res.on("close", () => stream.destroy());
+    stream.on("error", () => res.destroy());
+    stream.on("data", (chunk) => {
+      stream.pause();
+      res.write(chunk);
+      setTimeout(() => stream.resume(), (chunk.length * 1000) / PACE);
+    });
+    stream.on("end", () => res.end());
+  };
+  if (!fs.existsSync(file)) {
+    res.statusCode = 404;
+    return res.end();
+  }
+  const size = fs.statSync(file).size;
+  res.setHeader("Content-Type", type);
+  const range = o.whole ? null : /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? "");
+  if (!range) {
+    res.setHeader("Content-Length", size);
+    return send();
+  }
+  res.setHeader("Accept-Ranges", "bytes");
+  const start = range[1] ? Number(range[1]) : Math.max(0, size - Number(range[2]));
+  const end = range[1] && range[2] ? Math.min(size - 1, Number(range[2])) : size - 1;
+  if (start >= size || end < start) {
+    res.statusCode = 416;
+    res.setHeader("Content-Range", `bytes */${size}`);
+    return res.end();
+  }
+  res.statusCode = 206;
+  res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
+  res.setHeader("Content-Length", end - start + 1);
+  send({ start, end });
+}
+
+/**
+ * In `vite preview`: the sidebar's files as GitHub Pages serves the deployed
+ * demo. With `Access-Control-Allow-Origin: *`: the frame, an opaque origin,
+ * reads the first bytes of an image it is given the address of. A `.gz` or
+ * `.br` file as itself: the preview server would send it as the file it
+ * compresses (`Content-Encoding`), which the browser then unpacks.
+ */
+function sidebarFiles(): Plugin {
+  let base = "/";
+  return {
+    name: "demo-sidebar-files",
+    configResolved(config) {
+      base = config.base;
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const url = (req.url ?? "").split("?")[0] ?? "";
+        const m = new RegExp(`^${base}(showcase|examples)/([\\w.-]+)$`).exec(url);
+        if (!m) return next();
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        if (!/\.(gz|br)$/.test(m[2]!)) return next();
+        serveFile(req, res, path.join(pkgDir, "demo", "dist", m[1]!, m[2]!), "application/octet-stream");
+      });
+    },
+  };
+}
+
 /**
  * In `vite preview` only: the browser tests' files (e2e/delivery-setup.ts
  * writes them in e2e/.out/, the samples in its samples/), under `${base}e2e/`, with range requests and
@@ -126,20 +198,6 @@ function licences(): Plugin {
 function e2eFiles(): Plugin {
   const dir = path.join(pkgDir, "e2e", ".out");
   const TYPES: Record<string, string> = { ".pdf": "application/pdf", ".zip": "application/zip", ".webm": "video/webm", ".png": "image/png", ".js": "text/javascript" };
-  // A third above clip.webm's bitrate (10 MB for 13 s): it plays without stalling.
-  const PACE = 1024 * 1024;
-  const send = (file: string, res: ServerResponse, paced: boolean, range?: { start: number; end: number }) => {
-    const stream = fs.createReadStream(file, { ...range, highWaterMark: 64 * 1024 });
-    if (!paced) return stream.pipe(res);
-    res.on("close", () => stream.destroy());
-    stream.on("error", () => res.destroy());
-    stream.on("data", (chunk) => {
-      stream.pause();
-      res.write(chunk);
-      setTimeout(() => stream.resume(), (chunk.length * 1000) / PACE);
-    });
-    stream.on("end", () => res.end());
-  };
   return {
     name: "demo-e2e-files",
     configurePreviewServer(server) {
@@ -152,30 +210,7 @@ function e2eFiles(): Plugin {
         res.setHeader("Cache-Control", "no-store");
         if (req.method === "OPTIONS") return res.end();
         const file = path.join(dir, m[2]!);
-        if (!fs.existsSync(file)) {
-          res.statusCode = 404;
-          return res.end();
-        }
-        const size = fs.statSync(file).size;
-        res.setHeader("Content-Type", TYPES[path.extname(file)] ?? "application/octet-stream");
-        const paced = m[1] === "paced/";
-        const range = m[1] === "whole/" ? null : /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? "");
-        if (!range) {
-          res.setHeader("Content-Length", size);
-          return send(file, res, paced);
-        }
-        res.setHeader("Accept-Ranges", "bytes");
-        const start = range[1] ? Number(range[1]) : Math.max(0, size - Number(range[2]));
-        const end = range[1] && range[2] ? Math.min(size - 1, Number(range[2])) : size - 1;
-        if (start >= size || end < start) {
-          res.statusCode = 416;
-          res.setHeader("Content-Range", `bytes */${size}`);
-          return res.end();
-        }
-        res.statusCode = 206;
-        res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
-        res.setHeader("Content-Length", end - start + 1);
-        send(file, res, paced, { start, end });
+        serveFile(req, res, file, TYPES[path.extname(file)] ?? "application/octet-stream", { paced: m[1] === "paced/", whole: m[1] === "whole/" });
       });
     },
   };
@@ -193,7 +228,7 @@ export default defineConfig({
   define: { __DEMO_ORIGIN__: JSON.stringify(origin), __EXTERNAL_CONVERTER__: JSON.stringify(externalConverter ?? null) },
   // The sandboxed frame at `${base}frame/`, served with its headers by `vite
   // preview`. It may play the demo's own media by URL and fetch from it.
-  plugins: [exavViewer({ frameDir: "frame", frameOrigin: origin, mediaOrigins: [origin], connectOrigins: [origin], externalConverter, formats: frameFormats }), licences(), e2eFiles()],
+  plugins: [exavViewer({ frameDir: "frame", frameOrigin: origin, mediaOrigins: [origin], connectOrigins: [origin], externalConverter, formats: frameFormats }), licences(), sidebarFiles(), e2eFiles()],
   // Beside the docs site's 4321.
   server: { port: 4322, strictPort: true, host: true, fs: { allow: [pkgDir, nodeModules, unpackWasm, ...(externalDir ? [externalDir] : [])] } },
   // headless.html: a host drawing its own controls, without React.

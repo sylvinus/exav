@@ -4,6 +4,7 @@
 //! a limit stopped is not reported clean.
 
 use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
+use exav_unpack::zip_write::{FileOptions, ZipWriter};
 use image::{DynamicImage, GrayImage, ImageFormat};
 
 /// A code for `payload`, four pixels to a module, with its quiet zone; drawn
@@ -71,9 +72,8 @@ fn a_codes_payload_is_matched_only_when_asked_for() {
 #[test]
 fn a_code_in_an_image_inside_an_archive_is_read() {
     use std::io::Write;
-    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    w.start_file("scan-me.png", zip::write::SimpleFileOptions::default())
-        .unwrap();
+    let mut w = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    w.start_file("scan-me.png", FileOptions::default()).unwrap();
     w.write_all(&qr_png(URL)).unwrap();
     let zip = w.finish().unwrap().into_inner();
     assert!(matches!(

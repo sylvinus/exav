@@ -545,6 +545,8 @@ def build_candidate(target):
     """Builds what the release publishes, as the release workflow does, and
     returns its sizes."""
     bins, wasi, wasi_out = release_builds()
+    # As the workflow: the checkout and the cargo home mapped to fixed names.
+    env = {**os.environ, "RUSTFLAGS": run(str(ROOT / "scripts" / "build-flags.sh")).strip()}
     meta = json.loads(run("cargo", "metadata", "--no-deps", "--format-version", "1", "--locked", cwd=ROOT))
     owner = {t["name"]: p["name"] for p in meta["packages"] for t in p["targets"] if "bin" in t["kind"]}
     sizes = {}
@@ -552,9 +554,9 @@ def build_candidate(target):
         # One binary at a time, as each upload step does: the features of one
         # do not reach the others.
         cmd = ["cargo", "build", "--release", "--locked", "--target", target, "-p", owner[name], "--bin", name]
-        subprocess.run(cmd + (["--features", features] if features else []), cwd=ROOT, check=True)
+        subprocess.run(cmd + (["--features", features] if features else []), cwd=ROOT, env=env, check=True)
         sizes[name] = (ROOT / "target" / target / "release" / name).stat().st_size
-    subprocess.run(wasi, cwd=ROOT, check=True)
+    subprocess.run(wasi, cwd=ROOT, env=env, check=True)
     packages = {}
     # With the dependencies already installed for this machine (`npm ci`):
     # installing them here would replace those of another machine that shares
@@ -564,13 +566,19 @@ def build_candidate(target):
         ("@exav/viewer", "crates/exav-viewer", [["npm", "run", "build:wasm"], ["npm", "run", "build"]]),
     ):
         for step in steps:
-            subprocess.run(step, cwd=ROOT / path, check=True)
+            subprocess.run(step, cwd=ROOT / path, env=env, check=True)
         packed = json.loads(run("npm", "pack", "--dry-run", "--json", "--ignore-scripts", cwd=ROOT / path))[0]
         packages[package] = {
             "tarball": packed["size"],
             "unpacked": packed["unpackedSize"],
             "wasm": {f["path"]: f["size"] for f in sorted(packed["files"], key=lambda f: f["path"]) if f["path"].endswith(".wasm")},
         }
+    # What the candidate would publish holds no path of this machine.
+    built = [ROOT / "target" / target / "release" / name for name in sizes] + [ROOT / wasi_out]
+    built += [ROOT / "crates" / "exav-unpack-wasm" / "pkg", ROOT / "crates" / "exav-viewer" / "wasm", ROOT / "crates" / "exav-viewer" / "dist"]
+    # The exceptions are those of the release workflow's gate.
+    skip = [f"--except=/{f}" for f in ("docx_parser_bg.wasm", "pptx_parser_bg.wasm", "xlsx_parser_bg.wasm", "pdfjs.worker.js")]
+    subprocess.run([sys.executable, "-I", str(ROOT / "scripts" / "check-build-paths.py"), *skip, *map(str, built)], check=True)
     return {"binaries": {target: dict(sorted(sizes.items()))}, "wasi": (ROOT / wasi_out).stat().st_size, "npm": packages}
 
 
@@ -777,7 +785,10 @@ def bench(args, candidate=None):
     files = dataset(work, args.corpus)
     listing, one, eicar = work / "files.txt", work / "one.txt", work / "eicar.com"
     listing.write_text("".join(f"{f}\n" for f, _ in files))
-    eicar.write_text("X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-" + "TEST-FILE!$H+H*")
+    # Two halves the script normaliser does not join, so that exav's scan of
+    # its own tree finds nothing here.
+    half = "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-"
+    eicar.write_text(half + "TEST-FILE!$H+H*")
     one.write_text(f"{eicar}\n")
     # One copy of the signatures, so that freshclam cannot change them halfway.
     db = work / "db"

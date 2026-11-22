@@ -5,8 +5,8 @@ use exav_unpack::{Budget, Format, Limits, Member, MemberMeta, walk};
 use std::io::Write;
 
 fn zip_of(name: &str, contents: &[u8]) -> Vec<u8> {
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    z.start_file(name, zip::write::SimpleFileOptions::default())
+    let mut z = exav_unpack::zip_write::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    z.start_file(name, exav_unpack::zip_write::FileOptions::default())
         .unwrap();
     z.write_all(contents).unwrap();
     z.finish().unwrap().into_inner()

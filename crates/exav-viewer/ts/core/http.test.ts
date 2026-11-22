@@ -87,6 +87,16 @@ describe("a request", () => {
     ]);
   });
 
+  it("keeps a range's answer out of the browser's cache, which would join it to a later request for the whole file", async () => {
+    const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetcher);
+    const http = createFetcher({ url: "https://files.test/f" }, null, signal);
+    await http.get({ from: 0, to: 9 }, signal);
+    await http.get({ suffix: 7 }, signal);
+    await http.get(null, signal);
+    expect(fetcher.mock.calls.map(([, init]) => init?.cache)).toEqual(["no-store", "no-store", undefined]);
+  });
+
   it("signs a source again for requests that failed together, once", async () => {
     let signed = 0;
     const resolve = vi.fn(async () => `https://files.test/f?sig=${++signed}`);
@@ -138,6 +148,13 @@ describe("the answer to a range request", () => {
       ["other status", new Response(null, { status: 500 }), { from: 10, to: 19 }],
     ];
     for (const [name, response, span] of cases) expect(await ask(response, span), name).toMatchObject({ kind: "refused" });
+  });
+
+  it("is encoded when the server compressed it: its range is of the compressed bytes", async () => {
+    const gzip = (headers: Record<string, string>) => new Response(FILE.slice(0, 20), { status: 206, headers: { "content-range": "bytes 0-19/1000", ...headers } });
+    expect(await ask(gzip({ "content-encoding": "gzip" }), { from: 0, to: 19 })).toEqual({ kind: "encoded" });
+    expect(await ask(gzip({ "content-encoding": " BR " }), { from: 0, to: 19 })).toEqual({ kind: "encoded" });
+    expect(await ask(gzip({ "content-encoding": "identity" }), { from: 0, to: 19 })).toMatchObject({ kind: "part" });
   });
 
   it("is unreadable when a 206 has no Content-Range, whatever the body", async () => {

@@ -16,19 +16,30 @@ const NATIVE: Partial<Record<ConvertedFormat, Native>> = {
   visio: "slides",
   doc: "docs",
   odt: "docs",
+  pages: "docs",
   rtf: "docs",
 };
 
+/** The package's converter for `kind`, whichever goes first. */
+export const nativeOf = (kind: ConvertedFormat): Native | null => NATIVE[kind] ?? null;
+
+/** What `options.converter` says for `kind`: one word for every format, or the format's entry. */
+function chosen(kind: ConvertedFormat, options: ConversionOptions): "exav" | "external" | undefined {
+  const c = options.converter;
+  return typeof c === "string" ? c : c?.[kind];
+}
+
 /**
  * Which of the package's converters a file of `kind` goes to first, if any:
- * none with `converter: "external"`; text documents only with `converter:
- * "exav"`, or where no external converter is set, since the external one
- * is better at them where there is one.
+ * none where `converter` says "external" for it; text documents only where
+ * it says "exav", or where no external converter is set, since the external
+ * one is better at them where there is one.
  */
 export function nativeFirst(kind: ConvertedFormat, options: ConversionOptions): Native | null {
-  const native = NATIVE[kind] ?? null;
-  if (!native || options.converter === "external") return null;
-  if (native === "docs") return options.converter === "exav" || options.externalConverter === undefined ? "docs" : null;
+  const native = nativeOf(kind);
+  const choice = chosen(kind, options);
+  if (!native || choice === "external") return null;
+  if (native === "docs") return choice === "exav" || options.externalConverter === undefined ? "docs" : null;
   return native;
 }
 

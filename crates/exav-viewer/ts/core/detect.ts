@@ -40,9 +40,11 @@ export function checkSniffTimeout(ms: number | undefined): number {
 }
 
 /**
- * The limits on a ZIP's directory when the host gives none. The members are
- * the Office plugins' own default (`maxArchiveEntries`), the bytes the
- * `archive()` plugin's, and the ratio the scanner's (`--max-compression-ratio`).
+ * The limits on a ZIP's directory when the host gives none, and the defaults
+ * of the steps after it, the `archive()` plugin's and the Office plugins'
+ * (`maxArchiveEntries`), so that a file this check lets through is opened.
+ * Below the scanner's (100,000 members, 1 GiB): a browser tab has less
+ * memory. The ratio is the scanner's (`--max-compression-ratio`).
  */
 export const DEFAULT_PACKAGE_LIMITS: PackageLimits = { maxExtractedBytes: 512 * 1024 * 1024, maxMembers: 20_000, maxCompressionRatio: 1000 };
 
@@ -65,7 +67,7 @@ export function checkPackageLimits(config: Partial<PackageLimits>): PackageLimit
  * here because `checksDirectory` is synchronous and decides whether the
  * module is asked at all: each request loads it in a worker of its own.
  */
-export const PACKAGE_FORMATS: ReadonlySet<FormatId> = new Set(["docx", "xlsx", "pptx", "odt", "ods", "odp", "odg", "visio", "keynote", "numbers", "archive"]);
+export const PACKAGE_FORMATS: ReadonlySet<FormatId> = new Set(["docx", "xlsx", "pptx", "odt", "ods", "odp", "odg", "visio", "keynote", "numbers", "pages", "archive"]);
 
 /** Whether `Detector.exceeds` looks at files of format `kind` under `limits`: a ZIP-based format, and some limit set. */
 export function checksDirectory(kind: FormatId, limits: PackageLimits): boolean {
@@ -264,7 +266,8 @@ export function createDetector(
     limits,
     exceeds,
     detectFile,
-    detectBytes: (name, head, size, signal) => detectFile({ name, path: name, type: "" }, head, size, signal),
+    detectBytes: (name, head, size, signal) =>
+      detectFile({ name, path: name, type: "" }, head, size, signal, head.length >= (size ?? head.length) ? async () => ({ bytes: head, size: head.length }) : undefined),
     table(): DetectionTable {
       return {
         formats: entries.map((e) => ({ id: e.id, matcher: e.match })),

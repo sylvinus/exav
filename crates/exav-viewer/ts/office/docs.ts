@@ -117,11 +117,11 @@ export function sniffDocs(bytes: Uint8Array, kinds: readonly string[] | null): D
   // A compound file too large to look into is taken as its name says.
   if (kinds === null) return isCompound(bytes) ? "doc" : null;
   if (isCompound(bytes) || isZip(bytes)) return FROM_KINDS.find((kind) => kinds.includes(kind)) ?? null;
-  // RTF, after any white space or a byte order mark.
+  // RTF, after any white space or a byte order mark: `{\rt`, as exav-unpack's `is_rtf`.
   let at = 0;
   if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) at = 3;
   while (at < 16 && (bytes[at] === 0x20 || bytes[at] === 0x0a || bytes[at] === 0x0d || bytes[at] === 0x09)) at++;
-  if (ascii(bytes, at, "{\\rtf")) return "rtf";
+  if (ascii(bytes, at, "{\\rt")) return "rtf";
   // Word's "Save as Web Page": an HTML page that declares Word's namespace,
   // alone or in the MIME message of "Single File Web Page". Before the XML
   // kinds, which look for the same namespace.
